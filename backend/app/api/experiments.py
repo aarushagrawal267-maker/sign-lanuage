@@ -68,6 +68,47 @@ def list_experiments(db: Session = Depends(get_db)):
     return [_summary(e) for e in db.scalars(select(Experiment).order_by(Experiment.id.desc()))]
 
 
+def _csv(df, filename: str):
+    from fastapi.responses import Response
+
+    return Response(df.to_csv(index=False), media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@router.get("/export.csv", summary="Export all experiments with their metrics as CSV")
+def export_experiments(db: Session = Depends(get_db)):
+    import pandas as pd
+
+    rows = []
+    for e in db.scalars(select(Experiment).order_by(Experiment.id)):
+        s = _summary(e)
+        rows.append({
+            "id": e.id, "name": e.name, "status": e.status, "architecture": e.architecture, "split": e.split_name,
+            "signer_independent": None if e.split_id is None else bool(db.get(Split, e.split_id).signer_independent),
+            "dataset_version": e.dataset_version, "seq_len": s["seq_len"], "n_params": e.n_params, "epochs_run": s["epochs_run"],
+            "val_top1": (s["val"] or {}).get("top1"), "val_top5": (s["val"] or {}).get("top5"), "val_macro_f1": (s["val"] or {}).get("macro_f1"),
+            "test_top1": (s["test"] or {}).get("top1"), "test_top5": (s["test"] or {}).get("top5"), "test_macro_f1": (s["test"] or {}).get("macro_f1"),
+            "synthetic": e.is_synthetic, "checkpoint": e.checkpoint_path, "created_at": e.created_at, "config": e.config,
+        })
+    return _csv(pd.DataFrame(rows), "experiments.csv")
+
+
+@router.get("/{exp_id}/per-class.csv", summary="Per-class validation (and test, if evaluated) metrics as CSV")
+def export_per_class(exp_id: int, db: Session = Depends(get_db)):
+    import pandas as pd
+
+    e = db.get(Experiment, exp_id)
+    if e is None:
+        raise HTTPException(404, "experiment not found")
+    frames = []
+    for part, m in (("val", e.val_metrics or {}), ("test", e.test_metrics or {})):
+        if m.get("per_class"):
+            frames.append(pd.DataFrame(m["per_class"]).assign(partition=part))
+    if not frames:
+        raise HTTPException(404, "no per-class metrics recorded")
+    return _csv(pd.concat(frames), f"experiment{exp_id}_per_class.csv")
+
+
 @router.get("/{exp_id}", summary="Full experiment record incl. history and metrics")
 def get_experiment(exp_id: int, db: Session = Depends(get_db)):
     e = db.get(Experiment, exp_id)
