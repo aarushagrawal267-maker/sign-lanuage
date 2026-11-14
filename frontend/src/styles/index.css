@@ -1,0 +1,166 @@
+@import "tailwindcss";
+@import "@fontsource/ibm-plex-sans/400.css";
+@import "@fontsource/ibm-plex-sans/500.css";
+@import "@fontsource/ibm-plex-sans/600.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+
+/* Design tokens - Sign Intelligence Studio (dark, charcoal) */
+@theme {
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-ink-950: #0b0d10; /* page */
+  --color-ink-900: #111317; /* sidebar */
+  --color-ink-850: #15181d; /* surface */
+  --color-ink-800: #1b1f25; /* raised */
+  --color-ink-700: #262b33; /* hairline */
+  --color-ink-600: #343a44; /* strong hairline */
+  --color-fg: #e8ebef; /* primary text */
+  --color-fg-2: #b4bcc7; /* secondary text */
+  --color-fg-3: #8a93a0; /* muted text (>= 4.5:1 on surface) */
+
+  --color-accent: #4c8dff; /* electric blue - active / interactive */
+  --color-accent-soft: #1d3157;
+  --color-teal: #2dd4bf; /* confirmed recognition */
+  --color-teal-soft: #0f3a36;
+  --color-warn: #fab219;
+  --color-serious: #ec835a;
+  --color-danger: #f0616d;
+  --color-good: #0ca30c;
+
+  /* chart series (validated: dark mode, surface #15181d) */
+  --color-series-1: #3987e5;
+  --color-series-2: #d95926;
+  --color-series-3: #199e70;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background: var(--color-ink-950);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  min-height: 100vh;
+}
+
+::selection {
+  background: var(--color-accent-soft);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-ink-600) transparent;
+}
+
+.fade-in {
+  animation: fade-in 180ms ease-out both;
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.pulse-dot {
+  animation: pulse 1.6s ease-in-out infinite;
+}
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* Long-form documentation */
+.prose-doc h2 {
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin: 2rem 0 0.75rem;
+  color: var(--color-fg);
+}
+.prose-doc h3 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 1.25rem 0 0.5rem;
+  color: var(--color-fg);
+}
+.prose-doc p,
+.prose-doc li {
+  color: var(--color-fg-2);
+  line-height: 1.7;
+  font-size: 0.925rem;
+}
+.prose-doc p {
+  margin: 0.6rem 0;
+}
+.prose-doc ul {
+  list-style: disc;
+  padding-left: 1.25rem;
+  margin: 0.5rem 0;
+}
+.prose-doc ol {
+  list-style: decimal;
+  padding-left: 1.25rem;
+  margin: 0.5rem 0;
+}
+.prose-doc code {
+  font-family: var(--font-mono);
+  font-size: 0.82em;
+  background: var(--color-ink-800);
+  border: 1px solid var(--color-ink-700);
+  padding: 0.05rem 0.35rem;
+  border-radius: 4px;
+  color: var(--color-fg);
+}
+.prose-doc pre {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  background: var(--color-ink-900);
+  border: 1px solid var(--color-ink-700);
+  border-radius: 10px;
+  padding: 0.9rem 1rem;
+  overflow-x: auto;
+  color: var(--color-fg-2);
+  margin: 0.75rem 0;
+}
+.prose-doc a {
+  color: var(--color-accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.prose-doc strong {
+  color: var(--color-fg);
+  font-weight: 600;
+}

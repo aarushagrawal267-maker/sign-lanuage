@@ -40,7 +40,7 @@ class EngineConfig:
     mode: str = "segment"  # segment | sliding
     threshold: float | None = None  # None -> model's validation-derived threshold
     min_margin: float = 0.10
-    min_frames: int = 10
+    min_frames: int = 6
     min_hand_ratio: float = 0.5
     start_frames: int = 3
     pre_roll_ms: float = 240.0

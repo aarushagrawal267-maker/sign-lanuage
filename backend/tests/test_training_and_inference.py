@@ -135,3 +135,11 @@ def test_lstm_and_tcn_train(synthetic_env):
         wait_job(c, r.json()["job_id"], timeout=120)
         e = c.get(f"/api/experiments/{r.json()['experiment_id']}").json()
         assert e["status"] == "completed" and e["split"]["signer_independent"] is True
+
+
+def test_csv_exports(synthetic_env):
+    c = synthetic_env["client"]
+    r = c.get("/api/experiments/export.csv")
+    assert r.status_code == 200 and r.text.startswith("id,name,status")
+    r = c.get(f"/api/experiments/{synthetic_env['experiment_id']}/per-class.csv")
+    assert r.status_code == 200 and "partition" in r.text.splitlines()[0]
