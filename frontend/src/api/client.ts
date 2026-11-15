@@ -1,6 +1,36 @@
 // Thin typed client for the FastAPI backend (proxied at /api by Vite).
 
 export const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? "";
+/** Static build: no backend. Read-only data comes from JSON snapshots; the model runs in the browser. */
+export const IS_STATIC = import.meta.env.VITE_STATIC === "1";
+const STATIC_MSG = "Not available in the online demo (it runs entirely in your browser). Run the project locally to download data, train or analyse files.";
+
+const staticCache = new Map<string, Promise<unknown>>();
+function staticJson(key: string): Promise<unknown> {
+  if (!staticCache.has(key)) {
+    staticCache.set(key, fetch(`${import.meta.env.BASE_URL}static-data/api/${key}.json`).then((r) => {
+      if (!r.ok) throw new ApiError(404, "Not included in the online demo");
+      return r.json();
+    }));
+  }
+  return staticCache.get(key)!;
+}
+
+async function staticGet<T>(path: string): Promise<T> {
+  const [p, qs] = path.split("?");
+  const key = p.replace(/^\/api\//, "").replace(/^\/+|\/+$/g, "").replace(/\//g, "__");
+  if (key === "dataset__videos") {
+    const q = new URLSearchParams(qs ?? "");
+    let rows = (await staticJson(key)) as Record<string, unknown>[];
+    for (const f of ["class_index", "signer_id"]) if (q.has(f)) rows = rows.filter((r) => String(r[f]) === q.get(f));
+    for (const f of ["status", "split"]) if (q.has(f)) rows = rows.filter((r) => r[f] === q.get(f));
+    const off = Number(q.get("offset") ?? 0), lim = Number(q.get("limit") ?? 50);
+    return { total: rows.length, items: rows.slice(off, off + lim) } as T;
+  }
+  if (key.startsWith("dataset__videos__")) throw new ApiError(404, "Not included in the online demo (WLASL data is not redistributed)");
+  if (key.startsWith("jobs")) return [] as T;
+  return (await staticJson(key)) as T;
+}
 
 export class ApiError extends Error {
   status: number;
@@ -24,7 +54,14 @@ async function parse<T>(res: Response): Promise<T> {
   return (await res.json()) as T;
 }
 
-export const api = {
+const staticDenied = <T>(): Promise<T> => Promise.reject(new ApiError(403, STATIC_MSG));
+
+export const api = IS_STATIC ? {
+  get: staticGet,
+  post: <T>(_path: string, _body?: unknown) => staticDenied<T>(),
+  del: <T>(_path: string) => staticDenied<T>(),
+  upload: <T>(_path: string, _form: FormData) => staticDenied<T>(),
+} : {
   get: <T>(path: string) => fetch(API_BASE + path).then((r) => parse<T>(r)),
   post: <T>(path: string, body?: unknown) =>
     fetch(API_BASE + path, {
@@ -94,6 +131,7 @@ export type SystemInfo = {
   holistic_model_present: boolean;
   data_dir: string;
   public_demo?: boolean;
+  static?: boolean;
 };
 
 export type Job = {

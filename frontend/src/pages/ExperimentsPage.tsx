@@ -1,7 +1,7 @@
 import { Fragment, useState } from "react";
 import { Link } from "react-router-dom";
 import { ChevronDown, ChevronRight, Download, Trash2, Zap } from "lucide-react";
-import { api, type ExperimentDetail, type ExperimentSummary } from "../api/client";
+import { IS_STATIC, api, type ExperimentDetail, type ExperimentSummary } from "../api/client";
 import { useApi } from "../lib/hooks";
 import { dateTime, num, pct } from "../lib/format";
 import { Badge, Button, Card, Empty, Kv, PageHeader } from "../components/ui";
@@ -50,7 +50,7 @@ export default function ExperimentsPage() {
     <div className="fade-in">
       <PageHeader eyebrow="Reproducible runs" title="Experiment History"
         description="Every training run with its dataset version, vocabulary, architecture, features, sequence length, parameters, signer partitions, metrics, checkpoint and timestamp."
-        actions={rows.length > 0 && <a href="/api/experiments/export.csv" download><Button variant="ghost" icon={<Download className="size-4" />}>Export CSV</Button></a>} />
+        actions={rows.length > 0 && !IS_STATIC && <a href="/api/experiments/export.csv" download><Button variant="ghost" icon={<Download className="size-4" />}>Export CSV</Button></a>} />
       <Card padded={false}>
         {!rows.length ? (
           <Empty title="No experiments yet">Runs started in the Model Laboratory are recorded here automatically.</Empty>

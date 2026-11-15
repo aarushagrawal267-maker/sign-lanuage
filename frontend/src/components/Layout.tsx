@@ -148,8 +148,9 @@ export function Layout({ children }: { children: ReactNode }) {
         </header>
         {sys?.public_demo && (
           <div role="note" className="border-b border-warn/30 bg-warn/[0.07] px-4 py-2 text-xs text-fg-2 md:px-8">
-            <span className="font-medium text-warn">Public read-only demo.</span> Live recognition, video analysis and results are available;
-            downloading WLASL data and training are disabled (run the project locally for those). Your camera is processed in your browser only.
+            <span className="font-medium text-warn">{sys.static ? "Online demo — runs entirely in your browser." : "Public read-only demo."}</span>{" "}
+            {sys.static ? "Camera frames, landmarks and the model all stay on your device." : "Your camera is processed in your browser only."}{" "}
+            Downloading WLASL data, training{sys.static ? " and video-file analysis" : ""} are disabled here — run the project locally for those.
           </div>
         )}
         <main className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-6 md:px-8 md:py-8">{children}</main>

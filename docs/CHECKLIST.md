@@ -17,8 +17,8 @@ Verification environment for this build: Linux container (4 CPU cores, no GPU), 
 | 7–9 | Hand / body / face processing | ✅ | features with tests (invariances, missing handling) |
 | 10 | Feature normalisation | ✅ | translation/scale/aspect invariance tests |
 | 11 | Temporal sequences | ✅ | timestamp resampling, masks, augmentation |
-| 12 | Trained LSTM or GRU model **on WLASL100** | ⏳ | pipeline trains GRU/LSTM/TCN end-to-end (synthetic data); real training needs the videos (decision 1) |
-| 13 | Baseline comparisons | 🟡 | GRU vs LSTM vs TCN supported + comparison view; real numbers pending data |
+| 12 | Trained LSTM or GRU model **on WLASL100** | ✅ | GRU on 524 real clips: val top-1 62.0%, held-out test (7 unseen signers) top-1 44.3% / top-5 72.2% (`models/`) |
+| 13 | Baseline comparisons | ✅ | val top-1 / macro F1: GRU 62.0/58.1, GRU no-face 62.0/58.6, TCN 60.8/56.7, LSTM 55.7/53.4 |
 | 14 | Signer-independent evaluation | ✅ | signer-holdout + 5-fold signer CV built from real metadata, all pass leakage checks |
 | 15 | Automated leakage checks | ✅ | signer/hash/source/duplicate/class checks + tests; detected and fixed a shared-source signer pair (5 & 64) |
 | 16 | Live webcam recognition | ✅/🟡 | verified with a real signing clip as fake camera: waiting → collecting → inference → recognised; physical webcam on Windows pending |
@@ -53,7 +53,7 @@ Verification environment for this build: Linux container (4 CPU cores, no GPU), 
 | Sequence construction works | ✅ |
 | Model can be trained locally | ✅ (CPU, synthetic) · ⏳ WLASL100 |
 | Signer-independent evaluation where metadata permits | ✅ |
-| Model can classify actual signs | ⏳ requires a WLASL-trained model |
+| Model can classify actual signs | ✅ 44.3% top-1 on unseen signers (modest: ~5 training clips per sign) |
 | Live predictions from webcam input | ✅ (pipeline, synthetic model) · ⏳ meaningful predictions need a WLASL model |
 | Smoothing prevents repeated unstable text | ✅ (tests; real-clip loop produced ≈1 word per repetition) |
 | Unknown / uncertain signs handled | ✅ threshold, margin, agreement, explicit "uncertain" state |
@@ -61,6 +61,14 @@ Verification environment for this build: Linux container (4 CPU cores, no GPU), 
 | Experiment history saved | ✅ |
 | Important workflows pass automated tests | ✅ |
 | Documentation explains the methodology | ✅ |
+
+## Data acquired (2026-11-15)
+
+524 of 2,038 WLASL100 instances usable, all 100 glosses covered (min 2 per gloss). YouTube (685) refuses cloud downloads; signingsavvy/handspeak links are mostly dead (404); aslpro, aslsearch, aslsignbank, aslbricks hosts unreachable. Missing videos were requested from the WLASL authors.
+
+## Deployment
+
+Online demo (static, browser-only): https://huggingface.co/spaces/agrawalaarush08/sign-language-studio — verified live: camera, MediaPipe, ONNX model, recognition statuses. TS feature port matches Python on real clips (Vitest parity test).
 
 ## Open decisions (from the Stage 1 blueprint)
 

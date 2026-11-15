@@ -68,10 +68,8 @@ def stage(out: Path, data_dir: Path, artifacts_dir: Path) -> None:
 def push(out: Path, repo_id: str) -> str:
     from huggingface_hub import HfApi
 
-    token = os.environ.get("HF_TOKEN")
-    if not token:
-        sys.exit("HF_TOKEN is not set")
-    api = HfApi(token=token)
+    # HF_TOKEN if set; otherwise rely on an authenticating proxy / cached login.
+    api = HfApi(token=os.environ.get("HF_TOKEN"))
     api.create_repo(repo_id, repo_type="space", space_sdk="docker", exist_ok=True)
     api.upload_folder(folder_path=str(out), repo_id=repo_id, repo_type="space",
                       commit_message="Deploy Sign Intelligence Studio")
