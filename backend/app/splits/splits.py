@@ -228,3 +228,19 @@ def refresh_leakage(db: Session, split: Split) -> dict:
     split.leakage_report = report
     split.signer_independent = bool(report["signer_independent"])
     return report
+
+
+def build_available_holdout(db: Session, seed: int = 0, val_frac: float = 0.15, test_frac: float = 0.15) -> Split:
+    """Signer-grouped holdout over the videos that were actually acquired (status=valid).
+
+    The default signer-holdout is computed over all annotated instances; when many
+    URLs are dead its partitions become unbalanced. This split re-balances over
+    what is available, still keeping every signer group in one partition.
+    """
+    valid = {v for (v,) in db.execute(select(Video.video_id).where(Video.status == "valid"))}
+    meta = [m for m in load_meta(db) if m.video_id in valid]
+    if not meta:
+        raise ValueError("no valid videos yet")
+    assign = signer_holdout(meta, val_frac=val_frac, test_frac=test_frac, seed=seed)
+    return save_split(db, "signer-holdout-available", "signer_grouped", assign, meta, seed,
+                      {"val_frac": val_frac, "test_frac": test_frac, "basis": f"{len(meta)} valid videos"})
