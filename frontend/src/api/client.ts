@@ -93,6 +93,7 @@ export type SystemInfo = {
   mediapipe: string | null;
   holistic_model_present: boolean;
   data_dir: string;
+  public_demo?: boolean;
 };
 
 export type Job = {

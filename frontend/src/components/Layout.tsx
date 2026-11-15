@@ -4,7 +4,7 @@ import {
   Activity, BookOpen, Boxes, Database, FileVideo, FlaskConical, Gauge, History, LayoutDashboard, Menu, ScanFace, Video, X,
 } from "lucide-react";
 import { useApi } from "../lib/hooks";
-import type { ModelInfo } from "../api/client";
+import type { ModelInfo, SystemInfo } from "../api/client";
 import { Badge, cx } from "./ui";
 
 const NAV: { group: string; items: { to: string; label: string; icon: ReactNode }[] }[] = [
@@ -97,6 +97,7 @@ export function Layout({ children }: { children: ReactNode }) {
   const [open, setOpen] = useState(false);
   const { data: health, error } = useApi<{ ok: boolean }>("/api/health", 10000);
   const { data: model } = useApi<ModelInfo | { experiment_id: null }>("/api/models/active", 15000);
+  const { data: sys } = useApi<SystemInfo>("/api/system");
   const loc = useLocation();
   const m = model && model.experiment_id !== null ? (model as ModelInfo) : null;
 
@@ -145,6 +146,12 @@ export function Layout({ children }: { children: ReactNode }) {
             </span>
           </div>
         </header>
+        {sys?.public_demo && (
+          <div role="note" className="border-b border-warn/30 bg-warn/[0.07] px-4 py-2 text-xs text-fg-2 md:px-8">
+            <span className="font-medium text-warn">Public read-only demo.</span> Live recognition, video analysis and results are available;
+            downloading WLASL data and training are disabled (run the project locally for those). Your camera is processed in your browser only.
+          </div>
+        )}
         <main className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-6 md:px-8 md:py-8">{children}</main>
         <footer className="border-t border-ink-700 px-4 py-4 text-[11px] text-fg-3 md:px-8">
           WLASL data © the WLASL authors, used under the Computational Use of Data Agreement (C-UDA) — academic &amp; computational use only, no

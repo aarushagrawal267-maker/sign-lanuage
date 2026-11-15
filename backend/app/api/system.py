@@ -44,6 +44,7 @@ def system():
         "mediapipe": mp_version,
         "holistic_model_present": s.holistic_model_path.exists(),
         "data_dir": str(s.data_dir),
+        "public_demo": s.public_demo,
     }
 
 
