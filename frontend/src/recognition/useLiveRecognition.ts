@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { HolisticLandmarker } from "@mediapipe/tasks-vision";
-import { api, wsUrl, type FeatureSpec, type ModelInfo, type RawFrame, type TopK } from "../api/client";
+import { LocalRecognitionSocket } from "../static/engine";
+import { IS_STATIC, api, wsUrl, type FeatureSpec, type ModelInfo, type RawFrame, type TopK } from "../api/client";
 import { DEFAULT_FACE_IDX, loadHolistic, toRawFrame } from "../mediapipe/holistic";
 import { drawFrame } from "../mediapipe/draw";
 import { RollingStat, deriveStatus, engineConfigPayload, type LiveSettings, type ServerState, type TranscriptItem } from "./live";
@@ -74,7 +75,7 @@ export function useLiveRecognition(settings: LiveSettings) {
     closeSocket();
     setSocket("connecting");
     setModelAvailable(null);
-    const ws = new WebSocket(wsUrl("/api/ws/recognize"));
+    const ws = (IS_STATIC ? new LocalRecognitionSocket() : new WebSocket(wsUrl("/api/ws/recognize"))) as WebSocket;
     wsRef.current = ws;
     ws.onopen = () => {
       setSocket("open");

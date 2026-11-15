@@ -1,0 +1,102 @@
+{
+  "experiment_id": 5,
+  "name": "GRU \u00b7 no face \u00b7 T=64 \u00b7 150ep",
+  "architecture": "gru",
+  "split": "signer-holdout-available",
+  "dataset_version": "WLASL_v0.3/WLASL100@31ba5a5c421b",
+  "config": {
+    "architecture": "gru",
+    "hidden": 128,
+    "layers": 2,
+    "bidirectional": true,
+    "dropout": 0.3,
+    "lr": 0.001,
+    "weight_decay": 0.01,
+    "batch_size": 32,
+    "epochs": 150,
+    "patience": 40,
+    "label_smoothing": 0.1,
+    "class_weighting": "none",
+    "augment": true,
+    "seed": 42,
+    "device": "auto",
+    "min_hand_rate": 0.1,
+    "features": {
+      "seq_len": 64,
+      "use_face": false,
+      "use_velocity": true,
+      "max_gap": 5
+    }
+  },
+  "feature_config": {
+    "seq_len": 64,
+    "use_face": false,
+    "use_velocity": true,
+    "max_gap": 5
+  },
+  "data_summary": {
+    "skipped": {
+      "no_landmarks": 1,
+      "low_hand_detection": 0,
+      "no_body": 0,
+      "unassigned": 0
+    },
+    "train": {
+      "videos": 366,
+      "signers": 26,
+      "classes": 99,
+      "median_frames": 62.0
+    },
+    "val": {
+      "videos": 79,
+      "signers": 2,
+      "classes": 74,
+      "median_frames": 87.0
+    },
+    "test": {
+      "videos": 79,
+      "signers": 7,
+      "classes": 59,
+      "median_frames": 75.0
+    }
+  },
+  "validation": {
+    "top1": 0.620253164556962,
+    "top5": 0.8227848101265823,
+    "macro_f1": 0.5855855855855855,
+    "n": 79,
+    "classes_evaluated": 74,
+    "recommended_threshold": 0.85,
+    "best_epoch": 57
+  },
+  "test": {
+    "top1": 0.4430379746835443,
+    "top5": 0.7215189873417721,
+    "macro_f1": 0.43954802259887,
+    "n": 79,
+    "classes_evaluated": 59,
+    "evaluated_at": "2026-11-15T18:26:21.824870+00:00"
+  },
+  "comparison_validation": {
+    "GRU \u00b7 signer-holdout-available \u00b7 T=64": {
+      "top1": 0.569620253164557,
+      "macro_f1": 0.5423423423423424
+    },
+    "GRU \u00b7 T=64 \u00b7 150ep": {
+      "top1": 0.620253164556962,
+      "macro_f1": 0.581081081081081
+    },
+    "LSTM \u00b7 T=64 \u00b7 150ep": {
+      "top1": 0.5569620253164557,
+      "macro_f1": 0.5337837837837838
+    },
+    "TCN \u00b7 T=64 \u00b7 150ep": {
+      "top1": 0.6075949367088608,
+      "macro_f1": 0.5671171171171171
+    },
+    "GRU \u00b7 no face \u00b7 T=64 \u00b7 150ep": {
+      "top1": 0.620253164556962,
+      "macro_f1": 0.5855855855855855
+    }
+  }
+}

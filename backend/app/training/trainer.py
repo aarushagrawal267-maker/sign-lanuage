@@ -15,7 +15,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from app.core.config import get_settings, resolve_device
+from app.core.config import get_settings, resolve_checkpoint, resolve_device
 from app.dataset.annotations import dataset_version
 from app.db.models import Experiment, Split, utcnow
 from app.db.session import session_scope
@@ -101,7 +101,7 @@ def measure_latency(predictor: Predictor, repeats: int = 30) -> dict:
 
 
 def evaluate_partition(exp: Experiment, data: LoadedData, partition: str, device: str = "cpu") -> dict:
-    predictor = Predictor(Path(exp.checkpoint_path), device)
+    predictor = Predictor(resolve_checkpoint(exp.checkpoint_path), device)
     fcfg = predictor.feature_config
     samples = data.samples[partition]
     ds = SequenceDataset(samples, fcfg, train=False)

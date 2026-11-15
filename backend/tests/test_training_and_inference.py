@@ -143,3 +143,14 @@ def test_csv_exports(synthetic_env):
     assert r.status_code == 200 and r.text.startswith("id,name,status")
     r = c.get(f"/api/experiments/{synthetic_env['experiment_id']}/per-class.csv")
     assert r.status_code == 200 and "partition" in r.text.splitlines()[0]
+
+
+def test_available_holdout_split(synthetic_env):
+    from app.db.session import session_scope
+    from app.splits.splits import build_available_holdout
+
+    with session_scope() as db:
+        sp = build_available_holdout(db)
+        rep = sp.leakage_report
+    assert rep["signer_independent"] and rep["passed"]
+    assert sum(rep["n_videos"].values()) == 144

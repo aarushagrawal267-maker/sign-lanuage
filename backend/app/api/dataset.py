@@ -191,7 +191,7 @@ def video_file(video_id: str, db: Session = Depends(get_db)):
 @router.get("/videos/{video_id}/landmarks", summary="Raw extracted landmarks for one video")
 def video_landmarks(video_id: str, db: Session = Depends(get_db), max_frames: int = 400):
     lf = db.get(LandmarkFile, video_id)
-    if lf is None or not lf.path or not Path(lf.path).exists():
+    if lf is None or not lf.path or not Path(lf.path).is_file():
         raise HTTPException(404, "landmarks not extracted for this video")
     v = db.get(Video, video_id)
     seq = RawSequence.load(Path(lf.path))

@@ -39,7 +39,8 @@ def main(argv: list[str] | None = None) -> int:
     e = sub.add_parser("extract")
     e.add_argument("--limit", type=int)
     e.add_argument("--redo", action="store_true")
-    sub.add_parser("splits")
+    sp = sub.add_parser("splits")
+    sp.add_argument("--available", action="store_true", help="(re)build signer-holdout-available over acquired videos")
     t = sub.add_parser("train")
     t.add_argument("--arch", default="gru", choices=["gru", "lstm", "tcn"])
     t.add_argument("--split", default="signer-holdout")
@@ -92,6 +93,11 @@ def main(argv: list[str] | None = None) -> int:
 
         from app.db.models import Split
 
+        if args.available:
+            from app.splits.splits import build_available_holdout
+
+            with session_scope() as db:
+                build_available_holdout(db)
         with session_scope() as db:
             for s in db.scalars(select(Split).order_by(Split.id)):
                 r = s.leakage_report

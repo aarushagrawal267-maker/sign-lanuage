@@ -3,8 +3,9 @@
 import { FilesetResolver, HolisticLandmarker, type HolisticLandmarkerResult, type NormalizedLandmark } from "@mediapipe/tasks-vision";
 import type { RawFrame } from "../api/client";
 
-export const MODEL_URL = "/assets/mediapipe/holistic_landmarker.task";
-export const WASM_BASE = "/mediapipe/wasm";
+const STATIC = import.meta.env.VITE_STATIC === "1";
+export const MODEL_URL = STATIC ? `${import.meta.env.BASE_URL}static-data/holistic_landmarker.task` : "/assets/mediapipe/holistic_landmarker.task";
+export const WASM_BASE = `${import.meta.env.BASE_URL}mediapipe/wasm`;
 
 export type DelegatePref = "auto" | "GPU" | "CPU";
 let landmarkerPromise: Promise<{ landmarker: HolisticLandmarker; delegate: "GPU" | "CPU" }> | null = null;
