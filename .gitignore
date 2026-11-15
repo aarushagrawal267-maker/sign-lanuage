@@ -1,0 +1,26 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Data: WLASL videos must not be redistributed (C-UDA); derived data stays local
+data/*
+!data/README.md
+artifacts/*
+!artifacts/README.md
+assets/mediapipe/*.task
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/public/mediapipe/wasm/
+frontend/test-results/
+frontend/playwright-report/
+
+# Runtime
+.run/
+*.log
+.env
+frontend/*.tsbuildinfo

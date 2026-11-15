@@ -1,0 +1,15 @@
+# Python 3.11 or 3.12 recommended (MediaPipe wheels). Install torch first for CUDA (see setup.ps1).
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30
+pydantic>=2.7,<3
+pydantic-settings>=2.3
+sqlalchemy>=2.0,<3
+python-multipart>=0.0.9
+numpy>=1.26
+pandas>=2.2
+scikit-learn>=1.5
+opencv-python-headless>=4.10
+mediapipe>=0.10.30
+torch>=2.5
+requests>=2.32
+yt-dlp>=2025.1.1
