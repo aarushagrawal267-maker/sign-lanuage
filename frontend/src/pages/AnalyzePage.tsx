@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { FileVideo, Upload } from "lucide-react";
-import { api, type ModelInfo, type RawFrame, type TopK } from "../api/client";
+import { IS_STATIC, api, type ModelInfo, type RawFrame, type TopK } from "../api/client";
 import { drawFrame } from "../mediapipe/draw";
 import { ms, pct } from "../lib/format";
 import { REJECT_REASON } from "../recognition/status";
@@ -85,6 +85,7 @@ export default function AnalyzePage() {
       <PageHeader eyebrow="Offline · not live recognition" title="Video Analysis"
         description="Analyse a local video file you are permitted to use. Frames are processed by MediaPipe on the local backend, classified with the active model, and the temporary copy is deleted immediately afterwards." />
 
+      {IS_STATIC && <div className="mb-5"><Notice tone="warn" title="Not available in the online demo">Video-file analysis needs the Python backend. Run the project locally (setup.ps1 / start.ps1) to use it; live webcam recognition works here.</Notice></div>}
       <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_380px]">
         <div className="flex min-w-0 flex-col gap-4">
           <Card>
@@ -100,7 +101,7 @@ export default function AnalyzePage() {
               <Field label="Mode">
                 <Segmented ariaLabel="Analysis mode" value={mode} onChange={setMode} options={[{ value: "segment", label: "Sign boundaries" }, { value: "sliding", label: "Sliding window" }]} />
               </Field>
-              <Button variant="primary" size="lg" icon={<FileVideo className="size-4" />} disabled={!file} loading={busy} onClick={analyze}>{busy ? "Analysing…" : "Analyse"}</Button>
+              <Button variant="primary" size="lg" icon={<FileVideo className="size-4" />} disabled={!file || IS_STATIC} loading={busy} onClick={analyze}>{busy ? "Analysing…" : "Analyse"}</Button>
             </div>
             <div className="mt-3"><ErrorText error={err} /></div>
           </Card>

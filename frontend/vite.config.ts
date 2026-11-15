@@ -6,6 +6,8 @@ import tailwindcss from "@tailwindcss/vite";
 const backend = process.env.SLR_BACKEND ?? "http://127.0.0.1:8000";
 
 export default defineConfig({
+  // Static (browser-only) build is served from a sub-path-agnostic location with hash routing.
+  base: process.env.VITE_STATIC === "1" ? "./" : "/",
   plugins: [react(), tailwindcss()],
   server: {
     host: "localhost",

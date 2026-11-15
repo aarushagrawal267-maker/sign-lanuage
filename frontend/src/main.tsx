@@ -1,6 +1,6 @@
 import { StrictMode, Suspense, lazy } from "react";
 import { createRoot } from "react-dom/client";
-import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { BrowserRouter, HashRouter, Route, Routes } from "react-router-dom";
 import "./styles/index.css";
 import { Layout } from "./components/Layout";
 
@@ -15,13 +15,16 @@ const EvaluationPage = lazy(() => import("./pages/EvaluationPage"));
 const ExperimentsPage = lazy(() => import("./pages/ExperimentsPage"));
 const ResearchPage = lazy(() => import("./pages/ResearchPage"));
 
+// Static hosting (e.g. a Hugging Face static Space) cannot rewrite deep links, so use hash URLs there.
+const Router = import.meta.env.VITE_STATIC === "1" ? HashRouter : BrowserRouter;
+
 function NotFound() {
   return <p className="text-sm text-fg-2">Page not found.</p>;
 }
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <BrowserRouter>
+    <Router>
       <Layout>
         <Suspense fallback={<p className="text-sm text-fg-3">Loading…</p>}>
           <Routes>
@@ -39,6 +42,6 @@ createRoot(document.getElementById("root")!).render(
           </Routes>
         </Suspense>
       </Layout>
-    </BrowserRouter>
+    </Router>
   </StrictMode>,
 );

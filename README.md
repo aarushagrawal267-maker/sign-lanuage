@@ -4,6 +4,10 @@
 
 > **Educational and research implementation.** It recognises *one isolated sign at a time* from a fixed 100-word vocabulary and outputs an ASL **gloss label**. It does not translate ASL sentences, does not model ASL grammar, and must not be used in place of a qualified interpreter. WLASL data is licensed for **non-commercial, computational use only** (C-UDA).
 
+**Online demo (runs entirely in your browser):** https://huggingface.co/spaces/agrawalaarush08/sign-language-studio
+
+**Current model** (`models/wlasl100-gru-signer-holdout`): bidirectional GRU trained on the 524 WLASL100 clips that could be downloaded (~5 per sign). Signer-independent results — validation top-1 62.0%; held-out test on 7 unseen signers: **top-1 44.3%, top-5 72.2%**. Live webcam accuracy will be lower.
+
 ---
 
 ## Contents
@@ -208,6 +212,24 @@ The **code** in this repository is provided for education and research. The **WL
 ```
 
 MediaPipe © Google (Apache-2.0). Fonts: IBM Plex (SIL OFL 1.1). Icons: Lucide (ISC).
+
+## Deployment (Hugging Face)
+
+The online demo is a free **static** Space: the GRU is exported to ONNX and run with ONNX Runtime Web, and the feature pipeline and recognition engine have TypeScript ports (`frontend/src/static/`) whose output is tested against the Python implementation.
+
+```bash
+python scripts/export_static.py
+```
+
+```bash
+cd frontend; npm run build:static
+```
+
+```bash
+python scripts/deploy_hf_static.py <user>/<space>
+```
+
+A full-backend Docker Space (`deploy/huggingface`, `scripts/build_hf_space.py`) is also provided; Hugging Face requires a PRO plan for Docker Spaces.
 
 ## Status
 

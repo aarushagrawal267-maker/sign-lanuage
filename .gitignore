@@ -26,3 +26,7 @@ frontend/playwright-report/
 frontend/*.tsbuildinfo
 missing.txt
 build/
+frontend/public/ort/
+frontend/public/static-data/
+frontend/dist-static/
+frontend/src/static/__fixtures__/
