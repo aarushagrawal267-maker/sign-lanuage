@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     torch_threads: int = 0  # 0 = let torch decide
     download_workers: int = 4
     download_timeout_s: int = 60
+    # Public read-only demo (e.g. Hugging Face Space): disables downloads, training and deletions.
+    public_demo: bool = False
+    frontend_dist: Path = REPO_ROOT / "frontend" / "dist"
 
     @property
     def annotations_dir(self) -> Path:
@@ -84,6 +87,18 @@ def get_settings() -> Settings:
     s = Settings()
     s.ensure_dirs()
     return s
+
+
+def resolve_checkpoint(path: str | Path | None) -> Path | None:
+    """Checkpoint paths are stored absolute; fall back to the checkpoints dir when the
+    project has been moved (e.g. into a container)."""
+    if not path:
+        return None
+    p = Path(path)
+    if p.exists():
+        return p
+    alt = get_settings().checkpoints_dir / p.name
+    return alt if alt.exists() else None
 
 
 def resolve_device(pref: str | None = None) -> str:

@@ -25,3 +25,4 @@ frontend/playwright-report/
 .env
 frontend/*.tsbuildinfo
 missing.txt
+build/

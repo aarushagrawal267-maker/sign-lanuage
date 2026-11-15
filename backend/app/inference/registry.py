@@ -7,6 +7,7 @@ from pathlib import Path
 
 from sqlalchemy import select
 
+from app.core.config import resolve_checkpoint
 from app.db.models import Experiment
 from app.db.session import session_scope
 from app.models.checkpoint import Predictor
@@ -25,12 +26,13 @@ def get_predictor() -> tuple[Predictor | None, dict | None]:
     """Returns (predictor, info) for the active experiment, loading it on first use."""
     with session_scope() as db:
         e = db.scalar(select(Experiment).where(Experiment.is_active.is_(True)))
-        if e is None or not e.checkpoint_path or not Path(e.checkpoint_path).exists():
+        ck = resolve_checkpoint(e.checkpoint_path) if e is not None else None
+        if e is None or ck is None:
             return None, None
         info = {"experiment_id": e.id, "name": e.name, "architecture": e.architecture, "split": e.split_name,
                 "is_synthetic": e.is_synthetic, "val_top1": (e.val_metrics or {}).get("top1"),
                 "checkpoint": e.checkpoint_path}
-        eid, path = e.id, e.checkpoint_path
+        eid, path = e.id, str(ck)
     with _lock:
         if _cache["id"] != eid or _cache["predictor"] is None:
             _cache["predictor"] = Predictor(Path(path), "cpu")

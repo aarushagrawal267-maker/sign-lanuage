@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Camera, CameraOff, Circle, Pause, Play, Wand2 } from "lucide-react";
-import { api, type FeatureSpec, type LandmarkClip, type RawFrame, type TopK, type VideoRow } from "../api/client";
+import { api, type SystemInfo, type FeatureSpec, type LandmarkClip, type RawFrame, type TopK, type VideoRow } from "../api/client";
 import { DEFAULT_FACE_IDX, loadHolistic, toRawFrame } from "../mediapipe/holistic";
 import { COLORS, HAND_CONNECTIONS, drawFrame } from "../mediapipe/draw";
 import { useApi } from "../lib/hooks";
@@ -138,6 +138,7 @@ export default function StudioPage() {
   const [pred, setPred] = useState<{ top?: TopK[]; error?: string } | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const rec = useRecorder();
+  const { data: sys } = useApi<SystemInfo>("/api/system");
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const vids = useApi<{ items: VideoRow[] }>(source === "dataset" ? "/api/dataset/videos?status=valid&limit=500" : null);
   const withLm = (vids.data?.items ?? []).filter((v) => v.landmarks?.status === "ok");
@@ -307,6 +308,7 @@ export default function StudioPage() {
               {pred?.error && <p className="mt-3 text-sm text-danger">{pred.error}</p>}
             </Card>
           )}
+          {source === "dataset" && sys?.public_demo && <Notice>Dataset clips need the locally extracted WLASL landmarks; they are not included in the public demo.</Notice>}
           {source === "dataset" && !withLm.length && vids.data && <Notice>No clips have landmarks yet. Extract landmarks on the Dataset page.</Notice>}
           {!clip && source === "dataset" && <Card><Empty title="No clip loaded" /></Card>}
         </div>

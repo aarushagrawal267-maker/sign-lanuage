@@ -9,8 +9,9 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api import dataset, experiments, recognition, system
@@ -50,10 +51,33 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    if s.public_demo:
+        allowed = {"/api/analyze/video", "/api/analyze/landmarks"}
+
+        @app.middleware("http")
+        async def read_only_guard(request: Request, call_next):
+            if request.method in ("POST", "PUT", "PATCH", "DELETE") and request.url.path not in allowed:
+                return JSONResponse({"detail": "Disabled in the public demo. Run the project locally to download data or train models."},
+                                    status_code=403)
+            return await call_next(request)
+
     for r in (system.router, dataset.router, experiments.router, recognition.router):
         app.include_router(r)
     s.assets_dir.mkdir(parents=True, exist_ok=True)
-    app.mount("/assets", StaticFiles(directory=s.assets_dir), name="assets")
+    app.mount("/assets/mediapipe", StaticFiles(directory=s.assets_dir / "mediapipe", check_dir=False), name="mediapipe-model")
+
+    dist = s.frontend_dist
+    if (dist / "index.html").exists():
+        # Single-origin deployment: serve the built frontend (SPA) from the API server.
+        @app.get("/{path:path}", include_in_schema=False)
+        async def spa(path: str):
+            if path.startswith("api/"):
+                return JSONResponse({"detail": "Not Found"}, status_code=404)
+            f = (dist / path).resolve()
+            if path and f.is_file() and dist.resolve() in f.parents:
+                return FileResponse(f)
+            return FileResponse(dist / "index.html")
+
     return app
 
 
