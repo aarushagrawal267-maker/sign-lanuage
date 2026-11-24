@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import {
   Camera, CameraOff, Copy, Eraser, Hand, Pause, Play, RotateCcw, Settings2, ShieldCheck, Square, User, Smile,
 } from "lucide-react";
+import { IS_STATIC } from "../api/client";
 import { useLocalStorage } from "../lib/hooks";
 import { ms, pct } from "../lib/format";
 import { DEFAULT_SETTINGS, type LiveSettings } from "../recognition/live";
@@ -55,7 +56,7 @@ export default function LivePage() {
         </div>
         <div className="flex items-center gap-2 text-xs text-fg-3">
           <ShieldCheck className="size-4 text-teal" aria-hidden />
-          Video stays in your browser · only landmark coordinates are sent to the local server
+          {IS_STATIC ? "Video, landmarks and the model all stay in your browser" : "Video stays in your browser · only landmark coordinates are sent to the local server"}
         </div>
       </div>
 

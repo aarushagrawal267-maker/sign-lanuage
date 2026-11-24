@@ -85,7 +85,7 @@ export default function AnalyzePage() {
       <PageHeader eyebrow="Offline · not live recognition" title="Video Analysis"
         description="Analyse a local video file you are permitted to use. Frames are processed by MediaPipe on the local backend, classified with the active model, and the temporary copy is deleted immediately afterwards." />
 
-      {IS_STATIC && <div className="mb-5"><Notice tone="warn" title="Not available in the online demo">Video-file analysis needs the Python backend. Run the project locally (setup.ps1 / start.ps1) to use it; live webcam recognition works here.</Notice></div>}
+      {IS_STATIC && <div className="mb-5"><Notice tone="warn" title="Not available in the online demo">Video-file analysis needs the Python backend. Run the project locally (setup + start scripts, see the README) to use it; live webcam recognition works here.</Notice></div>}
       <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_380px]">
         <div className="flex min-w-0 flex-col gap-4">
           <Card>

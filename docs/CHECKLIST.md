@@ -9,7 +9,7 @@ Verification environment for this build: Linux container (4 CPU cores, no GPU), 
 | # | Deliverable | Status | Evidence |
 |---|---|---|---|
 | 1 | Frontend | ✅ | 10 pages, typecheck + production build pass, Playwright renders every page without console errors |
-| 2 | Backend | ✅ | FastAPI, docs at `/docs`, 36 pytest tests |
+| 2 | Backend | ✅ | FastAPI, docs at `/docs`, 41 pytest tests |
 | 3 | WLASL100 acquisition pipeline | ✅/🟡 | YouTube/HTTP/ASLPro paths; failures recorded (verified with real URLs: 1 valid, 5 blocked-host failures recorded). Full download not run here (network) |
 | 4 | Dataset inventory | ✅ | per-gloss inventory API/page/CSV; verified on the real annotation file |
 | 5 | Video validation | ✅ | decode check, measured fps/resolution/duration/hash; tests with valid + corrupt files |
@@ -32,13 +32,14 @@ Verification environment for this build: Linux container (4 CPU cores, no GPU), 
 | 24 | Experiment history | ✅ | full configs, CSV export |
 | 25 | SQLite database | ✅ | |
 | 26 | API documentation | ✅ | `/docs` (HTTP 200 verified) |
-| 27 | Automated tests | ✅ | pytest 41 (incl. MediaPipe extractor tests when the model and libEGL are present), Vitest 8, Playwright 2 |
+| 27 | Automated tests | ✅ | pytest 41 (incl. MediaPipe extractor tests when the model and libEGL are present), Vitest 9 (8 + the TS-vs-Python parity test, which runs only when `export_static.py` has written the real-clip fixture), Playwright 2; GitHub Actions CI in `.github/workflows/ci.yml` |
 | 28–30 | setup / start / stop scripts | ✅/🟡 | all three run successfully under PowerShell 7 (Linux); Windows-only branches (`taskkill`, `Scripts\python.exe`, `npm.cmd`, CUDA wheel) need a run on Windows |
 | 31–36 | README, dataset docs, references, licensing, limitations, reproducibility | ✅ | `README.md`, `docs/` |
-
 | 37 | Works from a fresh clone without training | ✅ | bundled pretrained model auto-registered + activated on first backend start (`app/models/bundled.py`, `tests/test_bundled_model.py`); `python -m app.cli import-model` |
 | 38 | Linux / macOS scripts | ✅ | `setup.sh`, `start.sh`, `stop.sh` (verified on Linux, 2026-11-24; macOS not run) |
 | 39 | LICENSE | ✅ | MIT for code; WLASL data and derived weights remain C-UDA (non-commercial) |
+| 40 | Static export dependencies | ✅ | `backend/requirements-deploy.txt` (onnx, onnxruntime, huggingface_hub); `export_static.py` + `npm run build:static` verified 2026-11-24, ONNX parity max diff < 1e-4 |
+| 41 | Continuous integration | ✅ | `.github/workflows/ci.yml`: backend pytest (CPU torch) + frontend typecheck, Vitest and build on every push / PR |
 
 ## Final acceptance criteria
 
@@ -65,6 +66,14 @@ Verification environment for this build: Linux container (4 CPU cores, no GPU), 
 | Experiment history saved | ✅ |
 | Important workflows pass automated tests | ✅ |
 | Documentation explains the methodology | ✅ |
+
+## Independent re-verification (2026-11-24, Linux container, no GPU)
+
+* `./setup.sh --dev --cpu` then `./start.sh` on a fresh database: the bundled model was registered as experiment 1 and activated.
+* pytest 41 passed; Vitest 9 passed (incl. parity on 3 real clips); typecheck, `build`, `build:static` pass; Playwright 2 passed.
+* Three real WLASL BOOK clips (07068, 07069, 07070) downloaded through the app (12 of 15 attempted links failed: dead or blocked hosts). Offline *Video Analysis* classified all three as BOOK (whole-clip probability 0.92-0.96). These clips are in the model's **training** split, so this shows the pipeline works end to end, not generalisation.
+* The same clip fed as the fake camera on *Live Recognition* (backend mode and static browser-only build): statuses went waiting → collecting → inference with BOOK/FAMILY in the top-2; at the ~7 fps MediaPipe rate of a software-rendered headless browser the sign was rejected as below threshold. A real browser with GPU MediaPipe runs at much higher frame rates.
+* The videos were stored only in the git-ignored `data/` folder and were not committed.
 
 ## Data acquired (2026-11-15)
 

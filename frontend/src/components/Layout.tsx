@@ -4,7 +4,7 @@ import {
   Activity, BookOpen, Boxes, Database, FileVideo, FlaskConical, Gauge, History, LayoutDashboard, Menu, ScanFace, Video, X,
 } from "lucide-react";
 import { useApi } from "../lib/hooks";
-import type { ModelInfo, SystemInfo } from "../api/client";
+import { IS_STATIC, type ModelInfo, type SystemInfo } from "../api/client";
 import { Badge, cx } from "./ui";
 
 const NAV: { group: string; items: { to: string; label: string; icon: ReactNode }[] }[] = [
@@ -139,10 +139,10 @@ export function Layout({ children }: { children: ReactNode }) {
             )}
             <span
               className={cx("inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px]", health?.ok && !error ? "border-good/40 text-[#5fd35f]" : "border-danger/40 text-danger")}
-              title={error ?? "Backend reachable"}
+              title={error ?? (IS_STATIC ? "Model runs in this browser" : "Backend reachable")}
             >
               <span className={cx("size-1.5 rounded-full", health?.ok && !error ? "bg-good" : "bg-danger")} />
-              {health?.ok && !error ? "backend" : "backend offline"}
+              {health?.ok && !error ? (IS_STATIC ? "in-browser" : "backend") : "backend offline"}
             </span>
           </div>
         </header>

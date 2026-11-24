@@ -217,6 +217,8 @@ cd frontend; npx playwright install chromium; npx playwright test
 
 `E2E_FAKE_VIDEO=<file.y4m>` feeds a video file as the fake camera.
 
+GitHub Actions (`.github/workflows/ci.yml`) runs the backend pytest suite and the frontend typecheck, Vitest and production build on every push and pull request.
+
 Backend tests run against an isolated temporary data directory with **synthetic landmark sequences** (procedurally generated, clearly flagged). They verify the pipeline's wiring and logic, not ASL accuracy.
 
 ## Project structure
@@ -291,9 +293,17 @@ MediaPipe © Google (Apache-2.0). Fonts: IBM Plex (SIL OFL 1.1). Icons: Lucide (
 
 The online demo is a free **static** Space: the GRU is exported to ONNX and run with ONNX Runtime Web, and the feature pipeline and recognition engine have TypeScript ports (`frontend/src/static/`) whose output is tested against the Python implementation.
 
+The export and deploy scripts need a few extra packages (ONNX, ONNX Runtime, `huggingface_hub`):
+
+```bash
+.venv/bin/pip install -r backend/requirements-deploy.txt      # Windows: .venv\Scripts\pip install -r backend\requirements-deploy.txt
+```
+
 ```bash
 python scripts/export_static.py
 ```
+
+If you have extracted landmarks for some real WLASL clips, `export_static.py` also writes a parity fixture and `npm test` then runs the TypeScript-vs-Python feature/probability parity test (otherwise that one test is skipped). Deploying needs a Hugging Face write token in `HF_TOKEN`.
 
 ```bash
 cd frontend; npm run build:static
