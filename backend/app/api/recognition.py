@@ -62,6 +62,17 @@ def vocabulary(db: Session = Depends(get_db)):
             "local_example": next((v.video_id for v in vs if v.status == "valid" and v.file_path and Path(v.file_path).exists()), None),
             "val": per_val.get(g.class_index), "test": per_test.get(g.class_index),
         })
+    if not out and active is not None:
+        # Annotations not loaded yet (fresh install with the pretrained model): list the glosses
+        # the active model recognises so the vocabulary is still browsable.
+        try:
+            p, _ = registry.get_predictor()
+        except Exception:  # noqa: BLE001 - an unreadable checkpoint just means no fallback list
+            p = None
+        for i, name in enumerate(p.class_names if p is not None else []):
+            out.append({"class_index": i, "gloss": name, "annotated": 0, "valid": 0, "with_landmarks": 0,
+                        "train_official": 0, "signers": 0, "variations": 0, "local_example": None,
+                        "val": per_val.get(i), "test": per_test.get(i)})
     return {"model": None if active is None else {"id": active.id, "name": active.name, "split": active.split_name,
                                                    "is_synthetic": active.is_synthetic},
             "glosses": out}
@@ -182,6 +193,8 @@ async def analyze_video(file: UploadFile = File(...), mode: str = Form("segment"
         t0 = time.perf_counter()
         try:
             seq, fps = await asyncio.to_thread(ex.extract_video, Path(tmp))
+        except ExtractorUnavailable as e:
+            raise HTTPException(503, str(e)) from e
         except ValueError as e:
             raise HTTPException(400, f"could not read video: {e}") from e
         extract_s = time.perf_counter() - t0

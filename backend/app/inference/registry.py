@@ -34,9 +34,11 @@ def get_predictor() -> tuple[Predictor | None, dict | None]:
                 "checkpoint": e.checkpoint_path}
         eid, path = e.id, str(ck)
     with _lock:
-        if _cache["id"] != eid or _cache["predictor"] is None:
+        # Keyed by id *and* checkpoint path so a different database (or a re-imported model)
+        # with the same experiment id never reuses a stale predictor.
+        if _cache["id"] != (eid, path) or _cache["predictor"] is None:
             _cache["predictor"] = Predictor(Path(path), "cpu")
-            _cache["id"] = eid
+            _cache["id"] = (eid, path)
         p = _cache["predictor"]
     info["threshold"] = p.recommended_threshold
     info["seq_len"] = p.feature_config.seq_len

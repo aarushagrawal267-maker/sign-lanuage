@@ -38,6 +38,9 @@ async def lifespan(_: FastAPI):
     get_settings()
     get_engine()
     recover_stale_jobs()
+    from app.models.bundled import ensure_bundled_model
+
+    ensure_bundled_model()
     yield
 
 

@@ -57,7 +57,28 @@ function PerClassTable({ m }: { m: Metrics }) {
   );
 }
 
+function SummaryMetricsView({ m, exp }: { m: Metrics; exp: ExperimentDetail }) {
+  return (
+    <div className="flex flex-col gap-5">
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+        <Stat label="Top-1 accuracy" value={pct(m.top1)} tone="accent" sub={`${m.n} sequences`} />
+        <Stat label="Top-5 accuracy" value={pct(m.top5)} />
+        <Stat label="Macro F1" value={pct(m.macro_f1)} sub={m.classes_evaluated ? `over ${m.classes_evaluated} classes present` : undefined} />
+        <Stat label="Signers evaluated" value={exp.split?.n_signers?.[m.partition === "test" ? "test" : "val"] ?? "—"}
+          sub={exp.split?.signer_independent ? "unseen during training" : undefined} tone="teal" />
+        <Stat label="Live threshold" value={m.recommended_threshold !== undefined ? pct(m.recommended_threshold, 0) : "—"} />
+      </div>
+      <Notice tone="info" title="Pretrained model — summary metrics">
+        These numbers were recorded when the bundled model was trained (see <span className="font-mono">models/</span>). The per-class table,
+        confusion matrix and calibration curve need the WLASL landmark files, which are not redistributed. Download the dataset and
+        train a model in the Model Laboratory to see the full breakdown.
+      </Notice>
+    </div>
+  );
+}
+
 function MetricsView({ m, exp }: { m: Metrics; exp: ExperimentDetail }) {
+  if (!m.per_class || !m.confusion_matrix) return <SummaryMetricsView m={m} exp={exp} />;
   const labels = m.per_class.map((c) => c.gloss.toUpperCase());
   const signers = Object.entries(m.per_signer).sort((a, b) => b[1].n - a[1].n);
   return (

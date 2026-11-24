@@ -16,5 +16,6 @@ Files: `checkpoint.pt` (PyTorch, loaded by the backend), `model.onnx` (softmax o
 browser build), `model.json` (class names, feature config, live threshold).
 
 Derived from WLASL (C-UDA): academic / computational use only, no commercial use.
-To use locally: copy `checkpoint.pt` to `artifacts/checkpoints/` and train/activate from the Laboratory,
-or retrain with `python -m app.cli train --arch gru --split signer-holdout-available --seq-len 64 --hidden 128 --epochs 150 --patience 40 --no-face`.
+To use locally: nothing to do - the backend registers this model as a completed experiment and
+activates it the first time it starts (when no other model is active). To re-register it after
+deleting it: `python -m app.cli import-model` (from `backend/`). To retrain: `python -m app.cli train --arch gru --split signer-holdout-available --seq-len 64 --hidden 128 --epochs 150 --patience 40 --no-face`.

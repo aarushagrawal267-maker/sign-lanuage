@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     # Public read-only demo (e.g. Hugging Face Space): disables downloads, training and deletions.
     public_demo: bool = False
     frontend_dist: Path = REPO_ROOT / "frontend" / "dist"
+    # Register the pretrained WLASL100 model in models/ on first start so live recognition works
+    # straight after setup (no dataset download or training needed).
+    import_bundled_model: bool = True
 
     @property
     def annotations_dir(self) -> Path:
