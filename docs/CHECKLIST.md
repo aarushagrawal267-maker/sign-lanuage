@@ -32,9 +32,13 @@ Verification environment for this build: Linux container (4 CPU cores, no GPU), 
 | 24 | Experiment history | ✅ | full configs, CSV export |
 | 25 | SQLite database | ✅ | |
 | 26 | API documentation | ✅ | `/docs` (HTTP 200 verified) |
-| 27 | Automated tests | ✅ | pytest 36, Vitest 8, Playwright 2 |
+| 27 | Automated tests | ✅ | pytest 41 (incl. MediaPipe extractor tests when the model and libEGL are present), Vitest 8, Playwright 2 |
 | 28–30 | setup / start / stop scripts | ✅/🟡 | all three run successfully under PowerShell 7 (Linux); Windows-only branches (`taskkill`, `Scripts\python.exe`, `npm.cmd`, CUDA wheel) need a run on Windows |
 | 31–36 | README, dataset docs, references, licensing, limitations, reproducibility | ✅ | `README.md`, `docs/` |
+
+| 37 | Works from a fresh clone without training | ✅ | bundled pretrained model auto-registered + activated on first backend start (`app/models/bundled.py`, `tests/test_bundled_model.py`); `python -m app.cli import-model` |
+| 38 | Linux / macOS scripts | ✅ | `setup.sh`, `start.sh`, `stop.sh` (verified on Linux, 2026-11-24; macOS not run) |
+| 39 | LICENSE | ✅ | MIT for code; WLASL data and derived weights remain C-UDA (non-commercial) |
 
 ## Final acceptance criteria
 
@@ -54,10 +58,10 @@ Verification environment for this build: Linux container (4 CPU cores, no GPU), 
 | Model can be trained locally | ✅ (CPU, synthetic) · ⏳ WLASL100 |
 | Signer-independent evaluation where metadata permits | ✅ |
 | Model can classify actual signs | ✅ 44.3% top-1 on unseen signers (modest: ~5 training clips per sign) |
-| Live predictions from webcam input | ✅ (pipeline, synthetic model) · ⏳ meaningful predictions need a WLASL model |
+| Live predictions from webcam input | ✅ pipeline with the bundled WLASL100 model (active by default) · 🟡 accuracy with a physical webcam not measured |
 | Smoothing prevents repeated unstable text | ✅ (tests; real-clip loop produced ≈1 word per repetition) |
 | Unknown / uncertain signs handled | ✅ threshold, margin, agreement, explicit "uncertain" state |
-| Real evaluation results displayed | ✅ from stored experiment records (currently synthetic-flagged) |
+| Real evaluation results displayed | ✅ from stored experiment records (bundled model: summary metrics; locally trained models: full breakdown) |
 | Experiment history saved | ✅ |
 | Important workflows pass automated tests | ✅ |
 | Documentation explains the methodology | ✅ |
@@ -74,7 +78,7 @@ Online demo (static, browser-only): https://huggingface.co/spaces/agrawalaarush0
 
 1. **Where data acquisition and training run** — allow the video hosts in this environment, or run `acquire`/`extract`/`train` on your Windows machine.
 2. **Missing videos** — submit the WLASL authors' request form, or proceed with what downloads.
-3. **Committing derived data** — whether a trained checkpoint should be committed (landmarks stay local).
+3. **Committing derived data** — decided: the trained checkpoint is committed in `models/` (landmarks stay local).
 
 ## Notes
 
