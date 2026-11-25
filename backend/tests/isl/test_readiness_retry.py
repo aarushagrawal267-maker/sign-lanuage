@@ -98,3 +98,30 @@ def test_user_mode_needs_more_than_a_noise_gain(monkeypatch):
     monkeypatch.setattr(runners, "e4_my_signs", fake(0.615, n=400))  # 6 takes but only +0.015
     p, rep = ff.choose_user_mode(None, val, FusionParams())
     assert p.user_cls_mode == "penalty"
+
+
+def test_pack_serves_the_phase2_report_not_a_stale_results_json(tmp_path):
+    """A full run reuses ``artifacts/isl/<profile>/``, which still held the phase-1 smoke ``results.json``
+    (11:57, 25 Nov). ``build-pack`` copied it into the pack, so the app would have served phase-1 smoke results for
+    a phase-2 pack; and a phase-2 pack without that file served no results at all."""
+    from app.isl.paths import REPO_ROOT
+    from app.isl.training.common import ISL_FEATURES
+    from app.isl.training.pipeline import build_pack
+
+    vocab = tmp_path / "vocabulary.jsonl"
+    with (REPO_ROOT / "models" / "packs" / "isl" / "vocabulary.jsonl").open(encoding="utf-8") as fh:
+        vocab.write_text("".join(next(fh) for _ in range(5)), encoding="utf-8")
+    work = tmp_path / "w"
+    work.mkdir()
+    (work / "results.json").write_text(json.dumps({"schema": 1, "smoke": True, "label": "phase-1 smoke",
+                                                   "protocols": {"E1": {}}}))
+    r = build_pack(work, "commercial-safe", ISL_FEATURES, tmp_path / "p1", smoke=True, vocab_path=vocab)
+    assert json.loads((tmp_path / "p1" / "results.json").read_text())["label"] == "phase-1 smoke"  # phase-1 path
+    (work / "eval").mkdir()
+    rep = {"schema": 1, "smoke": False, "partial_data": False, "label": "phase-2 report", "protocols": {"E2": {}}}
+    (work / "eval" / "report.json").write_text(json.dumps(rep))
+    r = build_pack(work, "commercial-safe", ISL_FEATURES, tmp_path / "p2", smoke=True, vocab_path=vocab)
+    pack = tmp_path / "p2"
+    assert json.loads((pack / "results.json").read_text())["label"] == "phase-2 report"
+    assert (pack / "eval" / "report.json").exists() and "results.json" in r["files"]
+    assert json.loads((pack / "pack.json").read_text())["results"] == "results.json"

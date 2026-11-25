@@ -166,15 +166,23 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
     files = {}
-    for name in ("classifier.pt", "encoder.pt", "letters.pt", "fusion.json", "results.json"):
+    for name in ("classifier.pt", "encoder.pt", "letters.pt", "fusion.json"):
         if (work / name).exists():
             shutil.copy2(work / name, tmp / name)
             files[name] = _sha(tmp / name)
     if (work / "index" / "meta.json").exists():
         shutil.copytree(work / "index", tmp / "index")
         files["index/embeddings.f16.npy"] = _sha(tmp / "index" / "embeddings.f16.npy")
+    # the results the app serves (/api/languages/<id>/results): the phase-2 ``evaluate --all`` report when it exists
+    # (same top-level fields: label, smoke, partial_data, protocols), never a phase-1 ``results.json`` left in a
+    # reused work folder by an older run; the phase-1 ``evaluate`` results only when there is no phase-2 report
     if (work / "eval" / "report.json").exists():  # evaluate --all report travels with the pack
         shutil.copytree(work / "eval", tmp / "eval")
+        shutil.copy2(work / "eval" / "report.json", tmp / "results.json")
+        files["results.json"] = _sha(tmp / "results.json")
+    elif (work / "results.json").exists():
+        shutil.copy2(work / "results.json", tmp / "results.json")
+        files["results.json"] = _sha(tmp / "results.json")
     shutil.copy2(vocab_path or PACK_DIR / "vocabulary.jsonl", tmp / "vocabulary.jsonl")
     extra = work / "extra_concepts.jsonl"  # concepts only other sources (WSLP, ISL500, ...) know: appended
     if extra.exists() and extra.stat().st_size:
