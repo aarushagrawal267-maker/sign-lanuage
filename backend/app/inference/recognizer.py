@@ -78,8 +78,9 @@ class ClassifierRecognizer:
     accept iff p1 >= threshold and p1 - p2 >= min_margin and enough crops agree; otherwise ``suggest``."""
 
     def __init__(self, predictor: Predictor, language: str = "asl-wlasl100", threshold: float | None = None,
-                 min_margin: float = 0.10):
+                 min_margin: float = 0.10, lexicon=None):
         self.predictor = predictor
+        self.lexicon = lexicon  # optional HindiLexicon keyed by class name (ASL: the gloss)
         self.language = language
         self.feature_config = predictor.feature_config
         self.recommended_threshold = float(threshold if threshold is not None else predictor.recommended_threshold)
@@ -108,6 +109,9 @@ class ClassifierRecognizer:
         idx = np.argsort(-avg)[:top_k]
         cands = [Candidate(concept_id=names[i], class_index=int(i), gloss=names[i], prob=float(avg[i]),
                            text={"en": names[i]}, source="classifier") for i in idx]
+        if self.lexicon is not None:
+            for c in cands:
+                c.text["hi"], c.hi_review = self.lexicon.text(c.concept_id)
         th = self.recommended_threshold if threshold is None else float(threshold)
         srt = np.sort(avg)[::-1]
         need = 2 if len(crops) >= 3 else 1

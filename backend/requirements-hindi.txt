@@ -1,0 +1,5 @@
+# Offline tooling only (not needed by the app): drafting the Hindi lexicon with IndicTrans2
+#   nice -n 10 python -m app.isl.cli hindi --translate
+-r requirements.txt
+transformers>=4.46,<4.52
+sentencepiece>=0.2

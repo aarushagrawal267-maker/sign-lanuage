@@ -1,0 +1,77 @@
+# Closed-class words for the rule-based sentence builder (docs/ISL_DESIGN.md section 8.2).
+# Keys are English headwords in lower case (ISL concept "isl.i" -> "i", ASL gloss "what" -> "what").
+# Pronoun fields: en (subject form), en_obj (object form), hi (subject form), hi_obj (object form),
+#   agree: 1sg | 2 | 2tum | 1pl | 3sg | 3pl  (verb and copula agreement in English and Hindi)
+pronouns:
+  i:     {en: "I", en_obj: "me", hi: "मैं", hi_obj: "मुझे", agree: 1sg}
+  me:    {en: "I", en_obj: "me", hi: "मैं", hi_obj: "मुझे", agree: 1sg}
+  you:   {en: "you", en_obj: "you", hi: "आप", hi_obj: "आपको", agree: "2"}
+  he:    {en: "he", en_obj: "him", hi: "वह", hi_obj: "उसे", agree: 3sg}
+  she:   {en: "she", en_obj: "her", hi: "वह", hi_obj: "उसे", agree: 3sg}
+  it:    {en: "it", en_obj: "it", hi: "यह", hi_obj: "इसे", agree: 3sg}
+  we:    {en: "we", en_obj: "us", hi: "हम", hi_obj: "हमें", agree: 1pl}
+  us:    {en: "we", en_obj: "us", hi: "हम", hi_obj: "हमें", agree: 1pl}
+  they:  {en: "they", en_obj: "them", hi: "वे", hi_obj: "उन्हें", agree: 3pl}
+possessives:
+  my:    {en: "my", hi: "मेरा"}
+  mine:  {en: "my", hi: "मेरा"}
+  your:  {en: "your", hi: "आपका"}
+  his:   {en: "his", hi: "उसका"}
+  her:   {en: "her", hi: "उसकी"}
+  our:   {en: "our", hi: "हमारा"}
+  their: {en: "their", hi: "उनका"}
+  this:  {en: "this", hi: "यह"}
+  that:  {en: "that", hi: "वह"}
+question_words:
+  what:      {en: "what", hi: "क्या"}
+  where:     {en: "where", hi: "कहाँ"}
+  who:       {en: "who", hi: "कौन"}
+  when:      {en: "when", hi: "कब"}
+  why:       {en: "why", hi: "क्यों"}
+  how:       {en: "how", hi: "कैसे"}
+  how many:  {en: "how many", hi: "कितने"}
+  how much:  {en: "how much", hi: "कितना"}
+  which:     {en: "which", hi: "कौन-सा"}
+  whose:     {en: "whose", hi: "किसका"}
+negation:
+  not:     {en: "not", hi: "नहीं"}
+  no:      {en: "not", hi: "नहीं"}
+  never:   {en: "never", hi: "कभी नहीं"}
+  nothing: {en: "nothing", hi: "कुछ नहीं"}
+time_words:
+  today:     {en: "today", hi: "आज"}
+  tomorrow:  {en: "tomorrow", hi: "कल"}
+  yesterday: {en: "yesterday", hi: "कल"}
+  now:       {en: "now", hi: "अभी"}
+  later:     {en: "later", hi: "बाद में"}
+  morning:   {en: "in the morning", hi: "सुबह"}
+  afternoon: {en: "in the afternoon", hi: "दोपहर में"}
+  evening:   {en: "in the evening", hi: "शाम को"}
+  night:     {en: "at night", hi: "रात को"}
+  tonight:   {en: "tonight", hi: "आज रात"}
+  monday:    {en: "on Monday", hi: "सोमवार को"}
+  tuesday:   {en: "on Tuesday", hi: "मंगलवार को"}
+  wednesday: {en: "on Wednesday", hi: "बुधवार को"}
+  thursday:  {en: "on Thursday", hi: "गुरुवार को"}
+  friday:    {en: "on Friday", hi: "शुक्रवार को"}
+  saturday:  {en: "on Saturday", hi: "शनिवार को"}
+  sunday:    {en: "on Sunday", hi: "रविवार को"}
+  always:    {en: "always", hi: "हमेशा"}
+  before:    {en: "before", hi: "पहले"}
+  after:     {en: "after", hi: "बाद में"}
+# copula by agreement class (English "be", Hindi "होना" present)
+copula:
+  en: {1sg: "am", "2": "are", 2tum: "are", 1pl: "are", 3sg: "is", 3pl: "are"}
+  hi: {1sg: "हूँ", "2": "हैं", 2tum: "हो", 1pl: "हैं", 3sg: "है", 3pl: "हैं"}
+# Hindi present habitual ending after the verb stem (masculine forms; the builder says so in its rules)
+hi_present:
+  1sg: ["ता", "हूँ"]
+  "2": ["ते", "हैं"]
+  2tum: ["ते", "हो"]
+  1pl: ["ते", "हैं"]
+  3sg: ["ता", "है"]
+  3pl: ["ते", "हैं"]
+# subjects that take the feminine verb ending in Hindi (ता -> ती, ते -> ती)
+female_subjects: [she, mother, mom, sister, daughter, wife, grandmother, aunt, girl, woman, bride, niece, granddaughter, mother-in-law]
+# motion verbs that take "to" before a following place in English ("I go to school")
+motion_verbs: [go, come, walk, run, travel, return]

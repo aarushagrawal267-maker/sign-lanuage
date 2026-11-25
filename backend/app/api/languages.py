@@ -1,5 +1,6 @@
-"""Language packs: list, vocabulary, Hindi lexicon corrections, clip analysis, results and "My signs"
-(docs/ISL_DESIGN.md sections 4.4 and 7.4). The legacy ASL routes in ``recognition.py`` are unchanged."""
+"""Language packs: list, vocabulary, Hindi lexicon (summary, entries, corrections), approximate sentences,
+clip analysis, results and "My signs" (docs/ISL_DESIGN.md sections 4.4, 7.4 and 8). The legacy ASL routes in
+``recognition.py`` are unchanged."""
 
 from __future__ import annotations
 
@@ -83,7 +84,9 @@ def _vocab_row(i: int, r: dict, hi_get) -> dict:
     variants = r.get("variants", []) or []
     return {"class_index": i, "concept_id": r["concept_id"], "headword": r.get("headword"),
             "text": {"en": (r.get("display") or {}).get("en") or r.get("headword"), "hi": hi["hi"] if hi else None},
-            "hi_review": hi.get("review") if hi else None, "kind": r.get("kind", "word"), "category": r.get("category"),
+            "hi_review": hi.get("review") if hi else None, "hi_alt": (hi.get("hi_alt") or []) if hi else [],
+            "hi_source": hi.get("source") if hi else None, "hi_reviewed": bool(hi.get("reviewed")) if hi else False,
+            "kind": r.get("kind", "word"), "category": r.get("category"),
             "in_classifier": bool(r.get("in_classifier")), "indexable": r.get("indexable", True),
             "n_variants": len(variants), "sources": sorted({v.get("source") for v in variants if v.get("source")}),
             "regions": sorted({v["region"] for v in variants if v.get("region")}),
@@ -160,6 +163,87 @@ def language_vocabulary_entry(lang: str, concept_id: str, preview: bool = True):
     return out
 
 
+@router.get("/api/languages/{lang}/lexicon", summary="Hindi lexicon summary (coverage, sources, review states)")
+def lexicon_summary(lang: str, local: bool = False):
+    from app.isl.text.lexicon import EN_MISSING, HI_MISSING, REVIEW_LABELS
+
+    pack = _pack(lang)
+    lex = pack.lexicon() if hasattr(pack, "lexicon") else None
+    n_vocab = len(pack.vocabulary())
+    if lex is None:
+        return {"language": lang, "available": False, "concepts": n_vocab, "entries": 0,
+                "missing_text": {"en": EN_MISSING, "hi": HI_MISSING}}
+    st = lex.stats()
+    out = {"language": lang, "available": True, "concepts": n_vocab, **st,
+           "coverage": round(st["entries"] / n_vocab, 4) if n_vocab else 0.0,
+           "review_labels": REVIEW_LABELS, "missing_text": {"en": EN_MISSING, "hi": HI_MISSING}}
+    if local:
+        out["local_rows"] = lex.local_rows()
+    return out
+
+
+@router.get("/api/languages/{lang}/lexicon/{concept_id}", summary="Hindi entry of one concept")
+def lexicon_entry(lang: str, concept_id: str):
+    from app.isl.text.lexicon import REVIEW_LABELS
+
+    pack = _pack(lang)
+    vocab = pack.vocabulary()
+    if vocab.get(concept_id) is None:
+        raise HTTPException(404, f"unknown concept {concept_id!r}")
+    hi = _hi_of(pack)(concept_id)
+    return {"concept_id": concept_id, "english": vocab.english(concept_id), "hindi": hi,
+            "available": hi is not None, "label": REVIEW_LABELS.get(hi.get("review")) if hi else None}
+
+
+class SentenceWord(BaseModel):
+    concept_id: str | None = Field(None, max_length=160)
+    en: str | None = Field(None, max_length=120)
+    hi: str | None = Field(None, max_length=120)
+
+
+class SentenceIn(BaseModel):
+    concept_ids: list[str] = Field(default_factory=list, max_length=40)
+    words: list[SentenceWord] = Field(default_factory=list, max_length=40)
+
+
+@router.post("/api/languages/{lang}/sentence",
+             summary="Approximate English + Hindi sentence from a sequence of recognised signs (rule-based)")
+def build_sentence_route(lang: str, body: SentenceIn):
+    """``concept_ids`` (recognised concepts, in signing order) or ``words`` (for My signs / spelled words:
+    ``{"concept_id"?, "en", "hi"?}``). The result is always labelled approximate."""
+    from app.isl.text.sentence import build_both, make_token, tokens_from_concepts
+
+    pack = _pack(lang)
+    vocab = pack.vocabulary()
+    lex = pack.lexicon() if hasattr(pack, "lexicon") else None
+    if body.concept_ids and body.words:
+        raise HTTPException(422, "send concept_ids or words, not both")
+    if body.concept_ids:
+        unknown = [c for c in body.concept_ids if vocab.get(c) is None]
+        if unknown:
+            raise HTTPException(404, f"unknown concept(s): {', '.join(unknown[:5])}")
+        tokens = tokens_from_concepts(body.concept_ids, vocab, lex)
+    else:
+        tokens = []
+        for w in body.words:
+            if w.concept_id and vocab.get(w.concept_id) is not None:
+                t = tokens_from_concepts([w.concept_id], vocab, lex)[0]
+                if w.hi:
+                    t.hi = w.hi
+                tokens.append(t)
+            elif w.en:
+                tokens.append(make_token(w.concept_id or f"word:{w.en}", w.en.strip(), (w.hi or "").strip() or None))
+            else:
+                raise HTTPException(422, "each word needs a known concept_id or an English text")
+    if not tokens:
+        raise HTTPException(422, "no words given")
+    out = build_both(tokens)
+    out["language"] = lang
+    if pack.info.sign_language != "ISL":
+        out["note"] = "The word-order rules are written for ISL; for other sign languages the result is rougher."
+    return out
+
+
 class LexiconPatch(BaseModel):
     hi: str = Field(min_length=1, max_length=120)
     hi_alt: list[str] = Field(default_factory=list, max_length=10)
@@ -173,7 +257,8 @@ def patch_lexicon(lang: str, concept_id: str, body: LexiconPatch):
     if pack.vocabulary().get(concept_id) is None:
         raise HTTPException(404, f"unknown concept {concept_id!r}")
     try:
-        return pack.lexicon().set_local(concept_id, body.hi, body.hi_alt, body.review, body.reviewer)
+        return pack.lexicon().set_local(concept_id, body.hi, body.hi_alt, body.review, body.reviewer,
+                                        english=pack.vocabulary().english(concept_id))
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
 
@@ -384,5 +469,5 @@ async def import_my_signs(lang: str, file: UploadFile = File(...), mode: str = F
 
 def demo_allowed(path: str) -> bool:
     """Write routes that stay enabled in the public read-only demo (pure analysis, nothing stored)."""
-    return path.startswith("/api/languages/") and path.endswith("/analyze/landmarks")
+    return path.startswith("/api/languages/") and (path.endswith("/analyze/landmarks") or path.endswith("/sentence"))
 

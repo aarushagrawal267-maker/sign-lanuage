@@ -1,0 +1,988 @@
+# Hand-curated Hindi for the most common everyday words (docs/ISL_DESIGN.md section 8.1, core list).
+# Written and checked by the AI engineer against standard Hindi usage; NOT yet reviewed by a native-speaker
+# teacher, so rows built from it carry review="curated", reviewed=false until someone confirms them in the app.
+# Columns (tab-separated): key  hindi  alternatives(|-separated)  pos  group
+#   key   = English headword in lower case (matches the plain concept isl.<slug>), or a full concept id (isl.x~y)
+#   pos   = n | v | adj | adv | pron | det | wh | neg | time | num | conj | prep | intj | phrase
+key	hindi	alt	pos	group
+hello	नमस्ते	नमस्कार|हैलो	intj	greetings
+hi	नमस्ते	हाय	intj	greetings
+namaste	नमस्ते	नमस्कार	intj	greetings
+good morning	सुप्रभात	नमस्ते	phrase	greetings
+good afternoon	नमस्कार	शुभ दोपहर	phrase	greetings
+good evening	शुभ संध्या	नमस्कार	phrase	greetings
+good night	शुभ रात्रि		phrase	greetings
+goodbye	अलविदा	फिर मिलेंगे	intj	greetings
+bye	अलविदा	बाय	intj	greetings
+see you later	फिर मिलेंगे		phrase	greetings
+thank you	धन्यवाद	शुक्रिया	phrase	greetings
+thanks	धन्यवाद	शुक्रिया	intj	greetings
+please	कृपया		adv	greetings
+sorry	माफ़ कीजिए	क्षमा करें|सॉरी	intj	greetings
+excuse me	सुनिए	क्षमा कीजिए	phrase	greetings
+welcome	स्वागत	स्वागत है	intj	greetings
+congratulations	बधाई हो	मुबारक हो	intj	greetings
+happy birthday	जन्मदिन मुबारक	जन्मदिन की शुभकामनाएँ	phrase	greetings
+how are you	आप कैसे हैं	आप कैसी हैं|तुम कैसे हो	phrase	greetings
+nice to meet you	आपसे मिलकर ख़ुशी हुई		phrase	greetings
+yes	हाँ	जी हाँ	intj	greetings
+no	नहीं	जी नहीं	neg	greetings
+ok	ठीक है	अच्छा	intj	greetings
+okay	ठीक है	अच्छा	intj	greetings
+fine	ठीक	अच्छा	adj	greetings
+name	नाम		n	greetings
+i	मैं		pron	pronouns
+me	मुझे	मैं	pron	pronouns
+my	मेरा	मेरी|मेरे	det	pronouns
+mine	मेरा	मेरी	pron	pronouns
+you	आप	तुम	pron	pronouns
+isl.you~plural	आप सब	आप लोग|तुम सब	pron	pronouns
+your	आपका	तुम्हारा|आपकी	det	pronouns
+he	वह	वो	pron	pronouns
+she	वह	वो	pron	pronouns
+it	यह	वह	pron	pronouns
+we	हम		pron	pronouns
+us	हमें		pron	pronouns
+our	हमारा	हमारी	det	pronouns
+they	वे	वो लोग	pron	pronouns
+their	उनका	उनकी	det	pronouns
+his	उसका		det	pronouns
+her	उसकी	उसका	det	pronouns
+this	यह	ये	det	pronouns
+that	वह	वो	det	pronouns
+these	ये		det	pronouns
+those	वे		det	pronouns
+self	स्वयं	ख़ुद	pron	pronouns
+myself	मैं ख़ुद	स्वयं	pron	pronouns
+someone	कोई		pron	pronouns
+everyone	सब लोग	सभी	pron	pronouns
+nobody	कोई नहीं		pron	pronouns
+family	परिवार		n	family
+mother	माँ	माता|मम्मी	n	family
+father	पिता	पापा|पिताजी	n	family
+mom	माँ	मम्मी	n	family
+dad	पापा	पिताजी	n	family
+parents	माता-पिता		n	family
+brother	भाई		n	family
+sister	बहन		n	family
+son	बेटा	पुत्र	n	family
+daughter	बेटी	पुत्री	n	family
+husband	पति		n	family
+wife	पत्नी		n	family
+grandfather	दादा	नाना	n	family
+grandmother	दादी	नानी	n	family
+grandson	पोता	नाती	n	family
+granddaughter	पोती	नातिन	n	family
+uncle	चाचा	मामा|ताऊ|मौसा|फूफा	n	family
+aunt	चाची	मौसी|बुआ|मामी|ताई	n	family
+cousin	चचेरा भाई	ममेरा भाई|मौसेरा भाई|चचेरी बहन	n	family
+nephew	भतीजा	भांजा	n	family
+niece	भतीजी	भांजी	n	family
+father-in-law	ससुर		n	family
+mother-in-law	सास		n	family
+baby	बच्चा	शिशु	n	family
+child	बच्चा		n	family
+children	बच्चे		n	family
+boy	लड़का		n	family
+girl	लड़की		n	family
+man	आदमी	पुरुष	n	family
+woman	औरत	महिला	n	family
+person	व्यक्ति		n	family
+people	लोग		n	family
+friend	दोस्त	मित्र	n	family
+neighbour	पड़ोसी		n	family
+neighbor	पड़ोसी		n	family
+relative	रिश्तेदार		n	family
+guest	मेहमान	अतिथि	n	family
+marriage	शादी	विवाह	n	family
+wedding	शादी	विवाह	n	family
+married	शादीशुदा	विवाहित	adj	family
+bride	दुल्हन		n	family
+groom	दूल्हा		n	family
+old man	बूढ़ा आदमी	बुज़ुर्ग	n	family
+zero	शून्य		num	numbers
+one	एक		num	numbers
+two	दो		num	numbers
+three	तीन		num	numbers
+four	चार		num	numbers
+five	पाँच		num	numbers
+six	छह		num	numbers
+seven	सात		num	numbers
+eight	आठ		num	numbers
+nine	नौ		num	numbers
+ten	दस		num	numbers
+hundred	सौ	एक सौ	num	numbers
+thousand	हज़ार	एक हज़ार	num	numbers
+lakh	लाख	एक लाख	num	numbers
+crore	करोड़	एक करोड़	num	numbers
+number	संख्या	नंबर	n	numbers
+first	पहला		adj	numbers
+isl.second~number	दूसरा		adj	numbers
+third	तीसरा		adj	numbers
+last	आख़िरी	अंतिम	adj	numbers
+half	आधा		adj	numbers
+quarter	चौथाई		n	numbers
+double	दोगुना		adj	numbers
+monday	सोमवार		time	time
+tuesday	मंगलवार		time	time
+wednesday	बुधवार		time	time
+thursday	गुरुवार	बृहस्पतिवार	time	time
+friday	शुक्रवार		time	time
+saturday	शनिवार		time	time
+sunday	रविवार	इतवार	time	time
+january	जनवरी		time	time
+february	फ़रवरी		time	time
+march	मार्च		time	time
+april	अप्रैल		time	time
+may	मई		time	time
+june	जून		time	time
+july	जुलाई		time	time
+august	अगस्त		time	time
+september	सितंबर		time	time
+october	अक्टूबर		time	time
+november	नवंबर		time	time
+december	दिसंबर		time	time
+day	दिन		n	time
+week	सप्ताह	हफ़्ता	n	time
+month	महीना	माह	n	time
+year	साल	वर्ष	n	time
+today	आज		time	time
+tomorrow	कल	आने वाला कल	time	time
+yesterday	कल	बीता हुआ कल	time	time
+now	अभी		time	time
+later	बाद में		time	time
+morning	सुबह		time	time
+afternoon	दोपहर		time	time
+evening	शाम		time	time
+night	रात		time	time
+tonight	आज रात		time	time
+time	समय	वक़्त	n	time
+hour	घंटा		n	time
+minute	मिनट		n	time
+isl.second~time	सेकंड	पल	n	time
+weekend	सप्ताहांत		n	time
+holiday	छुट्टी	अवकाश	n	time
+date	तारीख़	दिनांक|खजूर	n	time
+calendar	कैलेंडर	पंचांग	n	time
+birthday	जन्मदिन		n	time
+age	उम्र	आयु	n	time
+always	हमेशा	सदा	adv	time
+never	कभी नहीं		neg	time
+sometimes	कभी-कभी		adv	time
+often	अक्सर		adv	time
+early	जल्दी		adv	time
+late	देर	देर से	adv	time
+soon	जल्द ही	जल्दी	adv	time
+before	पहले		adv	time
+after	बाद	के बाद	adv	time
+again	फिर से	दोबारा	adv	time
+past	अतीत	बीता समय	n	time
+future	भविष्य		n	time
+season	मौसम	ऋतु	n	time
+weather	मौसम		n	time
+summer	गर्मी	ग्रीष्म ऋतु	n	time
+winter	सर्दी	शीत ऋतु|जाड़ा	n	time
+monsoon	बरसात	मानसून	n	time
+spring	वसंत	बसंत|स्प्रिंग	n	time
+autumn	पतझड़	शरद ऋतु	n	time
+colour	रंग		n	colours
+color	रंग		n	colours
+red	लाल		adj	colours
+green	हरा		adj	colours
+blue	नीला		adj	colours
+yellow	पीला		adj	colours
+black	काला		adj	colours
+white	सफ़ेद		adj	colours
+orange	नारंगी	संतरा	adj	colours
+pink	गुलाबी		adj	colours
+purple	बैंगनी		adj	colours
+brown	भूरा		adj	colours
+grey	स्लेटी	धूसर	adj	colours
+gray	स्लेटी	धूसर	adj	colours
+golden	सुनहरा		adj	colours
+dark	अँधेरा	गहरा	adj	colours
+food	खाना	भोजन	n	food
+water	पानी	जल	n	food
+milk	दूध		n	food
+tea	चाय		n	food
+coffee	कॉफ़ी		n	food
+bread	ब्रेड	डबल रोटी	n	food
+roti	रोटी	चपाती	n	food
+chapati	चपाती	रोटी	n	food
+rice	चावल	भात	n	food
+dal	दाल		n	food
+lentils	दाल		n	food
+vegetable	सब्ज़ी		n	food
+vegetables	सब्ज़ियाँ		n	food
+fruit	फल		n	food
+apple	सेब		n	food
+banana	केला		n	food
+mango	आम		n	food
+grapes	अंगूर		n	food
+guava	अमरूद		n	food
+papaya	पपीता		n	food
+watermelon	तरबूज़		n	food
+pineapple	अनानास		n	food
+lemon	नींबू		n	food
+coconut	नारियल		n	food
+potato	आलू		n	food
+onion	प्याज़		n	food
+tomato	टमाटर		n	food
+carrot	गाजर		n	food
+cabbage	पत्तागोभी	बंदगोभी	n	food
+cauliflower	फूलगोभी		n	food
+brinjal	बैंगन		n	food
+eggplant	बैंगन		n	food
+peas	मटर		n	food
+spinach	पालक		n	food
+sugar	चीनी	शक्कर	n	food
+salt	नमक		n	food
+oil	तेल		n	food
+ghee	घी		n	food
+butter	मक्खन		n	food
+curd	दही		n	food
+yogurt	दही		n	food
+paneer	पनीर		n	food
+cheese	चीज़	पनीर	n	food
+egg	अंडा		n	food
+meat	मांस	गोश्त	n	food
+chicken	चिकन	मुर्गा	n	food
+fish	मछली		n	food
+sweet	मीठा		adj	food
+sweets	मिठाई		n	food
+ice cream	आइसक्रीम		n	food
+juice	जूस	रस	n	food
+honey	शहद		n	food
+flour	आटा		n	food
+breakfast	नाश्ता		n	food
+lunch	दोपहर का खाना		n	food
+dinner	रात का खाना		n	food
+snacks	नाश्ता		n	food
+biscuit	बिस्कुट		n	food
+chocolate	चॉकलेट		n	food
+cake	केक		n	food
+candy	टॉफ़ी	मिठाई	n	food
+pizza	पिज़्ज़ा		n	food
+corn	मक्का	भुट्टा	n	food
+samosa	समोसा		n	food
+poha	पोहा		n	food
+jalebi	जलेबी		n	food
+laddu	लड्डू		n	food
+pickle	अचार		n	food
+paratha	पराठा		n	food
+biryani	बिरयानी		n	food
+idli	इडली		n	food
+dosa	डोसा		n	food
+spicy	तीखा	मसालेदार	adj	food
+sour	खट्टा		adj	food
+bitter	कड़वा		adj	food
+salty	नमकीन		adj	food
+hungry	भूखा	भूख लगी है	adj	food
+thirsty	प्यासा	प्यास लगी है	adj	food
+eat	खाना		v	food
+drink	पीना		v	food
+cook	पकाना	खाना बनाना|रसोइया	v	food
+taste	स्वाद		n	food
+delicious	स्वादिष्ट		adj	food
+kitchen	रसोई	रसोईघर	n	food
+plate	थाली	प्लेट	n	food
+glass	गिलास		n	food
+cup	कप	प्याला	n	food
+spoon	चम्मच		n	food
+bowl	कटोरी		n	food
+knife	चाकू		n	food
+home	घर		n	places
+house	घर	मकान	n	places
+school	विद्यालय	स्कूल	n	places
+college	महाविद्यालय	कॉलेज	n	places
+university	विश्वविद्यालय		n	places
+hospital	अस्पताल		n	places
+market	बाज़ार		n	places
+shop	दुकान		n	places
+bank	बैंक		n	places
+temple	मंदिर		n	places
+mosque	मस्जिद		n	places
+church	गिरजाघर	चर्च	n	places
+gurudwara	गुरुद्वारा		n	places
+office	दफ़्तर	कार्यालय	n	places
+police station	पुलिस थाना	थाना	n	places
+post office	डाकघर		n	places
+railway station	रेलवे स्टेशन		n	places
+station	स्टेशन		n	places
+bus stand	बस अड्डा		n	places
+airport	हवाई अड्डा		n	places
+road	सड़क		n	places
+street	गली		n	places
+city	शहर	नगर	n	places
+village	गाँव		n	places
+country	देश		n	places
+state	राज्य		n	places
+india	भारत	हिंदुस्तान	n	places
+indore	इंदौर		n	places
+madhya pradesh	मध्य प्रदेश		n	places
+bhopal	भोपाल		n	places
+delhi	दिल्ली		n	places
+mumbai	मुंबई		n	places
+river	नदी		n	places
+mountain	पहाड़	पर्वत	n	places
+park	पार्क	उद्यान	n	places
+garden	बगीचा	बाग़	n	places
+library	पुस्तकालय		n	places
+hotel	होटल		n	places
+restaurant	रेस्तराँ	भोजनालय	n	places
+toilet	शौचालय		n	places
+bathroom	स्नानघर	बाथरूम	n	places
+room	कमरा		n	places
+classroom	कक्षा		n	places
+cinema	सिनेमाघर		n	places
+playground	खेल का मैदान		n	places
+pharmacy	दवा की दुकान		n	places
+world	दुनिया	विश्व	n	places
+earth	पृथ्वी	धरती	n	places
+sea	समुद्र		n	places
+forest	जंगल	वन	n	places
+farm	खेत		n	places
+address	पता		n	places
+place	जगह	स्थान	n	places
+here	यहाँ		adv	places
+there	वहाँ		adv	places
+near	पास	नज़दीक	adv	places
+far	दूर		adv	places
+left	बायाँ	बाएँ	adj	places
+right	सही	दायाँ|दाएँ	adj	places
+up	ऊपर		adv	places
+down	नीचे		adv	places
+inside	अंदर		adv	places
+outside	बाहर		adv	places
+front	सामने	आगे	adv	places
+behind	पीछे		adv	places
+book	किताब	पुस्तक	n	school
+pen	पेन	कलम	n	school
+pencil	पेंसिल		n	school
+paper	काग़ज़		n	school
+notebook	कॉपी	नोटबुक	n	school
+teacher	शिक्षक	अध्यापक|टीचर	n	school
+student	छात्र	विद्यार्थी	n	school
+class	कक्षा	क्लास	n	school
+exam	परीक्षा		n	school
+examination	परीक्षा		n	school
+test	परीक्षा	टेस्ट	n	school
+study	पढ़ाई	पढ़ना	v	school
+read	पढ़ना		v	school
+write	लिखना		v	school
+learn	सीखना		v	school
+teach	पढ़ाना	सिखाना	v	school
+homework	गृहकार्य	होमवर्क	n	school
+question	प्रश्न	सवाल	n	school
+answer	उत्तर	जवाब	n	school
+lesson	पाठ		n	school
+word	शब्द		n	school
+letter	पत्र	चिट्ठी|अक्षर	n	school
+alphabet	वर्णमाला		n	school
+language	भाषा		n	school
+sign language	सांकेतिक भाषा		n	school
+english	अंग्रेज़ी		n	school
+hindi	हिंदी		n	school
+computer	कंप्यूटर		n	school
+bag	बस्ता	बैग|थैला	n	school
+blackboard	श्यामपट	ब्लैकबोर्ड	n	school
+chalk	चॉक	खड़िया	n	school
+eraser	रबर		n	school
+ruler	शासक	स्केल	n	school
+isl.ruler~academic	स्केल	पैमाना	n	school
+principal	प्रधानाचार्य	प्रिंसिपल	n	school
+education	शिक्षा		n	school
+knowledge	ज्ञान		n	school
+mathematics	गणित		n	school
+maths	गणित		n	school
+science	विज्ञान		n	school
+history	इतिहास		n	school
+geography	भूगोल		n	school
+art	कला		n	school
+music	संगीत		n	school
+dance	नाचना	नृत्य|डांस	v	school
+song	गाना	गीत	n	school
+sing	गाना		v	school
+draw	चित्र बनाना		v	school
+paint	रंगना	पेंट करना	v	school
+picture	चित्र	तस्वीर	n	school
+graduate	स्नातक		n	school
+deaf	बधिर	बहरा	adj	school
+hearing	सुनने वाला	श्रवण	adj	school
+interpreter	दुभाषिया		n	school
+body	शरीर		n	body
+head	सिर		n	body
+hair	बाल		n	body
+eye	आँख		n	body
+ear	कान		n	body
+nose	नाक		n	body
+mouth	मुँह		n	body
+tooth	दाँत		n	body
+teeth	दाँत		n	body
+tongue	जीभ		n	body
+lips	होंठ		n	body
+face	चेहरा		n	body
+neck	गर्दन		n	body
+shoulder	कंधा		n	body
+hand	हाथ		n	body
+finger	उँगली		n	body
+arm	बाँह	भुजा	n	body
+leg	पैर	टाँग	n	body
+foot	पैर	पाँव	n	body
+knee	घुटना		n	body
+stomach	पेट		n	body
+back	पीठ		n	body
+chest	छाती	सीना	n	body
+heart	दिल	हृदय	n	body
+blood	ख़ून	रक्त	n	body
+bone	हड्डी		n	body
+skin	त्वचा		n	body
+brain	दिमाग़	मस्तिष्क	n	body
+help	मदद करना	मदद|सहायता	v	medical
+emergency	आपातकाल	इमरजेंसी	n	medical
+doctor	डॉक्टर	चिकित्सक	n	medical
+nurse	नर्स		n	medical
+medicine	दवा	दवाई	n	medical
+pain	दर्द		n	medical
+fever	बुख़ार		n	medical
+cold	ठंडा	सर्दी-ज़ुकाम	adj	medical
+cough	खाँसी		n	medical
+headache	सिरदर्द		n	medical
+stomach ache	पेट दर्द		n	medical
+sick	बीमार		adj	medical
+ill	बीमार		adj	medical
+illness	बीमारी		n	medical
+disease	बीमारी	रोग	n	medical
+injury	चोट		n	medical
+hurt	चोट लगना	दर्द होना	v	medical
+wound	घाव		n	medical
+accident	दुर्घटना	हादसा	n	medical
+ambulance	एम्बुलेंस		n	medical
+police	पुलिस		n	medical
+fire	आग		n	medical
+danger	ख़तरा		n	medical
+dangerous	ख़तरनाक		adj	medical
+careful	सावधान		adj	medical
+safe	सुरक्षित		adj	medical
+stop	रुकना	रुको	v	medical
+call	बुलाना	फ़ोन करना	v	medical
+vomit	उल्टी		n	medical
+diarrhoea	दस्त		n	medical
+diarrhea	दस्त		n	medical
+dizzy	चक्कर आना		adj	medical
+breathe	साँस लेना		v	medical
+allergy	एलर्जी		n	medical
+injection	इंजेक्शन	सुई	n	medical
+vaccine	टीका	वैक्सीन	n	medical
+tablet	गोली	टैबलेट	n	medical
+operation	ऑपरेशन	शल्य क्रिया	n	medical
+pregnant	गर्भवती		adj	medical
+diabetes	मधुमेह	डायबिटीज़	n	medical
+blood pressure	रक्तचाप	ब्लड प्रेशर	n	medical
+heart attack	दिल का दौरा		n	medical
+health	स्वास्थ्य	सेहत	n	medical
+healthy	स्वस्थ		adj	medical
+thief	चोर		n	medical
+theft	चोरी		n	medical
+lost	खोया हुआ	गुम	adj	medical
+earthquake	भूकंप		n	medical
+flood	बाढ़		n	medical
+death	मृत्यु	मौत	n	medical
+die	मरना		v	medical
+dead	मृत	मरा हुआ	adj	medical
+alive	जीवित	ज़िंदा	adj	medical
+poison	ज़हर	विष	n	medical
+burn	जलना		v	medical
+unconscious	बेहोश		adj	medical
+x-ray	एक्स-रे		n	medical
+happy	ख़ुश	प्रसन्न	adj	emotions
+sad	दुखी	उदास	adj	emotions
+angry	ग़ुस्सा	नाराज़	adj	emotions
+love	प्यार करना	प्यार|प्रेम	v	emotions
+like	पसंद करना	पसंद	v	emotions
+hate	नफ़रत करना	नफ़रत|घृणा	v	emotions
+fear	डर	भय	n	emotions
+afraid	डरा हुआ		adj	emotions
+scared	डरा हुआ		adj	emotions
+surprise	आश्चर्य	हैरानी	n	emotions
+surprised	हैरान		adj	emotions
+tired	थका हुआ		adj	emotions
+bored	ऊबा हुआ		adj	emotions
+excited	उत्साहित		adj	emotions
+worried	चिंतित	परेशान	adj	emotions
+worry	चिंता		n	emotions
+shy	शर्मीला		adj	emotions
+proud	गर्व	गर्वित	adj	emotions
+jealous	ईर्ष्यालु	जलन	adj	emotions
+lonely	अकेला		adj	emotions
+calm	शांत		adj	emotions
+nervous	घबराया हुआ		adj	emotions
+upset	परेशान		adj	emotions
+feel	महसूस करना		v	emotions
+feeling	भावना	एहसास	n	emotions
+smile	मुस्कुराना	मुस्कान	v	emotions
+laugh	हँसना		v	emotions
+cry	रोना		v	emotions
+enjoy	मज़ा लेना	आनंद लेना	v	emotions
+hope	उम्मीद	आशा	n	emotions
+confused	उलझन में	भ्रमित	adj	emotions
+embarrassed	शर्मिंदा		adj	emotions
+kind	दयालु		adj	emotions
+beautiful	सुंदर	ख़ूबसूरत	adj	emotions
+ugly	बदसूरत		adj	emotions
+good	अच्छा		adj	emotions
+bad	बुरा	ख़राब	adj	emotions
+nice	अच्छा	बढ़िया	adj	emotions
+cool	बढ़िया	ठंडा	adj	emotions
+what	क्या		wh	questions
+where	कहाँ		wh	questions
+who	कौन		wh	questions
+when	कब		wh	questions
+why	क्यों		wh	questions
+how	कैसे		wh	questions
+how many	कितने		wh	questions
+how much	कितना		wh	questions
+which	कौन-सा	कौन-सी	wh	questions
+whose	किसका		wh	questions
+go	जाना		v	verbs
+come	आना		v	verbs
+sit	बैठना		v	verbs
+stand	खड़ा होना		v	verbs
+walk	चलना	टहलना	v	verbs
+run	दौड़ना		v	verbs
+sleep	सोना		v	verbs
+wake up	जागना	उठना	v	verbs
+give	देना		v	verbs
+take	लेना		v	verbs
+bring	लाना		v	verbs
+see	देखना		v	verbs
+look	देखना		v	verbs
+watch	देखना	घड़ी	v	verbs
+hear	सुनना		v	verbs
+listen	सुनना		v	verbs
+speak	बोलना		v	verbs
+talk	बात करना		v	verbs
+say	कहना		v	verbs
+tell	बताना		v	verbs
+ask	पूछना		v	verbs
+know	जानना		v	verbs
+understand	समझना		v	verbs
+think	सोचना		v	verbs
+remember	याद करना	याद रखना	v	verbs
+forget	भूलना		v	verbs
+want	चाहना		v	verbs
+need	ज़रूरत	चाहिए	v	verbs
+make	बनाना		v	verbs
+do	करना		v	verbs
+work	काम करना	काम	v	verbs
+play	खेलना	नाटक	v	verbs
+wait	इंतज़ार करना	रुकना	v	verbs
+open	खोलना	खुला	v	verbs
+close	बंद करना		v	verbs
+buy	ख़रीदना		v	verbs
+sell	बेचना		v	verbs
+pay	भुगतान करना	पैसे देना	v	verbs
+wash	धोना		v	verbs
+bath	नहाना	स्नान	v	verbs
+clean	साफ़	साफ़ करना	adj	verbs
+dirty	गंदा		adj	verbs
+live	रहना		v	verbs
+stay	रुकना	ठहरना	v	verbs
+leave	छोड़ना	जाना	v	verbs
+start	शुरू करना		v	verbs
+begin	शुरू करना		v	verbs
+finish	ख़त्म करना	पूरा करना	v	verbs
+meet	मिलना		v	verbs
+visit	मिलने जाना		v	verbs
+send	भेजना		v	verbs
+find	ढूँढना	पाना	v	verbs
+lose	खोना	हारना	v	verbs
+try	कोशिश करना		v	verbs
+use	इस्तेमाल करना	उपयोग करना	v	verbs
+change	बदलना		v	verbs
+decide	तय करना	फ़ैसला करना	v	verbs
+carry	उठाना	ले जाना	v	verbs
+pull	खींचना		v	verbs
+push	धक्का देना		v	verbs
+kiss	चूमना		v	verbs
+hug	गले लगाना		v	verbs
+cheat	धोखा देना		v	verbs
+swim	तैरना		v	verbs
+jump	कूदना		v	verbs
+travel	यात्रा करना	सफ़र करना	v	verbs
+drive	गाड़ी चलाना		v	verbs
+fly	उड़ना		v	verbs
+agree	सहमत होना		v	verbs
+believe	विश्वास करना	मानना	v	verbs
+marry	शादी करना		v	verbs
+grow	बढ़ना	उगाना	v	verbs
+fall	पतझड़	गिरना	n	verbs
+cut	काटना		v	verbs
+fight	लड़ना	लड़ाई	v	verbs
+win	जीतना		v	verbs
+catch	पकड़ना		v	verbs
+throw	फेंकना		v	verbs
+show	दिखाना		v	verbs
+sign	संकेत	इशारा	n	verbs
+big	बड़ा		adj	adjectives
+small	छोटा		adj	adjectives
+tall	लंबा		adj	adjectives
+short	छोटा	नाटा	adj	adjectives
+long	लंबा		adj	adjectives
+thin	पतला		adj	adjectives
+fat	मोटा		adj	adjectives
+hot	गरम		adj	adjectives
+new	नया		adj	adjectives
+old	पुराना	बूढ़ा	adj	adjectives
+young	जवान	युवा	adj	adjectives
+fast	तेज़		adj	adjectives
+slow	धीमा		adj	adjectives
+easy	आसान	सरल	adj	adjectives
+difficult	कठिन	मुश्किल	adj	adjectives
+hard	कठिन	कड़ा	adj	adjectives
+same	एक जैसा	समान	adj	adjectives
+different	अलग	भिन्न	adj	adjectives
+wrong	ग़लत		adj	adjectives
+correct	सही		adj	adjectives
+true	सच	सत्य	adj	adjectives
+false	झूठ	ग़लत	adj	adjectives
+full	भरा हुआ	पूरा	adj	adjectives
+empty	ख़ाली		adj	adjectives
+rich	अमीर	धनी	adj	adjectives
+poor	ग़रीब		adj	adjectives
+strong	मज़बूत	ताक़तवर	adj	adjectives
+weak	कमज़ोर		adj	adjectives
+heavy	भारी		adj	adjectives
+isl.light~less-weight	हल्का		adj	adjectives
+isl.light~electricity	बत्ती	रोशनी|लाइट	n	adjectives
+light	हल्का	रोशनी|प्रकाश	adj	adjectives
+high	ऊँचा		adj	adjectives
+low	नीचा	कम	adj	adjectives
+many	बहुत	कई	adj	adjectives
+much	बहुत		adj	adjectives
+more	और	ज़्यादा|अधिक	adj	adjectives
+less	कम		adj	adjectives
+all	सब	सभी	det	adjectives
+some	कुछ		det	adjectives
+few	थोड़े	कुछ	det	adjectives
+every	हर	प्रत्येक	det	adjectives
+only	केवल	सिर्फ़	adv	adjectives
+very	बहुत		adv	adjectives
+important	ज़रूरी	महत्वपूर्ण	adj	adjectives
+busy	व्यस्त		adj	adjectives
+free	मुफ़्त	ख़ाली|आज़ाद	adj	adjectives
+ready	तैयार		adj	adjectives
+wet	गीला		adj	adjectives
+dry	सूखा		adj	adjectives
+quiet	शांत	चुप	adj	adjectives
+loud	ज़ोर से	तेज़ आवाज़	adj	adjectives
+closed	बंद		adj	adjectives
+alone	अकेला		adj	adjectives
+together	साथ	एक साथ	adv	adjectives
+better	बेहतर		adj	adjectives
+best	सबसे अच्छा		adj	adjectives
+cheap	सस्ता		adj	adjectives
+expensive	महँगा		adj	adjectives
+blind	दृष्टिहीन	अंधा	adj	adjectives
+mute	मूक		adj	adjectives
+animal	जानवर	पशु	n	animals
+dog	कुत्ता		n	animals
+cat	बिल्ली		n	animals
+cow	गाय		n	animals
+buffalo	भैंस		n	animals
+goat	बकरी		n	animals
+horse	घोड़ा		n	animals
+elephant	हाथी		n	animals
+lion	शेर		n	animals
+tiger	बाघ	शेर	n	animals
+monkey	बंदर		n	animals
+bird	चिड़िया	पक्षी	n	animals
+snake	साँप		n	animals
+mouse	चूहा		n	animals
+rat	चूहा		n	animals
+rabbit	ख़रगोश		n	animals
+donkey	गधा		n	animals
+camel	ऊँट		n	animals
+pig	सूअर		n	animals
+sheep	भेड़		n	animals
+deer	हिरन		n	animals
+bear	भालू		n	animals
+peacock	मोर		n	animals
+parrot	तोता		n	animals
+crow	कौआ		n	animals
+hen	मुर्गी		n	animals
+duck	बत्तख़		n	animals
+frog	मेंढक		n	animals
+ant	चींटी		n	animals
+mosquito	मच्छर		n	animals
+butterfly	तितली		n	animals
+insect	कीड़ा		n	animals
+owl	उल्लू		n	animals
+pigeon	कबूतर		n	animals
+tortoise	कछुआ		n	animals
+turtle	कछुआ		n	animals
+spider	मकड़ी		n	animals
+lizard	छिपकली		n	animals
+wolf	भेड़िया		n	animals
+fox	लोमड़ी		n	animals
+bull	बैल	साँड	n	animals
+ox	बैल		n	animals
+door	दरवाज़ा		n	objects
+window	खिड़की		n	objects
+table	मेज़	टेबल	n	objects
+chair	कुर्सी		n	objects
+bed	बिस्तर	पलंग	n	objects
+fan	पंखा		n	objects
+lamp	दीया	लैंप	n	objects
+key	चाबी		n	objects
+lock	ताला		n	objects
+phone	फ़ोन		n	objects
+mobile	मोबाइल		n	objects
+television	टेलीविज़न	टीवी	n	objects
+clock	घड़ी		n	objects
+isl.watch-wristwatch-timepiece	घड़ी	कलाई घड़ी	n	objects
+money	पैसा	रुपये	n	objects
+rupee	रुपया		n	objects
+coin	सिक्का		n	objects
+ticket	टिकट		n	objects
+box	डिब्बा		n	objects
+bottle	बोतल		n	objects
+bucket	बाल्टी		n	objects
+soap	साबुन		n	objects
+towel	तौलिया		n	objects
+comb	कंघी		n	objects
+mirror	आईना	दर्पण	n	objects
+umbrella	छाता		n	objects
+shoe	जूता		n	objects
+shoes	जूते		n	objects
+slippers	चप्पल		n	objects
+clothes	कपड़े		n	objects
+shirt	कमीज़	शर्ट	n	objects
+pants	पैंट		n	objects
+trousers	पतलून	पैंट	n	objects
+dress	पोशाक	ड्रेस	n	objects
+saree	साड़ी		n	objects
+sari	साड़ी		n	objects
+kurta	कुर्ता		n	objects
+cap	टोपी		n	objects
+hat	टोपी		n	objects
+jacket	जैकेट		n	objects
+sweater	स्वेटर		n	objects
+glasses	चश्मा		n	objects
+spectacles	चश्मा		n	objects
+ring	अँगूठी		n	objects
+bangle	चूड़ी		n	objects
+necklace	हार		n	objects
+newspaper	अख़बार	समाचार पत्र	n	objects
+photo	फ़ोटो	तस्वीर	n	objects
+camera	कैमरा		n	objects
+gift	उपहार	तोहफ़ा	n	objects
+toy	खिलौना		n	objects
+ball	गेंद		n	objects
+kite	पतंग		n	objects
+car	कार	गाड़ी	n	objects
+bus	बस		n	objects
+train	रेलगाड़ी	ट्रेन	n	objects
+bicycle	साइकिल		n	objects
+cycle	साइकिल		n	objects
+motorcycle	मोटरसाइकिल		n	objects
+scooter	स्कूटर		n	objects
+auto rickshaw	ऑटो रिक्शा		n	objects
+rickshaw	रिक्शा		n	objects
+truck	ट्रक		n	objects
+aeroplane	हवाई जहाज़		n	objects
+airplane	हवाई जहाज़		n	objects
+boat	नाव		n	objects
+ship	जहाज़		n	objects
+cupboard	अलमारी		n	objects
+pillow	तकिया		n	objects
+blanket	कंबल		n	objects
+stove	चूल्हा	स्टोव	n	objects
+refrigerator	फ़्रिज		n	objects
+fridge	फ़्रिज		n	objects
+laptop	लैपटॉप		n	objects
+internet	इंटरनेट		n	objects
+email	ईमेल		n	objects
+message	संदेश	मैसेज	n	objects
+video	वीडियो		n	objects
+scissors	कैंची		n	objects
+needle	सुई		n	objects
+thread	धागा		n	objects
+rope	रस्सी		n	objects
+candle	मोमबत्ती		n	objects
+flower	फूल		n	nature
+tree	पेड़	वृक्ष	n	nature
+leaf	पत्ता		n	nature
+grass	घास		n	nature
+sun	सूरज	सूर्य	n	nature
+moon	चाँद	चंद्रमा	n	nature
+star	तारा		n	nature
+sky	आसमान	आकाश	n	nature
+cloud	बादल		n	nature
+rain	बारिश	वर्षा	n	nature
+wind	हवा		n	nature
+air	हवा	वायु	n	nature
+storm	तूफ़ान		n	nature
+snow	बर्फ़		n	nature
+ice	बर्फ़		n	nature
+stone	पत्थर		n	nature
+sand	रेत		n	nature
+soil	मिट्टी		n	nature
+gold	सोना		n	nature
+silver	चाँदी		n	nature
+iron	लोहा	इस्त्री	n	nature
+job	नौकरी		n	work
+worker	मज़दूर	कर्मचारी	n	work
+business	व्यापार	व्यवसाय	n	work
+salary	वेतन	तनख़्वाह	n	work
+price	क़ीमत	दाम	n	work
+farmer	किसान		n	work
+policeman	पुलिसवाला		n	work
+soldier	सैनिक	फ़ौजी	n	work
+army	सेना	फ़ौज	n	work
+driver	ड्राइवर	चालक	n	work
+engineer	इंजीनियर	अभियंता	n	work
+lawyer	वकील		n	work
+judge	न्यायाधीश	जज	n	work
+secretary	सचिव		n	work
+shopkeeper	दुकानदार		n	work
+carpenter	बढ़ई		n	work
+tailor	दर्ज़ी		n	work
+barber	नाई		n	work
+government	सरकार		n	work
+election	चुनाव		n	work
+vote	वोट	मत	n	work
+law	क़ानून	विधि	n	work
+court	अदालत	न्यायालय	n	work
+passport	पासपोर्ट		n	work
+form	फ़ॉर्म		n	work
+festival	त्योहार		n	festivals
+diwali	दिवाली	दीपावली	n	festivals
+holi	होली		n	festivals
+eid	ईद		n	festivals
+christmas	क्रिसमस		n	festivals
+raksha bandhan	रक्षाबंधन		n	festivals
+navratri	नवरात्रि		n	festivals
+dussehra	दशहरा		n	festivals
+ganesh chaturthi	गणेश चतुर्थी		n	festivals
+god	भगवान	ईश्वर	n	festivals
+prayer	प्रार्थना		n	festivals
+religion	धर्म		n	festivals
+hindu	हिंदू		n	festivals
+muslim	मुसलमान	मुस्लिम	n	festivals
+christian	ईसाई		n	festivals
+sikh	सिख		n	festivals
+jain	जैन		n	festivals
+thanksgiving	थैंक्सगिविंग		n	festivals
+thing	चीज़	वस्तु	n	misc
+way	रास्ता	तरीक़ा	n	misc
+problem	समस्या	परेशानी	n	misc
+idea	विचार	सुझाव	n	misc
+story	कहानी		n	misc
+news	समाचार	ख़बर	n	misc
+life	ज़िंदगी	जीवन	n	misc
+peace	शांति		n	misc
+truth	सच	सत्य	n	misc
+lie	झूठ		n	misc
+game	खेल		n	misc
+sport	खेल		n	misc
+cricket	क्रिकेट		n	misc
+football	फ़ुटबॉल		n	misc
+hockey	हॉकी		n	misc
+kabaddi	कबड्डी		n	misc
+chess	शतरंज		n	misc
+basketball	बास्केटबॉल		n	misc
+bowling	बॉलिंग		n	misc
+yoga	योग		n	misc
+exercise	व्यायाम	कसरत	n	misc
+africa	अफ़्रीका		n	misc
+and	और		conj	function
+or	या		conj	function
+but	लेकिन	पर	conj	function
+because	क्योंकि		conj	function
+if	अगर	यदि	conj	function
+with	साथ	के साथ	prep	function
+without	बिना		prep	function
+not	नहीं		neg	function
+can	सकना	सकता है	v	function
+must	ज़रूर	चाहिए	adv	function
+should	चाहिए		adv	function
+maybe	शायद		adv	function
+also	भी		adv	function
+enough	काफ़ी		adj	function
+actor	अभिनेता	कलाकार	n	include
+adult	वयस्क	बालिग़	n	include
+alright	ठीक है	अच्छा	intj	include
+artist	कलाकार		n	include
+attack	हमला		n	include
+isl.b-ed	बी.एड.	शिक्षा स्नातक	n	include
+bedroom	शयनकक्ष	बेडरूम	n	include
+bill	बिल		n	include
+card	कार्ड		n	include
+cell phone	मोबाइल फ़ोन	सेल फ़ोन	n	include
+clothing	कपड़े	वस्त्र	n	include
+crowd	भीड़		n	include
+curve	मोड़	वक्र	n	include
+deep	गहरा		adj	include
+dream	सपना	स्वप्न	n	include
+energy	ऊर्जा		n	include
+famous	प्रसिद्ध	मशहूर	adj	include
+female	महिला	स्त्री	adj	include
+flat	समतल	चपटा	adj	include
+ground	ज़मीन	मैदान	n	include
+gun	बंदूक		n	include
+king	राजा		n	include
+location	स्थान	जगह	n	include
+loose	ढीला		adj	include
+male	पुरुष		adj	include
+manager	प्रबंधक	मैनेजर	n	include
+mean	मतलबी	बुरा|कंजूस	adj	include
+narrow	संकरा	तंग	adj	include
+isl.old~things-time	पुराना		adj	include
+page	पन्ना	पृष्ठ	n	include
+pant	पैंट	पतलून	n	include
+parent	माता-पिता	अभिभावक	n	include
+patient	मरीज़	रोगी	n	include
+photograph	फ़ोटो	तस्वीर	n	include
+plane	हवाई जहाज़	विमान	n	include
+player	खिलाड़ी		n	include
+pocket	जेब		n	include
+president	राष्ट्रपति	अध्यक्ष	n	include
+priest	पुजारी		n	include
+queen	रानी		n	include
+isl.race~ethnicity	नस्ल	जाति	n	include
+radio	रेडियो		n	include
+reporter	पत्रकार	रिपोर्टर	n	include
+screen	स्क्रीन	परदा	n	include
+shallow	उथला		adj	include
+skirt	स्कर्ट		n	include
+isl.soft~person-behaviour	नरम	कोमल	adj	include
+suit	सूट		n	include
+t-shirt	टी-शर्ट		n	include
+team	टीम	दल	n	include
+technology	प्रौद्योगिकी	तकनीक	n	include
+telephone	टेलीफ़ोन	फ़ोन	n	include
+thick	मोटा		adj	include
+isl.tight~clothes	तंग	कसा हुआ	adj	include
+tool	औज़ार	उपकरण	n	include
+train station	रेलवे स्टेशन		n	include
+train ticket	ट्रेन टिकट	रेल टिकट	n	include
+transportation	परिवहन	यातायात	n	include
+waiter	वेटर	बैरा	n	include
+war	युद्ध	लड़ाई	n	include
+warm	गरम	गुनगुना	adj	include
+wide	चौड़ा		adj	include
+writer	लेखक	लेखिका	n	include
+isl.kind-kindhearted	दयालु	नेकदिल	adj	senses
+isl.fly	मक्खी	उड़ना	n	senses
+isl.can	डिब्बा	कैन	n	senses
+isl.left~hand	बायाँ	बायाँ हाथ	adj	senses
+isl.well~water	कुआँ		n	senses
+isl.fine~health	ठीक	स्वस्थ	adj	senses
+isl.fine~punishment	जुर्माना		n	senses
+isl.close~relation	क़रीबी	नज़दीकी	adj	senses
+isl.present~now	वर्तमान	अभी	time	senses
+isl.date~when	तारीख़	कब	n	senses
+c++	सी++		n	senses
+isl.six~cricket	छक्का		n	senses
+isl.four~cricket	चौका		n	senses

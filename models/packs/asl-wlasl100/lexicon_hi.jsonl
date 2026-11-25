@@ -1,0 +1,100 @@
+{"concept_id":"accident","english":"accident","hindi":"दुर्घटना","hi_alt":["हादसा"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"africa","english":"africa","hindi":"अफ़्रीका","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"all","english":"all","hindi":"सब","hi_alt":["सभी"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"apple","english":"apple","hindi":"सेब","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"basketball","english":"basketball","hindi":"बास्केटबॉल","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"bed","english":"bed","hindi":"बिस्तर","hi_alt":["पलंग"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"before","english":"before","hindi":"पहले","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"bird","english":"bird","hindi":"चिड़िया","hi_alt":["पक्षी"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"birthday","english":"birthday","hindi":"जन्मदिन","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"black","english":"black","hindi":"काला","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"blue","english":"blue","hindi":"नीला","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"book","english":"book","hindi":"किताब","hi_alt":["पुस्तक"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"bowling","english":"bowling","hindi":"बॉलिंग","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"brown","english":"brown","hindi":"भूरा","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"but","english":"but","hindi":"लेकिन","hi_alt":["पर"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"can","english":"can","hindi":"सकना","hi_alt":["सकता है"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"candy","english":"candy","hindi":"टॉफ़ी","hi_alt":["मिठाई"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"chair","english":"chair","hindi":"कुर्सी","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"change","english":"change","hindi":"बदलना","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"cheat","english":"cheat","hindi":"धोखा देना","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"city","english":"city","hindi":"शहर","hi_alt":["नगर"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"clothes","english":"clothes","hindi":"कपड़े","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"color","english":"color","hindi":"रंग","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"computer","english":"computer","hindi":"कंप्यूटर","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"cook","english":"cook","hindi":"पकाना","hi_alt":["खाना बनाना","रसोइया"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"cool","english":"cool","hindi":"बढ़िया","hi_alt":["ठंडा"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"corn","english":"corn","hindi":"मक्का","hi_alt":["भुट्टा"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"cousin","english":"cousin","hindi":"चचेरा भाई","hi_alt":["ममेरा भाई","मौसेरा भाई","चचेरी बहन"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"cow","english":"cow","hindi":"गाय","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"dance","english":"dance","hindi":"नाचना","hi_alt":["नृत्य","डांस"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"dark","english":"dark","hindi":"अँधेरा","hi_alt":["गहरा"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"deaf","english":"deaf","hindi":"बधिर","hi_alt":["बहरा"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"decide","english":"decide","hindi":"तय करना","hi_alt":["फ़ैसला करना"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"doctor","english":"doctor","hindi":"डॉक्टर","hi_alt":["चिकित्सक"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"dog","english":"dog","hindi":"कुत्ता","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"drink","english":"drink","hindi":"पीना","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"eat","english":"eat","hindi":"खाना","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"enjoy","english":"enjoy","hindi":"मज़ा लेना","hi_alt":["आनंद लेना"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"family","english":"family","hindi":"परिवार","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"fine","english":"fine","hindi":"ठीक","hi_alt":["अच्छा"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"finish","english":"finish","hindi":"ख़त्म करना","hi_alt":["पूरा करना"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"fish","english":"fish","hindi":"मछली","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"forget","english":"forget","hindi":"भूलना","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"full","english":"full","hindi":"भरा हुआ","hi_alt":["पूरा"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"give","english":"give","hindi":"देना","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"go","english":"go","hindi":"जाना","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"graduate","english":"graduate","hindi":"स्नातक","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"hat","english":"hat","hindi":"टोपी","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"hearing","english":"hearing","hindi":"सुनने वाला","hi_alt":["श्रवण"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"help","english":"help","hindi":"मदद करना","hi_alt":["मदद","सहायता"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"hot","english":"hot","hindi":"गरम","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"how","english":"how","hindi":"कैसे","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"jacket","english":"jacket","hindi":"जैकेट","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"kiss","english":"kiss","hindi":"चूमना","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"language","english":"language","hindi":"भाषा","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"last","english":"last","hindi":"आख़िरी","hi_alt":["अंतिम"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"later","english":"later","hindi":"बाद में","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"letter","english":"letter","hindi":"पत्र","hi_alt":["चिट्ठी","अक्षर"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"like","english":"like","hindi":"पसंद करना","hi_alt":["पसंद"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"man","english":"man","hindi":"आदमी","hi_alt":["पुरुष"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"many","english":"many","hindi":"बहुत","hi_alt":["कई"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"medicine","english":"medicine","hindi":"दवा","hi_alt":["दवाई"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"meet","english":"meet","hindi":"मिलना","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"mother","english":"mother","hindi":"माँ","hi_alt":["माता","मम्मी"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"need","english":"need","hindi":"ज़रूरत","hi_alt":["चाहिए"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"no","english":"no","hindi":"नहीं","hi_alt":["जी नहीं"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"now","english":"now","hindi":"अभी","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"orange","english":"orange","hindi":"नारंगी","hi_alt":["संतरा"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"paint","english":"paint","hindi":"रंगना","hi_alt":["पेंट करना"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"paper","english":"paper","hindi":"काग़ज़","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"pink","english":"pink","hindi":"गुलाबी","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"pizza","english":"pizza","hindi":"पिज़्ज़ा","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"play","english":"play","hindi":"खेलना","hi_alt":["नाटक"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"pull","english":"pull","hindi":"खींचना","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"purple","english":"purple","hindi":"बैंगनी","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"right","english":"right","hindi":"सही","hi_alt":["दायाँ","दाएँ"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"same","english":"same","hindi":"एक जैसा","hi_alt":["समान"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"school","english":"school","hindi":"विद्यालय","hi_alt":["स्कूल"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"secretary","english":"secretary","hindi":"सचिव","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"shirt","english":"shirt","hindi":"कमीज़","hi_alt":["शर्ट"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"short","english":"short","hindi":"छोटा","hi_alt":["नाटा"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"son","english":"son","hindi":"बेटा","hi_alt":["पुत्र"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"study","english":"study","hindi":"पढ़ाई","hi_alt":["पढ़ना"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"table","english":"table","hindi":"मेज़","hi_alt":["टेबल"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"tall","english":"tall","hindi":"लंबा","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"tell","english":"tell","hindi":"बताना","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"thanksgiving","english":"thanksgiving","hindi":"थैंक्सगिविंग","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"thin","english":"thin","hindi":"पतला","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"thursday","english":"thursday","hindi":"गुरुवार","hi_alt":["बृहस्पतिवार"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"time","english":"time","hindi":"समय","hi_alt":["वक़्त"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"walk","english":"walk","hindi":"चलना","hi_alt":["टहलना"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"want","english":"want","hindi":"चाहना","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"what","english":"what","hindi":"क्या","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"white","english":"white","hindi":"सफ़ेद","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"who","english":"who","hindi":"कौन","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"woman","english":"woman","hindi":"औरत","hi_alt":["महिला"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"work","english":"work","hindi":"काम करना","hi_alt":["काम"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"wrong","english":"wrong","hindi":"ग़लत","hi_alt":[],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"year","english":"year","hindi":"साल","hi_alt":["वर्ष"],"source":"manual","reviewed":false,"review":"curated","model":null}
+{"concept_id":"yes","english":"yes","hindi":"हाँ","hi_alt":["जी हाँ"],"source":"manual","reviewed":false,"review":"curated","model":null}

@@ -35,7 +35,21 @@ class AslExperimentPack:
         p, info, problem = experiment_registry.load_active()
         if p is None:
             return None, None, problem
-        return ClassifierRecognizer(p, self.manifest.id), info, None
+        return ClassifierRecognizer(p, self.manifest.id, lexicon=self.lexicon()), info, None
+
+    def lexicon(self):
+        """Hindi for the WLASL100 glosses (``lexicon_hi.jsonl`` next to pack.json; concept id = gloss), or None."""
+        from app.isl.text.lexicon import HindiLexicon
+
+        rel = self.manifest.lexicons.get("hi")
+        path = self.folder / rel if rel else None
+        if path is None or not path.exists():
+            return None
+        key = path.stat().st_mtime_ns
+        cached = getattr(self, "_lexicon", None)
+        if cached is None or cached[0] != key:
+            self._lexicon = (key, HindiLexicon(path, None))
+        return self._lexicon[1]
 
     def vocabulary(self) -> Vocabulary:
         p, _, _ = experiment_registry.load_active()

@@ -113,7 +113,10 @@ def test_registry_lists_both_languages(isl_env):
 def test_vocabulary_search_and_entry(isl_env):
     c = isl_env["client"]
     v = c.get("/api/languages/isl/vocabulary", params={"q": "do"}).json()
-    assert v["total"] == 1 and v["items"][0]["concept_id"] == "isl.dog" and v["items"][0]["text"]["hi"] is None
+    assert v["total"] == 1 and v["items"][0]["concept_id"] == "isl.dog"
+    # Hindi comes from the tracked lexicon (curated core word list), copied into the pack by build-pack
+    assert v["items"][0]["text"]["hi"] == "कुत्ता" and v["items"][0]["hi_review"] == "curated"
+    assert v["items"][0]["hi_source"] == "manual" and v["items"][0]["hi_reviewed"] is False
     assert c.get("/api/languages/isl/vocabulary", params={"in_classifier": False}).json()["total"] == 2
     e = c.get("/api/languages/isl/vocabulary/isl.dog").json()
     assert e["class_index"] == 3 and e["variants"][0]["source"] == "islrtc"
@@ -122,10 +125,33 @@ def test_vocabulary_search_and_entry(isl_env):
 
 def test_lexicon_patch_gives_hindi(isl_env):
     c = isl_env["client"]
-    r = c.patch("/api/languages/isl/lexicon/isl.dog", json={"hi": "कुत्ता", "review": "reviewed", "reviewer": "teacher-1"})
-    assert r.status_code == 200 and r.json()["hi"] == "कुत्ता"
-    assert c.get("/api/languages/isl/vocabulary", params={"q": "dog"}).json()["items"][0]["text"]["hi"] == "कुत्ता"
+    r = c.patch("/api/languages/isl/lexicon/isl.dog", json={"hi": "श्वान", "hi_alt": ["कुत्ता"], "review": "reviewed",
+                                                          "reviewer": "teacher-1"})
+    assert r.status_code == 200 and r.json()["hi"] == r.json()["hindi"] == "श्वान" and r.json()["reviewed"] is True
+    item = c.get("/api/languages/isl/vocabulary", params={"q": "dog"}).json()["items"][0]
+    assert item["text"]["hi"] == "श्वान" and item["hi_reviewed"] is True and item["hi_alt"] == ["कुत्ता"]
+    e = c.get("/api/languages/isl/lexicon/isl.dog").json()
+    assert e["available"] and e["english"] == "dog" and e["label"]["en"] == "checked by a Hindi speaker"
+    s = c.get("/api/languages/isl/lexicon", params={"local": True}).json()
+    assert s["available"] and s["local"] == 1 and s["local_rows"][0]["concept_id"] == "isl.dog"
+    assert s["missing_text"]["hi"] == "हिंदी उपलब्ध नहीं" and 0 < s["coverage"] <= 1
+    assert c.get("/api/languages/isl/lexicon/isl.nothing").status_code == 404
     assert c.patch("/api/languages/isl/lexicon/isl.dog", json={"hi": "x", "review": "bogus"}).status_code == 422
+
+
+def test_sentence_endpoint_both_languages(isl_env):
+    c = isl_env["client"]
+    r = c.post("/api/languages/isl/sentence", json={"words": [{"en": "I"}, {"concept_id": "isl.apple"}, {"en": "want"}]})
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["approximate"] is True and j["en"]["text"] == "I want apple." and j["en"]["approximate"] is True
+    assert j["hi"]["text"].startswith("मैं सेब") and j["label"]["hi"].startswith("अनुमानित")
+    j = c.post("/api/languages/isl/sentence", json={"concept_ids": ["isl.dog", "isl.cat"]}).json()
+    assert j["en"]["text"] and j["words"][0]["hi"] is not None
+    assert c.post("/api/languages/isl/sentence", json={"concept_ids": ["isl.nothing"]}).status_code == 404
+    assert c.post("/api/languages/isl/sentence", json={}).status_code == 422
+    assert c.post("/api/languages/isl/sentence", json={"concept_ids": ["isl.dog"], "words": [{"en": "x"}]}).status_code == 422
+    assert c.post("/api/languages/isl/sentence", json={"words": [{"hi": "x"}]}).status_code == 422
 
 
 def test_analyze_landmarks_with_language(isl_env):

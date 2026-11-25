@@ -121,7 +121,8 @@ def _language_session(pack_id: str | None, width: int = 640, height: int = 480, 
     cfg = EngineConfig.from_dict(engine_cfg) if engine_cfg else None
     if pack.info.kind == "experiment-registry":
         predictor, info, problem = registry.load_active()
-        eng = RecognitionEngine(predictor, width, height, cfg)
+        lexicon = pack.lexicon() if hasattr(pack, "lexicon") else None
+        eng = RecognitionEngine(predictor, width, height, cfg, lexicon=lexicon)
         exp_id = info["experiment_id"] if info else None
     else:
         rec, info, problem = pack.recognizer()

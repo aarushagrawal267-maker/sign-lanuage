@@ -121,8 +121,16 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
         shutil.copytree(work / "index", tmp / "index")
         files["index/embeddings.f16.npy"] = _sha(tmp / "index" / "embeddings.f16.npy")
     shutil.copy2(vocab_path or PACK_DIR / "vocabulary.jsonl", tmp / "vocabulary.jsonl")
-    if (PACK_DIR / "lexicon_hi.jsonl").exists():
-        shutil.copy2(PACK_DIR / "lexicon_hi.jsonl", tmp / "lexicon_hi.jsonl")
+    if (PACK_DIR / "lexicon_hi.jsonl").exists():  # only the rows of this pack's vocabulary
+        ids = {r["concept_id"] for r in Vocabulary.load(tmp / "vocabulary.jsonl").rows}
+        with (PACK_DIR / "lexicon_hi.jsonl").open(encoding="utf-8") as src, \
+                (tmp / "lexicon_hi.jsonl").open("w", encoding="utf-8") as dst:
+            for ln in src:
+                try:
+                    if json.loads(ln).get("concept_id") in ids:
+                        dst.write(ln)
+                except json.JSONDecodeError:
+                    continue
     write_spelling_lexicon(build_spelling_lexicon(Vocabulary.load(tmp / "vocabulary.jsonl").rows),
                            tmp / "spelling_lexicon.txt")
     enc_version = None

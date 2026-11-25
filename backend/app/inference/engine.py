@@ -103,9 +103,10 @@ class _Frame:
 
 class RecognitionEngine:
     def __init__(self, predictor: Predictor | None, width: int = 640, height: int = 480,
-                 config: EngineConfig | None = None, recognizer=None):
+                 config: EngineConfig | None = None, recognizer=None, lexicon=None):
         self.predictor = predictor
         self.recognizer = recognizer
+        self.lexicon = lexicon  # Hindi lexicon for the predictor path (ASL); recognisers carry their own
         self.cfg = config or EngineConfig()
         self.width, self.height = width, height
         self.segment_seq = 0
@@ -212,7 +213,12 @@ class RecognitionEngine:
             return self._topk_concepts(probs)
         names = self.predictor.class_names
         idx = np.argsort(-probs)[: self.cfg.top_k]
-        return [{"class_index": int(i), "gloss": names[i], "prob": float(probs[i])} for i in idx]
+        out = [{"class_index": int(i), "gloss": names[i], "prob": float(probs[i])} for i in idx]
+        if self.lexicon is not None:  # additive: English + Hindi text for the same gloss
+            for d in out:
+                hi, rev = self.lexicon.text(d["gloss"])
+                d["text"], d["hi_review"] = {"en": d["gloss"], "hi": hi}, rev
+        return out
 
     def _topk_concepts(self, probs: np.ndarray) -> list[dict]:
         """Closed-set top-k of a pack classifier (sliding mode) as candidate dicts."""
@@ -348,6 +354,8 @@ class RecognitionEngine:
             self.last_commit_t, self.last_commit_class = t, top[0]["class_index"]
             self.status = "recognized"
             out["commit"] = {"gloss": top[0]["gloss"], "class_index": top[0]["class_index"], "score": top[0]["prob"], "t": t}
+            if "text" in top[0]:
+                out["commit"]["text"], out["commit"]["hi_review"] = top[0]["text"], top[0]["hi_review"]
         else:
             self.status = "uncertain"
         self.last_prediction = res

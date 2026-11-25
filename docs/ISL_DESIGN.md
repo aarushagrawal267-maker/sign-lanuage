@@ -1308,6 +1308,63 @@ export function speechAvailable(lang: "hi-IN" | "en-IN"): boolean;
 Optional and off by default (a "Speak" button per word and per sentence, and an "auto-speak accepted words" toggle).
 If the browser has no `hi-IN` voice, the button explains that and offers `en-IN`. Nothing is sent to a server.
 
+### 8.4 Implementation notes and deviations (AI Engineer, Hindi and sentences, 25 Nov 2026)
+
+Implemented: `isl/text/hindi_build.py` (+ `data/hindi_core.tsv`), `isl/text/numbers_hi.py`, `isl/text/mt.py`
+(IndicTrans2 fetch/verify/translate, offline only), the full `isl/text/lexicon.py`, `isl/text/sentence.py`
+(+ `data/function_words.yaml`), the CLI command `hindi`, and the API fields below. Deviations, with reasons:
+
+* **Row fields.** Rows carry `english`, `hindi`, `hi_alt`, `source`, `reviewed` (bool), `review`, `model` (the task asked
+  for english / hindi / source / reviewed; `review` and `model` keep the richer states of 8.1). `translit` and
+  `updated` are left out of generated rows (a rebuild would rewrite every date); local corrections keep `updated` and
+  `reviewer`. The reader also accepts the older `hi` field.
+* **Result (25 Nov 2026).** Every one of the 12,442 vocabulary concepts has a Hindi row: 870 `manual`/`curated`
+  (core list), 20 `rule` (numbers), 11,552 `model`/`machine` (IndicTrans2, 11,829 model inputs, about 40 min on 2
+  CPU threads at `nice -n 10` beside the ingestion jobs); 0 `reviewed`. ASL: 100 of 100 WLASL glosses (all core list).
+  `lexicon_hi.jsonl` is 2.7 MB. A spot check of 100 random single-word machine rows **by the AI engineer, not a
+  native speaker**: about 89 acceptable, 7 clearly wrong (e.g. "pus" -> पस instead of मवाद, "batter (beat)" ->
+  बल्लेबाज, "laidback" -> आराम करें, "arraignment" -> नियुक्ति), 4 doubtful. Machine rows are therefore shown with the
+  "machine translation, not yet checked" marker, and a teacher review of the most-used words is still needed.
+* **New review state `curated`.** Rows from the hand-written core list (about 990 entries: greetings, family, numbers,
+  days, months, colours, food, places incl. Indore/MP, school, body, medical/emergency, emotions, question words,
+  common verbs and adjectives, and all 263 INCLUDE words) and from the number rules are careful but were written by
+  the AI engineer, not confirmed by a native-speaker teacher. Calling them `reviewed` would overstate what was done,
+  so `reviewed: true` is reserved for a person's confirmation (in the app, then `hindi --merge-local`).
+* **Sources are `manual`, `rule` or `model`** (`rule` for numbers, step 4 of 8.1). Proper nouns are not transliterated
+  separately: IndicTrans2 already transliterates names ("Indore" -> इंदौर, "Nagpur" -> नागपुर), and the important
+  places (Indore, Bhopal, MP, Delhi, Mumbai, India) are in the core list.
+* **Context for the model** (8.1 step 2) is given as English framing, because a bare word comes back as an imperative
+  ("go" -> जाओ) and padded batches sometimes run on ("सुंदर । । ।"): verbs (WordNet POS) as "to <verb>" (the purpose form
+  "<x>ने के लिए" is turned into the infinitive "<x>ना"), single nouns as "a <noun>" (a leading "एक" is dropped), a
+  domain/sense as "<word> (<domain>)" (the echoed parenthesis is dropped), output cut at the first danda or "..",
+  output length capped at 2 x input tokens + 8, `no_repeat_ngram_size=4`. A synonym list ("abhor despise detest hate
+  loathe") is translated member by member and the majority answer wins (the others go to `hi_alt`): translating the
+  whole list in one input produced "घृणा ( घृणा ) घृणा ...".
+* **Model download.** The official `ai4bharat/indictrans2-en-indic-dist-200M` repository is "gated: auto" (Hugging Face
+  asks the account owner to share contact details first). `mt.fetch_model` tries it first and otherwise downloads a
+  public mirror, accepting a file only if its git object id equals the official one pinned in `mt.py` (for LFS files
+  the pointer is rebuilt from the SHA-256 of the download), so the bytes are provably the official MIT release. The
+  owner can accept the gate on the model page to use the official repository directly. The model's own Python code is
+  loaded with `trust_remote_code` from that verified local folder only. `transformers` and `sentencepiece` are offline
+  tooling (`backend/requirements-hindi.txt`), not app requirements.
+* **ASL gets Hindi too.** `models/packs/asl-wlasl100/lexicon_hi.jsonl` covers all 100 WLASL glosses (all from the core
+  list). The ASL pack exposes `lexicon()`; `ClassifierRecognizer` and the legacy predictor path of the engine add
+  `text: {en, hi}` and `hi_review` to each top-k item and the commit. These keys are additive; without a lexicon the
+  ASL messages are byte-identical to before. ASL `output_languages` is now `["en", "hi"]`.
+* **build-pack** copies only the lexicon rows of the pack's vocabulary.
+* **Sentence builder additions** beyond 8.2, each recorded in `rules`: topic-first signing ("WATER I WANT" -> "I want
+  water"; a later pronoun becomes the subject); "YOU NAME WHAT" reads the pronoun as a possessive ("What is your
+  name?"); "to" after a motion verb before a place ("I go to school"); English do-support for questions and negation;
+  Hindi present-tense endings by subject (मैं -> ता हूँ, आप -> ते हैं, ...), feminine endings for a female subject
+  (mother, sister, she, ... -> "माँ खाना पकाती है"), otherwise masculine assumed. Past and future tense are not
+  inferred (ISL marks them with time signs; "YESTERDAY I DOCTOR MEET" stays "Yesterday I meet doctor").
+* **API** (all additive): `GET /api/languages/{lang}/lexicon` (coverage, counts by source/review, review labels in
+  English and Hindi, the "Hindi not available yet / हिंदी उपलब्ध नहीं" text, `?local=true` for local corrections),
+  `GET /api/languages/{lang}/lexicon/{concept_id}`, `POST /api/languages/{lang}/sentence` (`concept_ids` in signing
+  order, or `words` `[{concept_id?, en, hi?}]` for My signs and spelled words; returns `en` and `hi` `SentenceOut`,
+  the words used and the approximate label; allowed in the read-only demo because it stores nothing); vocabulary rows
+  gain `hi_alt`, `hi_source`, `hi_reviewed`; `PATCH .../lexicon/{concept_id}` stores `english` and `reviewed` too.
+
 ---
 
 ## 9. Evaluation (task 7)

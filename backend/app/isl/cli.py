@@ -32,6 +32,9 @@ artifacts/isl/<profile>/ and build-pack copies them to artifacts/packs/<isl|isl-
   evaluate               E1/E2/E3/E6 on the test fold -> results.json (+ results.md)
   build-pack             assemble the language pack the app loads
   smoke                  all of the above with tiny settings (a few CPU minutes) on whatever data is on disk
+  hindi [--translate]    Hindi lexicon models/packs/isl/lexicon_hi.jsonl (+ models/packs/asl-wlasl100/): curated
+                         core list, number rules and offline IndicTrans2 drafts (--translate fills the cache;
+                         about 40 min on 2 CPU threads); --merge-local folds reviewed local corrections back in
 
 Gated-dataset ingestion lives in ``scripts/ingest_isl_gated.py`` (CISLR, iSign).
 """
@@ -669,13 +672,71 @@ def cmd_smoke(paths: IslPaths, args) -> int:
     return 0
 
 
+ASL_PACK_DIR = PACK_DIR.parent / "asl-wlasl100"
+
+
+def _asl_class_names() -> list[str]:
+    """WLASL100 glosses of the bundled ASL model (the ASL pack's concept ids)."""
+    from app.core.config import REPO_ROOT
+
+    mj = REPO_ROOT / "models" / "wlasl100-gru-signer-holdout" / "model.json"
+    return list(json.loads(mj.read_text()).get("class_names", [])) if mj.exists() else []
+
+
+def cmd_hindi(paths: IslPaths, args) -> int:
+    """Hindi lexicon (docs/ISL_DESIGN.md section 8.1): curated core list + number rules + IndicTrans2 drafts."""
+    from app.isl.text import hindi_build as hb
+    from app.packs.vocabulary import Vocabulary
+
+    base = Path(args.out) if args.out else PACK_DIR / "lexicon_hi.jsonl"
+    asl_out = ASL_PACK_DIR / "lexicon_hi.jsonl"
+    from app.core.config import REPO_ROOT, get_settings
+
+    local = get_settings().data_dir / "isl" / "lexicon_hi.local.jsonl" if args.local is None else Path(args.local)
+    if args.merge_local:
+        _print({"merged": hb.merge_local(base, local), "from": str(local), "into": str(base)})
+        return 0
+    vocab = Vocabulary.load(PACK_DIR / "vocabulary.jsonl").rows
+    asl = _asl_class_names()
+    core = hb.load_core()
+    cache_path = Path(args.cache) if args.cache else paths.derived / "hindi_mt_cache.jsonl"
+    if args.translate:
+        from app.isl.text.mt import IndicTrans2, fetch_model
+
+        model_dir = Path(args.model_dir) if args.model_dir else (
+            REPO_ROOT / "artifacts" / "hf" / "indictrans2-en-indic-dist-200M")
+        fetch_model(model_dir, log=_log)
+        cache = hb.read_cache(cache_path)
+        asl_rows = hb.asl_vocab_rows(asl)
+        core_asl = {k: v for k, v in core.items() if not k.startswith("isl.")}
+        need = [i for r in vocab if hb._core_for(r, core) is None and r.get("kind") != "number"
+                for i in hb.mt_inputs(r)]
+        need += [i for r in asl_rows if hb._core_for(r, core_asl) is None for i in hb.mt_inputs(r)]
+        need = [i for i in need if i not in cache]
+        _log(f"[hindi] {len(set(need))} inputs to translate ({len(cache)} cached)")
+        tr = IndicTrans2(model_dir, threads=args.threads, num_beams=args.beams)
+        hb.translate_missing(need, cache_path, tr, batch=args.batch, limit=args.limit or None, log=_log)
+    cache = hb.read_cache(cache_path)
+    rows, stats = hb.build_rows(vocab, core, cache, hb.read_existing(base))
+    hb.write_rows(base, rows)
+    out = {"isl": {"file": str(base), **stats}}
+    if asl:
+        arows, astats = hb.build_asl_rows(asl, core, cache, hb.read_existing(asl_out))
+        hb.write_rows(asl_out, arows)
+        out["asl"] = {"file": str(asl_out), **astats}
+    out["cache"] = {"file": str(cache_path), "entries": len(cache)}
+    out["core_list"] = {"file": str(hb.CORE_TSV), "entries": len(core)}
+    _print(out)
+    return 0
+
+
 COMMANDS = {
     "status": cmd_status, "wordnet": cmd_wordnet, "vocab": cmd_vocab, "trim": cmd_trim,
     "trim-review": cmd_trim_review, "trim-eval": cmd_trim_eval, "splits": cmd_splits, "dedup": cmd_dedup,
     "access": cmd_access, "profiles": cmd_profiles,
     "train-classifier": cmd_train_classifier, "train-encoder": cmd_train_encoder, "build-index": cmd_build_index,
     "fit-fusion": cmd_fit_fusion, "evaluate": cmd_evaluate, "train-letters": cmd_train_letters,
-    "build-pack": cmd_build_pack, "smoke": cmd_smoke,
+    "build-pack": cmd_build_pack, "smoke": cmd_smoke, "hindi": cmd_hindi,
 }
 
 
@@ -745,6 +806,18 @@ def build_parser() -> argparse.ArgumentParser:
             sp2.add_argument("--all-include", action="store_true", help="centroids from every INCLUDE clip (final pack)")
         if name == "evaluate":
             sp2.add_argument("--part", default="test", choices=["val", "test"])
+    hi = sub.add_parser("hindi")
+    hi.add_argument("--translate", action="store_true", help="run IndicTrans2 on CPU for concepts not in the cache")
+    hi.add_argument("--limit", type=int, default=0, help="translate at most N new inputs (0 = all)")
+    hi.add_argument("--threads", type=int, default=2)
+    hi.add_argument("--beams", type=int, default=4)
+    hi.add_argument("--batch", type=int, default=24)
+    hi.add_argument("--model-dir", help="IndicTrans2 folder (default artifacts/hf/indictrans2-en-indic-dist-200M)")
+    hi.add_argument("--cache", help="translation cache (default data/isl/derived/hindi_mt_cache.jsonl)")
+    hi.add_argument("--out", help="lexicon file (default models/packs/isl/lexicon_hi.jsonl)")
+    hi.add_argument("--merge-local", action="store_true",
+                    help="fold local corrections (data/isl/lexicon_hi.local.jsonl) into the tracked lexicon")
+    hi.add_argument("--local", default=None, help="local corrections file for --merge-local")
     tl = sub.add_parser("train-letters")
     tl.add_argument("--clips", nargs="*", help="RawSequence .npz files of the alphabet signed in order")
     tl.add_argument("--letters", help="letters in the recordings, in order (default A-Z)")

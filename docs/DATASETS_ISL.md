@@ -19,6 +19,8 @@ running, partial data). Every number below says when and on how much data it was
 | WordNet 3.0 (via NLTK data) | synonym lists, part of speech, coarse categories | WordNet licence (permissive) | yes | both | public |
 | MediaPipe Holistic | landmark extractor | Apache-2.0 | yes | both | bundled |
 | pose-format (only for reading iSign; our reader is self-contained) | `.pose` file layout | MIT | yes | research | optional |
+| **IndicTrans2** en-indic distilled 200M (AI4Bharat), `ai4bharat/indictrans2-en-indic-dist-200M` | offline English -> Hindi drafts for `lexicon_hi.jsonl` (section 10); never shipped with or run by the app | MIT (model card + `LICENSE`, checked 25 Nov 2026) | yes; the Hindi rows it drafts are ours to license with the repository | both | official repo is "gated: auto" (contact details); fetched from a byte-identical public mirror verified against the official git object ids (`backend/app/isl/text/mt.py`) |
+| Hindi core word list (`backend/app/isl/text/data/hindi_core.tsv`) | about 990 hand-written everyday words and senses (870 match an ISL concept, all 100 WLASL glosses) | project licence (written for this repository) | yes | both | tracked |
 | User sign packs ("My signs") | user recordings as landmarks | chosen by the author at export (default CC BY 4.0) | per pack | never in global training | local |
 
 ### Required attribution (copy into the app's About / Research page and any publication)
@@ -27,6 +29,9 @@ running, partial data). Every number below says when and on how much data it was
   Dictionary, published on data.gov.in under the Government Open Data Licence - India (GODL)."
 * "INCLUDE dataset: A. Sridhar, R. G. Ganesan, P. Kumar, M. Khapra. INCLUDE: A Large Scale Dataset for Indian Sign
   Language Recognition. ACM Multimedia 2020. CC BY 4.0, https://zenodo.org/records/4010759."
+* Hindi machine drafts: "IndicTrans2: J. Gala et al., IndicTrans2: Towards High-Quality and Accessible Machine
+  Translation Models for all 22 Scheduled Indian Languages, TMLR 2023. AI4Bharat, MIT licence." (the lexicon rows with
+  `source: "model"`).
 * Research profile only: "CISLR: A. Joshi et al., EMNLP 2022" and "iSign: A. Joshi et al., 2024 (arXiv 2407.05404),
   CC BY-NC-SA 4.0". iSign-derived data (landmarks, models pre-trained on it) inherit NC and share-alike terms.
 
@@ -204,6 +209,8 @@ python -m app.isl.cli vocab [--no-trims]
 nice -n 10 python -m app.isl.cli trim [--redo] [--learned]
 python -m app.isl.cli trim-review | trim-eval
 python -m app.isl.cli splits [--fetch] | dedup | access | profiles
+nice -n 10 python -m app.isl.cli hindi --translate   # Hindi lexicon drafts (offline, CPU); then: hindi
+python -m app.isl.cli hindi --merge-local            # fold reviewed local Hindi corrections into the tracked file
 ```
 
 ## 9. Open issues
@@ -214,3 +221,27 @@ python -m app.isl.cli splits [--fetch] | dedup | access | profiles
 * 41 vocabulary concepts need a human review (`review.status == "needs_review"`), plus the synonym-list detection.
 * CISLR licence review (videos collected from third-party online sources) before any commercial use.
 * iSign hand labelling (left/right) to be verified on real data.
+* Hindi lexicon: curated rows await a native-speaker teacher; machine rows are unreviewed drafts (section 10).
+
+---
+
+## 10. Hindi lexicon (`python -m app.isl.cli hindi`)
+
+`models/packs/isl/lexicon_hi.jsonl` (tracked, one row per vocabulary concept) and `models/packs/asl-wlasl100/lexicon_hi.jsonl`
+(the 100 WLASL glosses). Row: `{"concept_id", "english", "hindi", "hi_alt", "source", "reviewed", "review", "model"}`.
+
+| `source` | `review` | Where it comes from |
+|---|---|---|
+| `manual` | `curated` | hand-written core list `backend/app/isl/text/data/hindi_core.tsv` (greetings, family, numbers, days, months, colours, food, places incl. Indore/MP, school, body, medical/emergency, emotions, questions, common verbs/adjectives, all 263 INCLUDE words). Written and checked by the AI engineer, **not yet confirmed by a native-speaker teacher**. |
+| `rule` | `curated` | numbers from the rule table (`numbers_hi.py`, Indian system: सौ, हज़ार, लाख, करोड़) |
+| `model` | `machine` | IndicTrans2 draft (beam 4, CPU). Input carries the sense: "to <verb>", "a <noun>", "<word> (<domain>)"; each member of a synonym list is translated and the majority wins |
+| `manual` | `reviewed` | a Hindi speaker confirmed it (local correction in the app, folded in with `hindi --merge-local`); `reviewed: true` only here |
+
+Status 25 Nov 2026: 12,442 of 12,442 ISL concepts have Hindi (870 curated, 20 rule, 11,552 machine, 0 reviewed);
+ASL 100 of 100. An AI spot check of 100 random machine word rows found about 89 acceptable, 7 clearly wrong, 4
+doubtful (not a native-speaker review).
+
+Steps: `nice -n 10 python -m app.isl.cli hindi --translate` (downloads and verifies the model into
+`artifacts/hf/`, translates what is not in `data/isl/derived/hindi_mt_cache.jsonl`, resumable; about 40 min on 2 threads
+while ingestion runs) and then `python -m app.isl.cli hindi` (rebuild from the cache, seconds). Reviewed rows are never
+overwritten by a rebuild. Extra Python packages for `--translate` only: `backend/requirements-hindi.txt`.

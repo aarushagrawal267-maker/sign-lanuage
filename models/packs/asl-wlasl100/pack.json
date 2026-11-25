@@ -5,9 +5,10 @@
   "sign_language": "ASL",
   "standard": "WLASL100",
   "display_name": {"en": "American Sign Language (WLASL100)", "hi": "अमेरिकी सांकेतिक भाषा"},
-  "output_languages": ["en"],
+  "output_languages": ["en", "hi"],
+  "lexicons": {"hi": "lexicon_hi.jsonl"},
   "capabilities": ["words"],
   "profile": "research",
   "licences": [{"source": "wlasl", "licence": "C-UDA-1.0", "commercial": false}],
-  "note": "The recogniser is the active experiment of the Model Laboratory (unchanged ASL behaviour)."
+  "note": "The recogniser is the active experiment of the Model Laboratory (unchanged ASL behaviour). lexicon_hi.jsonl gives Hindi for the 100 glosses (python -m app.isl.cli hindi)."
 }
