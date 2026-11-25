@@ -18,9 +18,20 @@ Algorithm: start = first active run (hand up or moving) lasting ``min_active_ms`
 *rest* (both hands down for ``rest_ms``), *dip* (both wrists drop to the waist for ``dip_ms``: in
 the ISLRTC videos the signer usually lowers both hands briefly between the sign and the explanation and
 then keeps signing, without a title card), *pause* (both still for ``pause_ms`` after ``min_sign_ms``),
-*source_end* (the clip ends: title card or end of file) and *cap* (``max_sign_ms`` reached: deepest motion
-minimum in the last 40% of the window). ``alternatives`` holds the next plausible ends (motion minima),
-used for augmentation and as extra index rows.
+*source_end* (the clip ends: title card or end of file) and *cap* (no boundary inside the sign window).
+
+trim-2 changes (measured in docs/DATASETS_ISL.md section 7; tooling in ``trim_bench.py``):
+
+* *cap* no longer takes the lowest hand position in the last 40% of the 4 s window; it scores every frame in
+  [0.6, 1.8] x the expected sign length (2.2 s, +0.6 s for multiword names; medians of bounded clips) by a
+  log-length prior plus hand height (``cap_scores``). On same-signer synthetic "sign straight into the
+  explanation" sequences this lifted cap ends within 300 ms from 35% to 66%.
+* every record gets a ``second`` cut (also in ``alternatives``) at least 400 ms from the main cut: the next
+  rest/dip (compounds that drop the hands between their parts), the last inner rest/dip of a bounded clip,
+  or the best length-prior frame. Training crops and the second index row should use it.
+* bounded clips up to 2 x the sign window keep their whole sign (long compounds run 5-8 s).
+* ``card`` clips that end with the hands still up are flagged ``truncated`` (the title-card detector of the
+  ingestion job also fires on plain backgrounds and then cuts mid-sign; re-extract them with ``--full``).
 """
 
 from __future__ import annotations
@@ -37,7 +48,7 @@ _POSE_LW, _POSE_RW = 5, 6
 _TIPS = [4, 8, 12, 16, 20]
 
 METHOD_CONFIDENCE = {"rest": 0.9, "dip": 0.75, "pause": 0.7, "source_end": 0.8, "clip_end": 0.5, "cap": 0.3, "empty": 0.0,
-                     "full": 0.8, "learned": 0.85}
+                     "full": 0.8, "learned": 0.85, "truncated": 0.1}
 
 
 @dataclass(frozen=True)
@@ -60,7 +71,19 @@ class TrimConfig:
     tail_ms: float = 150.0
     smooth_ms: float = 150.0
     pre_roll: int = 2
-    version: str = "trim-1"
+    # trim-2 (docs/DATASETS_ISL.md 7)
+    bounded_max_factor: float = 2.0  # a bounded clip longer than this x the sign window is treated as unbounded
+    # no boundary at all (continuous signing): end chosen by a sign-length prior + motion minima (cap_scores)
+    cap_prior: bool = True
+    cap_mu_ms: float = 2200.0
+    cap_mu_extra_ms: float = 600.0
+    cap_w_prior: float = 0.25
+    cap_w_motion: float = 0.0
+    cap_w_low: float = 2.0
+    second_sep_ms: float = 400.0  # the second cut must be at least this far from the main cut
+    # unbounded: a first rest/dip later than this x the expected length takes its second cut from the prior
+    late_factor: float | None = 1.3
+    version: str = "trim-2"
 
 
 @dataclass
@@ -69,10 +92,13 @@ class TrimResult:
     end: int  # frame slice [start, end)
     t_start_ms: float
     t_end_ms: float
-    method: str  # "rest" | "pause" | "source_end" | "clip_end" | "cap" | "empty" | "full" | "learned"
+    method: str  # rest | dip | pause | source_end | clip_end | cap | truncated | empty | full | learned
     confidence: float
     alternatives: list[int] = field(default_factory=list)  # up to 2 other plausible end frames
     notes: list[str] = field(default_factory=list)
+    # trim-2: the best other cut (exclusive end frame), for a second index row / training crop; None if no
+    # plausible second cut exists. Always one of ``alternatives``.
+    second: int | None = None
 
     def to_record(self, clip_id: str, n_frames: int, version: str) -> dict:
         d = asdict(self)
@@ -179,6 +205,20 @@ def bounded_stop(stop: str | None) -> bool:
     return any(k in s for k in ("card", "eof", "posegap"))
 
 
+def _highest_wrist(sig: dict[str, np.ndarray]) -> np.ndarray:
+    yl, yr = sig["wrist_y_left"], sig["wrist_y_right"]
+    hy = np.fmin(np.where(np.isfinite(yl), yl, np.inf), np.where(np.isfinite(yr), yr, np.inf))
+    hy = np.where(np.isfinite(hy), hy, np.nan)
+    if len(hy) >= 3:  # 3-frame median against single-frame landmark jitter
+        p = np.pad(hy, 1, mode="edge")
+        st = np.stack([p[:-2], p[1:-1], p[2:]])
+        cnt = np.isfinite(st).sum(axis=0)
+        srt = np.sort(np.where(np.isfinite(st), st, np.inf), axis=0)
+        mid = np.take_along_axis(srt, np.clip((cnt - 1) // 2, 0, 2)[None], axis=0)[0]
+        hy = np.where(cnt > 0, mid, np.nan)
+    return hy
+
+
 def find_first_sign(raw: RawSequence, stop: str | None = None, cfg: TrimConfig = TrimConfig(),
                     n_words: int = 1) -> TrimResult:
     """First-sign frame range. ``stop`` is the ingestion stop reason; ``n_words`` the number of words of a
@@ -212,6 +252,10 @@ def find_first_sign(raw: RawSequence, stop: str | None = None, cfg: TrimConfig =
     s_min = int(np.searchsorted(t, t0 + min_sign, side="left"))
     notes: list[str] = []
 
+    def cut_at(e: int) -> int:
+        """Exclusive end for a boundary whose first 'hands down' frame is ``e``."""
+        return int(min(n, e + tail))
+
     # boundary candidates: rest (both hands down) and dip (both hands lowered to the waist)
     bounds: list[tuple[int, str]] = []
     for a, b in _runs(sig["rest"]):
@@ -238,6 +282,7 @@ def find_first_sign(raw: RawSequence, stop: str | None = None, cfg: TrimConfig =
             break
 
     end, method = None, None
+    late = False
     if bounded:
         # The clip ended at a real boundary (title card / end of file / pose gap), so it normally holds the
         # sign only: keep everything up to the final return of the hands (last frame with a wrist in signing
@@ -245,23 +290,42 @@ def find_first_sign(raw: RawSequence, stop: str | None = None, cfg: TrimConfig =
         # drop the hands between their parts, so the first rest would cut them in half.
         idx = np.nonzero(~sig["dip"][start_run[0]:])[0]
         last = start_run[0] + int(idx[-1]) if len(idx) else n - 1
-        final = int(min(n, last + 1 + tail))
-        if t[final - 1] - t0 <= 1.25 * max_sign:
+        final = cut_at(last + 1)
+        if t[final - 1] - t0 <= cfg.bounded_max_factor * max_sign:
             # rest/dip boundaries inside the clip first (latest first), then motion minima
-            alts = [min(n, e + tail) for e, _ in reversed(bounds) if s + 2 < e + tail < final - 2]
+            alts = [cut_at(e) for e, _ in reversed(bounds) if s + 2 < cut_at(e) < final - 2]
             cb = candidate_boundaries(sig, t, after=s_min, until=final)
             alts += [c + 1 for c in reversed(cb) if s + 2 < c + 1 < final - 2]
             alts = sorted(list(dict.fromkeys(alts))[:2])
+            if "card" in (stop or "") and not sig["dip"][max(0, n - 3):].any():
+                # The title-card detector of the ingestion job also fires on plain backgrounds, so a "card" clip
+                # whose hands are still up in its last frames was usually cut in the middle of the sign (5 of the
+                # 8 card clips checked by eye). Keep the frames but flag them: re-extract with --full.
+                rd = [cut_at(e) for e, _ in reversed(bounds) if s + 2 < cut_at(e) < n - 2]
+                second = _second_cut(sig, t0, s, n, n_words, cfg, rd)
+                return TrimResult(s, n, float(t[s]), float(t[n - 1]), "truncated", METHOD_CONFIDENCE["truncated"],
+                                  _with_second(alts, second), [f"hands still up at a title-card stop (stop={stop}): "
+                                                               "probably cut mid-sign"], second)
+            # second cut: the last rest/dip inside the clip (compound first part / sign before an explanation)
+            rd = [cut_at(e) for e, _ in reversed(bounds) if s + 2 < cut_at(e) < final - 2]
+            second = _second_cut(sig, t0, s, final, n_words, cfg, rd)
             return TrimResult(s, final, float(t[s]), float(t[final - 1]), "source_end",
-                              METHOD_CONFIDENCE["source_end"], alts, [f"bounded clip (stop={stop})"])
+                              METHOD_CONFIDENCE["source_end"], _with_second(alts, second),
+                              [f"bounded clip (stop={stop})"], second)
         # short video that still contains an explanation: compounds take the last boundary in the window
         notes.append(f"bounded clip longer than the sign window (stop={stop})")
         if in_win:
             e, method = in_win[-1] if n_words > 1 else in_win[0]
-            end = min(n, e + tail)
+            end = cut_at(e)
     elif in_win:
         e, method = in_win[0]
-        end = min(n, e + tail)
+        end = cut_at(e)
+        if cfg.late_factor and t[e] - t0 > cfg.late_factor * _expected_ms(n_words, cfg):
+            # the first hands-down comes much later than a typical sign: either a long sign or the signer went
+            # straight on into the explanation and dropped the hands only inside it. Keep the boundary as the
+            # main cut (right for long signs) and take the second cut from the length prior (cap_scores).
+            notes.append(f"first {method} at {t[e] / 1000:.2f}s is late; second cut from the length prior")
+            late = True
     if end is None and pause_end is not None:
         end, method = min(n, pause_end + tail), "pause"
     if end is None:
@@ -272,22 +336,90 @@ def find_first_sign(raw: RawSequence, stop: str | None = None, cfg: TrimConfig =
             method = "clip_end"
             notes.append(f"clip ended inside the window (stop={stop})")
         else:
-            # no boundary inside the window: the lowest hand position (hands drop between signs), slightly
-            # favouring slow frames, in the last 40% of the window
-            lo = int(np.searchsorted(t, t0 + 0.6 * max_sign))
-            yl, yr = sig["wrist_y_left"], sig["wrist_y_right"]
-            low = np.fmin(np.where(np.isfinite(yl), yl, np.inf), np.where(np.isfinite(yr), yr, np.inf))
-            low = np.where(np.isfinite(low), low, cfg.rest_below)
-            score = (low - 0.1 * (sig["speed"] + sig["shape_change"]))[lo:win_end]
-            end = lo + int(np.argmax(score)) + 1 if len(score) else win_end
+            end = _cap_end(sig, t0, n_words, cfg) if cfg.cap_prior else _cap_end_v1(sig, t0, max_sign, win_end, cfg)
             method = "cap"
     end = int(max(s + 1, min(n, end)))
     cb = candidate_boundaries(sig, t, after=s_min, until=int(np.searchsorted(t, t0 + 1.5 * max_sign)) + 1)
     alts = [c + 1 for c in cb if c + 1 > end + 2][:2]
     if len(alts) < 2:
         alts += [c + 1 for c in reversed(cb) if c + 1 < end - 2 and c + 1 > s + 2][: 2 - len(alts)]
+    later = [cut_at(e) for e, _ in bounds if e < int(np.searchsorted(t, t0 + 1.5 * max_sign)) and cut_at(e) > end]
+    preferred = later if method in ("rest", "dip", "pause") and not late else []
+    second = _second_cut(sig, t0, s, end, n_words, cfg, preferred)
     conf = METHOD_CONFIDENCE[method]
-    return TrimResult(s, end, float(t[s]), float(t[end - 1]), method, conf, sorted(alts), notes)
+    return TrimResult(s, end, float(t[s]), float(t[end - 1]), method, conf, _with_second(alts, second), notes,
+                      second)
+
+
+def _with_second(alts: list[int], second: int | None) -> list[int]:
+    if second is None:
+        return sorted(alts)[:2]
+    return sorted([second] + [a for a in alts if a != second][:1])
+
+
+def _second_cut(sig: dict[str, np.ndarray], t0: float, s: int, end: int, n_words: int, cfg: TrimConfig,
+                preferred: list[int]) -> int | None:
+    """Best other cut at least ``second_sep_ms`` away from ``end``: the first of ``preferred`` (e.g. the next
+    rest after a rest cut: compounds that drop the hands between their parts), else the best cap-score frame
+    (sign-length prior + low hands)."""
+    t = sig["t"]
+    n = len(t)
+
+    def far(e: int) -> bool:
+        return s + 2 < e <= n and abs(float(t[min(e, n) - 1] - t[end - 1])) >= cfg.second_sep_ms
+
+    for e in preferred:
+        if far(e):
+            return int(e)
+    lo, sc = cap_scores(sig, t0, n_words, cfg)
+    for k in np.argsort(-sc, kind="stable"):
+        e = lo + int(k) + 1
+        if far(e):
+            return int(e)
+    return None
+
+
+def _cap_end_v1(sig: dict[str, np.ndarray], t0: float, max_sign: float, win_end: int, cfg: TrimConfig) -> int:
+    """trim-1 fallback: the lowest hand position, slightly favouring slow frames, in the last 40% of the window."""
+    t = sig["t"]
+    lo = int(np.searchsorted(t, t0 + 0.6 * max_sign))
+    yl, yr = sig["wrist_y_left"], sig["wrist_y_right"]
+    low = np.fmin(np.where(np.isfinite(yl), yl, np.inf), np.where(np.isfinite(yr), yr, np.inf))
+    low = np.where(np.isfinite(low), low, cfg.rest_below)
+    score = (low - 0.1 * (sig["speed"] + sig["shape_change"]))[lo:win_end]
+    return lo + int(np.argmax(score)) + 1 if len(score) else win_end
+
+
+def _expected_ms(n_words: int, cfg: TrimConfig) -> float:
+    """Typical first-sign length: median of bounded ISLRTC clips (2.2 s one word, ~2.8 s compounds)."""
+    return cfg.cap_mu_ms + (cfg.cap_mu_extra_ms if n_words > 1 else 0.0)
+
+
+def cap_scores(sig: dict[str, np.ndarray], t0: float, n_words: int, cfg: TrimConfig = TrimConfig()):
+    """Frame scores for the end of a sign that runs straight into the explanation (no rest/dip/pause): a
+    duration prior learned from bounded ISLRTC clips (median sign length 2.2 s for one word, 2.8 s for
+    compounds; docs/DATASETS_ISL.md 7) plus a bonus for slow frames (motion minima) and low hands.
+    Returns (first frame index, scores) for the search window [0.6, 1.8] x the expected length."""
+    t = sig["t"]
+    mu = _expected_ms(n_words, cfg)
+    lo = int(np.searchsorted(t, t0 + 0.6 * mu))
+    hi = int(np.searchsorted(t, t0 + 1.8 * mu, side="right"))
+    if hi <= lo:
+        return lo, np.zeros(0)
+    d = np.maximum(t[lo:hi] - t0, 1.0)
+    m = (sig["speed"] + sig["shape_change"])[lo:hi]
+    hy = _highest_wrist(sig)[lo:hi]
+    hy = np.where(np.isfinite(hy), hy, cfg.rest_below)
+    score = (-cfg.cap_w_prior * np.abs(np.log(d / mu)) - cfg.cap_w_motion * m / (np.median(m) + 1e-6)
+             + cfg.cap_w_low * hy)
+    return lo, score
+
+
+def _cap_end(sig: dict[str, np.ndarray], t0: float, n_words: int, cfg: TrimConfig) -> int:
+    lo, score = cap_scores(sig, t0, n_words, cfg)
+    if len(score) == 0:
+        return min(len(sig["t"]), lo + 1)
+    return lo + int(np.argmax(score)) + 1
 
 
 def words_for(kind: str | None, text: str | None) -> int:
