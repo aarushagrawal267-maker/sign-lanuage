@@ -69,3 +69,32 @@ def test_public_source_with_nothing_ingested_is_incomplete(tmp_path):
     assert not rep["ready"]
     assert any(r.startswith("manifest incomplete: hf_akrit_alphabet") for r in rep["reasons"])
     assert not any("cislr" in r or "isign" in r for r in rep["reasons"])
+
+
+def test_user_mode_needs_more_than_a_noise_gain(monkeypatch):
+    """Review open item: ``choose_user_mode`` picked ``neutral`` on any top-1 gain (one lucky take of 30)."""
+    from pathlib import Path
+
+    import app.isl.evaluation.runners as runners
+    from app.isl.models.fusion import FusionParams
+    from app.isl.training import fit_fusion as ff
+    from app.isl.training.common import Clip
+
+    def fake(top1_neutral, n=30):
+        def e4(rec, clips, ks, params, cache, **kw):
+            t = top1_neutral if params.user_cls_mode == "neutral" else 0.6
+            return {"run": True, "by_k": {"k3": {"n": n, "n_groups": 3, "top1_with_enrolment": t, "gain": 0.1,
+                                                 "user_sign_false_accept_rate": 0.02, "n_other_words": 50}}}
+        return e4
+
+    val = [Clip(f"v/{g}/{w}/{t}", "isl500", w, f"isl.{w}", None, None, Path("/x"), group=g)
+           for g in ("u1", "u2") for w in ("a", "b") for t in range(4)]
+    monkeypatch.setattr(runners, "e4_my_signs", fake(0.6 + 1 / 30))  # one more correct take of 30
+    p, rep = ff.choose_user_mode(None, val, FusionParams())
+    assert p.user_cls_mode == "penalty" and "within noise" in rep["reason"]
+    monkeypatch.setattr(runners, "e4_my_signs", fake(0.6 + 3 / 30))  # three more: a real gain
+    p, rep = ff.choose_user_mode(None, val, FusionParams())
+    assert p.user_cls_mode == "neutral" and rep["extra_correct_neutral"] == 3.0
+    monkeypatch.setattr(runners, "e4_my_signs", fake(0.615, n=400))  # 6 takes but only +0.015
+    p, rep = ff.choose_user_mode(None, val, FusionParams())
+    assert p.user_cls_mode == "penalty"

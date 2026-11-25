@@ -60,13 +60,18 @@ def fit_fusion(rec, val_clips: list[Clip], profile: str, version: str = "fusion-
 MIN_E4_TESTS = 30  # enrolled test takes needed before the user-sign classifier mode is chosen from data
 MIN_E4_GROUPS = 2
 MAX_FA_INCREASE = 0.01  # "neutral" may not raise the user-sign false-accept rate by more than this
+# "neutral" must beat "penalty" by more than noise: at least this top-1 gain AND at least MIN_EXTRA_CORRECT more
+# correct enrolled takes (with 30 takes one lucky take is a 0.033 gain)
+MIN_TOP1_GAIN = 0.02
+MIN_EXTRA_CORRECT = 2
 
 
 def choose_user_mode(rec, val_clips: list[Clip], params: FusionParams, ks=(3, 1)) -> tuple[FusionParams, dict]:
     """Pick the classifier term of "My signs" keys (``user_cls_mode``) on validation few-shot data: the val part's
     signer groups enrol ``k`` takes of half of their words (the E4 protocol, run on validation, never on test).
-    ``neutral`` is chosen only when it raises top-1 on the enrolled words and the false-accept rate of user signs
-    on the other words rises by at most ``MAX_FA_INCREASE``; with too little data the default ``penalty`` stays."""
+    ``neutral`` is chosen only when it raises top-1 on the enrolled words by more than noise (``MIN_TOP1_GAIN`` and
+    ``MIN_EXTRA_CORRECT`` takes) and the false-accept rate of user signs on the other words rises by at most
+    ``MAX_FA_INCREASE``; with too little data the default ``penalty`` stays."""
     from collections import Counter, defaultdict
 
     from app.isl.evaluation.runners import e4_my_signs
@@ -108,8 +113,13 @@ def choose_user_mode(rec, val_clips: list[Clip], params: FusionParams, ks=(3, 1)
     pen, neu = rep["modes"]["penalty"], rep["modes"]["neutral"]
     gain = neu["top1_with_enrolment"] - pen["top1_with_enrolment"]
     fa_up = (neu["user_sign_false_accept_rate"] or 0.0) - (pen["user_sign_false_accept_rate"] or 0.0)
-    choose = "neutral" if gain > 0 and fa_up <= MAX_FA_INCREASE else "penalty"
+    extra_correct = gain * (pen["n"] or 0)
+    clear_gain = gain >= MIN_TOP1_GAIN and extra_correct >= MIN_EXTRA_CORRECT - 1e-9
+    choose = "neutral" if clear_gain and fa_up <= MAX_FA_INCREASE else "penalty"
     rep.update(chosen=choose, k=k_used, top1_gain_neutral=round(gain, 4), false_accept_increase_neutral=round(fa_up, 4),
+               extra_correct_neutral=round(extra_correct, 1),
                reason=("neutral raises enrolled-word top-1 without more user-sign false accepts" if choose == "neutral"
-                       else "neutral did not raise enrolled-word top-1 or raised user-sign false accepts"))
+                       else (f"neutral's top-1 gain ({gain:+.3f}, {extra_correct:+.1f} takes) is within noise "
+                             f"(need >= {MIN_TOP1_GAIN} and >= {MIN_EXTRA_CORRECT} takes)" if not clear_gain
+                             else "neutral raised user-sign false accepts")))
     return params.with_(user_cls_mode=choose), rep
