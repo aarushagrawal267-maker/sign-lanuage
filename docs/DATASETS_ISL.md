@@ -101,7 +101,7 @@ nothing. `pose_sources.register(ADAPTERS)` adds the adapters to a registry.
 | `manifests/islrtc_index.json` | `scripts/ingest_isl.py islrtc` | the 13,665 dictionary file names and sizes |
 | `manifests/islrtc.jsonl` | `scripts/ingest_isl.py islrtc` (running) | one row per dictionary video: + stop (card / eof / max_s / +posegap), duration_s (approximate; `t_ms` in the npz is authoritative) |
 | `landmarks/{include,islrtc}/*.npz` | ingestion | `RawSequence` (pose 33x4, hands 21x3, face 20x3, t_ms; NaN = not detected). Videos are deleted after extraction |
-| `derived/islrtc_trim.jsonl` | `python -m app.isl.cli trim` | first-sign frame range per ISLRTC clip (sidecar; npz untouched) |
+| `derived/islrtc_trim.jsonl` | `python -m app.isl.cli trim` or `python -m app.isl.data.trim_bench run [--learned ...]` | first-sign frame range per ISLRTC clip + `second` cut (sidecar; npz untouched; section 7) |
 | `derived/vocab_report.json`, `derived/duplicates.jsonl` | `vocab`, `dedup` | build report, near-duplicate clusters |
 | `splits/official/*.txt` | `splits --fetch` | AI4Bharat lists (SHA-256 pinned in `splits.py`) |
 | `splits/*.json`, `splits/include_groups.json`, `splits/oneshot_concepts.json`, `splits/splits_report.json` | `splits` | split assignments with leakage reports, session / pseudo-signer groups, one-shot folds |
@@ -380,30 +380,139 @@ reuses one video for two entries). Duplicates are kept on the same side of every
 
 ## 7. ISLRTC first-sign trimming: quality
 
-Stage 1 on 1,010 ISLRTC clips (25 Nov 2026): source_end 331, cap 346, dip 158, rest 130, full (phrases) 31,
-pause 6, clip_end 5, empty 3. `cap` (confidence 0.3) means no boundary was found within the sign window: the signer
-went straight on into the explanation.
+Current version **`trim-2`** (25 Nov 2026), `backend/app/isl/data/trim.py`; checks and tooling in
+`trim_bench.py` (labels, sampling, synthetic checks, full run), `trim_sheet.py` (contact sheets), `trim_synth.py`
+(splice / join helpers), `trim_learned.py` (optional learned end for `cap` clips). Labels:
+`backend/app/isl/data/trim_labels_islrtc.jsonl`.
 
-How often is it right? There is no ground truth, so three checks:
+### 7.1 By-eye labels (ground truth)
 
-1. **Video check (by eye)**: the dictionary videos of 12 random clips (seed 29, 3 per method) were downloaded and
-   shown as 4 fps contact sheets with the cut marked, next to the wrist-height plots. Correct 7, wrong 2 (both compound
-   names, "Amniotic fluid" and "Adobe Creative Suite", cut after the first part), unclear 2 (continuous signing, no
-   visible boundary), 1 explanation entry (not indexed). That is **7 of 9 judgeable (about 78%)**, a small sample.
-   Earlier samples (24 clips) drove the rule changes listed in design 5.8 and are not counted.
-2. **Synthetic end error**: 331 clean bounded clips each followed by 2-6 s of another clip's explanation, aligned to
-   one body frame, trimmed as if `stop=max_s`: **67.7% within 300 ms** (design target 80%), median error 80 ms,
-   18.7% too late, 13.6% too early.
-3. **INCLUDE**: on 400 INCLUDE clips (one sign each) the trimmer keeps 100% of the active frames.
+167 random ISLRTC dictionary videos in three stratified samples (stop reason x name kind: one word, 2 words,
+3+ words, synonym list; phrases/explanations excluded): seed 2026 (64 clips, alternating `dev`/`test`), seed 7
+(63, all `test`) and seed 99 (40, `holdout`, labelled after the last rule change). Each video was downloaded,
+rendered as a **blind** contact sheet (one tile per 200 ms, no cut shown, signer crop or full frame) and the
+end of the first sign was written down as the first tile where the hands leave the sign. Videos were deleted
+after rendering.
 
-Stage 2 (learned boundary, smoke run on partial data: 698 clean signs, 112 tails, 10 epochs, ~1 min CPU): 88.7% of
-synthetic validation joins within 2 frames, but on the synthetic end-error check it scored 71.1% against 69.3% for
-stage 1 at that moment (about 270 clips), with leakage (the same clips in training and check). Not used by default.
+| status | bounded (`eof`/`card`) | `max_s+posegap` | `max_s` | all |
+|---|---|---|---|---|
+| `ok`: end clearly visible | 46 | 27 | 23 | 96 |
+| `guess`: plausible end | 0 | 0 | 5 | 5 |
+| `unclear`: no visible boundary | 13 | 0 | 52 | 65 |
+| not a sign | 1 | 0 | 0 | 1 |
 
-Review sheet: `python -m app.isl.cli trim-review` writes `artifacts/reports/trim_review/*.png` + `index.md`.
-Known failure modes: compound multiword names in `max_s` clips are cut after their first part; continuous signing
-without any drop of the hands ends at the 4 s cap. Mitigations already in the design: alternatives as extra training
-crops and a second index row per entry, low trim confidence lowers the weight of these references.
+**65% of plain `max_s` clips (52 of 80) have no boundary a person can see on 5 fps frames**: the signer goes
+from the sign straight into the explanation with the hands in signing space. These clips cannot be scored by
+eye; section 7.2 measures them on synthetic data. The 13 unclear bounded clips are 6 clips cut mid-sign by a
+false title-card stop and 7 `eof` clips with long continuous signing.
+
+End error (trim end time - label), share within 300 ms, on the 96 `ok` clips:
+
+| | dev (n=22) | test (n=56) | holdout (n=18) | all (n=96) |
+|---|---|---|---|---|
+| trim-1 | 81.8% | 94.6% | 94.4% | 91.7% |
+| **trim-2**, main cut | 81.8% | 94.6% | 94.4% | **91.7%** (88/96) |
+| trim-2, better of main and `second` cut | 90.9% | 98.2% | 94.4% | 95.8% |
+
+With the 5 guesses: trim-2 89.1% (90/101). "Usable" (between 300 ms early and 600 ms late): trim-2 95.8%,
+trim-1 94.8%. **On clips with a visible boundary both versions meet the 80% target; they differ on the
+continuous-signing clips, which by-eye labels cannot score.** Remaining errors (8): a second signer after a
+real title card (`Bermuda Shorts`, now `truncated`), one rest at the waist inside a compound (`Business
+Minded`), one `cap` 1.1 s early, four ends 360-560 ms late and one compound 0.9 s late (`Advocate General`).
+
+### 7.2 Synthetic checks (known boundary, no labels needed)
+
+`python -m app.isl.data.trim_bench synthetic --half report`. Clips are split into two stable halves by
+crc32 of the id; every rule and parameter was tuned on the `tune` half (and the `dev` labels) only. Numbers on
+the `report` half, clip set pinned to the 4,619 clips ingested at 15:30 UTC:
+
+* **spliced** (the hard case): an ISLRTC `max_s` clip whose sign ends in an unambiguous hands-down run has
+  those frames cut out and bridged with 2 interpolated frames, so the same signer runs straight from the sign
+  into the explanation. True end = last frame before the hands went down. n = 506.
+* **joined**: a bounded clip (whole clip = sign + trailing rest) followed by 2-6 s of another signer's
+  explanation moved into the same body frame. n = 743.
+
+| within 300 ms | spliced | spliced, 1 word | 2 words | 3+ words | spliced `cap` ends | joined |
+|---|---|---|---|---|---|---|
+| trim-1 | 23.9% | 32.0% | 13.8% | 10.0% | 35.1% (n=322) | 59.9% |
+| **trim-2** | **43.5%** | 48.0% | 41.3% | 24.0% | **65.8%** (n=322) | 65.8% |
+| trim-2, better of 2 cuts | 62.1% | | | | | 75.4% |
+| trim-2 + learned `cap` end (`trim_learned`, trained on `tune`) | 51.7% (n=520, stage 1 alone 43.8%) | | | | | |
+
+The old synthetic number (67.7%, section history) used tails cut at the trimmer's own end and is not
+comparable. **INCLUDE** (one sign per clip, 400 clips): trim-2 keeps 100% of the active frames on 100% of clips.
+
+### 7.3 What changed in trim-2 and what was tried
+
+Kept (each improved the tune half / dev labels and did not hurt the others):
+
+* **`cap` = sign-length prior**: with no rest/dip/pause, the end is the best frame in [0.6, 1.8] x the expected
+  length (2.2 s for one word, 2.8 s for multiword names; medians of 1,400 bounded clips), scored by a log-length
+  prior plus hand height. trim-1 took the lowest hand in the last 40% of a 4 s window, i.e. usually 3-4 s.
+  Spliced `cap` ends within 300 ms: 35% -> 66%.
+* **two candidate cuts per entry**: each record has `second` (also in `alternatives`, so the existing
+  training crops and the second index row pick it up) at least 400 ms from the main cut: the next rest/dip
+  after a rest/dip cut (compounds that drop the hands between parts), the last inner rest/dip of a bounded
+  clip, or the best prior frame; when the first rest/dip comes later than 1.3 x the expected length, the
+  second cut comes from the prior instead. Best of two: 91.7% -> 95.8% on labels, 43.5% -> 62.1% spliced.
+* **bounded clips keep long compounds**: the whole sign is kept up to 2 x the sign window (was 1.25 x);
+  `Beekeeper`-type 4-5 s signs were cut at a pause.
+* **`truncated` card clips**: the ingestion title-card detector (`_cut_at_card`, near-uniform left part of the
+  frame) also fires on plain grey backgrounds. Of 10 `card` clips viewed, 6 stopped mid-sign (0.8-3.8 s into
+  the video), 1 was a real card after a second signer, 3 were right. A `card` clip whose last frames still
+  have a hand up is now `truncated` (confidence 0.1; 53 of the 71 card clips in the final run). **These should
+  be re-extracted with
+  `scripts/ingest_isl.py islrtc --only ... --full --max-s 14 --out-subdir islrtc_full`** (not done here: the
+  ingestion jobs belong to the main session).
+* **learned end for `cap` clips** (`trim_learned.py`, optional): the stage-2 BiGRU of `boundary.py` trained on
+  same-signer spliced clips (not cross-signer joins). Spliced report half: 43.8% -> 51.7% main cut, 65.4% best
+  of 2. It changes only `cap` ends; applied to every method it reached 70% on spliced data but lost on the
+  labels (91.7% -> 90.6%), because real first rests/dips are mostly right. Train with
+  `python -m app.isl.data.trim_learned train` (about 15 min on the shared 4 CPUs,
+  `artifacts/isl/trim_boundary.pt`), apply with `trim_bench run --learned artifacts/isl/trim_boundary.pt`.
+  The default `cli trim` does not use it.
+
+Tried and dropped (measured, did not help):
+
+* end at the onset of the hand drop instead of where the hands reach the waist: dev labels +9 pt, test -9 pt
+  (people mark the first frame after the sign, where the hands are already dropping);
+* shot / signer change detector (shoulder jump between frames): fixed 1 labelled clip, broke 1;
+* longer `dip_ms` / `rest_ms`, larger minimum sign length per extra word (300-1000 ms), larger compound
+  offsets (1.2-1.8 s), motion-minimum weight in the prior: no gain or worse on the tune half;
+* the existing cross-signer stage-2 model (`cli trim --learned`): not re-trained here; the spliced model above
+  replaces it for `cap` clips.
+
+Number of words: about half of the labelled 2-3 word names are signed as **one** continuous sign (`Chop in Table
+Tennis`, `Bank Account Number`), so the word count only shifts the expected length (+0.6 s), it does not set a
+sign count. Synonym lists (`Almost Nearly`, `Customer Client`) are one sign.
+
+### 7.4 Method mix and confidence (all ingested clips)
+
+Run on all 4,832 ISLRTC clips ingested at 16:20 UTC (`trim_bench run --learned artifacts/isl/trim_boundary.pt`,
+sidecar `derived/islrtc_trim.jsonl`, `trim_version` `trim-2`; `.npz` files only read): source_end 1,950, cap
+1,341, dip 662, rest 653, full (phrases) 125, truncated 53, pause 31, clip_end 10, empty 7; 357 `cap` ends
+taken from the learned model (trained on all ingested `max_s` clips, 3,984 spliced examples, 15 min CPU);
+4,429 records have a `second` cut. `cap` clips keep 2.8 s (median; p10 1.8 s, p90 4.3 s) instead of 3.9 s.
+`cap` is still 28% of clips: they are the continuous-signing videos, not a failure of the boundary rules.
+Clips ingested later and trimmed by `python -m app.isl.cli trim` get stage 1 only (same `trim_version`);
+re-run `trim_bench run --learned ...` after ingestion to refine them.
+Confidence by method (unchanged): rest 0.9, source_end 0.8, dip 0.75, pause 0.7, cap 0.3, truncated 0.1.
+Measured: rest 14/16 and source_end 68/72 on labels (all dip labels right, n=6); `cap` 66% on spliced data,
+so 0.3 is conservative (kept: an existing data-layer test pins `cap <= 0.3`).
+
+**Estimate for all dictionary clips** (not a measurement): weighting the strata by their share of the corpus
+(bounded about 35%, `max_s+posegap` 7%, `max_s` 57%, of which about 65% continuous signing) with the label
+accuracy for clips with a visible end and the spliced accuracy for continuous signing gives roughly **70-75%
+within 300 ms for the main cut and about 80% for the better of the two cuts**. The design check in
+ISL_DESIGN 5.3 (bounded `card`/`eof` clips within 300 ms for >= 80%) is met on the labels: 91.3% of 46
+bounded clips (100% with the better of two cuts; `max_s+posegap` 96.3% of 27, `max_s` with a visible end 87.0%
+of 23);
+continuous signing remains the main error, and the second index row / training crop (`second`) is the
+mitigation.
+
+Review tooling: `python -m app.isl.data.trim_bench sheets SAMPLE.json OUT [--marked] [--full-frame]` renders
+contact sheets (download one video at a time, deleted after rendering); `--marked` shows the kept range and
+cuts. `python -m app.isl.cli trim-review` still draws the wrist-height plots.
 
 ---
 
@@ -415,6 +524,8 @@ python -m app.isl.cli wordnet           # once
 python -m app.isl.cli vocab [--no-trims]
 nice -n 10 python -m app.isl.cli trim [--redo] [--learned]
 python -m app.isl.cli trim-review | trim-eval
+python -m app.isl.data.trim_bench labels | synthetic --half report | include | run [--learned MODEL]
+python -m app.isl.data.trim_learned train | eval --half report    # learned end for cap clips (section 7.3)
 python -m app.isl.cli splits [--fetch] | dedup | access | profiles
 nice -n 10 python -m app.isl.cli hindi --translate   # Hindi lexicon drafts (offline, CPU); then: hindi
 python -m app.isl.cli hindi --merge-local            # fold reviewed local Hindi corrections into the tracked file
@@ -424,7 +535,9 @@ python -m app.isl.cli hindi --merge-local            # fold reviewed local Hindi
 
 * INCLUDE and ISLRTC ingestion are partial (about 10% and 8%); every count above must be refreshed after ingestion.
 * Pseudo-signers are estimates; INCLUDE signer identities are not published in the manifest or the split lists.
-* Trimming accuracy is about 70-78% by two rough measures; compound signs are the main error.
+* Trimming (trim-2): 91.7% within 300 ms on 96 by-eye labelled clips with a visible end, but 65% of plain `max_s`
+  videos run straight from the sign into the explanation and cannot be labelled by eye; on synthetic versions of
+  that case 44-52% (62-65% with the second cut). 53 `card` clips stopped mid-sign need a `--full` re-extraction.
 * 41 vocabulary concepts need a human review (`review.status == "needs_review"`), plus the synonym-list detection.
 * CISLR licence review (videos collected from third-party online sources) before any commercial use.
 * iSign hand labelling (left/right) to be verified on real data.
