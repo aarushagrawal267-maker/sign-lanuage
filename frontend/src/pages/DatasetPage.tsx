@@ -3,7 +3,7 @@ import { CheckCircle2, CloudDownload, Download, FileCheck2, Play, ScanFace, Shie
 import { api, type DatasetStatus, type DatasetSummary, type InventoryRow, type Job, type SplitInfo, type VideoRow } from "../api/client";
 import { useApi } from "../lib/hooks";
 import { dateTime, downloadCsv, num, pct } from "../lib/format";
-import { Badge, Button, Card, Empty, ErrorText, Field, Kv, Notice, PageHeader, Progress, Segmented, Stat, cx, inputCls } from "../components/ui";
+import { Badge, Button, Card, Empty, ErrorText, Field, Kv, Notice, PageHeader, Progress, ScrollRegion, Segmented, Stat, cx, inputCls } from "../components/ui";
 import { ColumnChart } from "../components/charts/Bars";
 
 const STATUS_TONE: Record<string, "good" | "danger" | "warn" | "neutral" | "accent"> = {
@@ -29,7 +29,7 @@ function JobPanel({ jobs, onCancel }: { jobs: Job[]; onCancel: (id: number) => v
                 {(j.status === "running" || j.status === "queued") && <Button size="sm" variant="ghost" onClick={() => onCancel(j.id)}>Cancel</Button>}
               </span>
             </div>
-            {(j.status === "running" || j.status === "queued") && <Progress value={j.progress} />}
+            {(j.status === "running" || j.status === "queued") && <Progress value={j.progress} label={`${j.kind} job #${j.id} progress`} />}
             {j.status !== "running" && Object.keys(j.result || {}).length > 0 && (
               <div className="font-mono text-[11px] text-fg-3">{Object.entries(j.result).map(([k, v]) => `${k}: ${String(v)}`).join(" · ")}</div>
             )}
@@ -104,7 +104,7 @@ function SplitsCard({ splits }: { splits: SplitInfo[] }) {
   if (!splits.length) return null;
   return (
     <Card title="Partitions & leakage checks" subtitle="Automated checks: signer overlap, duplicate content (hash), shared source files, class coverage">
-      <div className="overflow-x-auto">
+      <ScrollRegion label="Partitions table" className="overflow-x-auto">
         <table className="w-full min-w-[760px] text-sm">
           <thead>
             <tr className="border-b border-ink-700 text-left text-xs text-fg-3">
@@ -139,7 +139,7 @@ function SplitsCard({ splits }: { splits: SplitInfo[] }) {
             })}
           </tbody>
         </table>
-      </div>
+      </ScrollRegion>
       <p className="mt-3 text-xs text-fg-3">The official WLASL split is kept for comparability with published results but is labelled as not signer-independent. Signers who share a source video are grouped so the same footage never crosses partitions.</p>
     </Card>
   );
@@ -262,7 +262,7 @@ export default function DatasetPage() {
 
             <div className="grid gap-5 lg:grid-cols-2">
               <Card title="Availability by host" subtitle="Where the official URLs point">
-                <div className="overflow-x-auto">
+                <ScrollRegion label="Availability by host table" className="overflow-x-auto">
                   <table className="w-full text-sm">
                     <thead><tr className="border-b border-ink-700 text-left text-xs text-fg-3"><th className="py-2 font-medium">Host</th><th className="py-2 text-right font-medium">Total</th><th className="py-2 text-right font-medium">Valid</th><th className="py-2 text-right font-medium">Failed</th><th className="py-2 text-right font-medium">Pending</th></tr></thead>
                     <tbody>
@@ -277,7 +277,7 @@ export default function DatasetPage() {
                       ))}
                     </tbody>
                   </table>
-                </div>
+                </ScrollRegion>
                 {s && s.top_errors.length > 0 && (
                   <div className="mt-4">
                     <div className="mb-1 text-xs font-medium text-fg-2">Most common failure reasons</div>
@@ -306,14 +306,14 @@ export default function DatasetPage() {
 
             <div className="grid gap-5 lg:grid-cols-[1fr_1.4fr]">
               <Card title="Signers" subtitle={`${s?.signers.length ?? 0} signer ids · videos per signer (official split)`}>
-                <div className="max-h-80 overflow-y-auto pr-1">
+                <ScrollRegion label="Signers table" className="max-h-80 overflow-y-auto pr-1">
                   <table className="w-full text-sm">
                     <thead className="sticky top-0 bg-ink-850"><tr className="border-b border-ink-700 text-left text-xs text-fg-3"><th className="py-1.5 font-medium">Signer</th><th className="py-1.5 text-right font-medium">Videos</th><th className="py-1.5 text-right font-medium">train / val / test</th></tr></thead>
                     <tbody>{(s?.signers ?? []).map((g) => (
                       <tr key={g.signer_id} className="border-b border-ink-700/40"><td className="py-1 font-mono text-xs">{g.signer_id}</td><td className="py-1 text-right font-mono text-xs">{g.videos}</td><td className="py-1 text-right font-mono text-xs text-fg-3">{g.split.train ?? 0} / {g.split.val ?? 0} / {g.split.test ?? 0}</td></tr>
                     ))}</tbody>
                   </table>
-                </div>
+                </ScrollRegion>
                 <p className="mt-3 text-[11px] text-fg-3">Signers appearing in several official partitions are why the official split is not signer-independent.</p>
               </Card>
               <Card title="Provenance" subtitle="Annotation files exactly as fetched">

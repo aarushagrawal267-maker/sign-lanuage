@@ -3,7 +3,7 @@ import { ArrowRight, CheckCircle2, Circle, Cpu, Database, FlaskConical, Video } 
 import { useApi } from "../lib/hooks";
 import { dateTime, ms, num, pct, timeAgo } from "../lib/format";
 import type { Overview, SystemInfo } from "../api/client";
-import { Badge, Button, Card, Empty, Kv, Notice, PageHeader, Progress, Stat } from "../components/ui";
+import { Badge, Card, Empty, Kv, Notice, PageHeader, Progress, Stat, buttonClass } from "../components/ui";
 
 function Step({ done, title, children, to, cta }: { done: boolean; title: string; children: React.ReactNode; to: string; cta: string }) {
   return (
@@ -52,7 +52,7 @@ export default function OverviewPage() {
     <div className="fade-in">
       <PageHeader eyebrow="Sign intelligence overview" title="Overview"
         description="Status of the WLASL100 dataset, landmark extraction, models and recent recognitions. Every number on this page comes from the local database."
-        actions={<Link to="/live"><Button variant="primary" icon={<Video className="size-4" />}>Live recognition</Button></Link>} />
+        actions={<Link to="/live" className={buttonClass("primary")}><Video className="size-4" aria-hidden />Live recognition</Link>} />
 
       {active?.is_synthetic && (
         <div className="mb-5"><Notice tone="warn" title="Active model is a synthetic test model">It was trained on generated landmark data to verify the pipeline and is not an ASL recogniser.</Notice></div>
@@ -76,7 +76,7 @@ export default function OverviewPage() {
               {o.running_jobs.map((j) => (
                 <div key={j.id}>
                   <div className="mb-1.5 flex justify-between text-xs"><span className="font-medium text-fg">{j.kind} job #{j.id}</span><span className="text-fg-3">{j.message ?? "starting…"}</span></div>
-                  <Progress value={j.progress} />
+                  <Progress value={j.progress} label={`${j.kind} job #${j.id} progress`} />
                 </div>
               ))}
             </div>

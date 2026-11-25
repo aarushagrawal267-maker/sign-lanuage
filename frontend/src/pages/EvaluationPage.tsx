@@ -21,8 +21,8 @@ function PerClassTable({ m }: { m: Metrics }) {
     return r;
   }, [m, sort, asc, q]);
   const head = (k: SortKey, label: string) => (
-    <th className="py-2 pr-3 font-medium">
-      <button className="hover:text-fg" onClick={() => (sort === k ? setAsc(!asc) : (setSort(k), setAsc(k === "class_index")))} aria-sort={sort === k ? (asc ? "ascending" : "descending") : "none"}>
+    <th className="py-2 pr-3 font-medium" aria-sort={sort === k ? (asc ? "ascending" : "descending") : "none"}>
+      <button className="hover:text-fg" onClick={() => (sort === k ? setAsc(!asc) : (setSort(k), setAsc(k === "class_index")))}>
         {label}{sort === k ? (asc ? " ↑" : " ↓") : ""}
       </button>
     </th>

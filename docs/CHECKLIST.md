@@ -32,7 +32,7 @@ Verification environment for this build: Linux container (4 CPU cores, no GPU), 
 | 24 | Experiment history | ✅ | full configs, CSV export |
 | 25 | SQLite database | ✅ | |
 | 26 | API documentation | ✅ | `/docs` (HTTP 200 verified) |
-| 27 | Automated tests | ✅ | pytest 45 (incl. MediaPipe extractor tests when the model and libEGL are present), Vitest 9 (8 + the TS-vs-Python parity test, which runs only when `export_static.py` has written the real-clip fixture), Playwright 2; GitHub Actions CI in `.github/workflows/ci.yml` |
+| 27 | Automated tests | ✅ | pytest 45 (incl. MediaPipe extractor tests when the model and libEGL are present), Vitest 12 (11 + the TS-vs-Python parity test, which runs only when `export_static.py` has written the real-clip fixture), Playwright 3 (incl. a keyboard-only test); GitHub Actions CI in `.github/workflows/ci.yml` |
 | 28–30 | setup / start / stop scripts | ✅/🟡 | all three run successfully under PowerShell 7 (Linux); Windows-only branches (`taskkill`, `Scripts\python.exe`, `npm.cmd`, CUDA wheel) need a run on Windows |
 | 31–36 | README, dataset docs, references, licensing, limitations, reproducibility | ✅ | `README.md`, `docs/` |
 | 37 | Works from a fresh clone without training | ✅ | bundled pretrained model auto-registered + activated on first backend start (`app/models/bundled.py`, `tests/test_bundled_model.py`); `python -m app.cli import-model` |
@@ -74,6 +74,13 @@ Verification environment for this build: Linux container (4 CPU cores, no GPU), 
 * Three real WLASL BOOK clips (07068, 07069, 07070) downloaded through the app (12 of 15 attempted links failed: dead or blocked hosts). Offline *Video Analysis* classified all three as BOOK (whole-clip probability 0.92-0.96). These clips are in the model's **training** split, so this shows the pipeline works end to end, not generalisation.
 * The same clip fed as the fake camera on *Live Recognition* (backend mode and static browser-only build): statuses went waiting → collecting → inference with BOOK/FAMILY in the top-2; at the ~7 fps MediaPipe rate of a software-rendered headless browser the sign was rejected as below threshold. A real browser with GPU MediaPipe runs at much higher frame rates.
 * The videos were stored only in the git-ignored `data/` folder and were not committed.
+
+## Accessibility audit (2026-11-25, WCAG 2.1 AA)
+
+* axe-core 4.10.2 (tags wcag2a, wcag2aa, wcag21a, wcag21aa, best-practice) on all 10 pages at 1400 px and 390 px, plus states: live camera on with settings open, an expanded experiment row, the mobile menu open. Before: white text on the primary blue button (3.2:1), a horizontally scrolling table that keyboard users could not reach, an empty table header. After: 0 violations.
+* Keyboard-only walk of every page. Fixed: experiment rows opened only on mouse click (now a button with `aria-expanded`); the mobile menu did not take focus, trap Tab or close on Escape; no skip link; one page title for every view; focus stayed on the clicked link after navigation; the Video Analysis file picker had no visible focus; buttons nested inside links; the `<label>` around radio groups renamed their first option (e.g. "Architecture Architecture" instead of "GRU"); radio groups ignored arrow keys; progress bars had no name; `aria-sort` sat on the button instead of the column header.
+* Research page: section links broke the browser-only (hash-routed) build ("Page not found") and the page scrolled sideways at 320 px; both fixed.
+* Not tested: real screen readers (NVDA, JAWS, VoiceOver) and Windows high-contrast mode. Automated checks and keyboard tests do not replace them.
 
 ## Data acquired (2026-11-15)
 

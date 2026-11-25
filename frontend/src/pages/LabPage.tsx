@@ -4,7 +4,7 @@ import { FlaskConical, Play, Square, Zap } from "lucide-react";
 import { api, type ExperimentDetail, type ExperimentSummary, type SplitInfo, type DatasetSummary } from "../api/client";
 import { useApi } from "../lib/hooks";
 import { num, pct } from "../lib/format";
-import { Badge, Button, Card, Empty, ErrorText, Field, Kv, Notice, PageHeader, Progress, Segmented, Toggle, cx, inputCls } from "../components/ui";
+import { Badge, Button, Card, Empty, ErrorText, Field, Kv, Notice, PageHeader, Progress, ScrollRegion, Segmented, Toggle, cx, inputCls } from "../components/ui";
 import { LineChart } from "../components/charts/LineChart";
 
 type Form = {
@@ -88,7 +88,7 @@ function RunMonitor({ id, onDone }: { id: number; onDone: () => void }) {
       {running && (
         <div className="mb-4">
           <div className="mb-1.5 flex justify-between text-xs text-fg-3"><span>epoch {exp.history.length} / {String(exp.config.epochs)} (early stopping may end sooner)</span><span>{sec.toFixed(0)} s elapsed</span></div>
-          <Progress value={exp.history.length / Number(exp.config.epochs || 1)} />
+          <Progress value={exp.history.length / Number(exp.config.epochs || 1)} label="Training progress (epochs)" />
         </div>
       )}
       {exp.error && <div className="mb-3"><Notice tone="danger" title="Training failed">{exp.error}</Notice></div>}
@@ -147,7 +147,7 @@ function Compare({ exps }: { exps: ExperimentSummary[] }) {
       <LineChart ariaLabel="Validation macro F1 per epoch for selected experiments" x={Array.from({ length: maxEpoch }, (_, i) => i + 1)} xLabel="epoch" yDomain={[0, 1]}
         yFormat={(v) => `${Math.round(v * 100)}%`}
         series={loaded.map((d, i) => ({ key: String(d.id), label: `#${d.id} ${d.architecture.toUpperCase()}`, color: colors[i % 3], values: Array.from({ length: maxEpoch }, (_, k) => d.history[k]?.val_macro_f1 ?? null) }))} />
-      <div className="mt-4 overflow-x-auto">
+      <ScrollRegion label="Experiment comparison table" className="mt-4 overflow-x-auto">
         <table className="w-full min-w-[640px] text-sm">
           <thead><tr className="border-b border-ink-700 text-left text-xs text-fg-3">{["Run", "Arch", "Split", "T", "Params", "Val top-1", "Val top-5", "Val macro F1", "Latency"].map((h) => <th key={h} className="py-2 pr-3 font-medium">{h}</th>)}</tr></thead>
           <tbody>{loaded.map((d) => {
@@ -161,7 +161,7 @@ function Compare({ exps }: { exps: ExperimentSummary[] }) {
             );
           })}</tbody>
         </table>
-      </div>
+      </ScrollRegion>
     </Card>
   );
 }
@@ -210,7 +210,7 @@ export default function LabPage() {
                 </button>
               ))}
             </div>
-            <Field label="Architecture">
+            <Field label="Architecture" group>
               <Segmented ariaLabel="Architecture" value={f.architecture} onChange={(v) => set({ architecture: v })}
                 options={[{ value: "gru", label: "GRU" }, { value: "lstm", label: "LSTM" }, { value: "tcn", label: "Temporal CNN" }]} />
             </Field>
@@ -233,7 +233,7 @@ export default function LabPage() {
               <NumField label="Seed" value={f.seed} onChange={(v) => set({ seed: v })} />
               <Field label="Device"><select className={inputCls} value={f.device} onChange={(e) => set({ device: e.target.value as Form["device"] })}><option value="auto">auto (CUDA if available)</option><option value="cpu">CPU</option><option value="cuda">CUDA</option></select></Field>
             </div>
-            <Field label="Class imbalance">
+            <Field label="Class imbalance" group>
               <Segmented ariaLabel="Class weighting" value={f.class_weighting} onChange={(v) => set({ class_weighting: v })} options={[{ value: "none", label: "Unweighted loss" }, { value: "balanced", label: "Class-weighted loss" }]} />
             </Field>
             <div className="flex flex-col gap-2.5">

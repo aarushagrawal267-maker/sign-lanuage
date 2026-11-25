@@ -90,7 +90,7 @@ export default function AnalyzePage() {
         <div className="flex min-w-0 flex-col gap-4">
           <Card>
             <div className="flex flex-col gap-4 md:flex-row md:items-end">
-              <label className="flex flex-1 cursor-pointer items-center gap-3 rounded-xl border border-dashed border-ink-600 px-4 py-4 hover:border-accent">
+              <label className="flex flex-1 cursor-pointer items-center gap-3 rounded-xl border border-dashed border-ink-600 px-4 py-4 hover:border-accent has-[:focus-visible]:border-accent has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-accent">
                 <Upload className="size-5 text-accent" aria-hidden />
                 <span className="min-w-0 text-sm">
                   <span className="block truncate font-medium text-fg">{file ? file.name : "Choose a video file"}</span>
@@ -98,7 +98,7 @@ export default function AnalyzePage() {
                 </span>
                 <input type="file" accept="video/*" className="sr-only" onChange={(e) => pick(e.target.files?.[0] ?? null)} />
               </label>
-              <Field label="Mode">
+              <Field label="Mode" group>
                 <Segmented ariaLabel="Analysis mode" value={mode} onChange={setMode} options={[{ value: "segment", label: "Sign boundaries" }, { value: "sliding", label: "Sliding window" }]} />
               </Field>
               <Button variant="primary" size="lg" icon={<FileVideo className="size-4" />} disabled={!file || IS_STATIC} loading={busy} onClick={analyze}>{busy ? "Analysing…" : "Analyse"}</Button>

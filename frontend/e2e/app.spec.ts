@@ -45,3 +45,29 @@ test("live page: camera permission, MediaPipe in the browser, recognition socket
   await expect(status).toHaveText("Camera inactive");
   await expect(page.getByText("Camera on")).toHaveCount(0);
 });
+
+test("keyboard: skip link, focus after navigation, experiment details, mobile menu", async ({ page }) => {
+  await page.goto("/vocabulary");
+  await page.keyboard.press("Tab");
+  await expect(page.getByRole("link", { name: "Skip to main content" })).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(page.locator("main")).toBeFocused();
+
+  await page.getByRole("link", { name: "Experiment History" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveTitle(/Experiment History/);
+  await expect(page.locator("main")).toBeFocused();
+  const details = page.getByRole("button", { name: /^Details for run/ }).first();
+  await details.focus();
+  await page.keyboard.press("Enter");
+  await expect(details).toHaveAttribute("aria-expanded", "true");
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  const menu = page.getByRole("button", { name: "Open navigation" });
+  await menu.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("button", { name: "Close navigation" })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(menu).toBeFocused();
+});

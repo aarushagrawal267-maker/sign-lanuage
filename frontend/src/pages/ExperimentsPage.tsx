@@ -4,7 +4,7 @@ import { ChevronDown, ChevronRight, Download, Trash2, Zap } from "lucide-react";
 import { IS_STATIC, api, type ExperimentDetail, type ExperimentSummary } from "../api/client";
 import { useApi } from "../lib/hooks";
 import { dateTime, num, pct } from "../lib/format";
-import { Badge, Button, Card, Empty, Kv, PageHeader } from "../components/ui";
+import { Badge, Button, Card, Empty, Kv, PageHeader, buttonClass } from "../components/ui";
 import { TrainingCurves } from "./LabPage";
 
 function Detail({ id, onChange }: { id: number; onChange: () => void }) {
@@ -29,7 +29,7 @@ function Detail({ id, onChange }: { id: number; onChange: () => void }) {
           <Button size="sm" variant="primary" icon={<Zap className="size-3.5" />} disabled={e.status !== "completed" || e.is_active} onClick={() => api.post(`/api/experiments/${id}/activate`).then(onChange)}>
             {e.is_active ? "Active" : "Activate"}
           </Button>
-          <Link to={`/evaluation?exp=${id}`}><Button size="sm" variant="secondary">Evaluation</Button></Link>
+          <Link to={`/evaluation?exp=${id}`} className={buttonClass("secondary", "sm")}>Evaluation</Link>
           <Button size="sm" variant="danger" icon={<Trash2 className="size-3.5" />} disabled={e.is_active || e.status === "running"}
             onClick={() => window.confirm(`Delete experiment #${id} and its checkpoint?`) && api.del(`/api/experiments/${id}`).then(onChange)}>Delete</Button>
         </div>
@@ -50,7 +50,7 @@ export default function ExperimentsPage() {
     <div className="fade-in">
       <PageHeader eyebrow="Reproducible runs" title="Experiment History"
         description="Every training run with its dataset version, vocabulary, architecture, features, sequence length, parameters, signer partitions, metrics, checkpoint and timestamp."
-        actions={rows.length > 0 && !IS_STATIC && <a href="/api/experiments/export.csv" download><Button variant="ghost" icon={<Download className="size-4" />}>Export CSV</Button></a>} />
+        actions={rows.length > 0 && !IS_STATIC && <a href="/api/experiments/export.csv" download className={buttonClass("ghost")}><Download className="size-4" aria-hidden />Export CSV</a>} />
       <Card padded={false}>
         {!rows.length ? (
           <Empty title="No experiments yet">Runs started in the Model Laboratory are recorded here automatically.</Empty>
@@ -58,13 +58,19 @@ export default function ExperimentsPage() {
           <div className="overflow-x-auto">
             <table className="w-full min-w-[980px] text-sm">
               <thead><tr className="border-b border-ink-700 text-left text-xs text-fg-3">
-                {["", "Run", "Status", "Architecture", "Split", "T", "Params", "Epochs", "Val top-1", "Val F1", "Test top-1", "Created"].map((h, i) => <th key={i} className="px-3 py-2.5 font-medium">{h}</th>)}
+                {["Details", "Run", "Status", "Architecture", "Split", "T", "Params", "Epochs", "Val top-1", "Val F1", "Test top-1", "Created"].map((h, i) => <th key={i} className="px-3 py-2.5 font-medium">{i === 0 ? <span className="sr-only">{h}</span> : h}</th>)}
               </tr></thead>
               <tbody>
                 {rows.map((r) => (
                   <Fragment key={r.id}>
                     <tr className="cursor-pointer border-b border-ink-700/60 hover:bg-ink-800/50" onClick={() => setOpen(open === r.id ? null : r.id)}>
-                      <td className="px-3 py-2.5 text-fg-3">{open === r.id ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}</td>
+                      <td className="px-3 py-2.5 text-fg-3">
+                        {/* The whole row is clickable for mouse users; this button is the keyboard and screen-reader control. */}
+                        <button type="button" className="rounded p-0.5 hover:text-fg" aria-expanded={open === r.id} aria-label={`Details for run #${r.id} ${r.name}`}
+                          onClick={(e) => { e.stopPropagation(); setOpen(open === r.id ? null : r.id); }}>
+                          {open === r.id ? <ChevronDown className="size-4" aria-hidden /> : <ChevronRight className="size-4" aria-hidden />}
+                        </button>
+                      </td>
                       <td className="px-3 py-2.5">
                         <div className="flex items-center gap-2"><span className="font-mono text-xs text-fg-3">#{r.id}</span><span className="text-fg">{r.name}</span></div>
                         <div className="mt-0.5 flex gap-1.5">{r.is_active && <Badge tone="teal">active</Badge>}{r.is_synthetic && <Badge tone="warn">synthetic</Badge>}</div>
