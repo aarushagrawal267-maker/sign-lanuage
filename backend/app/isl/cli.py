@@ -50,6 +50,13 @@ training ones --resume / --max-minutes (exit code 75 = stopped with state saved,
   train-fingerspell      letter model from every letter source (+ leave-one-signer-out E5)
   evaluate --all         E1a/E1b/E1c/E2/E3/E4/E5/E6/E7/E8 -> <work>/eval and <pack>/eval report.json + report.md
   bench                  CPU seconds per training step for the model sizes (for the time budget)
+  readiness [--allow-partial --work DIR]
+                         is the data complete? (no ingestion job running, every manifest of the profile complete);
+                         exit 4 = not ready. --allow-partial marks DIR/partial_data.json (reports say PARTIAL DATA)
+  pretrain-dedup         OpenHands Sign Library chunks that repeat another chunk or contain an evaluation clip
+                         (pose-content matcher, calibrated first) -> <work>/pretrain_dedup.json, read by pretrain
+  trim [--learned-model auto|PATH|none]
+                         uses artifacts/isl/trim_boundary.pt (learned end) when present: trim_version trim-2+trim-learned-1
 
 Gated-dataset ingestion lives in ``scripts/ingest_isl_gated.py`` (CISLR, iSign).
 """
@@ -155,39 +162,79 @@ def cmd_vocab(paths: IslPaths, args) -> int:
 
 
 def _islrtc_records(paths: IslPaths) -> list[dict]:
+    """ISLRTC manifest rows with frames; a re-extracted row (``islrtc_recut.jsonl``, card-v2 detector) replaces the
+    original row of the same id (``training.common.islrtc_overrides``)."""
     from app.isl.data.manifest import read_manifest
+    from app.isl.training.common import islrtc_overrides
 
-    return [r for r in read_manifest(paths.manifest("islrtc")) if r.get("n_frames")]
+    over = islrtc_overrides(paths)
+    return [over.get(r["id"], r) for r in read_manifest(paths.manifest("islrtc")) if r.get("n_frames")
+            or over.get(r["id"], {}).get("n_frames")]
+
+
+def _trim_model(args):
+    """(model, version suffix, path) of the learned end model (``trim_learned``), or (None, "", None)."""
+    from app.isl.data.trim_learned import MODEL_VERSION, default_model_path, load
+
+    choice = getattr(args, "learned_model", "auto") or "auto"
+    if choice == "none":
+        return None, "", None
+    path = default_model_path() if choice == "auto" else Path(choice)
+    if not path.exists():
+        if choice != "auto":
+            raise SystemExit(f"learned trim model {path} not found")
+        return None, "", None
+    model, _ = load(path)
+    return model, f"+{MODEL_VERSION}", path
 
 
 def cmd_trim(paths: IslPaths, args) -> int:
+    """ISLRTC first-sign trims. Uses the learned end model (``artifacts/isl/trim_boundary.pt``, the same call as
+    ``trim_bench run --learned``) when it exists, rules otherwise; ``trim_version`` says which (``trim-2`` or
+    ``trim-2+trim-learned-1``), so clips trimmed by rules only are redone once a model exists. Clips whose
+    landmark file changed (re-extraction) are re-trimmed too; the record keeps the file it was computed on."""
     import time
 
     from app.isl.data.manifest import read_manifest, write_jsonl
-    from app.isl.data.trim import TrimConfig, trim_record_for, words_for
+    from app.isl.data.trim import TrimConfig, find_first_sign, trim_record_for, words_for
     from app.isl.vocab.normalize import parse_islrtc_name
     from app.landmarks.raw import RawSequence
 
     cfg = TrimConfig()
+    model, suffix, model_path = _trim_model(args)
+    version = cfg.version + suffix
     existing = {r["id"]: r for r in read_manifest(paths.trim_sidecar, only_ok=False)}
     recs = _islrtc_records(paths)
     todo = [r for r in recs if args.redo or r["id"] not in existing
-            or existing[r["id"]].get("trim_version") != cfg.version]
+            or existing[r["id"]].get("trim_version") != version
+            or existing[r["id"]].get("landmarks", None if r.get("recut_of") else r["path"]) != r["path"]]
     if args.limit:
         todo = todo[: args.limit]
     t0 = time.time()
-    n_err = 0
+    n_err = n_learned = 0
     for i, r in enumerate(todo):
         pn = parse_islrtc_name(r["id"].removeprefix("islrtc/"))
         try:
             raw = RawSequence.load(paths.resolve(r["path"]))
-            rec = trim_record_for(r["id"], raw, r.get("stop"), pn.kind, cfg, n_words=words_for(pn.kind, pn.text))
+            nw = words_for(pn.kind, pn.text)
+            if model is not None and pn.kind != "phrase":
+                from app.isl.data.trim_learned import refine_cap
+
+                res = refine_cap(raw, find_first_sign(raw, r.get("stop"), cfg, n_words=nw), model, nw, cfg)
+                n_learned += any("trim-learned" in x for x in res.notes)
+                rec = res.to_record(r["id"], len(raw), version)
+            else:
+                rec = trim_record_for(r["id"], raw, r.get("stop"), pn.kind, cfg, n_words=nw)
+                rec["trim_version"] = version
         except Exception as e:  # noqa: BLE001
             n_err += 1
             rec = {"id": r["id"], "start": 0, "end": int(r.get("n_frames") or 0), "method": "empty", "confidence": 0.0,
-                   "alternatives": [], "notes": [f"{type(e).__name__}: {e}"[:200]], "trim_version": cfg.version}
+                   "alternatives": [], "notes": [f"{type(e).__name__}: {e}"[:200]], "trim_version": version}
         rec["stop"] = r.get("stop")
         rec["kind"] = pn.kind
+        rec["landmarks"] = r["path"]
+        if r.get("recut_of"):
+            rec["recut"] = True
         existing[r["id"]] = rec
         if (i + 1) % 1000 == 0:
             print(f"  {i + 1}/{len(todo)} trimmed ({time.time() - t0:.0f}s)", flush=True)
@@ -196,6 +243,10 @@ def cmd_trim(paths: IslPaths, args) -> int:
     write_jsonl(paths.trim_sidecar, [existing[k] for k in sorted(existing)])
     methods = Counter(r.get("method") for r in existing.values())
     _print({"trimmed_now": len(todo), "errors": n_err, "total": len(existing), "methods": dict(methods),
+            "trim_version": version, "learned_model": str(model_path) if model_path else None,
+            "learned_ends_now": n_learned,
+            "versions": dict(Counter(r.get("trim_version") for r in existing.values())),
+            "truncated": methods.get("truncated", 0), "recut": sum(1 for r in existing.values() if r.get("recut")),
             "secs": round(time.time() - t0, 1), "sidecar": str(paths.trim_sidecar)})
     return 0
 
@@ -521,6 +572,26 @@ def cmd_access(paths: IslPaths, args) -> int:
     return 0 if all(v == "granted" for v in res.values()) else 3
 
 
+def cmd_readiness(paths: IslPaths, args) -> int:
+    """Data-completeness guard of full phase-2 runs: exit 0 = ready (or --allow-partial: then the work folder is
+    marked partial_data), 4 = an ingestion job runs or a manifest is incomplete."""
+    from app.isl.training.readiness import check, mark_partial
+
+    rep = check(paths, args.profile or "commercial-safe")
+    if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(json.dumps(rep, indent=1))
+    marker = None
+    if not rep["ready"] and args.allow_partial and args.work:
+        marker = str(mark_partial(Path(args.work), rep))
+    _print({"ready": rep["ready"], "reasons": rep["reasons"], "partial_marker": marker,
+            "sources": {k: {x: v.get(x) for x in ("done", "expected", "complete", "note") if v.get(x) is not None}
+                        for k, v in rep["sources"].items()}})
+    if rep["ready"] or args.allow_partial:
+        return 0
+    return 4
+
+
 def cmd_profiles(paths: IslPaths, args) -> int:
     from app.isl.profiles import PROFILES
 
@@ -535,17 +606,23 @@ def _vocab_path(args) -> Path:
     return Path(v) if v else PACK_DIR / "vocabulary.jsonl"
 
 
-def _record_sources(work: Path, rep: dict, role: str) -> None:
-    """Merge a source report into ``<work>/sources.json`` (build-pack lists every source used, with licence)."""
+def _record_sources(work: Path, rep: dict, role: str, used: dict | None = None) -> None:
+    """Merge a source report into ``<work>/sources.json``. ``used`` = clips of each source that really reached this
+    role's data (after caps, sampling and duplicate removal; default: the report's ``clips``). ``build-pack`` names
+    in the pack's licence list only the sources whose ``used`` count is > 0 for some role."""
     f = work / "sources.json"
     cur = json.loads(f.read_text()) if f.exists() else {}
     for name, d in rep.items():
         if not isinstance(d, dict):
             continue
         old = cur.get(name, {})
-        roles = sorted(set(old.get("roles", [])) | ({role} if d.get("available") else set()))
-        cur[name] = {**old, **d, "available": bool(old.get("available") or d.get("available")), "roles": roles,
-                     "role": ",".join(roles)}
+        n = int((used or {}).get(name, d.get("clips") or 0) if d.get("available") else 0)
+        per_role = {**(old.get("used") or {}), role: n}
+        roles = sorted(r for r, k in per_role.items() if k > 0)
+        cur[name] = {**old, **{k: v for k, v in d.items() if k != "clips"}, "available": bool(old.get("available") or
+                     d.get("available")), "clips_read": d.get("clips", old.get("clips_read")), "used": per_role,
+                     "clips": max(per_role.values(), default=0), "roles": roles, "role": ",".join(roles),
+                     "contributed": any(k > 0 for k in per_role.values())}
     f.write_text(json.dumps(cur, indent=1, ensure_ascii=False))
 
 
@@ -566,10 +643,12 @@ def _model_ctx(paths: IslPaths, args):
         rep = attach_all_sources(data, paths, vocab, profile, seed=args.seed,
                                  max_per_source=getattr(args, "max_per_source", 0) or None)
         write_extra_concepts(data.linker, work / "extra_concepts.jsonl")
-        _record_sources(work, rep.sources, "words")
+        used = Counter(c.source for c in data.extra if c.concept_id)
+        used.update({"include": sum(1 for c in data.include if c.concept_id), "islrtc": len(data.islrtc)})
+        _record_sources(work, rep.sources, "words", used)
         _record_sources(work, {"include": {"available": bool(data.include), "licence": "CC-BY-4.0", "commercial": True},
                                "islrtc": {"available": bool(data.islrtc), "licence": "GODL-India", "commercial": True}},
-                        "words")
+                        "words", used)
         (work / "multisource.json").write_text(json.dumps(rep.to_json(), indent=1, default=str))
     return profile, data, ISL_FEATURES, work
 
@@ -635,32 +714,30 @@ def _init_path(args, work: Path) -> Path | None:
 
 
 def _eval_clip_ids(data) -> set[str]:
-    """Ids of every evaluation clip plus every clip in the same duplicate group (same video / landmark file /
-    near-duplicate cluster): copies that ``attach_all_sources`` dropped from training or from the evaluation side
-    are re-read by ``pretrain_clips``, so excluding by id alone let a test video reach pre-training."""
-    ids = {c.clip_id for c in data.include if data.assign.get(c.clip_id) in ("val", "test")} | {
-        c.clip_id for c in getattr(data, "extra", []) if data.extra_assign.get(c.clip_id) in ("val", "test")}
-    dedup = getattr(data, "dedup", None)
-    if dedup is not None and getattr(dedup, "parent", None):
-        groups = {dedup.group(i) for i in ids}
-        ids |= {x for x in list(dedup.parent) if dedup.group(x) in groups}
-    return ids
+    from app.isl.training.multisource import eval_clip_ids
+
+    return eval_clip_ids(data)
 
 
 def cmd_pretrain(paths: IslPaths, args) -> int:
     """Self-supervised encoder pre-training on every unlabelled / sentence source of the profile."""
     import random as _r
 
-    from app.isl.training.multisource import pretrain_clips
+    from app.isl.training.multisource import pretrain_clips, write_pretrain_list
+    from app.isl.training.pose_dedup import DEDUP_FILE, apply_dedup, load_dedup
     from app.isl.training.pretrain import PretrainConfig, pretrain_encoder
 
     args.all_sources = True
     profile, data, fcfg, work = _model_ctx(paths, args)
     rep: dict = {}
     clips = pretrain_clips(paths, None, profile, exclude_ids=_eval_clip_ids(data), report=rep)
-    _record_sources(work, rep, "pretraining")
+    # OpenHands Sign Library: chunks that repeat another chunk or contain an evaluation clip (pretrain-dedup step);
+    # without that step's result the whole channel is left out
+    clips, sl_rep = apply_dedup(clips, load_dedup(work / DEDUP_FILE))
     if args.max_clips and len(clips) > args.max_clips:
         clips = _r.Random(args.seed).sample(clips, args.max_clips)
+    _record_sources(work, rep, "pretraining", Counter(c.source for c in clips))
+    lst = write_pretrain_list(work, clips, resume=args.resume)
     d = PretrainConfig()
     cfg = PretrainConfig(**{**d.__dict__, **({"hidden": 64, "layers": 1, "emb_dim": 128, "batch": 16, "epochs": 2,
                                                "steps_per_epoch": 10, "val_batches": 1} if args.smoke else {}),
@@ -668,12 +745,45 @@ def cmd_pretrain(paths: IslPaths, args) -> int:
                                                  "batch": args.batch_size, "epochs": args.epochs,
                                                  "steps_per_epoch": args.batches, "lr": args.lr,
                                                  "seed": args.seed}.items() if v is not None}})
-    _print({"pretrain_clips": len(clips), "by_source": dict(Counter(c.source for c in clips)), "config": cfg.__dict__})
+    _print({"pretrain_clips": len(clips), "by_source": dict(Counter(c.source for c in clips)), "sign_library": sl_rep,
+            "clip_list": lst, "config": cfg.__dict__})
     res = pretrain_encoder(clips, work / "pretrained_encoder.pt", fcfg, cfg, profile=profile,
                            max_minutes=args.max_minutes, fresh=not args.resume, threads=args.threads,
-                           smoke=args.smoke, progress=lambda m: _log(f"  pretrain {m}"))
+                           smoke=args.smoke, progress=lambda m: _log(f"  pretrain {m}"),
+                           extra_meta={"clip_list": lst, "sign_library": sl_rep})
     _print(res)
     return 0 if res.get("finished", True) else EX_PARTIAL
+
+
+def cmd_pretrain_dedup(paths: IslPaths, args) -> int:
+    """OpenHands Sign Library: find chunks that repeat another Sign Library chunk (its two files) or contain an
+    evaluation clip, by pose content -> <work>/pretrain_dedup.json (read by ``pretrain``)."""
+    import random as _r
+
+    from app.isl.training.multisource import PRETRAIN_SOURCES, eval_clips, open_adapter
+    from app.isl.training.pose_dedup import DEDUP_FILE, SIGN_LIBRARY, dedupe_sign_library
+
+    args.all_sources = True
+    profile, data, fcfg, work = _model_ctx(paths, args)
+    out = work / DEDUP_FILE
+    ad = open_adapter("openhands_raw", paths, None, profile) if "openhands_raw" in PRETRAIN_SOURCES[profile] else None
+    sl = [c for c in ad.clips() if c.category == SIGN_LIBRARY] if ad is not None else []
+    if not sl:
+        doc = {"skipped": True, "reason": "no OpenHands Sign Library chunks in this profile's pre-training data",
+               "reliable": True, "drop_ids": [], "drop_channels": []}
+        out.write_text(json.dumps(doc, indent=1))
+        _print(doc)
+        return 0
+    if args.max_chunks and len(sl) > args.max_chunks:  # smoke: every one-minute chunk + a sample of the others
+        one = [c for c in sl if "1_min" in str(c.quality.get("member") or "")]
+        rest = [c for c in sl if c not in one]
+        sl = one + _r.Random(args.seed).sample(rest, min(len(rest), max(0, args.max_chunks - len(one))))
+    res = dedupe_sign_library(sl, eval_clips(data), seed=args.seed, n_calib=args.calib, progress=_log)
+    doc = {**res.to_json(), "profile": profile, "split": data.split.get("name"), "sign_library_chunks_checked": len(sl)}
+    out.write_text(json.dumps(doc, indent=1, default=str))
+    _print({k: v for k, v in doc.items() if k not in ("drop_ids", "within_examples", "eval_matches")}
+           | {"drop_ids": len(doc["drop_ids"])})
+    return 0
 
 
 def cmd_train_oneshot(paths: IslPaths, args) -> int:
@@ -924,7 +1034,7 @@ def cmd_smoke(paths: IslPaths, args) -> int:
     args.smoke = True
     t0 = time.time()
     # first-sign trims for dictionary clips ingested since the last run (incremental, a few ms per clip)
-    cmd_trim(paths, argparse.Namespace(redo=False, limit=0, learned=False))
+    cmd_trim(paths, argparse.Namespace(redo=False, limit=0, learned=False, learned_model="auto"))
     profile, data, fcfg, work = _model_ctx(paths, args)
     report: dict = {"data": data.summary(), "work": str(work)}
     _log(f"[smoke] data: {report['data']}")
@@ -1017,7 +1127,8 @@ COMMANDS = {
     "fit-fusion": cmd_fit_fusion, "evaluate": cmd_evaluate, "train-letters": cmd_train_letters,
     "build-pack": cmd_build_pack, "smoke": cmd_smoke, "hindi": cmd_hindi,
     "link-sources": cmd_link_sources, "pretrain": cmd_pretrain, "train-oneshot": cmd_train_oneshot,
-    "train-fingerspell": cmd_train_fingerspell, "bench": cmd_bench,
+    "train-fingerspell": cmd_train_fingerspell, "bench": cmd_bench, "readiness": cmd_readiness,
+    "pretrain-dedup": cmd_pretrain_dedup,
 }
 
 
@@ -1064,7 +1175,9 @@ def build_parser() -> argparse.ArgumentParser:
     t = sub.add_parser("trim")
     t.add_argument("--redo", action="store_true")
     t.add_argument("--limit", type=int, default=0)
-    t.add_argument("--learned", action="store_true")
+    t.add_argument("--learned", action="store_true", help="old stage-2 boundary model (artifacts/isl/boundary.pt)")
+    t.add_argument("--learned-model", default="auto",
+                   help="learned end model: auto (artifacts/isl/trim_boundary.pt when present), a path, or none")
     t.add_argument("--retrain", action="store_true")
     t.add_argument("--epochs", type=int, default=15)
     t.add_argument("--examples", type=int, default=2000)
@@ -1088,6 +1201,11 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--threshold", type=float, default=0.02)
     sub.add_parser("access")
     sub.add_parser("profiles")
+    rd = sub.add_parser("readiness")
+    rd.add_argument("--profile", choices=["commercial-safe", "research"], default=None)
+    rd.add_argument("--out", help="write the full report (JSON) here")
+    rd.add_argument("--work", help="work folder to mark partial_data when --allow-partial is given")
+    rd.add_argument("--allow-partial", action="store_true", help="exit 0 even when not ready (marks --work)")
     for name in ("train-classifier", "train-encoder", "smoke", "pretrain", "train-oneshot"):
         spx = sub.add_parser(name)
         _model_args(spx, train=True)
@@ -1097,6 +1215,10 @@ def build_parser() -> argparse.ArgumentParser:
             spx.add_argument("--folds", type=int, nargs="+", default=[0, 1])
     lk = sub.add_parser("link-sources")
     _model_args(lk)
+    pdd = sub.add_parser("pretrain-dedup")
+    _model_args(pdd)
+    pdd.add_argument("--max-chunks", type=int, default=0, help="smoke: check at most N Sign Library chunks")
+    pdd.add_argument("--calib", type=int, default=300, help="synthetic positive / negative controls")
     fs = sub.add_parser("train-fingerspell")
     _model_args(fs)
     fs.add_argument("--epochs", type=int, default=None)

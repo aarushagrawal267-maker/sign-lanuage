@@ -154,7 +154,7 @@ class ViewSampler:
 
 def pretrain_encoder(clips: list[Clip], out: Path, fcfg: FeatureConfig, cfg: PretrainConfig, *, profile: str,
                      state_path: Path | None = None, max_minutes: float = 0.0, fresh: bool = False,
-                     threads: int = 2, smoke: bool = False, progress=None) -> dict:
+                     threads: int = 2, smoke: bool = False, progress=None, extra_meta: dict | None = None) -> dict:
     torch.set_num_threads(max(1, threads))
     torch.manual_seed(cfg.seed)
     t0 = time.time()
@@ -246,7 +246,7 @@ def pretrain_encoder(clips: list[Clip], out: Path, fcfg: FeatureConfig, cfg: Pre
             "model_kwargs": {"hidden": cfg.hidden, "layers": cfg.layers, "emb_dim": cfg.emb_dim, "dropout": cfg.dropout},
             "profile": profile, "language": "isl", "smoke": smoke,
             "pretraining": {"objective": "temporal NT-Xent + masked-frame modelling", "config": asdict(cfg),
-                            "sources": sources, "clips": len(clips), "labels_used": False}}
+                            "sources": sources, "clips": len(clips), "labels_used": False, **(extra_meta or {})}}
 
     def save_best(epoch: int, row: dict) -> None:
         atomic_save({"state_dict": enc.state_dict(), "meta": {**meta, "best_epoch": epoch, "val": row}}, out)

@@ -245,6 +245,16 @@ def test_evaluate_all_writes_report_with_rates_and_groups(phase2, tmp_path):
     assert p["E4"]["by_k"]["k1"]["user_sign_false_accept_rate"] is not None
     assert p["E1a"]["run"] is False and p["E5"]["run"] is False
     assert "| E2 |" in (out / "report.md").read_text()
+    # E2 says that unlabelled pre-training saw the dictionary clips it retrieves against
+    assert "WITHOUT labels" in p["E2"]["label"] and "reference clips E2 retrieves against" in p["E2"]["label"]
+    # no pre-training in this build: the guard says so instead of claiming True
+    assert doc["leakage_guards"]["pretraining_excludes_eval_clips"] is None
+    assert "Leakage guards" in (out / "report.md").read_text()
+    # every interval either exists with its group count or has a reason
+    for k in ("E1b", "E1c"):
+        for m, ci in p[k]["intervals"].items():
+            assert ci is not None or p[k]["interval_reasons"][m], (k, m)
+            assert p[k]["interval_groups"][m] >= (5 if ci else 0)
 
 
 def test_e2_refuses_an_encoder_that_saw_held_out_concepts(phase2):

@@ -14,7 +14,7 @@ import time
 import numpy as np
 
 from app.isl.data.sources import Clip
-from app.isl.evaluation.report import grouped_bootstrap
+from app.isl.evaluation.report import interval_fields
 from app.isl.models.calibration import summarize
 from app.isl.models.fusion import FusionInputs, fuse
 from app.isl.training.common import engine_crops
@@ -39,7 +39,7 @@ def e1_classifier(inputs: list[FusionInputs], truths: list[str], clips: list[Cli
     return {"label": label, "n": len(sel), "n_classes": len(set(y.tolist())), "n_groups": len(set(groups)),
             "metrics": {"top1": float(hit.mean()), "top5": float(top5.mean()),
                         "macro_f1": float(f1_score(y, pred, labels=sorted(set(y.tolist())), average="macro", zero_division=0))},
-            "intervals": {"top1": grouped_bootstrap(hit.tolist(), groups), "top5": grouped_bootstrap(top5.astype(float).tolist(), groups)}}
+            **interval_fields({"top1": (hit.tolist(), groups), "top5": (top5.astype(float).tolist(), groups)})}
 
 
 def e2_retrieval(rec, clips: list[Clip], label: str) -> dict | None:
@@ -72,9 +72,9 @@ def e2_retrieval(rec, clips: list[Clip], label: str) -> dict | None:
         for k in hits:
             hits[k].append(float(c.concept_id in ranked[:k]))
         groups.append(c.group)
-    return {"label": label, "n": len(groups), "gallery_concepts": len(isl_concepts),
+    return {"label": label, "n": len(groups), "n_groups": len(set(groups)), "gallery_concepts": len(isl_concepts),
             "metrics": {f"top{k}": (float(np.mean(v)) if v else None) for k, v in hits.items()},
-            "intervals": {"top1": grouped_bootstrap(hits[1], groups)}}
+            **interval_fields({"top1": (hits[1], groups)})}
 
 
 def e3_decisions(inputs: list[FusionInputs], truths: list[str], clips: list[Clip], params, label: str) -> dict:

@@ -37,7 +37,8 @@ from pathlib import Path
 import numpy as np
 
 from app.features.build import FeatureError, build_features
-from app.isl.evaluation.report import git_commit, grouped_bootstrap
+from app.isl.evaluation.report import (PARTIAL_DATA_LABEL, format_interval, git_commit, grouped_bootstrap,
+                                       interval_fields, interval_reason)
 from app.isl.models.calibration import fit_thresholds, summarize
 from app.isl.models.fusion import POLICIES, USER_PREFIX, FusionInputs, FusionParams, decide, fuse
 from app.isl.training.common import engine_crops
@@ -63,9 +64,8 @@ def decision_block(results, truths: list[str], params: FusionParams, groups: lis
         wrong_acc = [float(d == "accept" and not h) for (d, _), h in zip(dec, hit1)]
         not_sure = [float(d == "abstain") for d, _ in dec]
         out[pol] = {**s, "not_sure_rate": s.get("abstain_rate"), "wrong_accept_rate": s.get("silent_error_rate"),
-                    "intervals": {"wrong_accept_rate": grouped_bootstrap(wrong_acc, groups),
-                                  "not_sure_rate": grouped_bootstrap(not_sure, groups)}}
-    return {"policies": out, "intervals": {"top1": grouped_bootstrap(hit1, groups), "top5": grouped_bootstrap(hit5, groups)}}
+                    **interval_fields({"wrong_accept_rate": (wrong_acc, groups), "not_sure_rate": (not_sure, groups)})}
+    return {"policies": out, **interval_fields({"top1": (hit1, groups), "top5": (hit5, groups)})}
 
 
 def _metrics_from(block: dict, extra: dict | None = None) -> dict:
@@ -91,9 +91,15 @@ def drop_trained_duplicates(queries, train_clips, dedup) -> tuple[list, int]:
 
 # --------------------------------------------------------------------------------------------- E1 / E3
 
-def check_classifier_split(meta: dict, split_name: str) -> None:
-    if meta.get("split") and meta.get("split") != split_name:
-        raise LeakageError(f"classifier was trained on split {meta.get('split')!r}, evaluation asked for "
+def check_classifier_split(meta: dict | None, split_name: str) -> None:
+    """Refuse a classifier trained on another split - or one whose checkpoint does not say which split it was
+    trained on (then nobody can tell whether the test clips were its training clips)."""
+    trained = (meta or {}).get("split")
+    if not trained:
+        raise LeakageError(f"classifier checkpoint has no 'split' in its meta: cannot show that the test clips of "
+                           f"{split_name!r} were not its training clips (retrain it with this code)")
+    if trained != split_name:
+        raise LeakageError(f"classifier was trained on split {trained!r}, evaluation asked for "
                            f"{split_name!r}: its test clips may be training clips of that model")
 
 
@@ -103,7 +109,10 @@ def e1_closed_set(rec, clips, label: str, split_name: str, kind: str) -> dict:
 
     if rec.classifier is None:
         return {"label": label, "run": False, "reason": "no classifier"}
-    check_classifier_split(rec.classifier.meta if hasattr(rec.classifier, "meta") else {}, split_name)
+    try:
+        check_classifier_split(getattr(rec.classifier, "meta", None), split_name)
+    except LeakageError as e:
+        return {"label": label, "kind": kind, "run": False, "n": 0, "leakage": str(e), "reason": f"refused: {e}"}
     ids = list(rec.classifier.class_names)
     pos = {c: i for i, c in enumerate(ids)}
     sel = [c for c in clips if c.concept_id in pos]
@@ -138,10 +147,10 @@ def e1_closed_set(rec, clips, label: str, split_name: str, kind: str) -> dict:
                         "wrong_accept_rate": float((acc & (hit == 0)).mean())},
             "decision_note": f"classifier alone: accept when its probability >= the fused balanced threshold {thr:.2f}; "
                              "the app uses the fused decision (E3)",
-            "intervals": {"top1": grouped_bootstrap(hit.tolist(), groups),
-                          "top5": grouped_bootstrap(top5.tolist(), groups)},
-            "interval_note": None if len(set(groups)) >= 2 else
-            "one signer group in this test part: a signer-level interval needs the cross-validation folds (cv)",
+            **interval_fields({"top1": (hit.tolist(), groups), "top5": (top5.tolist(), groups)}),
+            "interval_note": None if interval_reason(hit.tolist(), groups) is None else
+            f"{interval_reason(hit.tolist(), groups)} in this test part: a signer-level interval needs more held-out "
+            "signers (the cross-validation folds pool them)",
             "_hits": hit.tolist(), "_groups": groups,
             "per_category_top1": {k: round(float(np.mean(v)), 4) for k, v in sorted(per_cat.items())}}
 
@@ -261,7 +270,7 @@ def e2_oneshot_fold(enc, fold: dict, data, linker, fcfg, base_params: FusionPara
         out[name] = {"n": len(qi), "n_groups": len(set(groups)), "n_classes": len(set(qt)),
                      "gallery_concepts": len(ids) if ids is not None else len(gal_concepts),
                      "metrics": _metrics_from(block, {f"top{k}": float(np.mean(v)) for k, v in hits.items()}),
-                     "intervals": {f"top{k}": grouped_bootstrap(v, groups) for k, v in hits.items()},
+                     **interval_fields({f"top{k}": (v, groups) for k, v in hits.items()}),
                      "_hits": hits, "_groups": groups, "_block": block}
     si, st, su = run(seen)
     if si:
@@ -288,7 +297,7 @@ def e2_pool(folds: list[dict]) -> dict:
                        for k in ("coverage", "not_sure_rate", "wrong_accept_rate", "suggest_rate")}
         out[name] = {"n": len(groups), "n_groups": len(set(groups)),
                      "metrics": {f"top{k}": float(np.mean(v)) for k, v in hits.items()} | pol["balanced"],
-                     "intervals": {f"top{k}": grouped_bootstrap(v, groups) for k, v in hits.items()},
+                     **interval_fields({f"top{k}": (v, groups) for k, v in hits.items()}),
                      "policies": pol}
     for f in folds:
         for name in ("full", "restricted"):
@@ -299,9 +308,14 @@ def e2_pool(folds: list[dict]) -> dict:
 
 # --------------------------------------------------------------------------------------------- E4
 
-def e4_my_signs(rec, clips, ks=(1, 3, 5), seed: int = 0, max_groups: int = 40) -> dict:
-    """Few-shot enrolment on held-out signers' own takes (no store or disk involved)."""
+def e4_my_signs(rec, clips, ks=(1, 3, 5), seed: int = 0, max_groups: int = 40, params: FusionParams | None = None,
+                cache: dict | None = None) -> dict:
+    """Few-shot enrolment on held-out signers' own takes (no store or disk involved). ``params`` overrides the
+    recogniser's fusion parameters (fit-fusion compares the user-sign classifier modes with it); ``cache`` shares
+    the per-clip evidence between such calls."""
     from app.isl.models.encoder import FeatureStatsEmbedder
+
+    fp = params or rec.fusion
 
     emb = rec.encoder if rec.encoder is not None else FeatureStatsEmbedder(rec.feature_config)
     by = defaultdict(lambda: defaultdict(list))
@@ -310,7 +324,7 @@ def e4_my_signs(rec, clips, ks=(1, 3, 5), seed: int = 0, max_groups: int = 40) -
             by[c.group][c.concept_id].append(c)
     rng = np.random.default_rng(seed)
     groups = sorted(by)[:max_groups]
-    cache: dict[str, tuple] = {}
+    cache = {} if cache is None else cache
 
     def ev(c):
         if c.clip_id not in cache:
@@ -339,7 +353,7 @@ def e4_my_signs(rec, clips, ks=(1, 3, 5), seed: int = 0, max_groups: int = 40) -
                     if k >= 2:
                         sims = E @ E.T
                         loo = [max(np.delete(sims[i], i)) for i in range(k)]
-                        theta = max(float(min(loo)) - 0.05, rec.fusion.user_theta_floor, rec.fusion.s_min)
+                        theta = max(float(min(loo)) - 0.05, fp.user_theta_floor, fp.s_min)
                     else:
                         theta = 1.0
                     signs[w] = (E, theta, takes[k:])
@@ -356,13 +370,13 @@ def e4_my_signs(rec, clips, ks=(1, 3, 5), seed: int = 0, max_groups: int = 40) -
                 zz = z / np.maximum(np.linalg.norm(z, axis=1, keepdims=True), 1e-8)
                 U = np.stack([(zz @ signs[s][0].T).max(1) for s in sorted(signs)], axis=1)
                 inp2 = FusionInputs(inp.cls_logp, inp.cls_ids, inp.ret, inp.ret_ids, U.astype(np.float32), uid, inp.prior)
-                base = fuse(inp, rec.fusion)
-                r = fuse(inp2, rec.fusion)
-                dec, _ = decide(r.probs, r.agree, len(r.per_crop_top1), rec.fusion, "balanced", r.best_cos)
+                base = fuse(inp, fp)
+                r = fuse(inp2, fp)
+                dec, _ = decide(r.probs, r.agree, len(r.per_crop_top1), fp, "balanced", r.best_cos)
                 top = r.keys[0] if r.keys else ""
                 if r.best_user is not None:  # direct "My signs" match (recogniser rule 7.3)
                     uk, uc = r.best_user
-                    if uc >= signs[uk.removeprefix(USER_PREFIX)][1] and uc >= r.best_global_cos + rec.fusion.user_margin:
+                    if uc >= signs[uk.removeprefix(USER_PREFIX)][1] and uc >= r.best_global_cos + fp.user_margin:
                         top, dec = uk, "accept"
                 pred = top.removeprefix(USER_PREFIX)
                 if is_enrolled:
@@ -378,9 +392,11 @@ def e4_my_signs(rec, clips, ks=(1, 3, 5), seed: int = 0, max_groups: int = 40) -
                             "top1_with_enrolment": float(np.mean(rows["with"])),
                             "gain": float(np.mean(rows["with"]) - np.mean(rows["base"])),
                             "interval_with": grouped_bootstrap(rows["with"], rows["g_hit"]),
+                            "interval_with_reason": interval_reason(rows["with"], rows["g_hit"]),
                             "n_other_words": len(rows["fa"]),
                             "user_sign_false_accept_rate": float(np.mean(rows["fa"])) if rows["fa"] else None,
-                            "interval_false_accept": grouped_bootstrap(rows["fa"], rows["g_fa"])}
+                            "interval_false_accept": grouped_bootstrap(rows["fa"], rows["g_fa"]),
+                            "interval_false_accept_reason": interval_reason(rows["fa"], rows["g_fa"])}
     label = ("My signs few-shot: a held-out signer enrols k takes of half of their words; tested on their other "
              "takes (gain over no enrolment) and on the words they did not enrol (false accepts of user signs). "
              "Groups are INCLUDE sessions / estimated signers, not verified identities.")
@@ -388,9 +404,46 @@ def e4_my_signs(rec, clips, ks=(1, 3, 5), seed: int = 0, max_groups: int = 40) -
         return {"label": label, "run": False, "reason": "no test signer has enough repeated takes", "n": 0}
     best = out.get("k3") or next(iter(out.values()))
     return {"label": label, "run": True, "n": best["n"], "n_groups": best["n_groups"],
+            "user_cls_mode": fp.user_cls_mode,
             "metrics": {"top1_with_enrolment_k3": best["top1_with_enrolment"], "gain_k3": best["gain"],
                         "user_sign_false_accept_rate_k3": best["user_sign_false_accept_rate"]},
             "by_k": out}
+
+
+# --------------------------------------------------------------------------------------------- pre-training guard
+
+def pretraining_guard(work: Path, data) -> dict:
+    """Computed, not asserted: the pre-trained encoder's actual clip list (``<work>/pretrain_clips.txt``, written by
+    ``pretrain``) against every evaluation clip and its duplicate group, plus the Sign Library content matches
+    (``pretrain_dedup.json``). ``excludes_eval_clips`` is True / False, or None when it cannot be checked."""
+    from app.isl.training.multisource import eval_clip_ids, read_pretrain_list
+    from app.isl.training.pose_dedup import DEDUP_FILE, load_dedup
+
+    ck = work / "pretrained_encoder.pt"
+    if not ck.exists():
+        return {"excludes_eval_clips": None, "reason": "no self-supervised pre-training in this build"}
+    ids = read_pretrain_list(work)
+    if ids is None:
+        return {"excludes_eval_clips": None,
+                "reason": "pre-training clip list (pretrain_clips.txt) missing: re-run the pretrain step to check"}
+    ev = eval_clip_ids(data)
+    overlap = sorted(ids & ev)
+    out = {"excludes_eval_clips": not overlap, "pretrain_clips": len(ids), "eval_clips_and_duplicates": len(ev),
+           "overlap": len(overlap), "overlap_examples": overlap[:10]}
+    dd = load_dedup(work / DEDUP_FILE)
+    if dd is not None:
+        chunks = {m.get("chunk") for m in dd.get("eval_matches") or []}
+        seen = sorted(chunks & ids)
+        out["sign_library"] = {"reliable": dd.get("reliable"), "drop_channels": dd.get("drop_channels"),
+                               "eval_content_matches": dd.get("n_eval_matches", 0), "matched_chunks_in_pretraining":
+                               len(seen)}
+        if seen:
+            out["excludes_eval_clips"] = False
+            out["overlap_examples"] += seen[:10]
+    gal = {c.clip_id for c in getattr(data, "islrtc", [])}
+    out["islrtc_clips_seen_unlabelled"] = len(gal & ids)
+    out["islrtc_clips"] = len(gal)
+    return out
 
 
 # --------------------------------------------------------------------------------------------- E5 / E7 / E8
@@ -408,7 +461,9 @@ def e5_from_letters(path: Path) -> dict:
     if not e5.get("measurable"):
         return {"label": lab, "run": False, "reason": e5.get("reason", "not measured"), "data": meta.get("data")}
     return {"label": lab, "run": True, "n": e5.get("n"), "n_groups": len(e5.get("signers") or []),
-            "metrics": e5.get("metrics"), "intervals": e5.get("intervals"), "per_letter": e5.get("per_letter"),
+            "metrics": e5.get("metrics"), "intervals": e5.get("intervals"),
+            "interval_reasons": e5.get("interval_reasons") or {}, "interval_groups": e5.get("interval_groups") or {},
+            "per_letter": e5.get("per_letter"),
             "words": e5.get("words"), "data": meta.get("data"),
             "note": "spelled words are always 'suggest' in the app (never auto-accepted): wrong-accept rate 0 by design"}
 
@@ -454,7 +509,7 @@ def e8_trim(paths, artifacts_dir: Path) -> dict:
 
 def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_path: Path | None = None,
                  paths=None, out_dirs: list[Path] | None = None, e4_ks=(1, 3, 5), latency_n: int = 20,
-                 progress=None) -> dict:
+                 progress=None, partial_data: bool | None = None) -> dict:
     """Run every protocol whose components exist in ``work`` and write ``eval/report.json`` + ``report.md``."""
     from app.core.config import REPO_ROOT, get_settings
     from app.isl.evaluation.protocols import e6_latency
@@ -462,8 +517,12 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     from app.isl.training.pipeline import load_recognizer
     from app.isl.training.train_encoder import encoder_training_clips
 
+    from app.isl.training.readiness import partial_data_flag
+
     log = progress or (lambda m: None)
     t0 = time.time()
+    partial = partial_data_flag(work) if partial_data is None else bool(partial_data)
+    pre_guard = pretraining_guard(work, data)
     split_name = data.split.get("name")
     rec = load_recognizer(work, fcfg, vocab_path, profile=profile)
     prot: dict = {}
@@ -503,11 +562,16 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
             prot["E1b"]["cv"] = {"folds": len(runs), "top1_mean": float(np.mean(tops)), "top1_sd": float(np.std(tops)),
                                  "pooled_n": len(hits), "pooled_top1": float(np.mean(hits)),
                                  "pooled_top1_interval": grouped_bootstrap(hits, grp),
+                                 "pooled_top1_interval_reason": interval_reason(hits, grp),
                                  "pooled_groups": len(set(grp)),
                                  "label": "every fold's held-out signers, each fold's model trained without them",
                                  "per_fold": [{"split": f["label"], "n": f.get("n"), "top1": f["metrics"]["top1"]}
                                               for f in runs]}
             prot["E1b"]["intervals"]["top1_cv_pooled"] = prot["E1b"]["cv"]["pooled_top1_interval"]
+            prot["E1b"].setdefault("interval_groups", {})["top1_cv_pooled"] = len(set(grp))
+            if prot["E1b"]["cv"]["pooled_top1_interval_reason"]:
+                prot["E1b"].setdefault("interval_reasons", {})["top1_cv_pooled"] = \
+                    prot["E1b"]["cv"]["pooled_top1_interval_reason"]
     off = work / "e1a" / "classifier.pt"
     if off.exists() and paths is not None:
         from app.isl.training.common import load_split
@@ -561,13 +625,20 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
                 folds.append({"fold": k, "run": False, "leakage": str(e)})
         pooled = e2_pool(folds)
         full = pooled.get("full", {})
+        seen_gal = pre_guard.get("islrtc_clips_seen_unlabelled")
         prot["E2"] = {"label": "E2 open vocabulary, one-shot: concepts held out of ALL supervised training (synonyms "
                                "too); other signers' INCLUDE clips (val/test parts, never seen even unlabelled) vs one "
                                "ISLRTC dictionary clip per word; thresholds "
                                "fitted on seen-class validation queries only. Some misses are regional variants, not "
-                               "model errors. Unlabelled pre-training may have seen dictionary clips (no labels).",
+                               "model errors. NOTE: self-supervised pre-training saw ISLRTC clips WITHOUT labels, "
+                               "including the dictionary reference clips E2 retrieves against"
+                               + (f" ({seen_gal} of {pre_guard.get('islrtc_clips')} ISLRTC clips were in the "
+                                  "pre-training list)" if seen_gal is not None else "") + ".",
+                      "pretraining_saw_gallery_unlabelled": (seen_gal > 0) if seen_gal is not None else None,
                       "run": bool(full), "n": full.get("n", 0), "n_groups": full.get("n_groups"),
                       "metrics": full.get("metrics", {}), "intervals": full.get("intervals", {}),
+                      "interval_reasons": full.get("interval_reasons", {}),
+                      "interval_groups": full.get("interval_groups", {}),
                       "restricted_gallery": pooled.get("restricted"), "folds": folds}
     else:
         prot["E2"] = {"run": False, "reason": "no held-out-concept encoders (work/oneshot/fold*/encoder.pt) or no "
@@ -591,14 +662,19 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
             v.pop(k, None)
     leak = {"split": split_name, "classifier_split_checked": True, "dedup": getattr(data, "multisource", {}).get("dedup"),
             "links": getattr(data, "multisource", {}).get("links"),
-            "pretraining_excludes_eval_clips": True}
-    doc = {"schema": 2, "language": "isl", "profile": profile, "smoke": smoke,
+            "pretraining_excludes_eval_clips": pre_guard.get("excludes_eval_clips"), "pretraining_check": pre_guard}
+    if smoke:
+        label = ("SMOKE RUN on partial data with tiny settings: proves the pipeline runs end to end. These numbers "
+                 "are NOT the accuracy of the app.")
+    elif partial:
+        label = PARTIAL_DATA_LABEL
+    else:
+        label = ("Measured on held-out data (test parts used once, after all selection on validation). Live "
+                 "webcam accuracy is expected to be lower.")
+    doc = {"schema": 2, "language": "isl", "profile": profile, "smoke": smoke, "partial_data": bool(partial or smoke),
            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "git_commit": git_commit(),
-           "label": ("SMOKE RUN on partial data with tiny settings: proves the pipeline runs end to end. These numbers "
-                     "are NOT the accuracy of the app." if smoke else
-                     "Measured on held-out data (test parts used once, after all selection on validation). Live "
-                     "webcam accuracy is expected to be lower."),
-           "data": data.summary(), "leakage_guards": leak, "protocols": prot, "seconds": round(time.time() - t0, 1)}
+           "label": label, "data": data.summary(), "leakage_guards": leak, "protocols": prot,
+           "seconds": round(time.time() - t0, 1)}
     md = markdown_report(doc)
     for d in [work / "eval", *(out_dirs or [])]:
         d.mkdir(parents=True, exist_ok=True)
@@ -615,10 +691,26 @@ def _fmt(v) -> str:
     return str(v)
 
 
+def _ci_cell(p: dict, key: str = "top1") -> str:
+    iv, why, ng = p.get("intervals") or {}, p.get("interval_reasons") or {}, p.get("interval_groups") or {}
+    ci, tag, k = iv.get(key), "", key
+    if not ci and iv.get(f"{key}_cv_pooled"):
+        k, tag = f"{key}_cv_pooled", "cv pooled, "
+        ci = iv[k]
+    if ci:
+        n = ng.get(k)
+        return f"{ci[0]:.3f}-{ci[1]:.3f} ({tag}{n if n is not None else '?'} groups)"
+    reason = why.get(f"{key}_cv_pooled") or why.get(key)
+    return f"none: {reason}" if reason else "-"
+
+
 def markdown_report(doc: dict) -> str:
-    lines = [f"# ISL evaluation report ({doc['profile']})", "", f"**{doc['label']}**", "",
+    partial = bool(doc.get("partial_data")) and not doc.get("smoke")
+    title = f"# ISL evaluation report ({doc['profile']})" + (" - PARTIAL DATA" if partial else "")
+    lines = [title, "", f"**{doc['label']}**", "",
              f"Created {doc['created']} at commit {doc.get('git_commit')}. Intervals: 95 % bootstrap over signer "
-             "groups. Not sure = abstain rate; wrong accept = accepted and wrong / all queries.", "",
+             "groups, shown only with at least 5 groups (the group count is printed next to every interval). Not "
+             "sure = abstain rate; wrong accept = accepted and wrong / all queries.", "",
              "| Protocol | n | groups | top-1 | 95% CI | top-5 | not sure | wrong accept | label |",
              "|---|---|---|---|---|---|---|---|---|"]
     for pid, p in doc["protocols"].items():
@@ -630,25 +722,39 @@ def markdown_report(doc: dict) -> str:
             lines.append(f"| {pid} | {p.get('n', '-')} | {p.get('n_groups', '-')} | - | - | - | - | - | "
                          f"{p.get('label', '')} (details below) |")
             continue
-        iv = p.get("intervals") or {}
-        ci, tag = iv.get("top1"), ""
-        if not ci and iv.get("top1_cv_pooled"):
-            ci, tag = iv["top1_cv_pooled"], " (cv pooled)"
-        lines.append(f"| {pid} | {p.get('n')} | {p.get('n_groups', '-')} | {_fmt(m.get('top1'))} | "
-                     f"{'-' if not ci else f'{ci[0]:.3f}-{ci[1]:.3f}{tag}'} | {_fmt(m.get('top5'))} | "
-                     f"{_fmt(m.get('not_sure_rate'))} | {_fmt(m.get('wrong_accept_rate'))} | {p.get('label', '')} |")
+        lines.append(f"| {pid} | {p.get('n')} | {p.get('n_groups', '-')} | {_fmt(m.get('top1'))} | {_ci_cell(p)} | "
+                     f"{_fmt(m.get('top5'))} | {_fmt(m.get('not_sure_rate'))} | {_fmt(m.get('wrong_accept_rate'))} | "
+                     f"{p.get('label', '')} |")
     cvb = doc["protocols"].get("E1b", {}).get("cv")
     if cvb:
         ci = cvb.get("pooled_top1_interval")
         lines += ["", f"E1b cross-validation: {cvb['folds']} folds, top-1 mean {cvb['top1_mean']:.3f} (sd "
                   f"{cvb['top1_sd']:.3f}); pooled over {cvb['pooled_groups']} held-out signer groups: "
-                  f"{cvb['pooled_top1']:.3f}" + (f" (95% CI {ci[0]:.3f}-{ci[1]:.3f})" if ci else "")]
+                  f"{cvb['pooled_top1']:.3f} (95% CI " + format_interval(ci, cvb['pooled_groups'],
+                                                                       cvb.get('pooled_top1_interval_reason')) + ")"]
     e4 = doc["protocols"].get("E4", {})
     if e4.get("run"):
-        lines += ["", "## E4 My signs", "", "| k | n | without | with | gain | user-sign false accepts |", "|---|---|---|---|---|---|"]
+        lines += ["", f"## E4 My signs (user-sign classifier term: {e4.get('user_cls_mode', 'penalty')})", "",
+                  "| k | n | groups | without | with | 95% CI (with) | gain | user-sign false accepts |",
+                  "|---|---|---|---|---|---|---|---|"]
         for k, v in e4["by_k"].items():
-            lines.append(f"| {k} | {v['n']} | {_fmt(v['top1_without_enrolment'])} | {_fmt(v['top1_with_enrolment'])} | "
+            lines.append(f"| {k} | {v['n']} | {v.get('n_groups', '-')} | {_fmt(v['top1_without_enrolment'])} | "
+                         f"{_fmt(v['top1_with_enrolment'])} | "
+                         f"{format_interval(v.get('interval_with'), v.get('n_groups'), v.get('interval_with_reason'))} | "
                          f"{_fmt(v['gain'])} | {_fmt(v['user_sign_false_accept_rate'])} |")
+    lg = doc.get("leakage_guards") or {}
+    pc = lg.get("pretraining_check") or {}
+    lines += ["", "## Leakage guards", "",
+              f"* classifier split checked: {lg.get('classifier_split_checked')} (a classifier without a recorded split "
+              "is refused)",
+              f"* pre-training excludes evaluation clips: {_fmt(lg.get('pretraining_excludes_eval_clips'))} "
+              + (f"(computed: {pc.get('overlap')} of {pc.get('pretrain_clips')} pre-training clips are evaluation "
+                 f"clips or their duplicates)" if pc.get("pretrain_clips") is not None else f"({pc.get('reason', '')})")]
+    if pc.get("sign_library"):
+        lines.append(f"* OpenHands Sign Library: {pc['sign_library']}")
+    if lg.get("pretraining_excludes_eval_clips") is False:
+        lines.append("* **LEAKAGE: pre-training saw evaluation clips; the numbers above are not clean.** Examples: "
+                     + ", ".join(pc.get("overlap_examples") or []))
     for k in ("E5", "E6", "E7", "E8"):
         p = doc["protocols"].get(k)
         if p:

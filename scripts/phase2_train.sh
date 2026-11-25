@@ -6,10 +6,18 @@
 #   scripts/phase2_train.sh --profile both                # commercial-safe, then research
 #   scripts/phase2_train.sh --profile research --smoke    # tiny settings on whatever data is on disk
 #
+# Data guard (full runs only): the driver refuses to start (exit 4) while any ingestion job runs
+# (scripts/ingest_isl.py / ingest_isl_pose.py / ingest_isl_video.py, or isl_queue.sh before its list is done) or
+# while any manifest the profile reads is incomplete (python -m app.isl.cli readiness). --allow-partial starts
+# anyway and marks the work folder (partial_data.json): every report and pack built from it then says PARTIAL DATA
+# (the mark stays until the work folder is rebuilt with --from trim). --check-only runs just this check.
+#
 # Steps (each one writes a stamp file when it succeeds; a re-run skips stamped steps, so the driver can be
 # restarted at any time; training steps also resume inside an epoch from their *.state files):
-#   trim dedup vocab splits link bench pretrain encoder oneshot classifier cv e1a fingerspell
+#   trim dedup vocab splits link bench pretrain_dedup pretrain encoder oneshot classifier cv e1a fingerspell
 #   index fusion evaluate index_final pack
+# (trim uses the learned end model artifacts/isl/trim_boundary.pt when it exists - trim_version
+#  trim-2+trim-learned-1 - and rules otherwise; pretrain_dedup checks the OpenHands Sign Library chunks)
 # Options:
 #   --from STEP      ignore stamps from STEP on (re-run it and everything after it)
 #   --only STEP      run just this step (ignores its stamp)
@@ -18,12 +26,15 @@
 #   --max-parts N    how many times a training step stopped by its time budget is re-run (default 1000)
 #   --step-minutes M time budget per training call (0 = none); the step is re-run with --resume until done
 #   --list           print the steps and their stamps
+#   --allow-partial  full run on incomplete data (reports and packs are labelled PARTIAL DATA)
+#   --check-only     run the data guard and exit (0 = ready or allowed, 4 = refused)
 # Environment overrides for the full settings: PRE_EPOCHS PRE_STEPS PRE_BATCH HIDDEN LAYERS EMB ENC_EPOCHS
 # ENC_STEPS CLS_EPOCHS CLS_STEPS E1A_STEPS CV_FOLDS (empty = skip cv) ONESHOT_FOLDS ONESHOT_EPOCHS LETTER_EPOCHS.
 #
 # Outputs: full -> artifacts/isl/<profile>/ (work) and artifacts/packs/<isl|isl-research>/ (pack the app loads);
 # smoke -> artifacts/isl/phase2-smoke/<profile>/ (work, pack/ inside it; never loaded by the app).
 # Logs: data/isl/logs/phase2_<profile>[_smoke].log. Everything runs under nice -n 10.
+# Test hooks: SLR_ISL_DIR (data root), PHASE2_WORK_BASE (instead of artifacts/isl), SLR_ISL_PROC_ROOT (process table).
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -37,7 +48,9 @@ THREADS="${THREADS:-2}"
 MAX_PARTS=1000
 STEP_MIN=0
 LIST=0
-STEPS=(trim dedup vocab splits link bench pretrain encoder oneshot classifier cv e1a fingerspell index fusion evaluate index_final pack)
+ALLOW_PARTIAL=0
+CHECK_ONLY=0
+STEPS=(trim dedup vocab splits link bench pretrain_dedup pretrain encoder oneshot classifier cv e1a fingerspell index fusion evaluate index_final pack)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -50,7 +63,9 @@ while [[ $# -gt 0 ]]; do
     --max-parts) MAX_PARTS="$2"; shift 2 ;;
     --step-minutes) STEP_MIN="$2"; shift 2 ;;
     --list) LIST=1; shift ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    --allow-partial) ALLOW_PARTIAL=1; shift ;;
+    --check-only) CHECK_ONLY=1; shift ;;
+    -h|--help) sed -n '2,42p' "$0"; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -60,14 +75,17 @@ if [[ "$PROFILE" == "both" ]]; then
   rc=0
   for p in commercial-safe research; do
     "$0" --profile "$p" $([[ $SMOKE == 1 ]] && echo --smoke) ${FROM:+--from "$FROM"} ${ONLY:+--only "$ONLY"} \
-      ${FORCE:+--force "$FORCE"} --threads "$THREADS" --max-parts "$MAX_PARTS" --step-minutes "$STEP_MIN" || rc=$?
+      ${FORCE:+--force "$FORCE"} --threads "$THREADS" --max-parts "$MAX_PARTS" --step-minutes "$STEP_MIN" \
+      $([[ $ALLOW_PARTIAL == 1 ]] && echo --allow-partial) $([[ $CHECK_ONLY == 1 ]] && echo --check-only) \
+      $([[ $LIST == 1 ]] && echo --list) || rc=$?
   done
   exit $rc
 fi
 case "$PROFILE" in commercial-safe|research) ;; *) echo "profile must be commercial-safe, research or both" >&2; exit 2 ;; esac
 
 TAG="$PROFILE$([[ $SMOKE == 1 ]] && echo _smoke)"
-LOGDIR="$REPO/data/isl/logs"
+ISL_ROOT="${SLR_ISL_DIR:-$REPO/data/isl}"
+LOGDIR="$ISL_ROOT/logs"
 STAMPS="$LOGDIR/phase2_${TAG}.stamps"
 LOG="$LOGDIR/phase2_${TAG}.log"
 mkdir -p "$LOGDIR" "$STAMPS"
@@ -81,9 +99,9 @@ if [[ $SMOKE == 1 ]]; then
   SROOT="$SLR_ISL_WORKDIR/isl_root_$PROFILE"
   if [[ ! -d "$SROOT" ]]; then
     mkdir -p "$SROOT/splits"
-    for d in manifests landmarks raw nltk_data; do ln -sfn "$REPO/data/isl/$d" "$SROOT/$d"; done
-    cp -r "$REPO/data/isl/derived" "$SROOT/derived" 2>/dev/null || mkdir -p "$SROOT/derived"
-    cp -r "$REPO/data/isl/splits/official" "$SROOT/splits/official" 2>/dev/null || true
+    for d in manifests landmarks raw nltk_data logs; do ln -sfn "$ISL_ROOT/$d" "$SROOT/$d"; done
+    cp -r "$ISL_ROOT/derived" "$SROOT/derived" 2>/dev/null || mkdir -p "$SROOT/derived"
+    cp -r "$ISL_ROOT/splits/official" "$SROOT/splits/official" 2>/dev/null || true
   fi
   ROOTARG="--root $SROOT"
   PACK_OUT="$WORK/pack"
@@ -94,9 +112,10 @@ if [[ $SMOKE == 1 ]]; then
   ONE="--hidden 32 --layers 1 --emb-dim 32 --epochs 1 --batches 3 --p 8 --k 2 --batch-size 16 --folds 0"
   CLS="--hidden 32 --layers 1 --epochs 2 --batches 6 --batch-size 16"
   LET="--epochs 3"
+  PDD="--max-chunks ${SMOKE_SL_CHUNKS:-600} --calib ${SMOKE_SL_CALIB:-100}"
 else
-  unset SLR_ISL_WORKDIR
-  WORK="$REPO/artifacts/isl/$PROFILE"
+  if [[ -n "${PHASE2_WORK_BASE:-}" ]]; then export SLR_ISL_WORKDIR="$PHASE2_WORK_BASE"; else unset SLR_ISL_WORKDIR; fi
+  WORK="${PHASE2_WORK_BASE:-$REPO/artifacts/isl}/$PROFILE"
   PACK_OUT=""
   SM=""
   CAP=""
@@ -106,8 +125,8 @@ else
   ONE="--hidden $H --layers $L --emb-dim $E --epochs ${ONESHOT_EPOCHS:-20} --batches ${ENC_STEPS:-300} --p 32 --k 2 --patience 6 --folds ${ONESHOT_FOLDS:-0 1}"
   CLS="--hidden $H --layers $L --epochs ${CLS_EPOCHS:-40} --batches ${CLS_STEPS:-300} --patience 10"
   LET="--epochs ${LETTER_EPOCHS:-40}"
+  PDD=""
 fi
-mkdir -p "$WORK"
 VOCAB="$WORK/vocabulary.jsonl"
 COMMON="--profile $PROFILE --threads $THREADS --vocab $VOCAB $SM"
 export SLR_TORCH_THREADS="$THREADS"
@@ -149,6 +168,7 @@ run_step() {
     splits) cli splits --vocab "$VOCAB" ;;  # fetches the official INCLUDE lists only when missing
     link) cli link-sources $COMMON --all-sources $CAP ;;
     bench) cli bench --threads "$THREADS" --steps $([[ $SMOKE == 1 ]] && echo 1 || echo 5) --hidden-sizes ${HIDDEN:-192} ;;
+    pretrain_dedup) cli pretrain-dedup $COMMON --all-sources $CAP $PDD ;;  # Sign Library copies / eval-clip matches
     pretrain) train pretrain $COMMON $CAP $PRE ;;
     encoder) train train-encoder $COMMON --all-sources $CAP $ENC --init auto ;;
     oneshot) train train-oneshot $COMMON --all-sources $CAP $ONE --init auto ;;
@@ -177,14 +197,37 @@ run_step() {
 }
 
 if [[ $LIST == 1 ]]; then
-  for s in "${STEPS[@]}"; do printf '%-12s %s\n' "$s" "$(cat "$STAMPS/$s.done" 2>/dev/null || echo -)"; done
+  for s in "${STEPS[@]}"; do printf '%-15s %s\n' "$s" "$(cat "$STAMPS/$s.done" 2>/dev/null || echo -)"; done
+  [[ -f "$WORK/partial_data.json" ]] && echo "work folder is marked PARTIAL DATA ($WORK/partial_data.json)"
   exit 0
 fi
+
+# ---- data guard: full runs never start silently on partial data -------------------------------------------
+[[ "$FROM" == "${STEPS[0]}" && -z "$ONLY" ]] && rm -f "$WORK/partial_data.json"  # rebuilt from scratch
+guard_args=(readiness --profile "$PROFILE" --out "$WORK/data_readiness.json" --work "$WORK")
+if [[ $SMOKE == 1 || $ALLOW_PARTIAL == 1 ]]; then guard_args+=(--allow-partial); fi
+nice -n 10 "$PY" -m app.isl.cli $ROOTARG "${guard_args[@]}" > "$LOGDIR/phase2_${TAG}.readiness.out" 2>&1
+grc=$?
+cat "$LOGDIR/phase2_${TAG}.readiness.out" >> "$LOG"
+if [[ $grc -ne 0 ]]; then
+  log "data guard: NOT READY - refusing to start a full run (an ingestion job is running or a manifest is incomplete;"
+  log "  details: $WORK/data_readiness.json). Wait for ingestion to finish, or pass --allow-partial (results and"
+  log "  packs are then labelled PARTIAL DATA)."
+  grep -A40 '"reasons"' "$LOGDIR/phase2_${TAG}.readiness.out" | sed -n '1,25p' >&2
+  exit 4
+fi
+if [[ -f "$WORK/partial_data.json" ]]; then
+  log "data guard: work folder marked PARTIAL DATA ($WORK/partial_data.json): reports and the pack will say so"
+else
+  log "data guard: ready (no ingestion job running, every manifest of $PROFILE complete)"
+fi
+[[ $CHECK_ONLY == 1 ]] && exit 0
+mkdir -p "$WORK"
 free_gb=$(df -Pk "$REPO" | awk 'NR==2 {print int($4/1048576)}')
 if [[ "$free_gb" -lt 10 ]]; then log "only ${free_gb} GB free (< 10 GB floor): not starting"; exit 3; fi
 if [[ -n "$FORCE" ]]; then rm -f "$STAMPS/$FORCE.done"; for f in $(state_files "$FORCE"); do rm -f "$f"; done; fi
 
-log "phase 2 driver: profile=$PROFILE smoke=$SMOKE threads=$THREADS work=$WORK git=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+log "phase 2 driver: profile=$PROFILE smoke=$SMOKE allow_partial=$ALLOW_PARTIAL threads=$THREADS work=$WORK git=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
 reached_from=0
 [[ -z "$FROM" ]] && reached_from=1
 for s in "${STEPS[@]}"; do

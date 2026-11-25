@@ -41,27 +41,18 @@ from pathlib import Path
 
 from app.isl.data.sources import Clip
 from app.isl.paths import IslPaths
-from app.isl.profiles import get_profile
+# The source lists live in app.isl.profiles (single source of truth, also behind DataProfile); re-exported here.
+from app.isl.profiles import (
+    COMMERCIAL,
+    LETTER_SOURCES,
+    PRETRAIN_SOURCES,
+    RESEARCH,
+    WORD_SOURCES,
+    get_profile,
+)
 
 log = logging.getLogger(__name__)
 
-COMMERCIAL, RESEARCH = "commercial-safe", "research"
-
-# labelled word sources (the order is the order of preference when the same video appears twice)
-WORD_SOURCES: dict[str, tuple[str, ...]] = {
-    COMMERCIAL: ("include", "islrtc", "mendeley_emergency", "mendeley_agri"),
-    RESEARCH: ("include", "islrtc", "isl500", "wslp", "cislr", "mendeley_emergency", "mendeley_agri"),
-}
-# unlabelled / sentence sources used only by self-supervised pre-training
-PRETRAIN_SOURCES: dict[str, tuple[str, ...]] = {
-    COMMERCIAL: ("isl_csltr",),
-    RESEARCH: ("isl_csltr", "glosl", "openhands_raw", "isign", "wslp_unlabelled"),
-}
-# letter / digit sources for the fingerspelling model
-LETTER_SOURCES: dict[str, tuple[str, ...]] = {
-    COMMERCIAL: ("mendeley_static",),
-    RESEARCH: ("mendeley_static", "isl_fingerspelling", "openhands_fs", "hf_hemg_alphabet", "hf_akrit_alphabet"),
-}
 # sources whose ``group`` is a real signer id (signer-independent held-out groups for evaluation)
 SIGNER_SOURCES = ("isl500", "mendeley_emergency")
 # per-source weight of retrieval index rows (dictionary references first; noisy web clips slightly lower)
@@ -89,22 +80,10 @@ def register_adapter(name: str, factory: Callable | None) -> None:
 def _factories() -> dict[str, Callable]:
     from app.isl.data import sources as base
 
-    f: dict[str, Callable] = {k: (lambda p, v, _c=c: _c(paths=p, vocab=v)) for k, c in base.ADAPTERS.items()}
-    try:
-        from app.isl.data.video_sources.adapters import VIDEO_ADAPTERS, WslpAdapter
-
-        for k, c in VIDEO_ADAPTERS.items():
-            f.setdefault(k, lambda p, v, _c=c: _c(paths=p, vocab=v))
-        f["wslp_unlabelled"] = lambda p, v: _Unlabelled(WslpAdapter(paths=p, vocab=v, require_label=False), "wslp")
-    except ImportError:  # package not present in this checkout
-        pass
-    try:
-        from app.isl.data.pose_sources import POSE_ADAPTERS
-
-        for k, c in POSE_ADAPTERS.items():
-            f.setdefault(k, lambda p, v, _c=c: _c(paths=p, vocab=v))
-    except ImportError:
-        pass
+    f: dict[str, Callable] = {k: (lambda p, v, _c=c: _c(paths=p, vocab=v)) for k, c in base.all_adapters().items()}
+    wslp = base.all_adapters().get("wslp")
+    if wslp is not None:  # the unlabelled WSLP val / test rows share the labelled manifest: a filtered view
+        f["wslp_unlabelled"] = lambda p, v: _Unlabelled(wslp(paths=p, vocab=v, require_label=False), "wslp")
     f.update(_EXTRA)
     return f
 
@@ -460,6 +439,48 @@ def pretrain_clips(paths: IslPaths, vocab, profile: str, exclude_ids: set[str] |
     clips = read_clips(dict.fromkeys(names), paths, vocab, profile, report)
     ex = exclude_ids or set()
     return [c for c in clips if c.clip_id not in ex]
+
+
+def eval_clip_ids(data) -> set[str]:
+    """Ids of every evaluation clip (INCLUDE val/test of the split, other sources' val/test signers) plus every clip
+    in the same duplicate group (same video / landmark file / near-duplicate cluster): copies that
+    ``attach_all_sources`` dropped from training or from the evaluation side are re-read by ``pretrain_clips``, so
+    excluding by id alone would let a test video reach pre-training."""
+    ids = {c.clip_id for c in data.include if data.assign.get(c.clip_id) in ("val", "test")} | {
+        c.clip_id for c in getattr(data, "extra", []) if data.extra_assign.get(c.clip_id) in ("val", "test")}
+    dedup = getattr(data, "dedup", None)
+    if dedup is not None and getattr(dedup, "parent", None):
+        groups = {dedup.group(i) for i in ids}
+        ids |= {x for x in list(dedup.parent) if dedup.group(x) in groups}
+    return ids
+
+
+def eval_clips(data) -> list[Clip]:
+    """The evaluation clips themselves (for content-based checks such as the Sign Library dedupe)."""
+    return [c for c in data.include if data.assign.get(c.clip_id) in ("val", "test")] + [
+        c for c in getattr(data, "extra", []) if data.extra_assign.get(c.clip_id) in ("val", "test")]
+
+
+PRETRAIN_LIST = "pretrain_clips.txt"
+
+
+def write_pretrain_list(work: Path, clips: list[Clip], resume: bool = False) -> dict:
+    """``<work>/pretrain_clips.txt``: every clip id the pre-training may draw (union with the previous list when
+    a run is resumed, so a leakage check never misses a clip an earlier part saw). Returns name, count, sha256."""
+    f = work / PRETRAIN_LIST
+    ids = {c.clip_id for c in clips}
+    if resume and f.exists():
+        ids |= {ln.strip() for ln in f.read_text(encoding="utf-8").splitlines() if ln.strip()}
+    text = "".join(f"{i}\n" for i in sorted(ids))
+    f.write_text(text, encoding="utf-8")
+    return {"file": PRETRAIN_LIST, "clips": len(ids), "sha256": hashlib.sha256(text.encode()).hexdigest()}
+
+
+def read_pretrain_list(work: Path) -> set[str] | None:
+    f = work / PRETRAIN_LIST
+    if not f.exists():
+        return None
+    return {ln.strip() for ln in f.read_text(encoding="utf-8").splitlines() if ln.strip()}
 
 
 def write_extra_concepts(linker: GlossLinker, path: Path) -> int:

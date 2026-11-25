@@ -96,8 +96,10 @@ def evaluate(work: Path, data, fcfg: FeatureConfig, smoke: bool, part: str = "te
         d["top1"] += int(bool(r.keys) and r.keys[0] == t)
         d["top5"] += int(t in r.keys[:5])
     per_class = {k: {"n": v["n"], "top1": v["top1"] / v["n"], "top5": v["top5"] / v["n"]} for k, v in per_class.items()}
+    from app.isl.training.readiness import partial_data_flag
+
     doc = write_results(work / "results.json", protocols, profile=data.profile, smoke=smoke, data=data.summary(),
-                        extra={"per_class": per_class, "partition": part})
+                        extra={"per_class": per_class, "partition": part}, partial_data=partial_data_flag(work))
     (work / "results.md").write_text(markdown_table(doc) + "\n")
     return doc
 
@@ -108,6 +110,42 @@ def _sha(p: Path) -> str:
         for b in iter(lambda: fh.read(1 << 20), b""):
             h.update(b)
     return h.hexdigest()
+
+
+CORE_LICENCES = {"include": {"licence": "CC-BY-4.0", "commercial": True},
+                 "islrtc": {"licence": "GODL-India", "commercial": True, "terms": ISLRTC_TERMS}}
+
+
+def pack_licences(work: Path) -> list[dict]:
+    """Licence entries of a pack: only the sources that really contributed clips to this build (``sources.json``
+    ``used`` counts > 0, written by the phase-2 commands), with their roles and clip counts. INCLUDE and ISLRTC are
+    always named because the pack's vocabulary is built from their word lists (role ``vocabulary`` when no clip of
+    theirs was used). Without ``sources.json`` (phase-1 commands) the build used exactly INCLUDE + ISLRTC."""
+    used = work / "sources.json"
+    rows: dict[str, dict] = {}
+    if used.exists():
+        try:
+            doc = json.loads(used.read_text())
+        except ValueError:
+            doc = {}
+        for name, d in sorted(doc.items()):
+            if not isinstance(d, dict):
+                continue
+            per_role = d.get("used")
+            if per_role is None:  # sources.json of an older build: no per-role counts (unknown count = assume used)
+                n = (int(d["clips"] or 0) if "clips" in d else 1) if d.get("available") else 0
+                per_role = {r: n for r in (d.get("roles") or ["words"])}
+            roles = sorted(r for r, k in per_role.items() if int(k or 0) > 0)
+            if not roles:
+                continue
+            rows[name] = {"source": name, "licence": d.get("licence", ""), "commercial": bool(d.get("commercial", False)),
+                          "role": ",".join(roles), "clips": {r: int(per_role[r]) for r in roles}}
+    else:
+        rows = {k: {"source": k, **v, "role": "words"} for k, v in CORE_LICENCES.items()}
+    for k, v in CORE_LICENCES.items():
+        rows[k] = {**rows.get(k, {"source": k, "role": "vocabulary"}), **v}
+    order = list(CORE_LICENCES) + sorted(x for x in rows if x not in CORE_LICENCES)
+    return [rows[k] for k in order]
 
 
 def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None = None, smoke: bool = False,
@@ -158,22 +196,11 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
         import torch
 
         enc_version = torch.load(work / "encoder.pt", map_location="cpu", weights_only=False)["meta"]["encoder_version"]
+    from app.isl.training.readiness import partial_data_flag
+
     base = json.loads((PACK_DIR / "pack.json").read_text())
-    licences = [{"source": "include", "licence": "CC-BY-4.0", "commercial": True},
-                {"source": "islrtc", "licence": "GODL-India", "commercial": True,
-                 "terms": ISLRTC_TERMS}]
-    if not prof.commercial:
-        licences += [{"source": "cislr", "licence": "CC-BY-NC-4.0 (README; HF tag says AFL-3.0)", "commercial": False},
-                     {"source": "isign", "licence": "CC-BY-NC-SA-4.0", "commercial": False}]
-    used = work / "sources.json"  # written by the phase-2 commands: every source that reached a component
-    if used.exists():
-        try:
-            for name, d in sorted(json.loads(used.read_text()).items()):
-                if isinstance(d, dict) and d.get("available") and not any(x["source"] == name for x in licences):
-                    licences.append({"source": name, "licence": d.get("licence", ""), "commercial": d.get("commercial", False),
-                                     **({"role": d["role"]} if d.get("role") else {})})
-        except (ValueError, KeyError):
-            pass
+    licences = pack_licences(work)
+    partial = partial_data_flag(work)
     if prof.commercial and any(not x.get("commercial", False) for x in licences):
         raise ValueError(f"refusing to build a commercial-safe pack with non-commercial sources: "
                          f"{[x['source'] for x in licences if not x.get('commercial', False)]}")
@@ -181,7 +208,10 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
            "profile": prof.name, "feature_config": fcfg.to_dict(), "licences": licences,
            "display_name": base["display_name"] if prof.commercial else
            {"en": "Indian Sign Language (ISL, research models)", "hi": "भारतीय सांकेतिक भाषा (शोध)"},
-           "note": ("SMOKE BUILD on partial data: proves the pipeline, not usable accuracy. " if smoke else "")
+           "partial_data": bool(partial or smoke),
+           "note": ("SMOKE BUILD on partial data: proves the pipeline, not usable accuracy. " if smoke else
+                    "PARTIAL DATA BUILD: trained while ingestion was incomplete (--allow-partial); not the app's "
+                    "accuracy. " if partial else "")
            + f"Built {time.strftime('%Y-%m-%d %H:%M')} by python -m app.isl.cli build-pack.",
            "checksums": files}
     man["components"] = dict(base["components"])

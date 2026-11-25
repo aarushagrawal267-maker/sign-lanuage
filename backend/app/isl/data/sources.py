@@ -311,24 +311,61 @@ class MySignsAdapter:
 
 
 ADAPTERS = {"include": IncludeAdapter, "islrtc": IslrtcAdapter, "cislr": CislrAdapter, "isign": ISignAdapter}
+_OPTIONAL_REGISTERED = False
+
+
+def register_optional_adapters(adapters: dict | None = None) -> dict:
+    """Add the video-source adapters (``video_sources.adapters.VIDEO_ADAPTERS``: WSLP, ISL-CSLTR, Mendeley, letters,
+    ...) and the pose-source adapters (``pose_sources.register``: GloSL, ISL500, OpenHands) to ``adapters``
+    (default: :data:`ADAPTERS`) without overwriting a name that is already there. Done lazily (first use) because
+    those packages import this module. Which profile may use which source is decided in ``app.isl.profiles``
+    (the single source of truth), not here."""
+    global _OPTIONAL_REGISTERED
+    reg = ADAPTERS if adapters is None else adapters
+    try:
+        from app.isl.data.video_sources.adapters import VIDEO_ADAPTERS
+
+        for k, v in VIDEO_ADAPTERS.items():
+            reg.setdefault(k, v)
+    except ImportError:  # package not present in this checkout
+        pass
+    try:
+        from app.isl.data.pose_sources import register
+
+        register(reg)
+    except ImportError:
+        pass
+    if adapters is None:
+        _OPTIONAL_REGISTERED = True
+    return reg
+
+
+def all_adapters() -> dict:
+    """:data:`ADAPTERS` with the optional video / pose adapters registered."""
+    if not _OPTIONAL_REGISTERED:
+        register_optional_adapters()
+    return ADAPTERS
 
 
 def get_adapter(name: str, paths: IslPaths | None = None, vocab=None):
     try:
-        return ADAPTERS[name](paths=paths, vocab=vocab)
+        return all_adapters()[name](paths=paths, vocab=vocab)
     except KeyError:
         raise ValueError(f"no adapter for source {name!r}") from None
 
 
 def load_profile_clips(profile: DataProfile | str, paths: IslPaths | None = None, vocab=None,
                        pretraining: bool = False) -> list[Clip]:
-    """Every usable clip of the sources a profile allows (``pretraining`` adds pre-training-only sources)."""
+    """Every usable clip of the labelled word sources a profile allows (``pretraining`` adds the pre-training-only
+    sources). The lists come from ``app.isl.profiles``; a source without a registered adapter (e.g. the
+    ``wslp_unlabelled`` view, built by ``training.multisource``) is skipped here."""
     prof = get_profile(profile)
     names = list(prof.sources) + ([s for s in prof.pretraining if s not in prof.sources] if pretraining else [])
+    reg = all_adapters()
     out: list[Clip] = []
     for n in names:
-        if n not in ADAPTERS:
-            continue  # e.g. "wlasl": handled by the ASL pipeline
+        if n not in reg:
+            continue
         ad = get_adapter(n, paths, vocab)
         if ad.available():
             out.extend(ad.clips())

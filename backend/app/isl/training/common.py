@@ -165,6 +165,7 @@ class IslData:
     linker: object = None
     dedup: object = None
     multisource: dict = field(default_factory=dict)
+    islrtc_stats: dict = field(default_factory=dict)  # re-extracted / truncated ISLRTC clips (resolve_islrtc)
 
     def include_part(self, part: str) -> list[Clip]:
         return [c for c in self.include if self.assign.get(c.clip_id) == part and c.concept_id]
@@ -186,17 +187,84 @@ class IslData:
                 "signer_independent": self.split.get("signer_independent"), "include": parts,
                 "include_unassigned": self.unassigned, "islrtc": len(self.islrtc),
                 "islrtc_untrimmed": sum(1 for c in self.islrtc if c.end is None and c.quality.get("kind") != "phrase"),
+                "islrtc_reextraction": dict(self.islrtc_stats),
+                "islrtc_trim_versions": dict(Counter(str(c.quality.get("trim_version")) for c in self.islrtc
+                                                     if c.end is not None)),
                 "include_concepts": len({c.concept_id for c in self.include if c.concept_id})}
+
+
+# ISLRTC rows re-extracted after the first pass (card-v2 title-card detector; ``scripts/ingest_isl.py
+# islrtc-recut``): a row here supersedes the islrtc.jsonl row with the same id
+ISLRTC_RECUT_MANIFESTS = ("islrtc_recut",)
+
+
+def islrtc_overrides(paths: IslPaths) -> dict[str, dict]:
+    """id -> re-extracted ISLRTC manifest row (ok rows with frames only; later manifests win)."""
+    from app.isl.data.manifest import read_manifest
+
+    out: dict[str, dict] = {}
+    for name in ISLRTC_RECUT_MANIFESTS:
+        f = paths.manifest(name)
+        if f.exists():
+            for r in read_manifest(f):
+                if r.get("n_frames"):
+                    out[r["id"]] = r
+    return out
+
+
+def resolve_islrtc(clips: list[Clip], paths: IslPaths) -> tuple[list[Clip], dict]:
+    """Prefer re-extracted ISLRTC files and keep cut-short clips out until they are re-extracted.
+
+    * a clip with a re-extracted row uses that file; its trim is kept only when the trim sidecar says it was
+      computed on that file (``landmarks``), otherwise the clip is used untrimmed until ``cli trim`` runs;
+    * a clip whose trim is ``truncated`` (the old title-card detector stopped it mid-sign) and that has no
+      re-extracted file yet is **excluded** from training, the index and evaluation galleries."""
+    from dataclasses import replace
+
+    from app.isl.data.manifest import read_manifest
+    from app.isl.data.sources import passes_quality
+
+    over = islrtc_overrides(paths)
+    trims = {r["id"]: r for r in read_manifest(paths.trim_sidecar, only_ok=False)} if paths.trim_sidecar.exists() else {}
+    out, st = [], Counter()
+    for c in clips:
+        if c.end is not None and c.clip_id in trims:
+            c = replace(c, quality={**c.quality, "trim_version": trims[c.clip_id].get("trim_version")})
+        o = over.get(c.clip_id)
+        if o is not None:
+            if not passes_quality(o):
+                st["recut_failed_quality"] += 1
+                continue
+            t = trims.get(c.clip_id) or {}
+            if t.get("landmarks") == o["path"]:
+                c = replace(c, path=paths.resolve(o["path"]), quality={**c.quality, "recut": True,
+                                                                         "stop": o.get("stop")})
+                if t.get("method") == "truncated":
+                    st["truncated_excluded"] += 1
+                    continue
+            else:
+                q = {k: v for k, v in c.quality.items() if not k.startswith("trim_")}
+                c = replace(c, path=paths.resolve(o["path"]), start=0, end=None,
+                            quality={**q, "recut": True, "stop": o.get("stop"), "n_frames": o.get("n_frames")})
+                st["recut_untrimmed"] += 1
+            st["recut_used"] += 1
+        elif c.quality.get("trim_method") == "truncated":
+            st["truncated_excluded"] += 1
+            continue
+        out.append(c)
+    return out, dict(st)
 
 
 def load_isl_data(paths: IslPaths, vocab, profile: str = "commercial-safe", split_name: str | None = None,
                   max_islrtc: int | None = None, seed: int = 0) -> IslData:
     prof = get_profile(profile)
     include, islrtc = [], []
+    islrtc_stats: dict = {}
     if "include" in prof.sources:
         include = list(IncludeAdapter(paths, vocab=vocab).clips())
     if "islrtc" in prof.sources:
-        islrtc = [c for c in IslrtcAdapter(paths, vocab=vocab).clips() if c.concept_id]
+        islrtc, islrtc_stats = resolve_islrtc([c for c in IslrtcAdapter(paths, vocab=vocab).clips() if c.concept_id],
+                                              paths)
     if max_islrtc and len(islrtc) > max_islrtc:
         rng = random.Random(seed)
         islrtc = rng.sample(islrtc, max_islrtc)
@@ -204,7 +272,7 @@ def load_isl_data(paths: IslPaths, vocab, profile: str = "commercial-safe", spli
     split = load_split(paths, name)
     assign = split.get("assign", {})
     unassigned = sum(1 for c in include if c.clip_id not in assign)
-    return IslData(include, islrtc, assign, split, prof.name, unassigned)
+    return IslData(include, islrtc, assign, split, prof.name, unassigned, islrtc_stats=islrtc_stats)
 
 
 def items_for(clips: list[Clip], label_of: dict[str, int], fcfg: FeatureConfig, with_alternatives: bool = True) -> list[Item]:

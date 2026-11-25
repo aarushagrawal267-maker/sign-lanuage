@@ -21,9 +21,9 @@
   },
   "results": "results.json",
   "licences": [
-    {"source": "include", "licence": "CC-BY-4.0", "commercial": true},
-    {"source": "islrtc", "licence": "GODL-India", "commercial": true,
+    {"source": "include", "licence": "CC-BY-4.0", "commercial": true, "role": "vocabulary"},
+    {"source": "islrtc", "licence": "GODL-India", "commercial": true, "role": "vocabulary",
      "terms": "free, non-profit use with acknowledgement only (ISLRTC FAQ Q.23); paid or ad-funded use needs ISLRTC permission"}
   ],
-  "note": "Tracked copy: vocabulary only. Model files are built locally into artifacts/packs/isl (python -m app.isl.cli build-pack), which overrides this folder."
+  "note": "Tracked copy: vocabulary only (built from the INCLUDE and ISLRTC word lists, the only sources named here). Model files are built locally into artifacts/packs/isl (python -m app.isl.cli build-pack), which overrides this folder and lists exactly the sources whose clips reached that build."
 }

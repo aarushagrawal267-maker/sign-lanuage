@@ -232,11 +232,11 @@ def evaluate_loso(ls: LetterSet, epochs: int, seed: int, max_per_class: int, lex
             raw_s = "".join(LETTERS[int(np.argmax(r))] for r in lp if int(np.argmax(r)) != NOISE)
             word_rows.append({"group": s, "top1": float(bool(words) and words[0] == w["word"]),
                               "top5": float(w["word"] in words[:5]), "raw": float(raw_s == w["word"])})
-    from app.isl.evaluation.report import grouped_bootstrap
+    from app.isl.evaluation.report import grouped_bootstrap, interval_fields, interval_reason
 
     out = {"measurable": True, "signers": signers, "n": len(letter_hits),
            "metrics": {"letter_top1": float(np.mean(letter_hits)) if letter_hits else None},
-           "intervals": {"letter_top1": grouped_bootstrap(letter_hits, letter_groups)},
+           **interval_fields({"letter_top1": (letter_hits, letter_groups)}),
            "per_letter": {k: {"acc": v[0] / v[1], "n": v[1]} for k, v in sorted(per_letter.items())}}
     if word_rows:
         out["words"] = {"n": len(word_rows),
@@ -244,6 +244,8 @@ def evaluate_loso(ls: LetterSet, epochs: int, seed: int, max_per_class: int, lex
                         "top5": float(np.mean([r["top5"] for r in word_rows])),
                         "raw_letters_exact": float(np.mean([r["raw"] for r in word_rows])),
                         "top1_interval": grouped_bootstrap([r["top1"] for r in word_rows], [r["group"] for r in word_rows]),
+                        "top1_interval_reason": interval_reason([r["top1"] for r in word_rows],
+                                                                [r["group"] for r in word_rows]),
                         "label": "held-out signer; word boundaries from the annotation spaces; letters from the live "
                                  "hold detector; lexicon = spelling lexicon + every annotated word (closed vocabulary). "
                                  "Spelled words are only ever suggested in the app, never auto-accepted."}

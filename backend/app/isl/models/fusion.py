@@ -3,7 +3,9 @@
 
 For one segment and one crop, over the union of candidate concepts::
 
-    z_k = alpha * log p_c(k)            (classifier, temperature t_c; concepts outside it get noncore_logp)
+    z_k = alpha * log p_c(k)            (classifier, temperature t_c; concepts outside it get noncore_logp;
+                                         user signs too, or - with user_cls_mode "neutral" - the crop's best
+                                         classifier log-probability, so the classifier cannot vote against them)
         + beta  * log p_r(k)            (p_r = softmax over every index concept and user sign of cos / tau_r,
                                          user signs get + user_bonus in logit units)
         + gamma * prior_k               (1 for core words, 0.5 single words, 0 multiword/phrases)
@@ -23,6 +25,7 @@ from pathlib import Path
 import numpy as np
 
 POLICIES = ("strict", "balanced", "lenient")
+USER_CLS_MODES = ("penalty", "neutral")
 USER_PREFIX = "mysign:"
 
 
@@ -42,6 +45,10 @@ class FusionParams:
     user_margin: float = 0.05  # cosine margin for the direct "My signs" override (7.3)
     user_theta_floor: float = 0.0  # lowest allowed per-sign acceptance cosine
     noncore_logp: float = math.log(1e-3)
+    # classifier term of a user ("My signs") key: "penalty" = noncore_logp like any non-core concept (default);
+    # "neutral" = the crop's best classifier log-probability (neither for nor against). Chosen by fit-fusion on
+    # validation few-shot (E4-style) data; kept "penalty" when that data is insufficient.
+    user_cls_mode: str = "penalty"
     top_n: int = 50
     version: str = "fusion-1"
     profile: str = ""
@@ -54,6 +61,8 @@ class FusionParams:
         # decide() raise for the missing ones (HTTP 500 in the API). Missing values are filled from the present
         # ones (or the defaults) and kept ordered strict >= balanced >= lenient.
         object.__setattr__(self, "accept", normalize_accept(self.accept))
+        if self.user_cls_mode not in USER_CLS_MODES:
+            raise ValueError(f"user_cls_mode must be one of {USER_CLS_MODES}, not {self.user_cls_mode!r}")
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -170,7 +179,11 @@ def fuse(inp: FusionInputs, p: FusionParams) -> FusionResult:
     z = np.zeros((crops, K), np.float64)
     if has_c:
         col = np.array([c_pos.get(k, -1) for k in keys])
-        cl = np.where(col[None, :] >= 0, clp[:, np.maximum(col, 0)], p.noncore_logp)
+        fill = np.full((crops, K), p.noncore_logp)
+        if has_u and p.user_cls_mode == "neutral":
+            is_user = np.array([k in set(inp.user_ids) for k in keys])
+            fill[:, is_user] = clp.max(1, keepdims=True)
+        cl = np.where(col[None, :] >= 0, clp[:, np.maximum(col, 0)], fill)
         z += p.alpha * cl
     if has_r or has_u:
         logits_all = []

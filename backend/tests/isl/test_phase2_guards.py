@@ -1,0 +1,457 @@
+"""Phase-2 honesty guards (docs/ISL_DESIGN.md 15.4), offline and synthetic:
+
+1. no "95 % interval" from fewer than 5 signer groups (JSON null + reason, markdown says why);
+2. the partial-data guard (process table + manifest completeness, ``--allow-partial`` marks the work folder, reports
+   and packs say PARTIAL DATA; the driver refuses with exit 4);
+3. a classifier without a recorded split is refused; the pre-training leakage flag is computed from the real list;
+4. one source of truth for profiles, registered adapters, licence lists naming only contributing sources;
+5. the Sign Library pose-content dedupe; 6. learned trims + re-extracted / truncated ISLRTC clips;
+7. the E2 label; 8. the "My signs" neutral classifier term chosen on validation data.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from app.isl.data.sources import Clip
+from app.isl.evaluation import report as rp
+from app.isl.models.fusion import FusionInputs, FusionParams, fuse
+from app.isl.training import multisource as ms
+from app.isl.training import pose_dedup as pd
+from app.isl.training import readiness as rd
+from tests.isl.helpers import write_manifest
+from tests.isl.isl_world import make_world
+
+REPO = Path(__file__).resolve().parents[3]
+
+
+# --------------------------------------------------------------------------------------------- 1. intervals
+
+def test_no_interval_from_fewer_than_five_groups():
+    vals = [1.0, 0.0, 1.0, 1.0, 0.0, 1.0]
+    two = ["a", "a", "a", "b", "b", "b"]
+    assert rp.grouped_bootstrap(vals, two) is None
+    assert rp.interval_reason(vals, two) == "too few signer groups (2)"
+    five = ["a", "b", "c", "d", "e", "e"]
+    ci = rp.grouped_bootstrap(vals, five)
+    assert ci is not None and ci[0] <= ci[1]
+    f = rp.interval_fields({"top1": (vals, two), "top5": (vals, five), "empty": ([], [])})
+    assert f["intervals"]["top1"] is None and f["interval_reasons"]["top1"] == "too few signer groups (2)"
+    assert f["intervals"]["top5"] and "top5" not in f["interval_reasons"] and f["interval_groups"]["top5"] == 5
+    assert f["interval_reasons"]["empty"] == "no values"
+    assert rp.format_interval(None, 2, "too few signer groups (2)") == "none: too few signer groups (2)"
+    assert rp.format_interval([0.5, 0.75], 7) == "0.500-0.750 (7 groups)"
+
+
+def _doc(**kw):
+    p = {"run": True, "n": 30, "n_groups": 2, "label": "E1b test", "metrics": {"top1": 0.5, "top5": 0.8},
+         **rp.interval_fields({"top1": ([1.0, 0.0] * 15, ["a", "b"] * 15)})}
+    return {"profile": "commercial-safe", "label": "x", "created": "now", "smoke": False, "protocols": {"E1b": p},
+            "leakage_guards": {"pretraining_excludes_eval_clips": None, "pretraining_check": {"reason": "none"}}, **kw}
+
+
+def test_markdown_report_says_why_there_is_no_interval_and_prints_group_counts():
+    from app.isl.evaluation.runners import markdown_report
+
+    md = markdown_report(_doc())
+    assert "none: too few signer groups (2)" in md and "95% CI" in md
+    doc = _doc()
+    doc["protocols"]["E1b"].update(rp.interval_fields({"top1": ([1.0, 0.0] * 15, list("abcdef") * 5)}))
+    assert "groups)" in markdown_report(doc)
+    md_t = rp.markdown_table({"protocols": {"E1": {"label": "l", "n": 4, "metrics": {"top1": 0.5},
+                                                   **rp.interval_fields({"top1": ([1.0, 0.0], ["a", "b"])})}}})
+    assert "none: too few signer groups (2)" in md_t
+
+
+# --------------------------------------------------------------------------------------------- 2. partial data
+
+def _proc(root: Path, pid: int, argv: list[str]) -> None:
+    d = root / str(pid)
+    d.mkdir(parents=True)
+    (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+
+
+def test_ingestion_processes_found_and_queue_polling_ignored(tmp_path):
+    proc = tmp_path / "proc"
+    _proc(proc, 101, [".venv/bin/python", "scripts/ingest_isl.py", "islrtc", "--workers", "3"])
+    _proc(proc, 102, ["python", "scripts/ingest_isl_pose.py", "status"])  # read-only: ignored
+    _proc(proc, 103, ["bash", "scripts/isl_queue.sh"])
+    _proc(proc, 104, ["/bin/bash", "-c", "echo scripts/isl_queue.sh is mentioned in a string"])  # not the script
+    _proc(proc, 105, ["python", "-m", "pytest"])
+    log = tmp_path / "queue.log"
+    log.write_text("2026-11-25 queue start (pid 103): wslp\n")
+    got = rd.ingestion_processes(proc, log, self_pid=1)
+    assert [(p["pid"], p["blocking"]) for p in got] == [(101, True), (103, True)]
+    log.write_text(log.read_text() + "2026-11-26 all listed sources processed; status:\n")
+    got = rd.ingestion_processes(proc, log, self_pid=1)
+    assert [(p["pid"], p["blocking"]) for p in got] == [(101, True), (103, False)]  # queue only polls CISLR now
+    log.write_text(log.read_text() + "2026-11-27 queue start (pid 200): wslp\n")  # restarted: blocks again
+    assert all(p["blocking"] for p in rd.ingestion_processes(proc, log, self_pid=1))
+
+
+def _complete_world(tmp_path) -> rd.IslPaths:
+    """Manifests of every commercial-safe source, complete against their item lists."""
+    from app.isl.paths import isl_paths
+
+    P = isl_paths(tmp_path / "isl")
+    for name in ("include", "islrtc", "mendeley_emergency", "mendeley_agri", "isl_csltr", "mendeley_static"):
+        ids = [f"{name}/{i}" for i in range(3)]
+        write_manifest(P.manifest(name), [{"id": i, "ok": True, "n_frames": 9} for i in ids])
+        (P.manifests / f"{name}_items.json").write_text(json.dumps([{"id": i} for i in ids]))
+    return P
+
+
+def test_readiness_checks_processes_and_every_manifest(tmp_path):
+    P = _complete_world(tmp_path)
+    empty = tmp_path / "proc_empty"
+    empty.mkdir()
+    rep = rd.check(P, "commercial-safe", proc_root=empty)
+    assert rep["ready"], rep["reasons"]
+    # an incomplete manifest blocks
+    (P.manifests / "mendeley_agri_items.json").write_text(json.dumps([{"id": f"mendeley_agri/{i}"} for i in range(5)]))
+    rep = rd.check(P, "commercial-safe", proc_root=empty)
+    assert not rep["ready"] and any("mendeley_agri 3/5" in r for r in rep["reasons"])
+    # a running ingestion job blocks
+    (P.manifests / "mendeley_agri_items.json").write_text(json.dumps([{"id": f"mendeley_agri/{i}"} for i in range(3)]))
+    proc = tmp_path / "proc"
+    _proc(proc, 300, ["python", "scripts/ingest_isl_video.py", "run", "wslp"])
+    rep = rd.check(P, "commercial-safe", proc_root=proc)
+    assert not rep["ready"] and rep["reasons"] == ["ingestion job running: pid 300 ingest_isl_video.py run"]
+    # gated sources without access are unavailable, not incomplete (research profile)
+    st = rd.source_status(P, "cislr")
+    assert st["complete"] is None and "gated" in st["note"]
+    # failed rows count as attempted; the published size is used when no item list exists
+    write_manifest(P.manifest("openhands_fs"), [{"id": f"x{i}", "ok": i % 2 == 0} for i in range(172)])
+    st = rd.source_status(P, "openhands_fs")
+    assert st["complete"] and st["failed"] == 86
+
+
+def test_partial_flag_labels_reports_and_packs(tmp_path, monkeypatch):
+    monkeypatch.delenv("SLR_ISL_PARTIAL_DATA", raising=False)
+    work = tmp_path / "w"
+    assert not rd.partial_data_flag(work)
+    rd.mark_partial(work, {"checked": "t0", "reasons": ["ingestion job running: pid 1"]})
+    assert rd.partial_data_flag(work)
+    doc = rp.write_results(tmp_path / "r.json", {}, profile="commercial-safe", smoke=False, data={}, partial_data=True)
+    assert doc["partial_data"] and "PARTIAL DATA" in doc["label"] and "Measured on held-out" not in doc["label"]
+    assert "PARTIAL DATA" in rp.markdown_table(doc)
+    from app.isl.evaluation.runners import markdown_report
+
+    md = markdown_report(_doc(partial_data=True, label=rp.PARTIAL_DATA_LABEL))
+    assert md.splitlines()[0].endswith("- PARTIAL DATA") and "Measured on held-out" not in md
+
+
+def _driver(tmp_path, *args, proc=None, isl_root=None):
+    env = {**os.environ, "PY": sys.executable, "SLR_ISL_DIR": str(isl_root), "PHASE2_WORK_BASE": str(tmp_path / "art"),
+           "SLR_ISL_PROC_ROOT": str(proc), "SLR_TORCH_THREADS": "1"}
+    env.pop("SLR_ISL_PARTIAL_DATA", None)
+    return subprocess.run(["bash", str(REPO / "scripts" / "phase2_train.sh"), "--profile", "commercial-safe",
+                           "--check-only", *args], capture_output=True, text=True, env=env, timeout=300)
+
+
+def test_driver_refuses_full_run_on_partial_data_unless_allowed(tmp_path):
+    P = _complete_world(tmp_path)
+    proc = tmp_path / "proc"
+    _proc(proc, 400, ["python", "scripts/ingest_isl.py", "include", "--workers", "1"])
+    r = _driver(tmp_path, proc=proc, isl_root=P.root)
+    assert r.returncode == 4, r.stdout + r.stderr
+    assert "refusing" in r.stdout + r.stderr
+    marker = tmp_path / "art" / "commercial-safe" / "partial_data.json"
+    assert not marker.exists()
+    r = _driver(tmp_path, "--allow-partial", proc=proc, isl_root=P.root)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads(marker.read_text())["partial_data"] is True
+    # ready data, no job: starts, and the old partial mark stays (sticky) until a rebuild --from trim
+    empty = tmp_path / "proc_empty"
+    empty.mkdir()
+    assert _driver(tmp_path, proc=empty, isl_root=P.root).returncode == 0 and marker.exists()
+    assert _driver(tmp_path, "--from", "trim", proc=empty, isl_root=P.root).returncode == 0 and not marker.exists()
+
+
+# --------------------------------------------------------------------------------------------- 3. guards
+
+def test_classifier_without_split_is_refused():
+    from app.isl.evaluation.runners import LeakageError, check_classifier_split, e1_closed_set
+
+    with pytest.raises(LeakageError, match="no 'split'"):
+        check_classifier_split({}, "a")
+    with pytest.raises(LeakageError):
+        check_classifier_split(None, "a")
+
+    class _Clf:
+        meta = {"class_names": ["x"]}
+        class_names = ["x"]
+
+    class _Rec:
+        classifier = _Clf()
+
+    out = e1_closed_set(_Rec(), [], "E1b", "a", "primary")
+    assert out["run"] is False and "refused" in out["reason"] and "split" in out["leakage"]
+
+
+class _Data:
+    def __init__(self, include, assign, islrtc=()):
+        self.include, self.assign, self.extra, self.extra_assign = include, assign, [], {}
+        self.islrtc = list(islrtc)
+        self.dedup = ms.DedupIndex()
+
+
+def test_pretraining_guard_is_computed_from_the_clip_list(tmp_path):
+    from app.isl.evaluation.runners import pretraining_guard
+
+    mk = lambda i, s="include": Clip(i, s, "w", "c", None, None, Path("/x"))  # noqa: E731
+    data = _Data([mk("inc/a"), mk("inc/b"), mk("inc/c")], {"inc/a": "train", "inc/b": "test", "inc/c": "val"},
+                 islrtc=[mk("islrtc/A/A.mp4", "islrtc")])
+    data.dedup.union("inc/b", "wslp/copy-of-b", "same_video")
+    work = tmp_path / "w"
+    work.mkdir()
+    assert pretraining_guard(work, data)["excludes_eval_clips"] is None  # no pre-training at all
+    (work / "pretrained_encoder.pt").write_bytes(b"x")
+    g = pretraining_guard(work, data)
+    assert g["excludes_eval_clips"] is None and "missing" in g["reason"]
+    ms.write_pretrain_list(work, [mk("inc/a"), mk("islrtc/A/A.mp4", "islrtc"), mk("glosl/1", "glosl")])
+    g = pretraining_guard(work, data)
+    assert g["excludes_eval_clips"] is True and g["overlap"] == 0 and g["islrtc_clips_seen_unlabelled"] == 1
+    # a duplicate of a test clip (other source, other id) in the list is caught through the duplicate group
+    ms.write_pretrain_list(work, [mk("wslp/copy-of-b", "wslp")], resume=True)
+    g = pretraining_guard(work, data)
+    assert g["excludes_eval_clips"] is False and g["overlap"] == 1 and "wslp/copy-of-b" in g["overlap_examples"]
+    assert len(ms.read_pretrain_list(work)) == 4  # resume keeps the union
+
+
+# --------------------------------------------------------------------------------------------- 4. profiles
+
+def test_profiles_are_the_multisource_lists_and_adapters_are_registered():
+    from app.isl import profiles
+    from app.isl.data import sources
+    from app.isl.data.pose_sources import PROFILE_SOURCES
+    from app.isl.data.video_sources.catalog import SOURCES, profile_sources
+
+    for name, prof in profiles.PROFILES.items():
+        assert prof.sources == ms.WORD_SOURCES[name] and prof.pretraining == ms.PRETRAIN_SOURCES[name]
+        assert prof.letters == ms.LETTER_SOURCES[name]
+        assert "wlasl" not in prof.all_sources() and "isl_csltr_words" not in prof.all_sources()
+    assert {"wlasl", "isl_csltr_words"} <= set(profiles.NOT_USED)
+    reg = sources.all_adapters()
+    assert {"glosl", "isl500", "openhands_raw", "openhands_fs", "wslp", "isl_csltr", "mendeley_static"} <= set(reg)
+    fac = ms._factories()
+    for prof in profiles.PROFILES.values():
+        for n in prof.all_sources():
+            assert n in fac, n  # every listed source has an adapter (wslp_unlabelled = filtered WSLP view)
+    # commercial-safe lists agree with the data agents' own profile tables
+    com = set(profiles.PROFILES["commercial-safe"].all_sources())
+    video = {s.manifest_name for s in SOURCES.values()}
+    assert com & video <= set(profile_sources("commercial-safe"))
+    assert not com & set(PROFILE_SOURCES["research"]["sources"] + PROFILE_SOURCES["research"]["pretraining"])
+
+
+def test_pack_licences_name_only_contributing_sources(tmp_path):
+    from app.isl.training.pipeline import pack_licences
+
+    work = tmp_path / "w"
+    work.mkdir()
+    assert [x["source"] for x in pack_licences(work)] == ["include", "islrtc"]  # phase-1 build
+    import argparse  # noqa: F401  (cli helper below)
+
+    from app.isl.cli import _record_sources
+
+    _record_sources(work, {"cislr": {"available": False}, "isign": {"available": False},
+                           "isl500": {"available": True, "clips": 900, "licence": "research-only", "commercial": False},
+                           "wslp": {"available": True, "clips": 50, "licence": "CC-BY-NC-ND-4.0", "commercial": False}},
+                    "words", {"isl500": 700, "wslp": 0})
+    _record_sources(work, {"glosl": {"available": True, "clips": 100, "licence": "CC-BY-NC-4.0", "commercial": False}},
+                    "pretraining", {"glosl": 40})
+    lic = {x["source"]: x for x in pack_licences(work)}
+    assert set(lic) == {"include", "islrtc", "isl500", "glosl"}  # no cislr / isign / wslp (0 clips used)
+    assert lic["isl500"]["clips"] == {"words": 700} and lic["glosl"]["role"] == "pretraining"
+    assert lic["include"]["role"] == "vocabulary"
+
+
+# --------------------------------------------------------------------------------------------- 5. Sign Library dedupe
+
+def _walk(rng, n=80):
+    """(n, 14) smooth random pose trajectories (like signing)."""
+    steps = rng.normal(0, 0.01, (n, 14)).cumsum(0)  # ~0.04 between frames, like the real 12.5 fps data
+    return (0.5 + 0.1 * np.sin(np.linspace(0, 6, n))[:, None] + steps).astype(np.float32)
+
+
+def test_frame_matcher_finds_recut_copies_and_not_other_videos():
+    rng = np.random.default_rng(0)
+    refs = [(f"r{i}", f"v{i // 2}", _walk(rng)) for i in range(20)]
+    idx = pd.FrameIndex([(a, v) for a, _, v in refs])
+    copy = pd._resample_half(refs[3][2][10:50], rng, 0.002)
+    rid, sc = idx.match(copy)
+    assert rid == "r3" and sc > 0.6
+    other = _walk(np.random.default_rng(99))
+    assert idx.match(other)[1] < 0.2
+    cal = pd.calibrate(refs, n=60, seed=1)
+    assert cal["reliable"] and cal["recall"] >= 0.95 and cal["false_positive_rate"] <= 0.01
+
+
+def test_apply_dedup_drops_sign_library_without_a_reliable_check():
+    mk = lambda i, ch: Clip(i, "openhands_raw", "", None, None, ch, Path("/x"))  # noqa: E731
+    clips = [mk("a", "Sign_Library"), mk("b", "Sign_Library"), mk("c", "NIOS"), Clip("g", "glosl", "", None, None,
+                                                                                      None, Path("/y"))]
+    keep, rep = pd.apply_dedup(clips, None)
+    assert [c.clip_id for c in keep] == ["c", "g"] and rep["dropped"] == 2
+    keep, _ = pd.apply_dedup(clips, {"reliable": True, "drop_ids": ["b"], "drop_channels": []})
+    assert [c.clip_id for c in keep] == ["a", "c", "g"]
+    keep, _ = pd.apply_dedup(clips, {"reliable": False, "drop_ids": [], "drop_channels": ["Sign_Library"]})
+    assert [c.clip_id for c in keep] == ["c", "g"]
+
+
+def test_dedupe_sign_library_end_to_end(tmp_path):
+    from app.landmarks.raw import RawSequence
+
+    rng = np.random.default_rng(3)
+
+    def save(name, vec):
+        n = len(vec)
+        pose = np.zeros((n, 33, 4), np.float32)
+        pose[:, list(pd.POSE_POINTS), :2] = vec.reshape(n, len(pd.POSE_POINTS), 2)
+        pose[:, :, 3] = 1.0
+        raw = RawSequence(pose, np.zeros((n, 21, 3), np.float32), np.zeros((n, 21, 3), np.float32),
+                          np.zeros((n, 478, 3), np.float32), np.arange(n) * 80.0, 1920, 1080)
+        p = tmp_path / f"{name}.npz"
+        raw.save(p)
+        return p
+
+    one, other = [], []
+    vids = [_walk(rng, 120) for _ in range(12)]
+    for i, v in enumerate(vids):
+        for j in range(2):
+            p = save(f"m{i}_{j}", v[60 * j:60 * j + 60])
+            one.append(Clip(f"sl/m{i}_{j}", "openhands_raw", "", None, None, "Sign_Library", p, group=f"v{i}",
+                            quality={"member": "Sign-Library/sign_library_1_min_splits.h5"}))
+    dup = save("dup", pd._resample_half(vids[4][20:60], rng, 0.002))
+    new = save("new", _walk(np.random.default_rng(77), 60))
+    for i, p in (("sl/dup", dup), ("sl/new", new)):
+        other.append(Clip(i, "openhands_raw", "", None, None, "Sign_Library", p, group=i,
+                          quality={"member": "Sign-Library/sign_library_sub_based.h5"}))
+    ev = save("eval", pd._resample_half(vids[7][62:100], rng, 0.002))  # an "evaluation clip" inside chunk m7_1
+    res = pd.dedupe_sign_library(one + other, [Clip("include/x", "include", "w", "c", None, None, ev)], n_calib=60)
+    assert res.reliable, res.report["calibration"]
+    assert "sl/dup" in res.drop_ids and "sl/new" not in res.drop_ids and "sl/m7_1" in res.drop_ids
+    assert res.report["n_eval_matches"] == 1
+
+
+# --------------------------------------------------------------------------------------------- 6. trimming
+
+def test_trim_uses_learned_model_and_prefers_reextracted_islrtc_files(tmp_path, monkeypatch):
+    from app.isl.cli import main
+    from app.isl.data.boundary import _model
+    from app.isl.data.manifest import read_manifest
+    from app.isl.data.trim_learned import MODEL_VERSION, save
+    from app.isl.training.common import load_isl_data
+    from app.isl.vocab.build import VocabIndex
+    from app.landmarks.raw import RawSequence
+
+    w = make_world(tmp_path)
+    P = w["paths"]
+    model = tmp_path / "trim_boundary.pt"
+    save(_model(), model, {"note": "untrained, test only"})
+    assert main(["--root", str(P.root), "trim", "--learned-model", str(model)]) == 0
+    trims = {r["id"]: r for r in read_manifest(P.trim_sidecar, only_ok=False)}
+    assert {r["trim_version"] for r in trims.values()} == {f"trim-2+{MODEL_VERSION}"}
+    # rules only (no model): every clip is redone and says so
+    assert main(["--root", str(P.root), "trim", "--learned-model", "none"]) == 0
+    trims = {r["id"]: r for r in read_manifest(P.trim_sidecar, only_ok=False)}
+    assert {r["trim_version"] for r in trims.values()} == {"trim-2"}
+    # a re-extracted (recut) file replaces the original; it is re-trimmed on the new file
+    cid = "islrtc/A/Apple.mp4"
+    src = RawSequence.load(P.resolve(trims[cid]["landmarks"]))
+    (P.landmarks / "islrtc_recut").mkdir()
+    src.save(P.landmarks / "islrtc_recut" / "A__Apple.npz")
+    write_manifest(P.manifest("islrtc_recut"), [{"id": cid, "path": "data/isl/landmarks/islrtc_recut/A__Apple.npz",
+                                                 "n_frames": len(src), "hands_frac": 0.9, "fps": 12.0, "stop": "eof",
+                                                 "ok": True, "recut_of": "islrtc"}])
+    assert main(["--root", str(P.root), "trim", "--learned-model", "none"]) == 0
+    trims = {r["id"]: r for r in read_manifest(P.trim_sidecar, only_ok=False)}
+    assert trims[cid]["landmarks"].endswith("islrtc_recut/A__Apple.npz") and trims[cid]["recut"]
+    # a truncated clip without a re-extraction is kept out of training; the recut one is used from its new file
+    rows = [{**r, "method": "truncated"} if r["id"] in (cid, "islrtc/B/Book.mp4") else r for r in trims.values()]
+    write_manifest(P.trim_sidecar, rows)
+    vocab = VocabIndex.load(w["vocab"])
+    data = load_isl_data(P, vocab, "commercial-safe", w["split"])
+    ids = {c.clip_id: c for c in data.islrtc}
+    assert "islrtc/B/Book.mp4" not in ids and cid not in ids  # recut clip whose trim on the new file is truncated
+    assert data.islrtc_stats["truncated_excluded"] == 2
+    rows = [{**r, "method": "rest"} if r["id"] == cid else r for r in rows]
+    write_manifest(P.trim_sidecar, rows)
+    data = load_isl_data(P, vocab, "commercial-safe", w["split"])
+    ids = {c.clip_id: c for c in data.islrtc}
+    assert ids[cid].path.name == "A__Apple.npz" and "islrtc_recut" in str(ids[cid].path) and ids[cid].quality["recut"]
+    assert data.summary()["islrtc_reextraction"]["recut_used"] == 1
+
+
+# --------------------------------------------------------------------------------------------- 8. My signs fusion
+
+def test_neutral_user_classifier_term():
+    cls = np.log(np.array([[0.7, 0.2, 0.1]] * 3, np.float32))
+    inp = FusionInputs(cls_logp=cls, cls_ids=["a", "b", "c"], ret=np.full((3, 3), 0.5, np.float32),
+                       ret_ids=["a", "b", "c"], user=np.full((3, 1), 0.5, np.float32), user_ids=["mysign:u"])
+    pen = fuse(inp, FusionParams(beta=0.0, gamma=0.0))
+    neu = fuse(inp, FusionParams(beta=0.0, gamma=0.0, user_cls_mode="neutral"))
+    p_pen = dict(zip(pen.keys, pen.probs))["mysign:u"]
+    p_neu = dict(zip(neu.keys, neu.probs))["mysign:u"]
+    assert p_pen < 0.01 and p_neu == pytest.approx(dict(zip(neu.keys, neu.probs))["a"], rel=1e-5)
+    assert FusionParams.from_json(FusionParams(user_cls_mode="neutral").to_json()).user_cls_mode == "neutral"
+    with pytest.raises(ValueError):
+        FusionParams(user_cls_mode="bonus")
+
+
+class _FakeRec:
+    """A recogniser stand-in for E4: retrieval evidence close to the clip's own class, a classifier that is
+    unsure between two words."""
+
+    def __init__(self):
+        from app.isl.training.common import ISL_FEATURES
+
+        self.feature_config = ISL_FEATURES
+        self.fusion = FusionParams()
+        self.encoder = None
+
+    def evidence(self, f, use_my_signs=False):
+        return FusionInputs(cls_logp=np.log(np.full((len(f), 2), 0.5, np.float32)), cls_ids=["x", "y"]), {}
+
+
+def test_fit_fusion_keeps_penalty_without_enough_validation_data():
+    from app.isl.training.fit_fusion import choose_user_mode
+
+    p, rep = choose_user_mode(_FakeRec(), [], FusionParams())
+    assert p.user_cls_mode == "penalty" and "insufficient" in rep["reason"]
+
+
+def test_fit_fusion_chooses_user_mode_on_validation_e4(monkeypatch):
+    from app.isl.training import fit_fusion as ff
+
+    calls = []
+
+    def fake_e4(rec, clips, ks, params, cache, **kw):
+        calls.append(params.user_cls_mode)
+        good = params.user_cls_mode == "neutral"
+        return {"run": True, "by_k": {"k3": {"n": 40, "n_groups": 3, "top1_with_enrolment": 0.9 if good else 0.6,
+                                             "gain": 0.3, "user_sign_false_accept_rate": 0.02, "n_other_words": 50}}}
+
+    import app.isl.evaluation.runners as runners
+
+    monkeypatch.setattr(runners, "e4_my_signs", fake_e4)
+    p, rep = ff.choose_user_mode(None, [], FusionParams())
+    assert p.user_cls_mode == "neutral" and rep["k"] == 3 and set(calls) == {"penalty", "neutral"}
+
+    def worse_fa(rec, clips, ks, params, cache, **kw):
+        r = fake_e4(rec, clips, ks, params, cache)
+        if params.user_cls_mode == "neutral":
+            r["by_k"]["k3"]["user_sign_false_accept_rate"] = 0.2
+        return r
+
+    monkeypatch.setattr(runners, "e4_my_signs", worse_fa)
+    p, rep = ff.choose_user_mode(None, [], FusionParams())
+    assert p.user_cls_mode == "penalty" and rep["false_accept_increase_neutral"] > 0.1
