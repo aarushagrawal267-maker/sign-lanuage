@@ -278,7 +278,11 @@ export default function LivePage() {
 
           <Card title="Model">
             {live.modelAvailable === false ? (
-              <p className="text-sm text-fg-2">No active model. <Link className="text-accent underline underline-offset-2" to="/lab">Train one in the Model Laboratory</Link> and activate it.</p>
+              live.modelMessage && !live.modelMessage.startsWith("No active model") ? (
+                <p className="text-sm text-fg-2">{live.modelMessage}</p>
+              ) : (
+                <p className="text-sm text-fg-2">No active model. <Link className="text-accent underline underline-offset-2" to="/lab">Train one in the Model Laboratory</Link> and activate it.</p>
+              )
             ) : model ? (
               <div className="flex flex-col gap-1.5 text-sm">
                 <div className="flex items-center justify-between gap-2"><span className="truncate text-fg">{model.name}</span>{model.is_synthetic && <Badge tone="warn">synthetic</Badge>}</div>

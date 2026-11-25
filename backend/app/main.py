@@ -20,6 +20,7 @@ from app.core.jobs import recover_stale_jobs
 from app.db.session import get_engine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("app.main")
 
 DESCRIPTION = """
 Educational and research implementation of **isolated, word-level** ASL sign
@@ -41,7 +42,25 @@ async def lifespan(_: FastAPI):
     from app.models.bundled import ensure_bundled_model
 
     ensure_bundled_model()
+    _preload_active_model()
     yield
+
+
+def _preload_active_model() -> None:
+    """Load the active model once at start-up so the first live connection does not wait for it,
+    and so a missing or broken checkpoint is reported in the server log straight away. Never raises."""
+    from app.inference import registry
+
+    try:
+        predictor, info, problem = registry.load_active()
+    except Exception:  # noqa: BLE001 - e.g. an unreadable database; the API reports it per request
+        log.exception("could not preload the active model")
+        return
+    if predictor is None:
+        log.warning("live recognition is unavailable: %s", problem)
+    else:
+        log.info("active model ready: %s (experiment %s, %d classes)", info["name"], info["experiment_id"],
+                 info["num_classes"])
 
 
 def create_app() -> FastAPI:

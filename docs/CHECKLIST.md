@@ -9,7 +9,7 @@ Verification environment for this build: Linux container (4 CPU cores, no GPU), 
 | # | Deliverable | Status | Evidence |
 |---|---|---|---|
 | 1 | Frontend | ✅ | 10 pages, typecheck + production build pass, Playwright renders every page without console errors |
-| 2 | Backend | ✅ | FastAPI, docs at `/docs`, 41 pytest tests |
+| 2 | Backend | ✅ | FastAPI, docs at `/docs`, 45 pytest tests |
 | 3 | WLASL100 acquisition pipeline | ✅/🟡 | YouTube/HTTP/ASLPro paths; failures recorded (verified with real URLs: 1 valid, 5 blocked-host failures recorded). Full download not run here (network) |
 | 4 | Dataset inventory | ✅ | per-gloss inventory API/page/CSV; verified on the real annotation file |
 | 5 | Video validation | ✅ | decode check, measured fps/resolution/duration/hash; tests with valid + corrupt files |
@@ -32,7 +32,7 @@ Verification environment for this build: Linux container (4 CPU cores, no GPU), 
 | 24 | Experiment history | ✅ | full configs, CSV export |
 | 25 | SQLite database | ✅ | |
 | 26 | API documentation | ✅ | `/docs` (HTTP 200 verified) |
-| 27 | Automated tests | ✅ | pytest 41 (incl. MediaPipe extractor tests when the model and libEGL are present), Vitest 9 (8 + the TS-vs-Python parity test, which runs only when `export_static.py` has written the real-clip fixture), Playwright 2; GitHub Actions CI in `.github/workflows/ci.yml` |
+| 27 | Automated tests | ✅ | pytest 45 (incl. MediaPipe extractor tests when the model and libEGL are present), Vitest 9 (8 + the TS-vs-Python parity test, which runs only when `export_static.py` has written the real-clip fixture), Playwright 2; GitHub Actions CI in `.github/workflows/ci.yml` |
 | 28–30 | setup / start / stop scripts | ✅/🟡 | all three run successfully under PowerShell 7 (Linux); Windows-only branches (`taskkill`, `Scripts\python.exe`, `npm.cmd`, CUDA wheel) need a run on Windows |
 | 31–36 | README, dataset docs, references, licensing, limitations, reproducibility | ✅ | `README.md`, `docs/` |
 | 37 | Works from a fresh clone without training | ✅ | bundled pretrained model auto-registered + activated on first backend start (`app/models/bundled.py`, `tests/test_bundled_model.py`); `python -m app.cli import-model` |

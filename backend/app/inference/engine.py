@@ -105,7 +105,10 @@ class RecognitionEngine:
         return self.predictor.recommended_threshold if self.predictor else 0.6
 
     def set_size(self, width: int, height: int) -> None:
-        self.width, self.height = int(width), int(height)
+        w, h = int(width), int(height)
+        if w <= 0 or h <= 0:  # the aspect correction in the features needs a real frame size
+            raise ValueError(f"width and height must be positive, got {w}x{h}")
+        self.width, self.height = w, h
 
     # --------------------------------------------------------------- helpers
     def _raw(self, frames: list[_Frame]) -> RawSequence:
