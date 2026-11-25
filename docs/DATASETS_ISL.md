@@ -636,6 +636,22 @@ points are safe. No existing `*.index.json` listing was made with loaded points,
 
 So OpenHands raw no longer limits research readiness; the video queue does (about 08:00-11:30 UTC, 26 Nov).
 
+**Status at 23:40 UTC (Reality Checker, read-only; ISL_DESIGN 15.11 "Live verification").** The NewzHook listing
+**ended 23:11:05 UTC**: 30,604 datasets (15,302 chunks) in 2,806 s, 61.27 GB fetched, `index.json` written. So a
+restart of PID 861 no longer needs the `.points` file moved aside. The fix (`3f2ad35`) was checked on the real
+member with a **copy** of the saved points (1,498 points). The same probe reading early pages after far jumps gave
+0 of 160 wrong reads on the new code and 158 of 160 wrong on the old code. The live `.points` file has the same
+SHA-256 before and after.
+
+| Measure (23:18-23:40 UTC) | Value |
+|---|---|
+| Forward pass | 31.49 GB inflated at 23:20:52 -> **94.24 of 159.48 GB at 23:39:19** (56.7 MB/s inflated, 5.1-5.3 chunks/s, 20.4-21.4 MB/s downloaded) |
+| Manifest | 73,021 rows, **all `ok`** (Sign Library 9,956, NIOS 1,936, ISH News 45,784, MBM 6,069, NewzHook growing; NewzHook hands_frac median 0.91) |
+| RSS | 1.21 -> 1.33 -> 1.26 GB, peak 1.39 GB, guard 1.5 GB. A guard respawn near the end would load the fixed code and resume (safe) |
+| Landmarks `openhands_raw` | **18.57 GB** (NewzHook 7.58 GB so far, 80 MB per inflated GB) -> about **23.7 GB** at the end, under the 26 GB budget |
+| Free disk | 22.47 GB now -> about 17 GB when the job ends; 0 deleted-but-open files |
+| ETA (estimate) | forward pass ends **about 23:58-00:10 UTC, 26 Nov**; NewzHook is the last member, so the job then ends normally (`all members done`) |
+
 ### 3.8 HF alphabet sets in full, `hfrow` fetch rules, OpenHands header errors (Data Engineer, 25 Nov 2026 22:10-22:40 UTC) <!-- hf-full -->
 
 **All rows.** `catalog.py` now has `per_class: None` for `hf_hemg_alphabet` and `hf_akrit_alphabet`:

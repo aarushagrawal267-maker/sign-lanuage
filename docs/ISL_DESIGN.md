@@ -2478,6 +2478,9 @@ Frontend: `npm run typecheck` pass, `npx vitest run` **81 passed / 1 skipped**, 
    command from the repository root (`nohup nice -n 10 .venv/bin/python scripts/ingest_isl_pose.py openhands-raw
    --workers 12 --budget-gb 26 --min-free-gb 8 >> data/isl/logs/ingest_pose_openhands_raw.log 2>&1 &`). After the
    listing (`<member>.index.json` written), a restart is safe.
+   **Done (23:40 UTC, 15.11 "Live verification"):** the NewzHook listing ended 23:11:05 (30,604 datasets, index
+   written), so a restart of PID 861 no longer needs the `.points` file moved aside; the code on disk (`3f2ad35`)
+   is also verified against the real member's saved points.
 2. Ready check: `scripts/phase2_train.sh --profile commercial-safe --check-only; echo $?` must print 0 (15.6 command 1).
 3. `mv artifacts/isl/commercial-safe artifacts/isl/commercial-safe.phase1_1157` (still the phase-1 smoke folder of
    11:57: classifier, encoder, index, results.json, smoke_report.json).
@@ -2516,3 +2519,55 @@ later `cli trim` re-trims those clips and E8 says `mismatch` (correct, but a loo
 `trim_bench run` writing the shared sidecar has the same effect once. (3) A sidecar record whose id later leaves
 `_islrtc_records` (n_frames 0 on both the original and the recut row) is never re-trimmed, so its old version /
 missing hash would keep E8 at `mismatch` (0 such records now; the version check had the same gap before).
+
+**Live verification (Reality Checker, 25 Nov 2026, 23:15-23:45 UTC, at `9a27bf9`; read-only, no job touched).**
+Default verdict NEEDS WORK; each line below is a measurement unless marked "estimate".
+
+| Check | Evidence | Result |
+|---|---|---|
+| Synthetic repro (`probe_meta.py`, 12 MB member, 20 persisted points) | fixed code (working tree = `9a27bf9`, no diff in `pose_sources/`) vs `6b54c28` exported with `git archive` into scratch | **0 / 7** wrong reads fixed, **2 / 7** old: the probe still catches the bug, and the fix removes it |
+| Real NewzHook member, byte level: the job's saved `.points` file **copied** to scratch (1,498 points, up to 159.39 of 159.48 GB); read byte 0, then jump to 150 / 95 / 40 / 120 GB, and after each jump do 40 random reads (512 B-4 KB) in the first 48 MB, compared with a fresh stream without points | same script, fixed vs old code | **fixed: 0 of 160 wrong** (71 restores, 1.09 GB fetched); **old: 158 of 160 wrong** (59,583 pages filed wrongly). This is the production bug, reproduced on the real member and gone with the fix |
+| Real member, h5py: 30 `links.get_info` lookups (two highest addresses first, then the two lowest, then 26 at random), compared with the job's own `index.json` (listed without points) | fixed code | 30 / 30 addresses equal, 0 errors, 1.18 GB fetched. The old code also passes this test, so it only backs up the byte-level test and does not tell the versions apart |
+| Real member, h5py `get_num_objs("keypoints")`: the full B-tree walk that crashed at 22:06, 4 min after start, with points loaded | fixed code | **no error over 14 min and 8 GB fetched**; stopped by the probe's own 8 GB download cap (it exited with 139 because the cap's exit was raised inside an h5py callback), so the walk was not finished. The job's listing ended without points anyway (below) |
+| Live `.points` file untouched | SHA-256 `ad5fe2d5...` before and after, size 20,223,146, mtime 23:10:58 | unchanged |
+| OpenHands raw PID 861 | log, `/proc/861`, manifest, `du`, `df` | NewzHook listing **ended 23:11:05** (30,604 datasets = 15,302 chunks, 2,806 s, 61.27 GB fetched; `index.json` written). Forward pass 31.49 GB inflated at 23:20:52 -> **94.24 of 159.48 GB at 23:39:19 = 56.7 MB/s inflated**, 5.1-5.3 chunks/s, 20.4-21.4 MB/s downloaded, no slowdown while the probes ran. Manifest 73,021 rows, **every row `ok`** (NewzHook 2,264 at 23:18, hands_frac median 0.91). RSS 1.21 GB (23:18), 1.33 GB (23:39), 1.26 GB (23:40), peak 1.39 GB, against the 1.5 GB guard: a guard respawn (`execv`) is possible near the end. It would load `3f2ad35` and resume from `headers.jsonl` with the index already there, so it is safe and costs only minutes. Landmarks `openhands_raw` 18.57 GB (NewzHook 7.58 GB so far = 80 MB per inflated GB). Free disk 22.47 GB; 0 deleted-but-open files |
+| OpenHands ETA (estimate) | 65.2 GB left at 56.7 MB/s | forward pass ends **about 23:58-00:10 UTC, 26 Nov**; NewzHook is the last member, so the job then logs `all members done`. Landmarks about **23.7 GB** (under the 26 GB budget), free disk about 17 GB |
+| `mendeley_static` item list | `mendeley_static_items.json` (22:54:18) | **102,470** items, all ids unique, 44 glosses; the 8 ingested rows are all in it. **Queue position:** `isl_queue.sh` (17314) is still on `wslp` (3,271 / 4,398 at 23:32), then `isl_fingerspelling` (4 / 1,308), then `mendeley_static` |
+| Data guard (`scripts/phase2_train.sh --profile X --check-only`, 23:20 UTC) | outputs | **commercial-safe exit 4**, blocked only by what it reads: islrtc (6785), the queue (17314, "mendeley_static, isl_csltr, mendeley_agri, mendeley_emergency"), islrtc-recut (20244); islrtc 9,093 / 13,665, mendeley_emergency 0 / 412 (3 to retry), mendeley_agri 2 / 78, isl_csltr 2 / 687, mendeley_static 8 / **102,470**. PID 861 and the WSLP chunk 20872 are not listed. **research exit 4**: the above plus 861, 20872, wslp 3,163 / 4,398, wslp_unlabelled 3 / 635, isl_fingerspelling 4 / 1,308, hf_hemg 0 / 42,745, hf_akrit 0 / 10,752, openhands_raw 66,644 / ? |
+| Backend suite | `cd backend && SLR_TORCH_THREADS=2 nice -n 10 ../.venv/bin/python -m pytest -q`, clean tree at `9a27bf9` | **539 passed** (71 s) |
+
+**Rates and readiness ETAs (estimates from these samples).** ISLRTC 8,607 (22:42) -> 9,093 (23:20) -> 9,243 (23:32) =
+12.3-12.8 / min (15-16 / min earlier, now under load 17-18). 4,422 left, so it ends **about 04:10-05:30 UTC**, faster once
+OpenHands stops at about 00:00; recut's final scan follows 30-60 min later. WSLP 2,820 (22:40) -> 3,271 (23:32) = 8.6-8.9 / min,
+so it ends **about 01:40**. ISL-Fingerspelling: 1,304 x 8.8 s on 1 worker, **about 04:50**. `mendeley_static`: 102,462
+photos at 0.30-0.41 s (3 workers once islrtc ends; the single fetch thread limits it, DATASETS 3.9) take 8.5-11.7 h, so it
+finishes **about 13:20-16:30**. CSLTR + agriculture + emergency (1,173 videos) take 0.8-2.1 h more, so
+**commercial-safe data is ready about 14:00-19:00 UTC, 26 Nov**. Research also needs CSLTR words, the HF sets
+(1.2-2.5 h) and WSLP unlabelled, so its data is ready **about 26 Nov 16:00 - 27 Nov 00:30 UTC**. Research starts
+after the commercial-safe run (13-24 h) in any case, so in practice **27 Nov about 03:00-19:00 UTC**.
+
+**Verdicts.**
+* **Commercial-safe: NEEDS WORK.** The code is ready (the guard refuses only on data it reads, the suite passes, and
+  the OpenHands fix is verified on the real member). The data is not complete: estimate 26 Nov 14:00-19:00 UTC.
+  There is also **one owner decision before anything trained by this profile is shipped**: `mendeley_static`
+  (102,470 photos; the **only** letter source of this profile, `LETTER_SOURCES` in `profiles.py`) has a licence field of CC BY 4.0 but a description
+  that says "research purposes only ... any other use strictly prohibited", and it shows faces, including children's
+  (DATASETS 3.9). The profile still lists it as commercial-safe. Recommendation: training can go ahead, but the
+  commercial-safe letter model should not ship until this is settled. Two known model-quality gaps remain open: the letter temperature is fitted on a
+  random 10 % of near-duplicate photos, and 3 photo pairs carry two labels (above).
+* **Research: NEEDS WORK.** The code is ready. Its data waits on the OpenHands job (estimate: ends about 00:00-00:10,
+  normal end) and on the whole queue (estimate: 26 Nov 16:00 - 27 Nov 00:30). It runs after the commercial-safe run.
+
+**Commands for the main session** (from the repository root; none of these is needed before the ETAs above).
+1. Leave PID 861 alone; check its end with `grep "all members done" data/isl/logs/ingest_pose_openhands_raw.log`.
+   If it stops early for any reason, restart it with the same command (15.10 item 1). The `.points` file can now stay
+   where it is.
+2. Ready check, repeat until it prints 0: `scripts/phase2_train.sh --profile commercial-safe --check-only; echo $?`.
+3. The owner decides on the `mendeley_static` licence (keep it in commercial-safe, or move it to research-only in
+   `backend/app/isl/profiles.py` before the run, which also drops it from this profile's data guard).
+4. `mv artifacts/isl/commercial-safe artifacts/isl/commercial-safe.phase1_1157`, then
+   `nohup scripts/phase2_train.sh --profile commercial-safe --threads 4 >> data/isl/logs/phase2_driver.out 2>&1 &`.
+5. After that run finishes: `scripts/phase2_train.sh --profile research --check-only; echo $?` must print 0, then
+   `nohup scripts/phase2_train.sh --profile research --threads 4 >> data/isl/logs/phase2_driver.out 2>&1 &`.
+6. After each run, `artifacts/isl/<profile>/eval/report.md` must not say PARTIAL DATA or SMOKE, and its trim-eval
+   line must say `ok`.
