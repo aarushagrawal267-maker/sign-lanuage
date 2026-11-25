@@ -30,3 +30,27 @@ frontend/public/ort/
 frontend/public/static-data/
 frontend/dist-static/
 frontend/src/static/__fixtures__/
+
+# Secrets and local credentials (pydantic-settings reads .env from the working dir)
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.netrc
+.huggingface/
+
+# Local databases and data dumps anywhere in the tree (default DB is data/app.db)
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
+*.dump
+
+# Other venv / dependency folder names
+venv/
+.venv*/
+node_modules/
