@@ -355,7 +355,9 @@ def run_islrtc(args) -> None:
     def downloader():
         for f in todo:
             url = f"https://huggingface.co/datasets/{HF_REPO}/resolve/main/{urllib.parse.quote(f['path'])}"
-            dest = Path(tempfile.mkstemp(prefix="islrtc_", suffix=Path(f["path"]).suffix, dir=tmp_root)[1])
+            fd, name = tempfile.mkstemp(prefix="islrtc_", suffix=Path(f["path"]).suffix, dir=tmp_root)
+            os.close(fd)  # curl writes by path; an open fd would keep deleted files' disk space allocated
+            dest = Path(name)
             try:
                 _download(url, dest)
                 q.put((f, dest))
