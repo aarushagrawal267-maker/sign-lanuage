@@ -37,7 +37,7 @@ running, partial data). Every number below says when and on how much data it was
 | User sign packs ("My signs") | user recordings as landmarks | chosen by the author at export (default CC BY 4.0) | per pack | never in global training | local |
 
 **What "commercial-safe" means.** The `commercial-safe` profile leaves out every dataset with a
-non-commercial licence (iSign, WLASL, CISLR). It still uses the ISLRTC dictionary, whose publisher allows research,
+non-commercial licence (iSign, WLASL, CISLR, and every other source marked "no" or "undecided" in the table above). It still uses the ISLRTC dictionary, whose publisher allows research,
 teaching and ISL technology but not resale or profiteering (ISLRTC FAQ Q.23, https://islrtc.nic.in/faq/, found by
 the dataset survey on 25 Nov 2026, `docs/ISL_DATASET_SURVEY.md` section 4). So a `commercial-safe` pack is fine for a
 free, non-profit app with acknowledgement; before any paid, subscription or ad-funded release, get written
@@ -85,6 +85,23 @@ claim and does not change this.
 | `research` | INCLUDE, ISLRTC, CISLR, iSign | WLASL, iSign | no |
 
 User data never enters a global model in either profile. The profile name is written into every derived artifact.
+
+**What phase-2 training actually uses** (checked 25 Nov 2026 16:40 UTC by the Reality Checker): the table above is
+still the content of `profiles.py`, which only the phase-1 commands read. The phase-2 commands (`--all-sources`,
+`scripts/phase2_train.sh`) take their source lists from `backend/app/isl/training/multisource.py`
+(`WORD_SOURCES`, `PRETRAIN_SOURCES`, `LETTER_SOURCES`) and check each adapter's own `commercial` flag as well:
+
+| Role | `commercial-safe` | `research` |
+|---|---|---|
+| labelled words | include, islrtc, mendeley_emergency, mendeley_agri | + isl500, wslp, cislr |
+| pre-training only | isl_csltr | + glosl, openhands_raw, isign, wslp_unlabelled |
+| letters | mendeley_static | + isl_fingerspelling, openhands_fs, hf_hemg_alphabet, hf_akrit_alphabet |
+
+Every adapter's flag was read on the real manifests: `commercial = True` only for include, islrtc, isl_csltr,
+isl_csltr_words, mendeley_emergency, mendeley_agri and mendeley_static; every NC / ND / research-only / no-licence /
+pending source is `False`, and asking for one in `commercial-safe` raises `LicenceError`. `isl_csltr_words` (1,036
+CC BY still frames) is ingested but is in neither profile's lists, so no model uses it yet. WLASL is listed in
+`profiles.py` but not in `multisource.py`. `profiles.py` should be brought in line with `multisource.py` (model owner).
 
 Pose-native sources (section 3.4) are not yet registered in `profiles.py` / `sources.ADAPTERS` (that is the model
 owner's call); `app.isl.data.pose_sources.PROFILE_SOURCES` says where they belong <!-- pose-sources -->: `research`
@@ -164,7 +181,8 @@ python scripts/ingest_isl_gated.py isign --mode stream           # fallback: par
   a compressed stream has to be re-read from the start (an `indexed_gzip` seek index would avoid that; not needed
   while the archive is a zip).
 * **iSign pose mapping** (`backend/app/isl/data/isign.py`, self-contained pose-format v0.1/v0.2 reader):
-  `POSE_LANDMARKS` (33, pixels) -> `pose` x/W, y/H, z/W, confidence as visibility; `LEFT_HAND_LANDMARKS` /
+  `POSE_LANDMARKS` (33, pixels) -> `pose` x/W, y/H, z as stored (raw MediaPipe z, like our extractor; the earlier
+  z/W scaling was removed in commit 514be97), confidence as visibility; `LEFT_HAND_LANDMARKS` /
   `RIGHT_HAND_LANDMARKS` (21) -> `left` / `right` (confidence 0 -> missing frame); `FACE_LANDMARKS` (468/478) ->
   the app's 20-point `FACE_IDX` subset; `POSE_WORLD_LANDMARKS` ignored; `t_ms` from the file fps;
   `extractor_version = "isign-pose-format"`. **Open check once data arrives**: whether the older Holistic used by
@@ -224,7 +242,8 @@ have only "is this word present" labels (no text) and stay out. WSLP `Shared_tas
 the iSign-style translation task: left for the pose-source owner. Cropped copies of the Mendeley videos (duplicates).
 
 **Throughput measured 25 Nov 2026** (1 worker at nice 10 while INCLUDE, ISLRTC and other agents' jobs kept the 4 CPUs
-busy, load average about 10; first few items of each source): WSLP 7.1 s/clip, ISL-Fingerspelling 8.9 s/segment
+busy, load average about 10; first few items of each source): WSLP 7.1 s/clip (11.7 s/clip at load 18-21 later
+that day, section 3.5), ISL-Fingerspelling 8.9 s/segment
 (every frame), emergency 3.9 s, agriculture 6.4 s, static photos 0.26 s + download, CSLTR word frames 0.3 s; CSLTR
 sentence videos not measured on the large 1080p files yet (estimate 20-40 s). Landmarks: about 110 KB per WSLP clip.
 
@@ -263,7 +282,9 @@ nice -n 10 .venv/bin/python scripts/ingest_isl_pose.py openhands-fs
 
 Conventions shared with `scripts/ingest_isl.py`: manifest `manifests/<source>.jsonl` (id, source, gloss, path relative
 to the repo, n_frames, fps, hands_frac, ok, error, secs, plus per-source fields), resumable (ok ids are skipped),
-failures retried on the next run. Every job holds a lock (`manifests/<source>.lock`) so a second copy exits, and
+failures retried on the next run. Every job started from the committed code holds a lock (`manifests/<source>.lock`) so a
+second copy exits (the `glosl` and `isl500` processes started at 14:45 UTC on 25 Nov ran pre-commit code and hold none:
+never start a second copy while they run), and
 stops cleanly (exit code 3) before free disk drops under 12 GB (`--min-free-gb`). Nothing is downloaded to disk except
 small CSV/JSON files and the 28 MB fingerspelling zip; pose files are converted in memory.
 
@@ -319,13 +340,39 @@ with our extractor once the CPU is free (estimate 8-10 CPU hours).
 
 **Jobs started 25 Nov 2026** (detached, `nice -n 10`, logs `data/isl/logs/ingest_pose_<source>.log`): `glosl`
 (14:45 UTC, 8 download threads, 8.5-12.6 clips/s depending on machine load, ETA about 19:00 UTC), `isl500` (14:45,
-6 threads, 4.5-5.8 clips/s, ETA about 20:10 UTC), `openhands-raw` (last restarted 15:02 with 12 read-ahead after stream fixes, 4-8 MB/s, budget
-12 GB, ETA about 21:30 UTC or earlier when the budget is reached; Zenodo allows 133 requests per minute and answers
-429 above that, which the reader waits out), `openhands-fs` (done 14:58: 172 of 172 clips ok). Rates measured on the
-first 3-7k items; every count in this section must be refreshed when the jobs finish.
+6 threads, 4.5-5.8 clips/s, ETA about 20:10 UTC), `openhands-raw` (restarted 15:02 with 12 read-ahead after stream
+fixes, 4-8 MB/s, budget 12 GB; Zenodo allows 133 requests per minute and answers 429 above that, which the reader
+waits out; **killed by the kernel OOM killer at 15:53** while streaming NIOS because the read cache stopped evicting
+after backward seeks, fixed in b4a29a2 and restarted at 16:26 UTC as PID 26183, which re-reads NIOS from the start
+before reaching new chunks), `openhands-fs` (done 14:58: 172 of 172 clips ok). Rates measured on the first 3-7k
+items; the measured status at 16:40 UTC is in section 3.5; every count must be refreshed when the jobs finish.
 
 **Not done / open**: none of these sources is registered in `profiles.py` yet; no model has been trained on them, so
 nothing here says anything about accuracy.
+
+### 3.5 Measured status of every ingestion job (Reality Checker, 25 Nov 2026 16:37-17:07 UTC)
+
+Measured from the processes (`ps`), manifest line counts taken every 5 minutes from 16:37 to 17:03, the logs and `df`,
+not from the agents' reports. Load average 18-21 on 4 CPUs the whole time; memory group of the jobs at 12-14 of 14.3 GB
+(6.0-6.7 GB resident, the rest page cache). No leaked deleted files in any job. Free disk under `data/isl`: 33.6 GB at 16:37, 32.3 GB
+at 16:48, 31.3 GB at 17:03 (an INCLUDE zip download sits in `data/isl/tmp` while it is converted).
+
+| Job (PID) | Done at 16:48 | Total | Rate (16:37-17:03) | Errors | ETA (UTC, estimate) |
+|---|---|---|---|---|---|
+| `ingest_isl.py include` (1632) | 2,895 rows, all ok | 4,292 | 6.7 videos/min | none | 20:00-21:30, 25 Nov |
+| `ingest_isl.py islrtc` (6785) | 5,239 rows, all ok | 13,665 | **5.7 videos/min** (17/min this morning on a quieter machine) | none | **04:00-08:00, 26 Nov** (needs 12-17/min after the pose jobs end; the 00:20-01:00 ETA given earlier assumed the morning rate) |
+| `ingest_isl_pose.py glosl` (21834, no lock) | 57,633 ok | 126,846 | 7.9 clips/s | none | about 19:20, 25 Nov |
+| `ingest_isl_pose.py isl500` (21835, no lock) | 36,589 rows (about 4,260 failed by design: no WholeBody file; 1 frame-count mismatch) | 86,756 | 4.6 clips/s | by design only | about 19:50, 25 Nov |
+| `ingest_isl_pose.py openhands-raw` (26183, lock) | 11,812 chunks (Sign Library 9,956 done; NIOS about 1,850 of 1,936) | until `landmarks/openhands_raw` = 12 GB (2.7 GB at 16:49) | 4.5 GB of landmarks per hour on NIOS, 0.7 GB/h on ISH News (from 17:00; 2.9 GB at 17:07) | OOM kill at 15:53 (fixed, see 3.4) | budget reached between about 20:00, 25 Nov and 08:00, 26 Nov (depends on Zenodo speed and chunk sizes) |
+| `isl_queue.sh` (18382) -> `ingest_isl_video.py run wslp` | 619 rows (4 HTTP 429 fetch failures, retried next chunk) | 4,398 | **11.7 s/clip on 1 worker** (7.1 s measured earlier on the first items) | 429 only | WSLP about 03:00-07:00, 26 Nov (1 worker until INCLUDE and ISLRTC both end) |
+| rest of the queue (fingerspelling, Mendeley static / CSLTR / agriculture / emergency, CSLTR words, HF alphabets, WSLP unlabelled) | a few probe rows each | see 3.3 | not started | - | about 6-10 h after WSLP on 3 workers: **about 14:00-18:00, 26 Nov** |
+| `ingest_isl_pose.py openhands-fs` | 172 of 172 ok | 172 | - | none | done 14:58, 25 Nov |
+| CISLR / iSign | gated (403) | - | - | - | the queue polls CISLR every 6 h for 14 days |
+
+Projected disk: GloSL about 6.5 GB in total (3.0 GB at 16:50), ISL500 about 2 GB, OpenHands up to the 12 GB budget, ISLRTC
+about 1.3 GB, WSLP about 0.6 GB, the queue's remaining sources about 1 GB: roughly 15 GB free when everything has
+finished, above the 10 GB floor but with less margin than the 39-41 GB seen at 15:08. About 8 GB more can be freed
+outside the repository (an old clean clone in `/tmp/rc_isl`, 2.5 GB, and agents' scratch virtualenvs, about 5.8 GB).
 
 
 ---
@@ -533,7 +580,8 @@ python -m app.isl.cli hindi --merge-local            # fold reviewed local Hindi
 
 ## 9. Open issues
 
-* INCLUDE and ISLRTC ingestion are partial (about 10% and 8%); every count above must be refreshed after ingestion.
+* INCLUDE and ISLRTC ingestion are partial (25 Nov 16:40 UTC: 2,839 of 4,292 and 5,191 of 13,665; section 3.5);
+  every count above must be refreshed after ingestion.
 * Pseudo-signers are estimates; INCLUDE signer identities are not published in the manifest or the split lists.
 * Trimming (trim-2): 91.7% within 300 ms on 96 by-eye labelled clips with a visible end, but 65% of plain `max_s`
   videos run straight from the sign into the explanation and cannot be labelled by eye; on synthetic versions of
@@ -548,8 +596,8 @@ python -m app.isl.cli hindi --merge-local            # fold reviewed local Hindi
   (`derived/isl500_links.jsonl`), so check sign forms against ISLRTC before mixing them into one class; frame aspect
   of GloSL / OpenHands is a hand-bone estimate (about +-10 %); Sign Library's two OpenHands files may overlap by up
   to 6.8 h (hash-named chunks in `sub_based`), deduplicate by content before pre-training.
-* `isign.pose_to_raw` divides z by the frame width, but pose-format's Holistic writer stores raw MediaPipe z (and our
-  extractor stores raw z): fix it (or use `pose_sources.posefmt.holistic_pose_to_raw`) before the iSign job runs.
+* Fixed in commit 514be97: `isign.pose_to_raw` used to divide z by the frame width; it now keeps raw MediaPipe z like
+  pose-format's Holistic writer and our extractor. No iSign data exists yet (still gated), so nothing needs re-running.
 
 ---
 

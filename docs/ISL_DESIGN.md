@@ -1901,3 +1901,70 @@ logs `data/isl/logs/phase2_<profile>_smoke.log`.
   lexicon is regenerated for them (`hindi --translate` on the pack vocabulary, then review).
 * The refreshed `vocabulary.jsonl` is written to the work folder; copy it to `models/packs/isl/` and commit it after
   review (the consistency test needs >= 95 % Hindi coverage).
+
+### 15.3 Reality check of the data expansion and the phase-2 driver (Reality Checker, 25 Nov 2026, 16:37-17:30 UTC)
+
+**Verdict: NEEDS WORK (small, can be done while ingestion runs).** The pipeline itself is real: a fresh smoke run of
+both profiles at commit `35b4be6` (old smoke outputs moved to `artifacts/isl/phase2-smoke.prev_1638/`, new private ISL
+roots built from today's manifests) completed all 18 steps, the commercial-safe pack lists only CC BY / GODL sources,
+the shared `data/isl/derived`, `data/isl/splits` and `artifacts/packs/isl` were not touched, and the backend suite passes
+(375 passed). Times: commercial-safe 16:38-16:55 UTC, research 16:55-17:07 UTC, 0 failed steps. The research run read
+the real pose sources (GloSL 61,196 clips, ISL500 35,809, OpenHands raw 11,786, WSLP 682 at that moment) and its E1c
+ran for the first time (ISL500 held-out signer, n = 7). All smoke numbers are near chance and labelled SMOKE RUN. Minor:
+the research `pack.json` licence list also names `cislr` and `isign`, which contributed no clips.
+What is not ready: the evaluation report can print a "95 % interval" over one or two signer groups, nothing
+stops a full (non-smoke) run from starting on partial data, and ingestion ends about 4-9 hours later than the agents reported.
+
+**Evidence, not claims** (measured with `ps`, manifest counts every 5 minutes for 26 minutes, logs, `df`, `dmesg`):
+
+* Running and growing: INCLUDE, ISLRTC, GloSL, ISL500, OpenHands raw (restarted 16:26 after a memory-group OOM kill at
+  15:53 that `dmesg` confirms: 6.9 GB resident), the video queue on WSLP. OpenHands fingerspelling finished (172/172).
+  No error lines except WSLP HTTP 429s (retried) and ISL500's hands-only clips (failed by design). Counts, rates, ETAs
+  and the disk projection are in `docs/DATASETS_ISL.md` section 3.5.
+* **ISLRTC is the critical path**: 5.7 videos/min under today's load (17/min this morning), 8,330 left at 17:03, so it
+  ends about **04:00-08:00 UTC on 26 Nov**, not 00:20-01:00. The video queue stays on 1 worker until INCLUDE and
+  ISLRTC have both ended, so WSLP ends about 03:00-07:00 and the rest of the queue (letters, Mendeley, CSLTR, HF
+  alphabets, WSLP unlabelled) about **14:00-18:00 UTC on 26 Nov**.
+* Memory: the jobs' memory group sat at 12-14 GB of its 14.3 GB limit (6.0-6.7 GB resident, the rest page cache); a
+  second leak like the OpenHands one would again kill a random job of the group, the protected INCLUDE / ISLRTC jobs
+  included.
+* Licences: every adapter's `commercial` flag read on the real manifests is right (DATASETS_ISL.md section 1, "What
+  phase-2 training actually uses"). `profiles.py` still lists only include / islrtc (+ cislr, isign, wlasl); training
+  reads `multisource.py`, which is correct. `isl_csltr_words` is ingested but used by no profile.
+* Leakage guards that exist and are tested: E1 refuses a classifier trained on another split; E2 refuses an encoder that
+  saw held-out concepts (synonyms included); pre-training excludes every evaluation clip and its whole duplicate group;
+  `build-pack` refuses non-commercial sources in a commercial-safe pack. Weak spots: `check_classifier_split` passes a
+  classifier whose meta has no `split`; `leakage_guards.pretraining_excludes_eval_clips` is written as a constant `True`,
+  not checked against the pre-trained checkpoint; the OpenHands Sign Library overlap (up to 6.8 h) is not deduplicated.
+
+**Must fix before the full run reaches its `evaluate` step** (training steps can start meanwhile; the driver resumes):
+
+1. **Intervals over too few groups.** `grouped_bootstrap` (`evaluation/report.py`) returns an interval whenever there are
+   2 or more groups. The fresh commercial-safe smoke report prints E1b "95 % CI 0.006-0.007 (cv pooled)" from **2**
+   signer groups. At full settings E1b pools 5 pseudo-signers, E1c holds out about 15 % of ISL500's 15 signers (2) and
+   of Mendeley's 26 people (about 4): such intervals look precise and are not. Return no interval (or mark it "not
+   reliable") below about 5 groups, and print the group count next to every interval in `report.md`.
+2. **No partial-data guard.** A non-smoke `scripts/phase2_train.sh` started while ingestion runs would label its report
+   "Measured on held-out data" and copy it into the pack. Add a check at the start of non-smoke runs (refuse while
+   `pgrep -f 'scripts/ingest_isl(_pose|_video)?\.py '` matches, unless `--allow-partial`, and then write
+   `partial_data: true` into `report.json` / `pack.json`). Do not make it wait for `isl_queue.sh` itself: after its list
+   the queue only polls CISLR every 6 h for 14 days.
+3. After ISLRTC ingestion ends, re-run `python -m app.isl.data.trim_bench run --learned ../artifacts/isl/trim_boundary.pt`
+   (from `backend/`) before the driver: the driver's `trim` step is rules-only, so about 8,800 ISLRTC clips would get
+   the rules-only end (section 7 of DATASETS_ISL.md).
+
+**Realistic timeline on this 4-CPU machine** (estimates; the per-step times of the full run have never been measured on
+a free machine: `bench` at load 18-21 gave pre-training 9.9 s, encoder 4.4 s, classifier 5.4 s per step at full size,
+and the 15.2 budget assumes 10-20x faster once the CPUs are free):
+
+| When (UTC) | What |
+|---|---|
+| 25 Nov ~19:00-21:30 | GloSL, ISL500, INCLUDE done; OpenHands raw reaches its 12 GB budget between ~20:00 and 08:00 next day |
+| 26 Nov ~04:00-08:00 | ISLRTC done (critical path); WSLP done about the same time |
+| 26 Nov ~14:00-18:00 | rest of the video queue done (then it only polls CISLR) |
+| 26 Nov evening | data refresh (trim with the learned end, then the driver's dedup / vocab / splits / link: 0.5-1.5 h) |
+| 26 Nov ~20:00 -> 27 Nov ~09:00-20:00 | commercial-safe profile (15.2 estimate 13-24 h) |
+| -> 28 Nov ~02:00 to 29 Nov ~02:00 | research profile (15.2 says 17-24 h; allow up to 30 h: more data to dedup, index and pre-train on) |
+
+So the first full-settings, honestly evaluated packs can exist around **28-29 Nov**, if nothing fails and nothing else
+loads the CPUs. Setting `CV_FOLDS=""` saves 4-6 h per profile but leaves E1b without a signer-level interval.

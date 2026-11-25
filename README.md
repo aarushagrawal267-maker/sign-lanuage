@@ -15,6 +15,10 @@
 > (`python -m app.isl.cli smoke`, a few minutes of CPU on partial data) makes the whole flow run, but its results are mostly
 > wrong and are labelled *smoke run* in the app. Hindi: 890 rows are hand-written, 11,552 are unreviewed machine translations,
 > 0 are teacher-checked. Full training and evaluation happen in phase 2 (`docs/ISL_DESIGN.md` sections 11 and 15).
+> Phase 2 status (25 Nov 2026): landmarks from every openly downloadable ISL source are still being ingested
+> (`docs/DATASETS_ISL.md` section 3.5; expected to finish on 26 Nov); one resumable command,
+> `scripts/phase2_train.sh --profile both`, then trains and evaluates both data profiles (estimated 1.5-2 days on 4 CPUs, not yet measured).
+> Only its smoke mode has been run so far.
 
 ![Overview page](docs/screenshots/overview.png)
 
