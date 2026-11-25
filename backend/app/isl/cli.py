@@ -10,7 +10,9 @@ Run from the backend folder:  python -m app.isl.cli <command> [options]
                          ISLRTC first-sign trims -> data/isl/derived/islrtc_trim.jsonl (stage 1; --learned
                          trains/applies the stage-2 boundary model)
   trim-review [--n 60]   review sheet PNGs (20 random clips per method) -> artifacts/reports/trim_review/
-  trim-eval              synthetic end-error check + INCLUDE active-frame check -> artifacts/reports/trim_eval.json
+  trim-eval [--learned-model auto|PATH|none] [--out FILE]
+                         synthetic end-error check + INCLUDE active-frame check of the trimmer `trim` uses (records
+                         its trim_version) -> artifacts/reports/trim_eval.json, or FILE (driver: <work>/trim_eval.json)
   splits [--fetch] [--k 5] [--seed 0]
                          INCLUDE official / session / pseudo-signer splits with leakage checks, and the
                          cross-dataset one-shot concept folds -> data/isl/splits/
@@ -341,131 +343,41 @@ def cmd_trim_review(paths: IslPaths, args) -> int:
     return 0
 
 
-def align_concat(a, b, gap_frames: int = 0):
-    """A followed by B, with B moved/scaled so its median shoulder centre and width match A's (synthetic
-    'sign + explanation' sequences for the trim checks)."""
-    import numpy as np
-
-    from app.landmarks.raw import RawSequence
-
-    def frame(raw):
-        asp = raw.aspect
-        ls, rs = raw.pose[:, 11, :2].astype(np.float64).copy(), raw.pose[:, 12, :2].astype(np.float64).copy()
-        ls[:, 0] *= asp
-        rs[:, 0] *= asp
-        ok = ~np.isnan(ls[:, 0]) & ~np.isnan(rs[:, 0])
-        c = np.median((ls[ok] + rs[ok]) / 2, axis=0)
-        s = float(np.median(np.linalg.norm(ls[ok] - rs[ok], axis=1)))
-        return c, s
-
-    ca, sa = frame(a)
-    cb, sb = frame(b)
-    k = sa / sb if sb > 0 else 1.0
-
-    def mv(arr, src_asp, dst_asp):
-        out = arr.astype(np.float64).copy()
-        x = out[..., 0] * src_asp
-        y = out[..., 1]
-        out[..., 0] = ((x - cb[0]) * k + ca[0]) / dst_asp
-        out[..., 1] = (y - cb[1]) * k + ca[1]
-        if out.shape[-1] >= 3:
-            out[..., 2] = out[..., 2] * k * src_asp / dst_asp
-        return out.astype(np.float32)
-
-    dt = float(np.median(np.diff(a.t_ms))) if len(a) > 1 else 80.0
-    nanf = lambda shape: np.full(shape, np.nan, np.float32)  # noqa: E731
-    gp = nanf((gap_frames,) + a.pose.shape[1:])
-    pose_b = mv(b.pose, b.aspect, a.aspect)
-    pose_b[..., 3] = b.pose[..., 3]
-    t_b = a.t_ms[-1] + dt * (gap_frames + 1) + (b.t_ms - b.t_ms[0])
-    return RawSequence(
-        np.concatenate([a.pose, gp, pose_b]), np.concatenate([a.left, nanf((gap_frames, 21, 3)), mv(b.left, b.aspect, a.aspect)]),
-        np.concatenate([a.right, nanf((gap_frames, 21, 3)), mv(b.right, b.aspect, a.aspect)]),
-        np.concatenate([a.face, nanf((gap_frames,) + a.face.shape[1:]), mv(b.face, b.aspect, a.aspect)]),
-        np.concatenate([a.t_ms, a.t_ms[-1] + dt * np.arange(1, gap_frames + 1), t_b]), a.width, a.height,
-        a.extractor_version)
-
-
 def cmd_trim_eval(paths: IslPaths, args) -> int:
-    import numpy as np
-
+    """Synthetic end-error check + INCLUDE active-frame check of the trimmer ``cli trim`` uses (``trim_eval``
+    module): the learned end model (``--learned-model``, default auto = artifacts/isl/trim_boundary.pt when present,
+    exactly as ``trim``) or rules only. The report records the ``trim_version`` it evaluated, the model file and
+    the time; E8 refuses to show it for a run whose trims have another version. ``--out`` (the phase-2 driver:
+    <work>/trim_eval.json); default artifacts/reports/trim_eval.json (trim_eval_learned.json for ``--learned``)."""
     from app.core.config import get_settings
-    from app.isl.data.manifest import read_manifest
-    from app.isl.data.sources import IncludeAdapter
-    from app.isl.data.trim import TrimConfig, activity_signal, find_first_sign, words_for
-    from app.isl.vocab.normalize import parse_islrtc_name
-    from app.landmarks.raw import RawSequence
+    from app.isl.data import trim_eval as te
+    from app.isl.data.trim import TrimConfig
 
     cfg = TrimConfig()
-    rng = random.Random(args.seed)
-    recs = {r["id"]: r for r in _islrtc_records(paths)}
-    trims = {t["id"]: t for t in read_manifest(paths.trim_sidecar, only_ok=False) if t["id"] in recs}
-    model = None
-    if args.learned:
-        from app.core.config import get_settings as _gs
-        from app.isl.data.boundary import load_model, refine
+    legacy = model = model_path = None
+    suffix = ""
+    if args.learned:  # the old stage-2 boundary model (artifacts/isl/boundary.pt); no run uses it any more
+        from app.isl.data.boundary import load_model
 
-        mp = _gs().artifacts_dir / "isl" / "boundary.pt"
-        if not mp.exists():
+        model_path = get_settings().artifacts_dir / "isl" / "boundary.pt"
+        if not model_path.exists():
             print("no boundary model; run `trim --learned` first", file=sys.stderr)
             return 2
-        model, _meta = load_model(mp)
-    clean = [t for t in trims.values() if t["method"] == "source_end"]
-    tails = [t for t in trims.values() if (recs[t["id"]].get("stop") == "max_s") and t["method"] in ("dip", "rest", "cap")]
-    rng.shuffle(clean)
-    errs, methods, within = [], Counter(), 0
-    n = min(args.n, len(clean))
-    for t in clean[:n]:
-        a_full = RawSequence.load(paths.resolve(recs[t["id"]]["path"]))
-        a = a_full.slice(0, t["end"])
-        bt = rng.choice(tails) if tails else None
-        if bt is None:
-            break
-        b_full = RawSequence.load(paths.resolve(recs[bt["id"]]["path"]))
-        L = int(rng.uniform(2.0, 6.0) * 12)
-        b = b_full.slice(bt["end"], min(len(b_full), bt["end"] + L))
-        if len(b) < 6:
-            continue
-        x = align_concat(a, b, gap_frames=rng.randint(0, 3))
-        pn = parse_islrtc_name(t["id"].removeprefix("islrtc/"))
-        res = find_first_sign(x, "max_s", cfg, n_words=words_for(pn.kind, pn.text))
-        if model is not None:
-            res = refine(x, res, model, cfg)
-        truth_ms = float(a.t_ms[-1])
-        err = float(x.t_ms[min(len(x), res.end) - 1] - truth_ms)
-        errs.append(err)
-        methods[res.method] += 1
-        within += abs(err) <= 300
-    out: dict = {"synthetic": {
-        "description": "clean ISLRTC clips (bounded source_end trims) + 2-6 s explanation-like tail of another "
-                       "clip (after its stage-1 end), aligned to the same body frame; trimmer run as if stop=max_s",
-        "n": len(errs), "within_300ms": round(within / max(1, len(errs)), 3),
-        "median_abs_err_ms": round(float(np.median(np.abs(errs))), 1) if errs else None,
-        "late_frac": round(float(np.mean(np.array(errs) > 300)), 3) if errs else None,
-        "early_frac": round(float(np.mean(np.array(errs) < -300)), 3) if errs else None,
-        "methods": dict(methods)}}
-    # INCLUDE: one sign per clip; the trimmer (bounded) should keep >= 90% of the active frames
-    keep = []
-    for c in list(IncludeAdapter(paths).clips())[: args.n]:
-        raw = c.load()
-        try:
-            sig = activity_signal(raw, cfg)
-        except Exception:  # noqa: BLE001
-            continue
-        act = ~sig["dip"]
-        if act.sum() == 0:
-            continue
-        res = find_first_sign(raw, "eof", cfg)
-        kept = act[res.start: res.end].sum() / act.sum()
-        keep.append(float(kept))
-    out["include_active_kept"] = {"n": len(keep), "mean": round(float(np.mean(keep)), 3) if keep else None,
-                                  "frac_ge_90pct": round(float(np.mean(np.array(keep) >= 0.9)), 3) if keep else None}
-    out["methods_all"] = dict(Counter(t["method"] for t in trims.values()))
-    out["learned"] = model is not None
-    rp = get_settings().reports_dir / ("trim_eval_learned.json" if model is not None else "trim_eval.json")
+        legacy, _meta = load_model(model_path)
+        suffix = f"+{te.LEGACY_STAGE2}"
+    else:
+        model, suffix, model_path = _trim_model(args)
+    version = cfg.version + suffix
+    recs = {r["id"]: r for r in _islrtc_records(paths)}
+    out = te.run(paths, n=args.n, seed=args.seed, model=model, model_path=model_path, version=version,
+                 legacy_model=legacy, records=recs)
+    rp = Path(args.out) if args.out else get_settings().reports_dir / (
+        "trim_eval_learned.json" if legacy is not None else "trim_eval.json")
     rp.parent.mkdir(parents=True, exist_ok=True)
-    rp.write_text(json.dumps(out, indent=1))
-    _print(out)
+    tmp = rp.with_name(rp.name + ".tmp")
+    tmp.write_text(json.dumps(out, indent=1))
+    tmp.replace(rp)
+    _print({**out, "report": str(rp)})
     return 0
 
 
@@ -1194,7 +1106,12 @@ def build_parser() -> argparse.ArgumentParser:
     e = sub.add_parser("trim-eval")
     e.add_argument("--n", type=int, default=300)
     e.add_argument("--seed", type=int, default=0)
-    e.add_argument("--learned", action="store_true", help="also apply the stage-2 boundary model")
+    e.add_argument("--learned", action="store_true",
+                   help="old stage-2 boundary model (artifacts/isl/boundary.pt) instead of the run's trimmer")
+    e.add_argument("--learned-model", default="auto",
+                   help="learned end model, as for trim: auto (artifacts/isl/trim_boundary.pt when present), a path, "
+                        "or none (rules only)")
+    e.add_argument("--out", help="report path (phase-2 driver: <work>/trim_eval.json)")
     sp_ = sub.add_parser("splits")
     sp_.add_argument("--fetch", action="store_true", help="(re)download the official INCLUDE split lists")
     sp_.add_argument("--no-fetch", action="store_true", help="never download (use what is on disk)")

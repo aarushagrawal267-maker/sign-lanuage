@@ -15,9 +15,11 @@
 # Steps (each one writes a stamp file when it succeeds; a re-run skips stamped steps, so the driver can be
 # restarted at any time; training steps also resume inside an epoch from their *.state files):
 #   trim dedup vocab splits link bench pretrain_dedup pretrain encoder oneshot classifier cv e1a fingerspell
-#   index fusion evaluate index_final pack
+#   index fusion trim_eval evaluate index_final pack
 # (trim uses the learned end model artifacts/isl/trim_boundary.pt when it exists - trim_version
-#  trim-2+trim-learned-1 - and rules otherwise; pretrain_dedup checks the OpenHands Sign Library chunks)
+#  trim-2+trim-learned-1 - and rules otherwise; trim_eval runs `cli trim-eval` on that same trimmer into
+#  <work>/trim_eval.json, which E8 reads and checks against the trim sidecar's trim_version (stale -> "mismatch");
+#  pretrain_dedup checks the OpenHands Sign Library chunks)
 # Options:
 #   --from STEP      ignore stamps from STEP on (re-run it and everything after it)
 #   --only STEP      run just this step (ignores its stamp)
@@ -50,7 +52,7 @@ STEP_MIN=0
 LIST=0
 ALLOW_PARTIAL=0
 CHECK_ONLY=0
-STEPS=(trim dedup vocab splits link bench pretrain_dedup pretrain encoder oneshot classifier cv e1a fingerspell index fusion evaluate index_final pack)
+STEPS=(trim dedup vocab splits link bench pretrain_dedup pretrain encoder oneshot classifier cv e1a fingerspell index fusion trim_eval evaluate index_final pack)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -65,7 +67,7 @@ while [[ $# -gt 0 ]]; do
     --list) LIST=1; shift ;;
     --allow-partial) ALLOW_PARTIAL=1; shift ;;
     --check-only) CHECK_ONLY=1; shift ;;
-    -h|--help) sed -n '2,42p' "$0"; exit 0 ;;
+    -h|--help) awk 'NR > 1 && /^set -uo/ {exit} NR > 1' "$0"; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -189,6 +191,10 @@ run_step() {
     fingerspell) cli train-fingerspell --profile "$PROFILE" --threads "$THREADS" --vocab "$VOCAB" $SM $LET ;;
     index) cli build-index $COMMON --all-sources $CAP ;;  # training parts only: evaluation stays clean
     fusion) cli fit-fusion $COMMON --all-sources $CAP ;;
+    trim_eval)  # E8: evaluate exactly the trimmer of the trim step (same learned-model choice) into the work folder
+      # a new trim-eval makes an older report / pack stale: forget their stamps so they are rebuilt from it
+      cli trim-eval --learned-model auto --out "$WORK/trim_eval.json" $([[ $SMOKE == 1 ]] && echo "--n ${SMOKE_TRIM_EVAL_N:-60}") \
+        && rm -f "$STAMPS/evaluate.done" "$STAMPS/pack.done" ;;
     evaluate) cli evaluate --all $COMMON --all-sources $CAP ${PACK_OUT:+--out "$PACK_OUT"} ;;
     index_final) cli build-index $COMMON --all-sources $CAP --all-include ;;  # the shipped index: every reference
     pack) cli build-pack $COMMON ${PACK_OUT:+--out "$PACK_OUT"} ;;

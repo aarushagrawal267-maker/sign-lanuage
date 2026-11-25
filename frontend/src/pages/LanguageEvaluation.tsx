@@ -626,12 +626,12 @@ export function IslReport({ r }: { r: Results }) {
       {phase1 && <Notice tone="info" title={t("eval.phase1Title")}>{t("eval.phase1Body")}</Notice>}
       <div className="flex flex-wrap items-center gap-2 text-xs text-fg-3">
         <Badge tone={r.profile === "commercial-safe" ? "teal" : "warn"}><En>{r.profile}</En></Badge>
-        {r.smoke && <Badge tone="warn">SMOKE</Badge>}
+        {r.smoke && <Badge tone="warn">{t("eval.smokeBadge")}</Badge>}
         {r.partial_data && <Badge tone="danger">{t("eval.partialBadge")}</Badge>}
         {r.data?.split && <Badge>{t("eval.split")} <En>{r.data.split}</En></Badge>}
         {r.data?.split_label && <Badge><En>{String(r.data.split_label)}</En></Badge>}
         {r.created && <span>{r.created}</span>}
-        {r.git_commit && <span className="font-mono">commit {r.git_commit}</span>}
+        {r.git_commit && <span className="font-mono">{t("eval.commit", { sha: r.git_commit })}</span>}
       </div>
       <SummaryTable ids={ids} P={P} />
       <div className="grid gap-5 lg:grid-cols-2">

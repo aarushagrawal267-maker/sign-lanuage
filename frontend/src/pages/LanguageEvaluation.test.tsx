@@ -208,6 +208,16 @@ describe("Hindi interface", () => {
     expect(row("E1b")).toHaveTextContent("कोई अंतराल नहीं:");
     const reason = within(row("E1b")).getByText("too few signer groups (4)");
     expect(reason).toHaveAttribute("lang", "en");
+    // the smoke badge and the commit label are the page's words too (not hard-coded English)
+    expect(screen.getByText("स्मोक रन")).toBeInTheDocument();
+    expect(screen.getByText("कमिट b00fe99")).toBeInTheDocument();
+    expect(screen.queryByText("SMOKE")).not.toBeInTheDocument();
+  });
+
+  it("shows the smoke badge and the commit in English", () => {
+    wrap(phase2());
+    expect(screen.getByText("SMOKE")).toBeInTheDocument();
+    expect(screen.getByText("commit b00fe99")).toBeInTheDocument();
   });
 });
 

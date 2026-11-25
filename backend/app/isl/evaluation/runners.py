@@ -18,7 +18,7 @@ E4   My signs few-shot: enrol k takes of a test signer's word, test on their oth
 E5   fingerspelling, leave-one-signer-out (computed when the letter model is trained; read from its checkpoint)
 E6   latency per segment
 E7   ASL regression: the bundled ASL model's results file is unchanged
-E8   trim quality (``cli trim-eval`` report + the trim method mix)
+E8   trim quality (``cli trim-eval`` report of the run's trimmer, version-checked, + the trim method mix)
 
 Leakage guards: E1 refuses a classifier trained on another split; E2 refuses an encoder whose excluded
 concepts do not cover the (synonym-expanded) held-out set; queries in a duplicate group of any training clip
@@ -499,25 +499,40 @@ def e7_asl_regression(repo_root: Path) -> dict:
             "metrics": {"passed": 1.0 if diff == "" else 0.0}}
 
 
-def e8_trim(paths, artifacts_dir: Path) -> dict:
+def e8_trim(paths, artifacts_dir: Path, work: Path | None = None) -> dict:
+    """Trim quality of the trims this run used. The synthetic / INCLUDE numbers come from the trim-eval report the
+    driver's ``trim_eval`` step writes into the work folder (``<work>/trim_eval.json``; without ``work`` the old
+    ``artifacts/reports/trim_eval.json``) and are shown only when that report evaluated the same ``trim_version``
+    as the run's trim sidecar (and the same learned model file); otherwise ``trim_eval_check`` says ``mismatch`` or
+    ``missing`` with the reason, and the label says so."""
     from app.isl.data.manifest import read_manifest
+    from app.isl.data.trim_eval import check_report
 
-    rep = artifacts_dir / "reports" / "trim_eval.json"
+    rep = (Path(work) / "trim_eval.json") if work is not None else artifacts_dir / "reports" / "trim_eval.json"
     trims = read_manifest(paths.trim_sidecar, only_ok=False) if paths.trim_sidecar.exists() else []
     mix = Counter(r.get("method") for r in trims)
-    out = {"label": "ISLRTC first-sign trim quality (synthetic end-error check, INCLUDE active-frame check) "
-                    "from 'cli trim-eval', plus the method mix of the trim sidecar", "run": bool(trims) or rep.exists(),
+    versions = Counter(r.get("trim_version") for r in trims)
+    chk = check_report(rep, dict(versions))
+    doc = chk.pop("doc", None)
+    label = ("ISLRTC first-sign trim quality (synthetic end-error check, INCLUDE active-frame check) from "
+             "'cli trim-eval' of the run's trimmer, plus the method mix of the trim sidecar")
+    if chk["status"] != "ok":
+        label += (f". Synthetic trim check NOT SHOWN ({chk['status'].upper()}): {chk['reason']}")
+    else:
+        label += (f" (trim-eval of {chk['trim_version']}, written {chk.get('written_at') or chk.get('file_mtime_utc')})")
+    out = {"label": label, "run": bool(trims) or doc is not None,
            "trims": len(trims), "method_mix": dict(mix),
+           "trim_version": next(iter(versions)) if len(versions) == 1 else None, "trim_versions": dict(versions),
            "low_confidence_frac": (sum(1 for r in trims if float(r.get("confidence") or 0) < 0.5) / len(trims))
-           if trims else None}
+           if trims else None,
+           "trim_eval_check": chk}
+    if not out["run"]:
+        out["reason"] = "no trim sidecar and " + (chk["reason"] or "no trim-eval report")
     if trims:
         out["metrics"] = {"trims": len(trims), "low_confidence_frac": out["low_confidence_frac"],
                           "cap_frac": mix.get("cap", 0) / len(trims)}
-    if rep.exists():
-        try:
-            out["trim_eval"] = json.loads(rep.read_text())
-        except ValueError:
-            pass
+    if doc is not None:
+        out["trim_eval"] = doc
     return out
 
 
@@ -681,7 +696,7 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     prot["E6"] = e6_latency(rec, test_inc + extra_test, n=latency_n)
     prot["E7"] = e7_asl_regression(REPO_ROOT)
     if paths is not None:
-        prot["E8"] = e8_trim(paths, get_settings().artifacts_dir)
+        prot["E8"] = e8_trim(paths, get_settings().artifacts_dir, work)
     for v in prot.values():
         for k in ("_hits", "_groups"):
             v.pop(k, None)
@@ -786,6 +801,20 @@ def markdown_report(doc: dict) -> str:
     for k in ("E5", "E6", "E7", "E8"):
         p = doc["protocols"].get(k)
         if p:
-            lines += ["", f"## {k}", "", "```", json.dumps({x: y for x, y in p.items() if x not in ("trim_eval",)},
-                                                           indent=1, default=str)[:1500], "```"]
+            lines += ["", f"## {k}", ""]
+            if k == "E8" and p.get("trim_eval_check"):
+                c = p["trim_eval_check"]
+                lines.append(f"* trim-eval: **{c.get('status')}** - file {c.get('file')} (written "
+                             f"{c.get('written_at') or c.get('file_mtime_utc') or '-'}), evaluated "
+                             f"{c.get('trim_version') or '-'}; run's trims {c.get('run_trim_versions')}"
+                             + (f"; {c['reason']}" if c.get("reason") else ""))
+                syn = (p.get("trim_eval") or {}).get("synthetic") or {}
+                if syn:
+                    lines.append(f"* synthetic end error: within 300 ms {_fmt(syn.get('within_300ms'))}, median "
+                                 f"{syn.get('median_abs_err_ms')} ms, late {_fmt(syn.get('late_frac'))}, early "
+                                 f"{_fmt(syn.get('early_frac'))} (n {syn.get('n')}, learned ends "
+                                 f"{syn.get('learned_ends')})")
+                lines.append("")
+            lines += ["```", json.dumps({x: y for x, y in p.items() if x not in ("trim_eval",)},
+                                        indent=1, default=str)[:1500], "```"]
     return "\n".join(lines) + "\n"

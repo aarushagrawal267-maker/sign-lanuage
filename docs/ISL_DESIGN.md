@@ -2233,3 +2233,45 @@ driver never re-runs `trim-eval`, so the full run's E8 synthetic check would des
    read `trim_eval_learned.json` when the sidecar's `trim_version` contains `trim-learned`, and record the file's
    time). Until then, read E8's synthetic numbers as the rules-only trimmer's.
 3. Then follow the 15.6 commands unchanged; check-only must print 0 for each profile first.
+
+### 15.8 Honest E8: the driver evaluates the trimmer the run uses (AI Engineer, 25 Nov 2026, 22:00-22:30 UTC)
+
+Fixes item 2 of 15.7. Before: `e8_trim` read `artifacts/reports/trim_eval.json` (written 11:00 by the rules-only
+`cli trim-eval`), the driver never re-ran `trim-eval`, and `trim-eval --learned` applied the *old* stage-2 model
+(`boundary.pt`), not the learned end the trim step uses (`trim_boundary.pt`, `refine_cap`). So E8 and the page said
+"Learned trim model used: no" for runs trimmed with `trim-2+trim-learned-1`.
+
+Now:
+* **`cli trim-eval`** (`app/isl/data/trim_eval.py`) runs exactly the trimmer of `cli trim`: stage 1, then
+  `trim_learned.refine_cap` for non-phrases (phrases keep the full clip), chosen the same way
+  (`--learned-model auto|PATH|none`, default auto = `artifacts/isl/trim_boundary.pt` when present). The report
+  records `trim_version` (`trim-2` / `trim-2+trim-learned-1`), the model file (path, SHA-256, time), the sidecar's
+  versions / record count / time, `learned_ends` in the synthetic set, and `written_at`. `--out FILE` writes it
+  elsewhere (atomic). `--learned` (old stage-2 model) is kept for comparison only, as `trim-2+boundary-stage2`.
+* **Driver step `trim_eval`** (between `fusion` and `evaluate`; stamped and resumable like every step):
+  `cli trim-eval --learned-model auto --out <work>/trim_eval.json` (`--n 60` in smoke runs). When it runs it drops
+  the `evaluate` and `pack` stamps, so a report built before it is rebuilt.
+* **E8** reads `<work>/trim_eval.json` (never the global file when a work folder is given) and shows its numbers
+  only when its `trim_version` equals the single `trim_version` of the run's trim sidecar and the learned model file
+  is unchanged (same SHA-256). Otherwise `trim_eval_check.status` is `mismatch` (other version, no version recorded,
+  mixed sidecar versions, model file changed or gone) or `missing`, with the reason, the numbers are left out and the
+  label says "Synthetic trim check NOT SHOWN (MISMATCH|MISSING): reason" (the page shows the label). The report
+  records the file, its `written_at` / file time, the evaluated `trim_version` and the run's versions; `report.md`
+  prints them on an explicit "trim-eval:" line. Limit: the sidecar records the trim version, not the model's hash,
+  so a model replaced *between* the trim step and `trim_eval` is not detected (nothing retrains the model in a run).
+* Evaluation page: the SMOKE badge and the "commit" label are i18n keys (`eval.smokeBadge`, `eval.commit`; Hindi
+  "स्मोक रन", "कमिट").
+
+Checks: offline tests `backend/tests/isl/test_trim_eval_e8.py` (statuses; E8 refuses the old rules-only report for
+learned trims and reads only the work folder; `trim_one` gives exactly the sidecar cuts of `cli trim` with a learned
+model; `trim-eval` applies the learned model and records its version, rules-only gives `trim-2`; the driver's
+`--only trim_eval` writes `<work>/trim_eval.json`, drops the evaluate / pack stamps, and the step sits between
+`fusion` and `evaluate`). Backend suite 465 passed; frontend typecheck, vitest (77 passed / 1 skipped), build pass.
+
+Smoke check on a scratch copy of `artifacts/isl/phase2-smoke/research` + its private ISL root (the shared folders and
+stamps untouched): `trim-eval --learned-model auto --n 60` 9 s, `evaluate --all` 184 s, both exit 0. The report's E8:
+`trim_eval_check.status ok`, evaluated `trim-2+trim-learned-1` = the sidecar's 6,521 trims, written 22:09:42 UTC,
+model `trim_boundary.pt` (16:20:46, SHA-256 `4c0efb82...`), **Learned trim model used: yes**; synthetic n 60: within
+300 ms 0.717, median 0 ms, late 0.083, early 0.200 (3 learned ends); INCLUDE active frames kept 1.000 (smoke-sized
+samples, not the full run's numbers). The same sidecar against the old 11:00 `artifacts/reports/trim_eval.json`
+gives `mismatch` ("the report records no trim_version ... learned=False").
