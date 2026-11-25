@@ -2135,8 +2135,20 @@ stopped or fixed (one decision, below).** Nothing was trained at full settings; 
 1. Ingestion is complete for a profile when
    `scripts/phase2_train.sh --profile commercial-safe --check-only; echo $?` prints 0 (same for `research`).
    The signs behind it: `data/isl/logs/islrtc.log` ends with `islrtc done: total ok ...`; `islrtc_recut.log` with
-   `islrtc-recut: finished`; `queue.log` contains `all listed sources processed`; `pgrep -af 'scripts/ingest_isl'`
+   `islrtc-recut: finished`; the queue has no source of the profile left (`queue.log`: every source the profile
+   reads logged `finished` / `giving up`, or `all listed sources processed`); `pgrep -af 'scripts/ingest_isl'`
    shows no job for a source of the profile; `artifacts/isl/<profile>/data_readiness.json` lists no reasons.
+   *(Since 25 Nov 22:20 UTC, `readiness.queue_progress`.)* A running queue blocks only the profiles that read a source
+   it still has to process: its list is the `queue start (pid N): ...` line of that pid, checked against the
+   `SOURCES` default of `isl_queue.sh` (or the process's `SOURCES`), progress is its per-source log lines, its running
+   child counts, and CISLR / iSign count until they logged `finished` (the queue may start them before any chunk).
+   So commercial-safe is no longer held back by the research-only end of the list (`isl_csltr_words`, the two HF
+   alphabet sets, WSLP unlabelled). Anything unreadable or inconsistent (no start line for that pid, another list, an
+   unknown name or child) blocks both profiles; `processes[].queue` in `data_readiness.json` shows `remaining` or
+   the `error`. `ingest_isl_video.py list <source>` blocks only the profiles of that source. A gated source (CISLR,
+   iSign) left partly ingested by a stopped job is `partial (gated; job not running)`: not a reason (research uses
+   the rows that exist), but listed under `warnings` / `partial_gated` there and in the report's `data.readiness`
+   ("Data readiness" section of `report.md`).
    If the queue gave up on a source (`queue.log`: `giving up`), re-run that one source, e.g.
    `nice -n 10 .venv/bin/python scripts/ingest_isl_video.py run hf_akrit_alphabet --workers auto --min-free-gb 10`,
    then check again.

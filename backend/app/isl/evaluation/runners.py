@@ -548,7 +548,7 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     from app.isl.training.pipeline import load_recognizer
     from app.isl.training.train_encoder import encoder_training_clips
 
-    from app.isl.training.readiness import partial_data_flag
+    from app.isl.training.readiness import partial_data_flag, readiness_summary
 
     log = progress or (lambda m: None)
     t0 = time.time()
@@ -712,9 +712,13 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     else:
         label = ("Measured on held-out data (test parts used once, after all selection on validation). Live "
                  "webcam accuracy is expected to be lower.")
+    data_doc = data.summary()
+    guard = readiness_summary(work)  # what the data guard saw at the run's start (non-blocking warnings included)
+    if guard is not None:
+        data_doc = {**data_doc, "readiness": guard}
     doc = {"schema": 2, "language": "isl", "profile": profile, "smoke": smoke, "partial_data": bool(partial or smoke),
            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "git_commit": git_commit(),
-           "label": label, "data": data.summary(), "leakage_guards": leak, "protocols": prot,
+           "label": label, "data": data_doc, "leakage_guards": leak, "protocols": prot,
            "seconds": round(time.time() - t0, 1)}
     md = markdown_report(doc)
     for d in [work / "eval", *(out_dirs or [])]:
@@ -784,6 +788,15 @@ def markdown_report(doc: dict) -> str:
                          f"{_fmt(v['top1_with_enrolment'])} | "
                          f"{format_interval(v.get('interval_with'), v.get('n_groups'), v.get('interval_with_reason'))} | "
                          f"{_fmt(v['gain'])} | {_fmt(v['user_sign_false_accept_rate'])} |")
+    guard = (doc.get("data") or {}).get("readiness")
+    if guard:
+        lines += ["", "## Data readiness", "",
+                  f"* data guard at the run's start ({guard.get('checked') or '-'}): "
+                  + ("ready" if guard.get("ready") else "NOT ready (run started with --allow-partial)")]
+        lines += [f"* not ready: {r}" for r in (guard.get("reasons") or [])[:20]]
+        lines += [f"* warning: {w}" for w in guard.get("warnings") or []]
+        if guard.get("error"):
+            lines.append(f"* {guard['error']}")
     lg = doc.get("leakage_guards") or {}
     pc = lg.get("pretraining_check") or {}
     lines += ["", "## Leakage guards", "",

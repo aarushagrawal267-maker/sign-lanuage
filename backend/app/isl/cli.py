@@ -496,7 +496,8 @@ def cmd_readiness(paths: IslPaths, args) -> int:
     marker = None
     if not rep["ready"] and args.allow_partial and args.work:
         marker = str(mark_partial(Path(args.work), rep))
-    _print({"ready": rep["ready"], "reasons": rep["reasons"], "partial_marker": marker,
+    _print({"ready": rep["ready"], "reasons": rep["reasons"], "warnings": rep.get("warnings", []),
+            "partial_marker": marker,
             "sources": {k: {x: v.get(x) for x in ("done", "expected", "complete", "note") if v.get(x) is not None}
                         for k, v in rep["sources"].items()}})
     if rep["ready"] or args.allow_partial:
