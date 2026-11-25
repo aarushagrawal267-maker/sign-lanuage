@@ -200,6 +200,8 @@ class SeekableInflate(io.RawIOBase):
         self.meta_cap = meta_cap
         self.scan_pos = 0
         self.stage = bytearray()
+        self.zero_pages: set[int] = set()  # all-zero pages (served without a restart)
+        self._prev: tuple[int, bytes, bool] | None = None  # previous scanned page (index, bytes, kept)
         self._restore(0)
 
     # -- inflate state
@@ -252,20 +254,38 @@ class SeekableInflate(io.RawIOBase):
         if not n:
             return
         first = (self.scan_pos - len(self.stage)) // self.MPAGE
+        zero = bytes(self.MPAGE)
         for j in range(n // self.MPAGE):
+            k = first + j
             pg = bytes(self.stage[j * self.MPAGE:(j + 1) * self.MPAGE])
-            if self.meta_bytes < self.meta_cap and looks_like_metadata(pg):
-                self.meta[first + j] = pg
-                self.meta_bytes += len(pg)
+            if pg == zero:
+                if len(self.zero_pages) < 4_000_000:
+                    self.zero_pages.add(k)
+                kept = False
+            else:
+                kept = looks_like_metadata(pg)
+                # metadata blocks straddle page boundaries: keep the neighbours of a kept page too
+                if kept or (self._prev is not None and self._prev[2] and self._prev[0] == k - 1):
+                    self._keep(k, pg)
+                if kept and self._prev is not None and self._prev[0] == k - 1 and not self._prev[2]:
+                    self._keep(k - 1, self._prev[1])
+            self._prev = (k, pg, kept)
         del self.stage[:n]
+
+    def _keep(self, k: int, pg: bytes) -> None:
+        if k in self.meta or k in self.zero_pages or self.meta_bytes >= self.meta_cap:
+            return
+        self.meta[k] = pg
+        self.meta_bytes += len(pg)
 
     def _from_meta(self, p: int, n: int) -> bytes | None:
         if p + n > self.scan_pos - len(self.stage):
             return None
         a, b = p // self.MPAGE, (p + n - 1) // self.MPAGE
-        if any(k not in self.meta for k in range(a, b + 1)):
+        if any(k not in self.meta and k not in self.zero_pages for k in range(a, b + 1)):
             return None
-        blob = b"".join(self.meta[k] for k in range(a, b + 1))
+        zero = bytes(self.MPAGE)
+        blob = b"".join(self.meta.get(k, zero) for k in range(a, b + 1))
         return blob[p - a * self.MPAGE: p - a * self.MPAGE + n]
 
     def _goto(self, p: int) -> None:
@@ -352,7 +372,8 @@ def looks_like_metadata(page: bytes) -> bool:
     """True for a page that is probably HDF5 metadata, not coordinates: it carries an HDF5 block signature, or
     fewer than 99 % of its 8-byte words read as plain float64 values (0 or 1e-6 < |v| < 1e3). Addresses and
     lengths read as denormals, names as wild exponents. Verified on Sign_Library's 1-minute file: 195 of
-    357,076 pages kept; h5py then lists all 748 datasets from them (two page misses fall back to a restart)."""
+    357,076 pages flagged; with their neighbours (446 pages) and the all-zero pages h5py lists all 748 datasets
+    without a single restart (``SeekableInflate`` keeps both)."""
     if _SIGNATURES.search(page):
         return True
     a = np.frombuffer(page[: len(page) // 8 * 8], dtype="<f8")

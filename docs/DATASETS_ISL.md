@@ -285,7 +285,9 @@ stored frame (GloSL), about 360 bytes (OpenHands, no face).
 requests with parallel read-ahead (Zenodo gives about 1 MB/s per connection; 8 parallel 8 MB blocks gave 6 MB/s).
 While inflating, a `zlib` snapshot is kept every max(4 MB, size / 3000) of output so backward seeks restart nearby,
 and 4 KB pages that look like HDF5 metadata (a block signature, or under 99 % plausible float64 words) are kept in
-memory (Sign Library 1-minute file: 195 of 357,076 pages, enough for h5py to list all 748 datasets). Pass 1 lists
+memory with their neighbours, plus the indexes of all-zero pages (Sign Library 1-minute file: 446 of 357,076 pages,
+enough for h5py to list all 748 datasets without a restart; without the neighbours the 6.1 GB `sub_based` file
+needed hundreds of restarts, which is why the first run was restarted at 14:57 UTC). Pass 1 lists
 the datasets and their object-header addresses with h5py (one streaming pass; the list is cached in
 `raw/openhands_raw/<member>.index.json`), pass 2 parses each small version-1 object header itself and reads the data
 in address order. Network cost about twice the compressed size; no temp files; peak memory about 0.5 GB. Chunks of a

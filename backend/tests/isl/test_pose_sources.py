@@ -398,3 +398,55 @@ def test_registry_and_profiles():
     assert not PROFILE_SOURCES["commercial-safe"]["sources"] and not PROFILE_SOURCES["commercial-safe"]["pretraining"]
     research = set(PROFILE_SOURCES["research"]["sources"]) | set(PROFILE_SOURCES["research"]["pretraining"])
     assert research == set(POSE_ADAPTERS)
+
+
+# --------------------------------------------------------------------------------------------- script helpers
+
+def _script():
+    import importlib.util
+
+    from app.core.config import REPO_ROOT
+
+    spec = importlib.util.spec_from_file_location("ingest_isl_pose_script", REPO_ROOT / "scripts" / "ingest_isl_pose.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_script_manifest_and_isl500_splits(tmp_path):
+    mod = _script()
+    man = mod.Manifest(tmp_path / "m.jsonl")
+    man.add({"id": "a", "ok": False, "error": "x"})
+    man.add({"id": "a", "ok": True})
+    man.add({"id": "b", "ok": False})
+    assert mod.Manifest(tmp_path / "m.jsonl").done == {"a"}
+    (tmp_path / "PersonDependentTrain.csv").write_text(
+        "fold_0\r\n/mnt/x/ISL_Goa_Data_h5_30fps/ISL_DATA_USER001/_mnt_x_R2_Clips_R2_user001_Absent__session7__clip000.h5\r\n")
+    (tmp_path / "PersonDependentTest.csv").write_text("fold_2\n/mnt/x/ISL_DATA_USER002/Accept__s1__c2.h5\nnot a path\n")
+    sp = mod.read_pd_splits(tmp_path)
+    assert sp == {("user001", "Absent__session7__clip000"): "train", ("user002", "Accept__s1__c2"): "test"}
+
+
+def test_inflate_metadata_pages_serve_reads_without_restart():
+    rng = np.random.default_rng(11)
+    page = 4096
+    data = rng.uniform(-1, 1, 200 * page // 8).astype("<f8").tobytes()  # float pages: dropped
+    meta = b"SNOD" + bytes(range(256)) * 3  # metadata block straddling a page boundary
+    plain = bytearray(data)
+    off = 50 * page - 300
+    plain[off:off + len(meta)] = meta
+    plain[120 * page:121 * page] = bytes(page)  # an all-zero page
+    plain = bytes(plain)
+    comp = _deflate(plain)
+    reader = openhands.PrefetchReader(lambda s, e: comp[s:e + 1], len(comp), block=1 << 20, ahead=0)
+    st = openhands.SeekableInflate(reader, 0, len(comp), len(plain), every=1 << 20)
+    st.read_range(0, len(plain))  # first forward pass (what h5py's listing triggers)
+    restores = st.restores
+    st.seek(off)
+    assert st.read(len(meta)) == meta  # crosses into the next page: kept as a neighbour
+    st.seek(120 * page + 10)
+    assert st.read(100) == bytes(100)
+    assert st.restores == restores and 120 in st.zero_pages and len(st.meta) <= 6
+    st.seek(10 * page)
+    assert st.read(64) == plain[10 * page:10 * page + 64]  # a dropped float page needs a restart
+    assert st.restores == restores + 1
