@@ -578,6 +578,20 @@ of about 23 GB (about +12 GB) and about 2.3 h more of forward pass; with the oth
 disk to about 10 GB, under this job's 12 GB `--min-free-gb` floor, so it would stop near 90 % of NewzHook anyway. The
 budget was not changed (owner decision).
 
+**Adversarial review (Code Reviewer, 21:20-21:40 UTC; takes effect at the job's next start or memory respawn, the
+running PID 25287 still has the code above).** Confirmed by a 200-run fuzz against the old path (random subsets,
+windows 512 B-16 MB, interrupted runs with cut header files, persisted points, injected download failures): same arrays
+and error strings every time. Fixed: (1) `PrefetchReader` kept a block whose download failed (range_fetch gave up
+after its 10 tries) as a failed Future, so every later read of that block re-raised the same error: the forward
+pass's "restore and retry" re-read the cached failure 5 times and the job died; failed blocks are now fetched again.
+(2) A restore inside the error handler (or a jump) that itself failed was fatal at once; it is now retried like a
+failed step, and 256 MB of clean progress forgets earlier errors (a 6th error without that progress still stops the job). (3) A header-cache
+line cut just before its newline was kept, so the next append ran into it and the following load dropped every later
+line; the last line of a file without a final newline is now treated as cut. (4) The pass dropped none of the loaded
+headers (0.9 KB each in memory, measured: 70 MB for ISH News; for a NewzHook-sized member of ~460k datasets about
+0.4 GB, reloaded on every restart, near the 1.5 GB guard if the budget is raised); they are released once queued.
+Tests: `test_openhands_forward.py` (4 new).
+
 ---
 
 ## 4. Vocabulary (`python -m app.isl.cli vocab`)

@@ -169,7 +169,10 @@ class PrefetchReader:
     def _get(self, k: int) -> bytes:
         with self.lock:
             sequential = k in (self.last, self.last + 1)
-            if k not in self.futs:
+            f = self.futs.get(k)
+            if f is None or (f.done() and (f.cancelled() or f.exception() is not None)):
+                # a block whose download failed (range_fetch gave up) is fetched again on the next read: kept,
+                # it re-raised the same error forever, so a caller's retry could never succeed
                 self.futs[k] = self._submit(k)
             self.futs.move_to_end(k)
             if sequential and self.pool is not None:
@@ -590,6 +593,8 @@ class HeaderCache:
         self.flush_every = flush_every
         self._head = json_dumps({"key": key, "usize": self.usize})
         self._valid = False
+        self._released = False
+        self.loaded = 0  # headers read from the file by load()
 
     def load(self) -> HeaderCache:
         import json
@@ -597,12 +602,15 @@ class HeaderCache:
         if self.path is None or not self.path.exists():
             return self
         lines = self.path.read_bytes().split(b"\n")
-        if not lines or lines[0].decode("utf-8", "replace") != self._head:
+        # the last element is b"" when the file ends with a newline, else a line cut by a kill (even one cut just
+        # before its newline: kept, the next append would run on into it and lose every later line)
+        if len(lines) < 2 or lines[0].decode("utf-8", "replace") != self._head:
             return self
         self._valid = True
         good = len(lines[0]) + 1
-        for ln in lines[1:]:
+        for ln in lines[1:-1]:
             if not ln:
+                good += 1
                 continue
             try:
                 r = json.loads(ln)
@@ -612,6 +620,7 @@ class HeaderCache:
                 break
             self.items[a] = v
             good += len(ln) + 1
+        self.loaded = len(self.items)
         size = self.path.stat().st_size
         if good < size:  # cut the damaged tail so later appends stay readable
             with self.path.open("r+b") as fh:
@@ -621,11 +630,19 @@ class HeaderCache:
     def get(self, addr: int):
         return self.items.get(int(addr))
 
+    def release(self) -> None:
+        """Drop the loaded headers from memory (about 0.9 KB each: 70 MB for ISH News, several hundred MB for a
+        NewzHook-sized member, reloaded on every restart); later :meth:`add` calls are only written to the file."""
+        self.loaded = max(self.loaded, len(self.items))
+        self.items = {}
+        self._released = True
+
     def add(self, addr: int, value: dict | str) -> None:
         addr = int(addr)
         if addr in self.items:
             return
-        self.items[addr] = value
+        if not self._released:
+            self.items[addr] = value
         if self.path is None:
             return
         self._buf.append(json_dumps({"a": addr, "e": value} if isinstance(value, str)
@@ -685,13 +702,14 @@ class ForwardPass:
     HEADER_BYTES = 4096
 
     def __init__(self, stream: SeekableInflate, pairs, headers: HeaderCache | None = None, window: int = 16 << 20,
-                 jump: int = 64 << 20, step: int = 1 << 20, max_stream_errors: int = 5):
+                 jump: int = 64 << 20, step: int = 1 << 20, max_stream_errors: int = 5, forgive: int = 256 << 20):
         import heapq
 
         self._heapq = heapq
         self.st = stream
         self.headers = headers if headers is not None else HeaderCache(None, "", stream.usize)
         self.window, self.jump, self.step, self.max_stream_errors = int(window), int(jump), int(step), max_stream_errors
+        self.forgive = int(forgive)  # bytes of clean progress after which earlier stream errors are forgotten
         self.heap: list = []
         self._seq = 0
         self.active: list[_Req] = []
@@ -718,6 +736,7 @@ class ForwardPass:
                     self._got_header(name, role, h)
                 if c["done"]:
                     break
+        self.headers.release()  # every cached header this pass needs is queued above
 
     # -- bookkeeping
     def _push(self, r: _Req) -> None:
@@ -862,9 +881,29 @@ class ForwardPass:
             self._restore_before(first)
         else:
             self.win, self.win_start = bytearray(), st.out
-        errors = 0
+        errors, err_at, redo = 0, 0, None
+
+        def stream_error(e: OSError, at: int) -> None:
+            nonlocal errors, err_at
+            errors += 1
+            err_at = max(err_at, at)
+            self.stats["stream_errors"] += 1
+            if errors > self.max_stream_errors:
+                raise e
+            log.warning("forward pass: stream error at %d (%s); restoring (%d of %d)", at, e, errors,
+                        self.max_stream_errors)
+            time.sleep(min(60, 5 * errors))
+
         while self.heap or self.active:
-            self._maybe_jump()
+            # restores read from the network too: a failed one is retried like a failed step, never fatal at once
+            try:
+                if redo is not None:
+                    self._restore_before(redo)
+                    redo = None
+                self._maybe_jump()
+            except OSError as e:
+                stream_error(e, st.out)
+                continue
             self._activate()
             while self.ready:
                 yield self.ready.pop(0)
@@ -878,15 +917,11 @@ class ForwardPass:
             except EOFError:
                 break
             except OSError as e:  # network gave up after its retries: re-position and try again
-                errors += 1
-                self.stats["stream_errors"] += 1
-                if errors > self.max_stream_errors:
-                    raise
-                log.warning("forward pass: stream error at %d (%s); restoring (%d of %d)", o, e, errors,
-                            self.max_stream_errors)
-                time.sleep(min(60, 5 * errors))
-                self._restore_before(o)
+                stream_error(e, o)
+                redo = o
                 continue
+            if errors and st.out > err_at + self.forgive:  # an outage long ago does not count against a later one
+                errors = 0
             self.stats["inflated"] += len(piece)
             self._feed(o, piece)
             while self.ready:

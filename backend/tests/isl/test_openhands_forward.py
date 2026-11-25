@@ -344,3 +344,99 @@ def test_range_fetch_retries_a_broken_connection(monkeypatch):
 
     assert openhands.range_fetch("https://x/y.zip", 0, len(body) - 1, session=Session()) == body
     assert calls["n"] == 2
+
+
+# --------------------------------------------------------------------------------------------- adversarial review
+
+def test_prefetch_reader_refetches_a_block_whose_download_failed():
+    """A failed download must not stay cached: with read-ahead the failed Future was kept, so every later read
+    of that block re-raised the same error and the forward pass's 'restore and retry' could never succeed."""
+    data = bytes(range(256)) * 64
+    calls: dict[int, int] = {}
+
+    def fetch(s, e):
+        calls[s] = calls.get(s, 0) + 1
+        if s == 1024 and calls[s] == 1:
+            raise OSError("range fetch failed after 10 tries")
+        return data[s:e + 1]
+
+    r = openhands.PrefetchReader(fetch, len(data), block=1024, ahead=2)
+    try:
+        r.read_at(0, 10)  # sequential: blocks 1 and 2 are read ahead; block 1 fails
+        with pytest.raises(OSError):
+            r.read_at(1024, 10)
+        assert r.read_at(1024, 10) == data[1024:1034]
+        assert calls[1024] == 2
+    finally:
+        r.close()
+
+
+@pytest.mark.parametrize("ahead", [0, 2])
+def test_forward_pass_survives_network_outages(member, monkeypatch, ahead):
+    """Downloads that fail (after range_fetch's own retries), including the reads of a restore, are retried by
+    the pass with the read-ahead reader the job uses; the result is identical to the old path."""
+    monkeypatch.setattr(openhands.time, "sleep", lambda s: None)
+    ref = {n: _old_path(_stream(member), k, v) for n, k, v in member.pairs}
+    seen: dict[int, int] = {}
+
+    def fetch(s, e):
+        seen[s] = seen.get(s, 0) + 1
+        if (s // (16 << 10)) % 4 == 1 and seen[s] == 1:  # first download of every 4th block fails
+            raise OSError("range fetch failed after 10 tries (simulated)")
+        return member.blob[s:e + 1]
+
+    span = openhands.zip_member_span(openhands.PrefetchReader(lambda s, e: member.blob[s:e + 1], len(member.blob),
+                                                              block=16 << 10, ahead=0), member.info)
+    reader = openhands.PrefetchReader(fetch, len(member.blob), block=16 << 10, ahead=ahead)
+    try:
+        start, csize, usize, _ = span
+        st = openhands.SeekableInflate(reader, start, csize, usize, every=64 << 10, chunk=16 << 10)
+        fp = openhands.ForwardPass(st, member.pairs, window=1 << 20, jump=1 << 30, max_stream_errors=2,
+                                   forgive=64 << 10)
+        got = {}
+        for name, kp, vis, err in fp:
+            got[name] = (kp, vis, None if err is None else f"{type(err).__name__}: {err}")
+    finally:
+        reader.close()
+    if ahead == 0:  # (with read-ahead, how many failures reach the pass depends on thread timing)
+        # more outages than allowed in a row, all survived: each was retried, clean progress forgave the last one
+        assert fp.stats["stream_errors"] > fp.max_stream_errors
+    _check_identical(member, got, ref)
+
+
+def test_header_cache_line_cut_just_before_its_newline(tmp_path):
+    """A kill between a line's last byte and its newline: the line is dropped, so the next append starts on a
+    fresh line instead of running into it (which lost every later line on the following load)."""
+    p = tmp_path / "m.headers.jsonl"
+    hc = openhands.HeaderCache(p, "Z.zip:a.h5", 1000, flush_every=1)
+    hc.add(10, "a")
+    hc.add(20, "b")
+    p.write_bytes(p.read_bytes()[:-1])  # '{"a":20,"e":"b"}' without its newline
+    back = openhands.HeaderCache(p, "Z.zip:a.h5", 1000).load()
+    assert back.items == {10: "a"}
+    back.add(30, "c")
+    back.add(40, "d")
+    back.flush()
+    assert openhands.HeaderCache(p, "Z.zip:a.h5", 1000).load().items == {10: "a", 30: "c", 40: "d"}
+    p.write_bytes(p.read_bytes().split(b"\n")[0])  # only the head line, cut before its newline
+    again = openhands.HeaderCache(p, "Z.zip:a.h5", 1000).load()
+    assert again.items == {}
+    again.add(50, "e")
+    again.flush()
+    assert openhands.HeaderCache(p, "Z.zip:a.h5", 1000).load().items == {50: "e"}
+
+
+def test_forward_pass_does_not_keep_the_header_cache_in_memory(member, tmp_path):
+    """Loaded headers are queued and then dropped (0.9 KB each); new ones still reach the file."""
+    hp = tmp_path / "x.headers.jsonl"
+    st = _stream(member)
+    half = member.pairs[: len(member.pairs) // 2]
+    list(openhands.ForwardPass(st, half, headers=openhands.HeaderCache(hp, "k", st.usize).load()))
+    hc = openhands.HeaderCache(hp, "k", st.usize).load()
+    n_before = hc.loaded
+    assert n_before > 0
+    fp = openhands.ForwardPass(_stream(member), member.pairs, headers=hc)
+    assert hc.items == {} and fp.stats["header_cache_hits"] > 0
+    got = {name: err for name, _, _, err in fp}
+    assert set(got) == {n for n, _, _ in member.pairs}
+    assert len(openhands.HeaderCache(hp, "k", st.usize).load().items) > n_before

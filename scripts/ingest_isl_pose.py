@@ -581,7 +581,7 @@ def _openhands_member(args, stream, entries, channel, mkey, member, man, out_dir
     hcache = openhands.HeaderCache(headers_file, mkey, stream.usize).load()
     fp = openhands.ForwardPass(stream, pending, headers=hcache)
     log.info("openhands-raw: %s: %d chunks pending, %d headers cached, first wanted byte at %.2f GB of %.2f GB", mkey,
-             len(pending), len(hcache.items), (fp.heap[0][0] if fp.heap else stream.usize) / 1e9, stream.usize / 1e9)
+             len(pending), hcache.loaded, (fp.heap[0][0] if fp.heap else stream.usize) / 1e9, stream.usize / 1e9)
 
     def relief() -> None:  # memory guard: page cache, metadata pages, read-ahead
         stream.pages.clear()
