@@ -59,8 +59,11 @@ CITATION = ("Selvaraj et al., OpenHands: Making Sign Language Recognition Access
 
 # --------------------------------------------------------------------------------------------- HTTP
 
-def range_fetch(url: str, start: int, end: int, retries: int = 10, timeout: float = 120.0, session=None) -> bytes:
-    """Bytes [start, end] inclusive. Never downloads a whole file when a server ignores ``Range``."""
+def range_fetch(url: str, start: int, end: int, retries: int = 10, timeout: float = 30.0, session=None,
+                min_rate: float = 100e3) -> bytes:
+    """Bytes [start, end] inclusive. Never downloads a whole file when a server ignores ``Range``. A transfer
+    slower than ``min_rate`` bytes/s on average (after a 30 s grace) is abandoned and retried: Zenodo
+    connections sometimes stall without closing."""
     import requests
 
     s = session or _session()
@@ -68,10 +71,18 @@ def range_fetch(url: str, start: int, end: int, retries: int = 10, timeout: floa
     want = end - start + 1
     for i in range(retries):
         try:
-            with s.get(url, headers={"Range": f"bytes={start}-{end}"}, timeout=timeout, stream=True,
+            with s.get(url, headers={"Range": f"bytes={start}-{end}"}, timeout=(30.0, timeout), stream=True,
                        allow_redirects=True) as r:
                 if r.status_code == 206:
-                    data = r.raw.read(want + 1, decode_content=False)
+                    deadline = time.time() + 30.0 + want / min_rate
+                    buf = bytearray()
+                    for chunk in r.raw.stream(1 << 20, decode_content=False):
+                        buf += chunk
+                        if len(buf) > want:
+                            break
+                        if time.time() > deadline:
+                            raise TimeoutError(f"stalled transfer ({len(buf)} of {want} bytes)")
+                    data = bytes(buf)
                     if len(data) == want:
                         return data
                     err = f"short read {len(data)} of {want}"
