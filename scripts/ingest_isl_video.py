@@ -9,12 +9,15 @@ Usage (repository root; CPU work runs with nice 10):
   python scripts/ingest_isl_video.py sources                       # catalogue + manifest counts
   python scripts/ingest_isl_video.py probe [SOURCE ...]            # are the files reachable? (CISLR: granted/pending)
   python scripts/ingest_isl_video.py run SOURCE [--workers N|auto] [--limit N] [--max-minutes M] [--per-class N]
+  python scripts/ingest_isl_video.py list SOURCE [--per-class N]    # item list only (manifests/<source>_items.json)
   python scripts/ingest_isl_video.py islrtc-full [--paths A/Alphabet.mp4 ...]   # full-length ISLRTC compilations
   python scripts/ingest_isl_video.py status
 
 Exit codes of `run`: 0 finished, 10 stopped after --max-minutes (more to do), 4 stopped for low disk,
 3 gated dataset not accessible yet, 5 stopped for memory (--max-rss-gb; resumable, the queue restarts it),
 6 another run of the same manifest is active (lock manifests/<manifest>.lock or a process scan), 2 error.
+An HF alphabet listing that Hugging Face keeps refusing (429 / 503) exits 10 when it saved new rows (resumes next
+chunk) and 2 when it made no progress; raw/<source>/listing_status.json says how far it got.
 CISLR has exactly one ingestion path: this `run cislr` (the queue runs it as soon as the 1-byte probe of
 dataset.csv answers); scripts/ingest_isl_gated.py cislr delegates here and shares the lock.
 --workers auto: 1 while INCLUDE (1 worker) and ISLRTC (3 workers) ingestion run, otherwise the CPUs they leave free
@@ -253,36 +256,11 @@ def build_items(name: str, paths, per_class: int | None = None):
         return spec, items, Fetcher()
 
     if name in ("hf_hemg_alphabet", "hf_akrit_alphabet"):
-        ds = ex["dataset"]
-        items = []
-        for split in ex["splits"]:
-            lab_path = raw / f"labels_{split}.json"
-            part_path = raw / f"labels_{split}.partial.json"  # listing resumes after a rate-limit failure
-            if lab_path.exists():
-                lab = json.loads(lab_path.read_text())
-            else:
-                lab = json.loads(part_path.read_text()) if part_path.exists() else {"names": None, "rows": []}
-                off = len(lab["rows"])
-                while True:
-                    r = _get("https://datasets-server.huggingface.co/rows",
-                             params={"dataset": ds, "config": "default", "split": split, "offset": off, "length": 100})
-                    d = r.json()
-                    if lab["names"] is None:
-                        feat = next(f for f in d["features"] if f["name"] == "label")
-                        lab["names"] = feat["type"]["names"]
-                    rows = d.get("rows", [])
-                    lab["rows"] += [[int(x["row_idx"]), int(x["row"]["label"])] for x in rows]
-                    off += len(rows)
-                    if len(lab["rows"]) % 2000 < 100:
-                        part_path.write_text(json.dumps(lab))
-                    if not rows or off >= int(d.get("num_rows_total") or 0):
-                        break
-                    time.sleep(1.0)  # the rows API answers 429 when paged quickly
-                lab_path.write_text(json.dumps(lab))
-                part_path.unlink(missing_ok=True)
-            items += L.hf_rows_items(spec.prefix, ds, split, [tuple(x) for x in lab["rows"]], lab["names"],
-                                     per_class=per_class or ex["per_class"])
-        return spec, items, Fetcher()
+        # polite, resumable rows-API listing (backoff, Retry-After, progress saved after every page, status in
+        # raw/<source>/listing_status.json); raises hf_listing.ListingError when HF keeps refusing
+        from app.isl.data.video_sources.hf_listing import build_hf_items
+
+        return spec, build_hf_items(spec, raw, per_class=per_class), Fetcher()
 
     raise ValueError(f"no listing for {name}")
 
@@ -396,6 +374,12 @@ def _run_locked(args, paths, spec, engine) -> int:
     except PermissionError as e:
         log.info("%s: %s", args.source, e)
         return EXIT_GATED
+    except OSError as e:
+        rc = _listing_rc(e)
+        if rc is None:
+            raise
+        log.error("%s: listing incomplete: %s", args.source, e)
+        return rc
     engine.dump_items(paths.manifests / f"{spec.name}_items.json", items)  # what this run selected (audit)
     log.info("%s: %d items listed, %d workers, profile %s, licence %s", spec.name, len(items), workers, spec.profile,
              spec.licence)
@@ -412,6 +396,50 @@ def _run_locked(args, paths, spec, engine) -> int:
     if args.limit and stats["todo"] >= args.limit:
         return EXIT_MORE
     return 0
+
+
+def _listing_rc(e: OSError) -> int | None:
+    """Exit code for an HF listing the server refused (hf_listing.ListingError): 10 (more to do) when this run saved
+    new rows - the queue starts the next chunk, which resumes the listing, without counting a failed try - else 2
+    (the queue counts it and backs off). None for any other OSError."""
+    from app.isl.data.video_sources.hf_listing import ListingError
+
+    if not isinstance(e, ListingError):
+        return None
+    return EXIT_MORE if e.progressed and not e.permanent else EXIT_ERR
+
+
+def cmd_list(args) -> int:
+    """Write manifests/<source>_items.json (the run's item list) without fetching or extracting any item. Holds
+    the source's manifest lock, so it never runs alongside an ingestion run of the same source (exit 6 then)."""
+    from app.isl.data.video_sources import engine
+    from app.isl.data.video_sources.catalog import get_source
+
+    paths = _paths(args.root)
+    _setup_logging(paths, args.source)
+    spec = get_source(args.source)
+    lock = source_lock(paths, spec, args.source)
+    if lock is None:
+        return EXIT_BUSY
+    try:
+        try:
+            spec, items, fetcher = build_items(args.source, paths, per_class=args.per_class)
+        except PermissionError as e:
+            log.info("%s: %s", args.source, e)
+            return EXIT_GATED
+        except OSError as e:
+            rc = _listing_rc(e)
+            if rc is None:
+                raise
+            log.error("%s: listing incomplete: %s", args.source, e)
+            return rc
+        fetcher.close_archives()
+        out = paths.manifests / f"{spec.name}_items.json"
+        engine.dump_items(out, items)
+        log.info("%s: %d items listed -> %s (nothing fetched)", spec.name, len(items), out)
+        return 0
+    finally:
+        lock.close()
 
 
 ISLRTC_FULL_PATTERN = r"(alphabet|fingerspell)"
@@ -492,6 +520,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--per-class", type=int, default=None, help="image sets: sample size per class")
     p.add_argument("--max-rss-gb", type=float, default=1.5,
                    help="soft memory cap per process (this one and each worker); stop with exit 5 above it; 0 = off")
+    p = sub.add_parser("list", help="write manifests/<source>_items.json only (no fetch / extraction)")
+    p.add_argument("source")
+    p.add_argument("--per-class", type=int, default=None, help="image sets: sample size per class")
     p = sub.add_parser("islrtc-full")
     p.add_argument("--paths", nargs="*", help="ISLRTC paths (default: alphabet / fingerspell / number compilations)")
     p.add_argument("--max-s", type=float, default=180.0)
@@ -502,8 +533,8 @@ def main(argv: list[str] | None = None) -> int:
     except OSError:
         pass
     os.environ.setdefault("SLR_TORCH_THREADS", "2")
-    cmds = {"sources": cmd_sources, "probe": cmd_probe, "run": cmd_run, "islrtc-full": cmd_islrtc_full,
-            "status": cmd_status}
+    cmds = {"sources": cmd_sources, "probe": cmd_probe, "run": cmd_run, "list": cmd_list,
+            "islrtc-full": cmd_islrtc_full, "status": cmd_status}
     try:
         return cmds[args.cmd](args)
     except KeyboardInterrupt:

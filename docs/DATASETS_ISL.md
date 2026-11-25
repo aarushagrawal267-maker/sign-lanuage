@@ -21,7 +21,7 @@ running, partial data). Every number below says when and on how much data it was
 | **ISL emergency words** (Mendeley `2vfdm42337` v1, Adithya & Rajesh) | 8 words x 26 people x 2 takes (412 raw videos), hands only (signer behind a board) | CC BY 4.0 | yes, with attribution | commercial-safe + research | public |
 | **ISL agricultural words** (Mendeley `6v53kfxf46` v1, Adithya & Rajesh) | 13 words, 3 deaf farmers outdoors; 78 original videos (the crop1/2/3 folders are crops of the same recordings, not used) | CC BY 4.0 | yes, with attribution | commercial-safe + research | public |
 | **Static ISL alphabet, Hindi vowels, numerals** (Mendeley `7tsw22y96w` v1, Singh et al.) | 102,470 photos, 46 classes (A-Z with two E signs, 8 Hindi vowels, 0-9 with two 9 signs), kids / teens / adults; we use a balanced sample of 300 per class (13,800) | CC BY 4.0 | yes, with attribution | commercial-safe + research | public |
-| `Hemg/Indian_sign_language_dataset`, `akritRihal/Indian_Sign_Language_dataset` (Hugging Face) | alphabet + digit images (42,745 hand crops / 10,752 photos); 300 per class sampled | **none stated**, no provenance | **no** (unknown) | research only | public |
+| `Hemg/Indian_sign_language_dataset`, `akritRihal/Indian_Sign_Language_dataset` (Hugging Face) | alphabet + digit images (42,745 hand crops / 10,752 photos); 300 per class sampled | **none stated**, no provenance (re-checked 25 Nov 2026 20:40 UTC: no `license:` tag in either card, Hemg's card says "More Information needed", akrit's README is only the `dataset_info` block) | **no** (unknown) | research only (`profiles.LETTER_SOURCES["research"]`; in no commercial-safe list) | public |
 | MediaPipe HandLandmarker (`hand_landmarker.task`) | hand landmarks where Holistic finds none (hands-only videos, still images) | Apache-2.0 | yes | both | downloaded to `assets/mediapipe/` (git-ignored) |
 | WLASL (existing ASL model) | ASL, 100 words | C-UDA 1.0 | **no** | research only (warm start) | see `docs/LICENSING.md` |
 | WordNet 3.0 (via NLTK data) | synonym lists, part of speech, coarse categories | WordNet licence (permissive) | yes | both | public |
@@ -277,9 +277,25 @@ free disk under `data/isl` must stay above 10 GB (checked before every item; the
 | `mendeley_emergency` | 412 raw videos (8 zips, 2.58 GB; the cropped copies are not used) | 8 words | commercial-safe | hands only. Some takes are byte-identical (e.g. `call_001_01` = `call_001_02`): kept once (`duplicate_of`) |
 | `mendeley_agri` | 78 videos (the `Original` folders; crop1/2/3 are crops of the same recordings) | 13 words (`Cococnut` -> coconut) | commercial-safe | outdoor, faces often cut off at the top -> `hands` mode. Subject 1's `Original` folder actually holds the `crop1` files (same names and sizes as its `cropped1` folder) |
 | `mendeley_static` | 13,800 of 102,470 photos (300 per folder, round-robin over kids/teens/adults x full/half sleeves, seed 13) | A-Z (`E1`/`E2` -> E, kept as `variant`), 8 Hindi vowels, 0-9 (`9a`/`9b` -> 9) | commercial-safe | `--per-class N` for more; the selected list is in `manifests/mendeley_static_items.json`; Mendeley SHA-256 verified per file |
-| `hf_akrit_alphabet` | up to 300 per class of 10,752 (33 classes, no h/j/v) | letters, digits | research | licence unknown |
-| `hf_hemg_alphabet` | up to 300 per class of 42,745 (35 classes, 128x128 hand crops) | letters 1-9 + A-Z | research | licence unknown; probably augmented copies of few originals |
+| `hf_akrit_alphabet` | up to 300 per class **and split** of 10,752 (33 classes, no h/j/v): 10,118 items (train 8,505, test 1,613 = all of test) | letters, digits | research | licence unknown. Item list written 25 Nov 2026 20:43 UTC by `ingest_isl_video.py list` (nothing fetched; the queue's run reuses the cached labels) |
+| `hf_hemg_alphabet` | up to 300 per class of 42,745 (35 classes, 128x128 hand crops) | letters 1-9 + A-Z | research | licence unknown; probably augmented copies of few originals. Item list written 25 Nov 2026 21:08 UTC by `ingest_isl_video.py list`: 10,500 items (35 classes x 300; 1,200-1,447 images per class) |
 | `islrtc-full` | ISLRTC compilations not yet in `islrtc_full.jsonl`: `A/Ancient_Alphabets`, `G/Greek_Alphabets` (the 7 others were done on 25 Nov) | as ISLRTC | as ISLRTC | runs `scripts/ingest_isl.py`'s own `run_islrtc` (`--only --full --max-s 180 --out-subdir islrtc_full`) in-process, so no second `ingest_isl.py islrtc` process appears |
+
+**HF alphabet listings** (`app.isl.data.video_sources.hf_listing`, since 25 Nov 2026). The labels come from the
+datasets-server rows API (100 rows per request; no parquet reader in the venv), which answers 429 after roughly 30
+quick pages and has 503 spells - why the first listings failed. The listing now waits at least 2 s between
+requests, backs off exponentially on 429 / 5xx / connection errors (5 s doubling to 10 min, +0-20 % jitter, never
+shorter than `Retry-After`; a `Retry-After` above 30 min stops at once), saves the rows listed so far after every
+page (`raw/<source>/labels_<split>.partial.json`, only a validated contiguous prefix is kept) and gives up after 8
+failed tries in a row. `raw/<source>/listing_status.json` says per split `complete` / `listing` / `incomplete` /
+`failed`, rows / total and the last error. A refused `run` exits 10 (more to do, the queue resumes it next chunk
+without counting a failed try) when it saved new rows, else 2 (the queue's 5 tries). Measured 25 Nov 20:35-21:08:
+a 429 every 28-30 pages (17 times over both sets), each cleared after 1-4 retries (at most 90 s); akrit (110
+pages) took 8 min, Hemg (428 pages) 25 min. Both listings are complete; readiness now expects 10,118 / 10,500 items
+(0 ingested: the queue runs them after WSLP and the sources before them).
+`python scripts/ingest_isl_video.py list SOURCE` writes `manifests/<source>_items.json` without fetching anything
+(holds the manifest lock, so a queue run of the same source waits, exit 6). The images themselves are still fetched
+through the rows API page of each item (`engine.Fetcher`, kind `hfrow`, its own 6-try backoff).
 
 **Decided not to ingest.** WSLP `Shared_task_WPP` query videos: all 2,541 (train 1,410, val 576, test 555) are
 byte-identical copies (same CRC32 and size, same uid) of WR clips, so they add no word labels; the WPP sentence videos
