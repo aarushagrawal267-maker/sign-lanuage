@@ -125,3 +125,39 @@ def test_pack_serves_the_phase2_report_not_a_stale_results_json(tmp_path):
     assert json.loads((pack / "results.json").read_text())["label"] == "phase-2 report"
     assert (pack / "eval" / "report.json").exists() and "results.json" in r["files"]
     assert json.loads((pack / "pack.json").read_text())["results"] == "results.json"
+
+
+def test_a_job_blocks_only_the_profiles_that_read_its_source(tmp_path):
+    """The OpenHands raw job (research only) reads ~10 chunks / min of 86k on 25 Nov: it must not hold back the
+    commercial-safe run, which never reads OpenHands. The queue and unknown jobs still block every profile."""
+    P = _paths(tmp_path)
+    for name in ("include", "islrtc", "mendeley_emergency", "mendeley_agri", "isl_csltr", "mendeley_static"):
+        ids = [f"{name}/{i}" for i in range(3)]
+        write_manifest(P.manifest(name), [{"id": i, "ok": True} for i in ids])
+        (P.manifests / f"{name}_items.json").write_text(json.dumps([{"id": i} for i in ids]))
+    proc = tmp_path / "proc"
+
+    def add(pid, argv):
+        d = proc / str(pid)
+        d.mkdir(parents=True)
+        (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+
+    add(201, ["/v/python", "/r/scripts/ingest_isl_pose.py", "openhands-raw", "--workers", "12"])
+    add(202, ["python", "scripts/ingest_isl_video.py", "run", "wslp", "--workers", "auto"])
+    add(203, ["python", "scripts/ingest_isl_gated.py", "isign", "--mode", "zip"])
+    rep = rd.check(P, "commercial-safe", proc_root=proc)
+    assert rep["ready"], rep["reasons"]
+    assert {p["pid"]: p["source"] for p in rep["processes"]} == {201: "openhands_raw", 202: "wslp", 203: "isign"}
+    assert all("does not read" in p["note"] for p in rep["processes"])
+    rep = rd.check(P, "research", proc_root=proc)
+    assert {r for r in rep["reasons"] if r.startswith("ingestion job")} == {
+        "ingestion job running: pid 201 ingest_isl_pose.py openhands-raw",
+        "ingestion job running: pid 202 ingest_isl_video.py run",
+        "ingestion job running: pid 203 ingest_isl_gated.py isign"}
+    # jobs of commercial-safe sources, the queue and unknown sub-commands block commercial-safe
+    add(204, ["python", "scripts/ingest_isl.py", "islrtc-recut", "--follow"])
+    add(205, ["python", "scripts/ingest_isl_video.py", "run", "mendeley_agri"])
+    add(206, ["bash", "scripts/isl_queue.sh"])
+    add(207, ["python", "scripts/ingest_isl_video.py", "something-new"])
+    rep = rd.check(P, "commercial-safe", proc_root=proc)
+    assert sorted(int(r.split()[4]) for r in rep["reasons"] if r.startswith("ingestion job")) == [204, 205, 206, 207]

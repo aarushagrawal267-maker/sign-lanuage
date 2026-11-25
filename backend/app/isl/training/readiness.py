@@ -2,7 +2,9 @@
 
 Two checks, both required before ``scripts/phase2_train.sh`` starts a full run:
 
-* **no ingestion job is running**: a process whose command line runs ``scripts/ingest_isl.py``,
+* **no ingestion job is running** that writes a source of the profile (a job of a single known source, e.g.
+  ``ingest_isl_pose.py openhands-raw``, blocks only the profiles that read that source; the queue and any job whose
+  source is unknown block every profile): a process whose command line runs ``scripts/ingest_isl.py``,
   ``ingest_isl_pose.py``, ``ingest_isl_video.py`` (except the read-only ``status`` / ``sources`` / ``probe``
   sub-commands), ``ingest_isl_gated.py cislr|isign`` (not its ``--check`` access probe) or ``isl_queue.sh``.
   The queue counts only until its log says "all listed sources processed":
@@ -78,6 +80,25 @@ def queue_polling_only(queue_log: Path | None) -> bool:
     return text.find(QUEUE_DONE_MARK, max(0, start)) >= 0
 
 
+def process_source(script: str, rest: list[str]) -> str | None:
+    """The data source an ingestion process writes, or None when it is unknown or several (the queue)."""
+    args = [a for a in rest if not a.startswith("-")]
+    if not args or script == "isl_queue.sh":
+        return None
+    sub = args[0]
+    if script == "ingest_isl.py":
+        return "islrtc" if sub.startswith("islrtc") else sub if sub == "include" else None
+    if script == "ingest_isl_video.py":
+        if sub == "islrtc-full":
+            return "islrtc"
+        return args[1].replace("-", "_") if sub == "run" and len(args) > 1 else None
+    if script == "ingest_isl_pose.py":
+        return sub.replace("-", "_")
+    if script == GATED_SCRIPT:
+        return next((a for a in args if a in GATED), None)
+    return None
+
+
 def ingestion_processes(proc_root: Path | None = None, queue_log: Path | None = None,
                         self_pid: int | None = None) -> list[dict]:
     """Running ingestion jobs: ``[{pid, script, subcommand, cmd, blocking}]`` (``blocking`` False only for a queue
@@ -107,7 +128,7 @@ def ingestion_processes(proc_root: Path | None = None, queue_log: Path | None = 
                 sub = next(a for a in rest if a in ("cislr", "isign"))
             blocking = not (script == "isl_queue.sh" and queue_polling_only(queue_log))
             out.append({"pid": int(d.name), "script": script, "subcommand": sub, "cmd": " ".join(argv)[:200],
-                        "blocking": blocking})
+                        "blocking": blocking, "source": process_source(script, argv[i + 1:])})
             break
     return sorted(out, key=lambda r: r["pid"])
 
@@ -234,9 +255,16 @@ def profile_source_names(profile: str) -> list[str]:
 def check(paths: IslPaths, profile: str, proc_root: Path | None = None, queue_log: Path | None = None) -> dict:
     """``{"ready": bool, "reasons": [...], "processes": [...], "sources": {name: status}}``."""
     procs = ingestion_processes(proc_root, queue_log if queue_log is not None else paths.root / "logs" / "queue.log")
+    names = profile_source_names(profile)
+    # a job that writes one known source blocks only the profiles that read it (an OpenHands raw job, research only,
+    # must not hold back the commercial-safe run); the queue and unknown jobs block every profile (fail closed)
+    for p in procs:
+        if p["blocking"] and p.get("source") is not None and p["source"] not in names:
+            p["blocking"] = False
+            p["note"] = f"writes {p['source']}, which profile {profile} does not read"
     blocking = [p for p in procs if p["blocking"]]
-    scripts = {p["script"] for p in procs}
-    sources = {n: source_status(paths, n, scripts) for n in profile_source_names(profile)}
+    scripts = {p["script"] for p in procs if p.get("source") is None or p["source"] in names}
+    sources = {n: source_status(paths, n, scripts) for n in names}
     reasons = [f"ingestion job running: pid {p['pid']} {p['script']} {p['subcommand']}".strip() for p in blocking]
     for n, st in sources.items():
         if st["complete"] is False:

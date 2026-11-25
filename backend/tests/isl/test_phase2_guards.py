@@ -121,7 +121,7 @@ def test_readiness_checks_processes_and_every_manifest(tmp_path):
     # a running ingestion job blocks
     (P.manifests / "mendeley_agri_items.json").write_text(json.dumps([{"id": f"mendeley_agri/{i}"} for i in range(3)]))
     proc = tmp_path / "proc"
-    _proc(proc, 300, ["python", "scripts/ingest_isl_video.py", "run", "wslp"])
+    _proc(proc, 300, ["python", "scripts/ingest_isl_video.py", "run", "mendeley_agri"])  # a commercial-safe source
     rep = rd.check(P, "commercial-safe", proc_root=proc)
     assert not rep["ready"] and rep["reasons"] == ["ingestion job running: pid 300 ingest_isl_video.py run"]
     # gated sources without access are unavailable, not incomplete (research profile)
