@@ -153,9 +153,11 @@ class PrefetchReader:
                     if j * self.block < self.size and j not in self.futs:
                         self.futs[j] = self._submit(j)
             self.last = k
+            # evict least-recently-used blocks, sparing only the current block and its read-ahead window (an
+            # index-based stop here kept every block after a backward seek: 6.9 GB RSS, OOM-killed on NIOS)
             while len(self.futs) > self.keep + self.ahead:
-                old = next(iter(self.futs))
-                if old >= k:
+                old = next((j for j in self.futs if not (k <= j <= k + self.ahead)), None)
+                if old is None:
                     break
                 self.futs.pop(old)
             fut = self.futs[k]

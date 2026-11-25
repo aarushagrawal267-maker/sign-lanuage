@@ -296,6 +296,24 @@ def test_seekable_inflate_random_access():
     reader.close()
 
 
+def test_prefetch_cache_stays_bounded_after_backward_seek():
+    """Regression: a backward seek used to stop LRU eviction until the read passed the old blocks again
+    (907 of 9 blocks kept here; 6.9 GB RSS and an OOM kill on the 30 GB NIOS member)."""
+    blob = bytes(range(256)) * 4096 * 4  # 4 MB
+    reader = openhands.PrefetchReader(lambda s, e: blob[s:e + 1], len(blob), block=4096, ahead=3, keep=6)
+    try:
+        for k in range(900, 1000):
+            assert reader.read_at(k * 4096, 10) == blob[k * 4096:k * 4096 + 10]
+        reader.read_at(5 * 4096, 10)
+        peak = 0
+        for k in range(5, 900):
+            assert reader.read_at(k * 4096 + 3, 5) == blob[k * 4096 + 3:k * 4096 + 8]
+            peak = max(peak, len(reader.futs))
+        assert peak <= reader.keep + reader.ahead
+    finally:
+        reader.close()
+
+
 def test_zip_member_span_and_safe_names():
     payload = b"abc" * 100_000
     b = io.BytesIO()
