@@ -29,7 +29,12 @@ ISLRTC_TERMS = ("free, non-profit use with acknowledgement only (ISLRTC FAQ Q.23
 
 
 def workdir(profile: str) -> Path:
-    d = get_settings().artifacts_dir / "isl" / get_profile(profile).name
+    """``<artifacts>/isl/<profile>``; ``SLR_ISL_WORKDIR`` overrides the parent folder (smoke runs of the phase-2
+    driver use it so they never overwrite a real build)."""
+    import os
+
+    base = Path(os.environ["SLR_ISL_WORKDIR"]) if os.environ.get("SLR_ISL_WORKDIR") else get_settings().artifacts_dir / "isl"
+    d = base / get_profile(profile).name
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -123,7 +128,19 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
     if (work / "index" / "meta.json").exists():
         shutil.copytree(work / "index", tmp / "index")
         files["index/embeddings.f16.npy"] = _sha(tmp / "index" / "embeddings.f16.npy")
+    if (work / "eval" / "report.json").exists():  # evaluate --all report travels with the pack
+        shutil.copytree(work / "eval", tmp / "eval")
     shutil.copy2(vocab_path or PACK_DIR / "vocabulary.jsonl", tmp / "vocabulary.jsonl")
+    extra = work / "extra_concepts.jsonl"  # concepts only other sources (WSLP, ISL500, ...) know: appended
+    if extra.exists() and extra.stat().st_size:
+        have = {r["concept_id"] for r in Vocabulary.load(tmp / "vocabulary.jsonl").rows}
+        with extra.open(encoding="utf-8") as src, (tmp / "vocabulary.jsonl").open("a", encoding="utf-8") as dst:
+            for ln in src:
+                try:
+                    if ln.strip() and json.loads(ln)["concept_id"] not in have:
+                        dst.write(ln if ln.endswith("\n") else ln + "\n")
+                except (json.JSONDecodeError, KeyError):
+                    continue
     if (PACK_DIR / "lexicon_hi.jsonl").exists():  # only the rows of this pack's vocabulary
         ids = {r["concept_id"] for r in Vocabulary.load(tmp / "vocabulary.jsonl").rows}
         with (PACK_DIR / "lexicon_hi.jsonl").open(encoding="utf-8") as src, \
@@ -148,6 +165,18 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
     if not prof.commercial:
         licences += [{"source": "cislr", "licence": "CC-BY-NC-4.0 (README; HF tag says AFL-3.0)", "commercial": False},
                      {"source": "isign", "licence": "CC-BY-NC-SA-4.0", "commercial": False}]
+    used = work / "sources.json"  # written by the phase-2 commands: every source that reached a component
+    if used.exists():
+        try:
+            for name, d in sorted(json.loads(used.read_text()).items()):
+                if isinstance(d, dict) and d.get("available") and not any(x["source"] == name for x in licences):
+                    licences.append({"source": name, "licence": d.get("licence", ""), "commercial": d.get("commercial", False),
+                                     **({"role": d["role"]} if d.get("role") else {})})
+        except (ValueError, KeyError):
+            pass
+    if prof.commercial and any(not x.get("commercial", False) for x in licences):
+        raise ValueError(f"refusing to build a commercial-safe pack with non-commercial sources: "
+                         f"{[x['source'] for x in licences if not x.get('commercial', False)]}")
     man = {**base, "id": PACK_IDS[prof.name], "version": PACK_VERSION + ("-smoke" if smoke else ""),
            "profile": prof.name, "feature_config": fcfg.to_dict(), "licences": licences,
            "display_name": base["display_name"] if prof.commercial else

@@ -1726,3 +1726,118 @@ Checked from a clean clone of `claude/indian-sign-language` (commit `fc1745a`) i
     signers; ask an Indore school to record the ISL alphabet and everyday words with 5+ consenting signers.
 12. **Smaller gaps**: look-alike conflict report on sign-pack import; Playwright `e2e/isl.spec.ts` against a backend with
     the trained pack; ISL in the static demo (IndexedDB) later; licence decision on ISLRTC before any paid release.
+
+### 15.2 Phase-2 training and evaluation on all sources (AI Engineer, 25 Nov 2026)
+
+**Status: ready to run, not run at full settings.** Everything below is implemented and tested on synthetic data
+and smoke-tested on the partial data of 25 Nov; no full training has been started (ingestion is still running).
+
+**One command per profile** (resumable; run it again after any stop and it continues where it was):
+
+```
+nohup scripts/phase2_train.sh --profile both >> data/isl/logs/phase2_driver.out 2>&1 &   # commercial-safe, then research
+scripts/phase2_train.sh --profile research --list                                      # which steps are done
+```
+
+Steps (one stamp file per step in `data/isl/logs/phase2_<profile>.stamps/`, log in `data/isl/logs/phase2_<profile>.log`,
+everything under `nice -n 10`, stops before any step if less than 10 GB of disk is free):
+
+| Step | Command | What it does |
+|---|---|---|
+| trim | `trim` | ISLRTC first-sign trims for clips without one (incremental) |
+| dedup | `dedup --sources include islrtc cislr wslp isl500 mendeley_*` | landmark near-duplicates across sources |
+| vocab | `vocab --no-trims --out <work>/vocabulary.jsonl` | refreshed vocabulary in the work folder (review, then commit it to `models/packs/isl/`) |
+| splits | `splits --vocab <work>/vocabulary.jsonl` | INCLUDE official / session / pseudo-signer splits, one-shot concept folds |
+| link | `link-sources --all-sources` | every labelled word source linked to concepts, signer-held-out splits, duplicates dropped |
+| bench | `bench` | CPU seconds per step for the chosen model size (logged, for the time budget) |
+| pretrain | `pretrain` | self-supervised encoder pre-training on every unlabelled / sentence source |
+| encoder | `train-encoder --all-sources --init auto` | fine-tune (SupCon + sub-centre ArcFace) from the pre-trained trunk |
+| oneshot | `train-oneshot --folds 0 1` | E2 encoders, each fold's concepts held out of all supervised training |
+| classifier | `train-classifier --all-sources` | closed-set classifier over every concept with >= 2 signer groups |
+| e1a | `train-classifier --split include-official --ckpt <work>/e1a/classifier.pt` | the model E1a needs (official split) |
+| fingerspell | `train-fingerspell` | letter model from every letter source + leave-one-signer-out E5 |
+| index | `build-index --all-sources` | index over training references only (keeps evaluation clean) |
+| fusion | `fit-fusion --all-sources` | fusion weights and thresholds on validation; always writes strict / balanced / lenient |
+| evaluate | `evaluate --all --all-sources` | E1a-E8 -> `<work>/eval/report.json` + `report.md` and `artifacts/packs/<pack>/eval/` |
+| index_final | `build-index --all-sources --all-include` | the shipped index: every reference of every source |
+| pack | `build-pack` | `artifacts/packs/isl` or `isl-research` (copies `eval/`, lists every source and licence) |
+
+Options: `--from STEP`, `--only STEP`, `--force STEP` (also deletes that step's training state), `--threads 4` once the
+machine is free, `--step-minutes M` (each training call stops after M minutes with its state saved and is re-run with
+`--resume` until done: exit code 75 means "stopped, continue later"). Full-setting sizes can be overridden with
+environment variables (`HIDDEN LAYERS EMB PRE_EPOCHS PRE_STEPS PRE_BATCH ENC_EPOCHS ENC_STEPS CLS_EPOCHS CLS_STEPS
+ONESHOT_FOLDS ONESHOT_EPOCHS LETTER_EPOCHS`). `--smoke` uses tiny settings, a private ISL root (real manifests and
+landmarks through read-only symlinks, its own `derived/` and `splits/`) and writes only under
+`artifacts/isl/phase2-smoke/`, so it never changes shared derived files or the packs the app loads.
+
+**Sources per profile** (`backend/app/isl/training/multisource.py`; enforced twice: an allow-list per profile **and**
+the adapter's own `commercial` flag, `LicenceError` otherwise; `build-pack` also refuses a commercial-safe pack whose
+`sources.json` lists a non-commercial source):
+
+| Role | commercial-safe | research (adds) |
+|---|---|---|
+| labelled words (classifier, encoder, index, calibration) | INCLUDE, ISLRTC (non-profit terms), Mendeley emergency + agriculture words | ISL500, WSLP, CISLR |
+| pre-training only (labels never read) | ISL-CSLTR sentences + the word clips without labels | GloSL-ISL, OpenHands raw, iSign, WSLP unlabelled |
+| letters | Mendeley static alphabet | ISL-Fingerspelling, OpenHands fingerspelling, HF alphabet image sets |
+
+My signs are never a training source. A source whose adapter or manifest is missing is simply skipped and reported.
+
+**Multi-source labelled data.** `GlossLinker` maps every source's gloss onto one concept id (adapter's own concept ->
+exact headword key, preferring the plain concept over domain-qualified ones -> a *unique* synonym key -> a new
+`isl.<slug>` concept shared by all sources with that gloss). New concepts go to `<work>/extra_concepts.jsonl` and are
+appended to the pack's vocabulary (no Hindi yet: they show English only until the lexicon covers them). Sources with
+real signer ids (ISL500, Mendeley emergency) are split by **whole signers** (about 15 % test, 10 % val; at least 6
+signers, else all training) and give E1c. The classifier takes every concept with >= 2 signer groups and >= 2 clips
+across the training sources (INCLUDE rule unchanged), class-balanced batches (class drawn with probability ~
+count^0.5, inside a class by per-source weight: INCLUDE / ISLRTC / ISL500 1.0, WSLP / CISLR 0.8, Mendeley 0.5;
+ISLRTC x4 as before). Augmentation is the existing strong signer augmentation (body proportions, rotation, scale,
+speed, hand chunk dropout, finger-angle noise); **left-handed signers are handled by `canonical_hand`** (the features
+mirror a left-dominant signer deterministically), so no random mirroring is added (it would create left-dominant
+inputs that never occur at inference). The index adds, per (concept, source), a centroid plus up to 3 per-signer
+centroids, or one row per clip for one-clip-per-word sources, with per-source row weights (ISLRTC / INCLUDE / ISL500
+1.0, Mendeley 0.97, CISLR / WSLP 0.95). Training sets too large to cache (ISL500 has tens of thousands of clips) use
+`LazyClipDataset` (bounded LRU of body frames, about 1.3 GB at the default 12,000 items).
+
+**Self-supervised pre-training** (`training/pretrain.py`): same `SignEncoder`, two CPU-feasible objectives:
+temporal contrastive NT-Xent between two augmented crops (1-4 s) of the same sequence that are close in time
+(whole-clip SimCLR views for short word clips), plus masked-frame modelling (25 % of frames in spans of 3 replaced by a
+learned token after the input projection, reconstructed from the BiGRU states). Sources are sampled ~ 1/sqrt(size)
+per clip so one huge corpus does not drown the others. The checkpoint is an ordinary encoder checkpoint
+(`meta.pretraining` lists sources, clip counts, config, `labels_used: false`); fine-tuning warm-starts from it
+(`--init auto`, recorded in the encoder's meta). **Evaluation clips are excluded from pre-training** (INCLUDE val/test
+of the primary split and the other sources' held-out signers), so test videos are not seen even without labels.
+Dictionary (ISLRTC) clips are in pre-training; E2's label says so.
+
+**Resumable training** (`training/loop.py`, used by pre-training, encoder and classifier): state (model, optimiser,
+scheduler, epoch, step inside the epoch, history, best score, RNG) is written atomically every 5 minutes and every
+epoch; batches are drawn from a `(seed, epoch)` RNG so a restart skips the batches already trained, by index, without
+loading data (tested: an interrupted run reaches the same weights as an uninterrupted one). A state file from a run
+with other settings is refused (delete it, or `--force STEP`).
+
+**Evaluation** (`evaluation/runners.py`, `evaluate --all`): every accuracy is reported with the **not-sure rate**
+(abstain), the **wrong-accept rate** (accepted and wrong / all), coverage, n, number of signer groups and a 95 %
+bootstrap interval over **signer groups**. E1a (only with the official-split model; labelled not
+signer-independent), E1b (primary split, + `cv/fold*/classifier.pt` models when present), E1c (other sources'
+held-out signers), E2 (below), E2_seen (the old seen-class retrieval number, labelled as such), E3 (fused system, all
+three policies, risk-coverage), E4 (My signs: a held-out signer enrols k = 1/3/5 takes of half of their words; gain
+on their other takes and false accepts of user signs on the words they did not enrol), E5 (fingerspelling,
+leave-one-signer-out, computed at training time and read from `letters.pt`), E6 (latency), E7 (ASL model files
+unchanged in git), E8 (trim report + method mix).
+Leakage guards: **E2** holds a fold's concepts **and every concept sharing a headword or synonym key with them** out of
+all supervised training (INCLUDE, ISLRTC, ISL500, WSLP, ...); the runner refuses an encoder whose
+`excluded_concepts` do not cover that set; the gallery is one ISLRTC clip per dictionary entry; decision thresholds are
+fitted on *seen-class* validation queries only; queries in a duplicate group of any training clip are dropped.
+**E1** refuses a classifier trained on another split. Duplicate groups (`DedupIndex`) join clips with the same
+source-video SHA-256, the same landmark file, or a `duplicates.jsonl` cluster; training clips sharing a group with any
+evaluation clip are removed before training (counts in `<work>/multisource.json`).
+
+**Fingerspelling** (`training/train_fingerspell.py`): letter frames from ISL-Fingerspelling (middle half of each
+annotated letter; space segments and frames outside letters = noise), OpenHands letter / digit clips and static
+alphabet images; the existing `LetterClassifier` trained class-balanced, temperature-scaled on a held-out signer,
+same checkpoint format, so `Speller` (dictionary-guided `SpellDecoder`) and the per-user alphabet calibration are
+unchanged. `n_signers` counts only known signer ids (3 in ISL-Fingerspelling), so spelling stays labelled
+experimental (< 5 signers) and spelled words are still only suggested, never auto-accepted.
+
+**Fusion fix**: `FusionParams` always holds all three policies (missing ones filled from the nearest present one,
+kept ordered strict >= balanced >= lenient), `fit_thresholds` always fits all three, and `fit-fusion` asserts it, so a
+partial `fusion.json` can no longer make `decide()` raise (HTTP 500).

@@ -1,6 +1,14 @@
-"""Closed-set core classifier for ISL (docs/ISL_DESIGN.md 6.3 a): the existing ``RecurrentClassifier``
-trained on INCLUDE clips plus the ISLRTC clips of the same concepts (another signer), with strong augmentation.
-The checkpoint uses the ASL format, so ``Predictor`` loads it unchanged (class names = concept ids)."""
+"""Closed-set core classifier for ISL (docs/ISL_DESIGN.md 6.3 a and 15.2): the existing ``RecurrentClassifier``
+trained on every labelled word clip of the profile with strong augmentation. The checkpoint uses the ASL format,
+so ``Predictor`` loads it unchanged (class names = concept ids).
+
+Classes: INCLUDE concepts with at least ``min_clips`` training clips (as before) plus, with ``data.extra``
+(ISL500, WSLP, CISLR, Mendeley ...), every concept that has at least ``min_signers`` different signer groups and
+``min_clips`` clips across the training sources (ISLRTC counts as one signer). Batches are class-balanced
+(class drawn with probability ~ count ** ``class_power``; inside a class, clips by per-source weight); ISLRTC clips
+of the classes join training with random trim ends. Selection on the validation part (macro F1), then
+temperature scaling on validation. Runs in the resumable loop (``loop.py``).
+"""
 
 from __future__ import annotations
 
@@ -12,70 +20,132 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
 
 from app.evaluation.metrics import confidence_curve, pick_threshold
 from app.features.spec import FeatureConfig
 from app.isl.models.calibration import fit_temperature
-from app.isl.training.common import ClipDataset, IslData, items_for, set_threads
+from app.isl.training.common import IslData, LazyClipDataset, multi_signer_counts, set_threads
+from app.isl.training.loop import LoopConfig, atomic_save, balanced_batches, run_loop
+from app.isl.training.multisource import SAMPLE_WEIGHTS
 from app.models.checkpoint import frame_mask
 from app.models.networks import build_model
-from app.training.trainer import TrainConfig, classification_val_metrics, fit, set_seed
+from app.training.trainer import TrainConfig, set_seed
+
+
+def classifier_classes(data: IslData, min_clips: int = 2, min_signers: int = 2, use_extra: bool = True) -> list[str]:
+    train_inc = data.include_part("train")
+    counts = Counter(c.concept_id for c in train_inc)
+    classes = {c for c, n in counts.items() if n >= min_clips}
+    if use_extra and data.extra:
+        pool = train_inc + data.extra_part("train") + [c for c in data.islrtc if c.concept_id]
+        groups = multi_signer_counts(pool)
+        n = Counter(c.concept_id for c in pool)
+        classes |= {c for c, g in groups.items() if len(g) >= min_signers and n[c] >= max(min_clips, 2)
+                    and any(x.concept_id == c for x in data.extra_part("train"))}
+    return sorted(classes)
 
 
 def train_classifier(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfig, *, min_clips: int = 2,
-                     islrtc_oversample: int = 4, smoke: bool = False, threads: int = 2, progress=None) -> dict:
+                     islrtc_oversample: int = 4, smoke: bool = False, threads: int = 2, progress=None,
+                     min_signers: int = 2, use_extra: bool = True, class_power: float = 0.5,
+                     source_weights: dict | None = None, steps_per_epoch: int | None = None, resume: bool = False,
+                     max_minutes: float = 0.0, state_path: Path | None = None, cache_items: int = 12000) -> dict:
     set_threads(threads)
     set_seed(cfg.seed)
     t0 = time.time()
-    train_inc = data.include_part("train")
-    counts = Counter(c.concept_id for c in train_inc)
-    classes = sorted(c for c, n in counts.items() if n >= min_clips)
+    classes = classifier_classes(data, min_clips, min_signers, use_extra)
     if len(classes) < 2:
-        raise RuntimeError(f"not enough INCLUDE training data: {len(classes)} concepts with >= {min_clips} clips")
+        raise RuntimeError(f"not enough training data: {len(classes)} concepts with >= {min_clips} clips")
     label_of = {c: i for i, c in enumerate(classes)}
+    train_clips = [c for c in data.include_part("train") if c.concept_id in label_of]
+    if use_extra:
+        train_clips += [c for c in data.extra_part("train") if c.concept_id in label_of]
     isl_same = [c for c in data.islrtc if c.concept_id in label_of]
-    train_items = items_for(train_inc, label_of, fcfg) + items_for(isl_same, label_of, fcfg) * islrtc_oversample
-    val_items = items_for(data.include_part("val"), label_of, fcfg, with_alternatives=False)
-    if not val_items:
-        raise RuntimeError("no INCLUDE validation clips for the trained concepts")
-    train_ds = ClipDataset(train_items, fcfg, train=True, seed=cfg.seed)
-    val_ds = ClipDataset(val_items, fcfg, train=False)
-    g = torch.Generator().manual_seed(cfg.seed)
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, generator=g,
-                              drop_last=len(train_ds) > cfg.batch_size)
-    val_loader = DataLoader(val_ds, batch_size=64)
+    sw = {**SAMPLE_WEIGHTS, **(source_weights or {})}
+    # ISLRTC: one clip per entry, so it is weighted up (the old x4 oversampling) inside its class
+    clips = train_clips + isl_same
+    weights = [float(sw.get(c.source, 1.0)) * (islrtc_oversample if c.source == "islrtc" else 1.0) for c in clips]
+    labels = [label_of[c.concept_id] for c in clips]
+    ds = LazyClipDataset(clips, labels, fcfg, train=True, seed=cfg.seed, cache_items=cache_items)
+    val_clips = [c for c in (data.include_part("val") + (data.extra_part("val") if use_extra else []))
+                 if c.concept_id in label_of]
+    vds = LazyClipDataset(val_clips, [label_of[c.concept_id] for c in val_clips], fcfg, train=False, cache_items=0)
+    vx, vy = [], []
+    for i in range(len(vds)):
+        f = vds.features(i)
+        if f is not None:
+            vx.append(f)
+            vy.append(vds.labels[i])
+    if not vx:
+        raise RuntimeError("no validation clips for the trained concepts")
+    VX = torch.from_numpy(np.stack(vx).astype(np.float32))
+    VY = np.array(vy)
     model = build_model(cfg.architecture, fcfg.dim, len(classes), **cfg.model_kwargs())
     crit = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
+    n_steps = steps_per_epoch or max(1, len(clips) // max(1, cfg.batch_size))
 
-    def loss_fn(m, x, y):
-        logits = m(x, frame_mask(x, fcfg))
-        return crit(logits, y), logits
+    def batches(epoch: int):
+        for s, idx in enumerate(balanced_batches(labels, weights, cfg.batch_size, n_steps, cfg.seed, epoch, class_power)):
+            yield (epoch, s, idx)
 
+    def loss_fn(m, item):
+        epoch, s, idx = item
+        b = ds.batch(idx, np.random.default_rng([cfg.seed, epoch, s]))
+        if b is None:
+            return torch.zeros((), requires_grad=True)
+        x, y = b
+        return crit(m(x, frame_mask(x, fcfg)), y)
+
+    @torch.no_grad()
+    def logits_of(m) -> np.ndarray:
+        m.eval()
+        return np.concatenate([m(VX[a:a + 256], frame_mask(VX[a:a + 256], fcfg)).numpy() for a in range(0, len(VX), 256)])
+
+    def val_fn(m) -> dict:
+        from sklearn.metrics import f1_score
+
+        lg = logits_of(m)
+        pred = lg.argmax(1)
+        return {"val_acc": float((pred == VY).mean()),
+                "val_macro_f1": float(f1_score(VY, pred, labels=sorted(set(VY.tolist())), average="macro",
+                                               zero_division=0))}
+
+    src = Counter(c.source for c in clips)
     meta = {"architecture": cfg.architecture, "model_kwargs": cfg.model_kwargs(), "feature_config": fcfg.to_dict(),
             "class_names": classes, "language": "isl", "profile": data.profile, "split": data.split.get("name"),
             "split_label": data.split.get("label"), "train_config": asdict(cfg), "smoke": smoke,
-            "data": {**data.summary(), "train_items": len(train_items), "val_items": len(val_items),
-                     "islrtc_clips_of_classes": len(isl_same)}}
-    res = fit(model, train_loader, lambda m: classification_val_metrics(m, val_loader, fcfg, "cpu"), loss_fn, cfg, out,
-              meta, progress=progress)
-    # calibration on validation: temperature + the classic confidence threshold
+            "data": {**data.summary(), "train_items": len(train_clips), "val_items": len(vx),
+                     "islrtc_clips_of_classes": len(isl_same), "train_sources": dict(src),
+                     "min_signers": min_signers, "class_power": class_power}}
+
+    def save_best(epoch: int, row: dict) -> None:
+        from app.models.checkpoint import save_checkpoint
+
+        save_checkpoint(out, model, {**meta, "best_epoch": epoch})
+
+    lc = LoopConfig(epochs=cfg.epochs, steps_per_epoch=n_steps, lr=cfg.lr, weight_decay=cfg.weight_decay,
+                    patience=cfg.patience, max_minutes=max_minutes, seed=cfg.seed,
+                    extra={"kind": "classifier", "model": cfg.model_kwargs(), "classes": len(classes),
+                           "items": len(clips)})
+    res = run_loop(model, batches, loss_fn, lc, state_path or Path(str(out) + ".state"), val_fn=val_fn,
+                   select_key="val_macro_f1", save_best=save_best, fresh=not resume,
+                   progress=(lambda m: progress(None, m)) if progress else None)
+    # calibration on validation: temperature + the classic confidence threshold (best checkpoint)
     ck = torch.load(out, map_location="cpu", weights_only=False)
     model.load_state_dict(ck["state_dict"])
-    model.eval()
-    xs = torch.stack([torch.from_numpy(f) for f in val_ds._cache])
-    ys = np.array([it.label for it in val_items])
-    with torch.no_grad():
-        logits = model(xs, frame_mask(xs, fcfg)).numpy()
-    T = fit_temperature(logits, ys)
+    logits = logits_of(model)
+    T = fit_temperature(logits, VY)
     z = logits / T
     probs = np.exp(z - z.max(1, keepdims=True))
     probs /= probs.sum(1, keepdims=True)
-    curve = confidence_curve(probs, ys)
-    ck["meta"].update(temperature=T, recommended_threshold=pick_threshold(curve), val_top1=float((probs.argmax(1) == ys).mean()),
-                      val_top5=float(np.mean([y in np.argsort(-p)[:5] for p, y in zip(probs, ys)])),
-                      train_seconds=time.time() - t0, history=res.history)
-    torch.save(ck, out)
+    curve = confidence_curve(probs, VY)
+    ck["meta"].update(temperature=T, recommended_threshold=pick_threshold(curve),
+                      val_top1=float((probs.argmax(1) == VY).mean()),
+                      val_top5=float(np.mean([y in np.argsort(-p)[:5] for p, y in zip(probs, VY)])),
+                      train_seconds=time.time() - t0, history=res.history, step_seconds=res.step_seconds,
+                      finished=res.finished)
+    atomic_save(ck, out)
     return {"checkpoint": str(out), "classes": len(classes), "best_epoch": res.best_epoch,
             "val_top1": ck["meta"]["val_top1"], "val_top5": ck["meta"]["val_top5"], "temperature": T,
-            "train_items": len(train_items), "val_items": len(val_items), "seconds": round(time.time() - t0, 1)}
+            "train_items": len(train_clips), "val_items": len(vx), "train_sources": dict(src),
+            "finished": res.finished, "step_seconds": res.step_seconds, "seconds": round(time.time() - t0, 1)}

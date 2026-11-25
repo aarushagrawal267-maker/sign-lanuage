@@ -38,6 +38,29 @@ class SignEncoder(nn.Module):
         h, _ = self.rnn(self.inp(x))
         return F.normalize(self.head(self.pool(h, mask)), dim=-1)
 
+    def encode(self, x: torch.Tensor, mask: torch.Tensor | None = None, replace: torch.Tensor | None = None,
+               token: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embedding and per-frame states ``(B, T, 2*hidden)``. ``replace`` (B, T) bool swaps those frames'
+        projected inputs for ``token`` (masked-frame pre-training)."""
+        e = self.inp(x)
+        if replace is not None and token is not None:
+            e = torch.where(replace[..., None], token.to(e.dtype).expand_as(e), e)
+        h, _ = self.rnn(e)
+        return F.normalize(self.head(self.pool(h, mask)), dim=-1), h
+
+
+def load_encoder_weights(enc: SignEncoder, path: Path) -> dict:
+    """Warm-start ``enc`` from an encoder checkpoint (pre-trained or earlier fine-tune). Parameters whose shape
+    differs (another embedding size) are skipped and listed. Returns the checkpoint meta + the load report."""
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    sd = ck["state_dict"]
+    own = enc.state_dict()
+    ok = {k: v for k, v in sd.items() if k in own and own[k].shape == v.shape}
+    skipped = sorted(set(sd) - set(ok))
+    own.update(ok)
+    enc.load_state_dict(own)
+    return {"meta": ck.get("meta", {}), "loaded": len(ok), "skipped": skipped, "path": str(path)}
+
 
 def encoder_kwargs(meta: dict) -> dict:
     return {k: meta["model_kwargs"][k] for k in ("hidden", "layers", "emb_dim", "dropout") if k in meta["model_kwargs"]}

@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import random
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -159,13 +159,30 @@ class IslData:
     split: dict
     profile: str
     unassigned: int = 0
+    # phase 2: every other labelled word source of the profile (training multisource.attach_all_sources)
+    extra: list[Clip] = field(default_factory=list)
+    extra_assign: dict[str, str] = field(default_factory=dict)  # clip id -> train | val | test (signer-held-out)
+    linker: object = None
+    dedup: object = None
+    multisource: dict = field(default_factory=dict)
 
     def include_part(self, part: str) -> list[Clip]:
         return [c for c in self.include if self.assign.get(c.clip_id) == part and c.concept_id]
 
+    def extra_part(self, part: str, sources: tuple[str, ...] | None = None) -> list[Clip]:
+        return [c for c in self.extra if self.extra_assign.get(c.clip_id) == part and c.concept_id
+                and (sources is None or c.source in sources)]
+
+    def labelled_part(self, part: str) -> list[Clip]:
+        """INCLUDE clips of a split part plus the other labelled sources' clips of that part."""
+        return self.include_part(part) + self.extra_part(part)
+
     def summary(self) -> dict:
         parts = {p: len(self.include_part(p)) for p in ("train", "val", "test")}
-        return {"profile": self.profile, "split": self.split.get("name"), "split_label": self.split.get("label"),
+        extra = {}
+        for c in self.extra:
+            extra.setdefault(c.source, Counter())[self.extra_assign.get(c.clip_id, "train")] += 1
+        return {"extra_sources": {k: dict(v) for k, v in extra.items()}, "profile": self.profile, "split": self.split.get("name"), "split_label": self.split.get("label"),
                 "signer_independent": self.split.get("signer_independent"), "include": parts,
                 "include_unassigned": self.unassigned, "islrtc": len(self.islrtc),
                 "islrtc_untrimmed": sum(1 for c in self.islrtc if c.end is None and c.quality.get("kind") != "phrase"),
@@ -213,3 +230,71 @@ def engine_crops(raw: RawSequence) -> list[RawSequence]:
 
 def set_threads(n: int) -> None:
     torch.set_num_threads(max(1, int(n)))
+
+
+class LazyClipDataset:
+    """Clips loaded on demand with a bounded LRU of body frames, for training sets too large to cache whole
+    (ISL500 alone has tens of thousands of clips). Same features as :class:`ClipDataset`: training = strong
+    augmentation + a random ISLRTC trim end; evaluation = deterministic features of the default slice."""
+
+    def __init__(self, clips: list[Clip], labels: list[int], fcfg: FeatureConfig, train: bool, seed: int = 0,
+                 aug: StrongAugmentConfig | None = None, end_jitter_p: float = 0.3, cache_items: int = 12000):
+        from collections import OrderedDict
+
+        self.clips, self.labels, self.fcfg, self.train = clips, labels, fcfg, train
+        self.aug = aug or StrongAugmentConfig()
+        self.rng = np.random.default_rng(seed)
+        self.end_jitter_p = end_jitter_p
+        self.cache_items = cache_items
+        self._cache: OrderedDict = OrderedDict()
+        self.bad: set[int] = set()
+
+    def __len__(self) -> int:
+        return len(self.clips)
+
+    def item(self, i: int) -> Item | None:
+        if i in self._cache:
+            self._cache.move_to_end(i)
+            return self._cache[i]
+        if i in self.bad:
+            return None
+        it = load_item(self.clips[i], self.labels[i], self.fcfg, with_alternatives=self.train)
+        if it is None:
+            self.bad.add(i)
+            return None
+        self._cache[i] = it
+        if len(self._cache) > self.cache_items:
+            self._cache.popitem(last=False)
+        return it
+
+    def features(self, i: int, rng: np.random.Generator | None = None) -> np.ndarray | None:
+        it = self.item(i)
+        if it is None:
+            return None
+        if not self.train:
+            return featurize(slice_bf(it.bf, 0, it.default_end), self.fcfg)
+        rng = rng or self.rng
+        end = it.default_end
+        if len(it.ends) > 1 and rng.random() < self.end_jitter_p:
+            end = int(rng.choice(it.ends))
+        return featurize(augment_strong(slice_bf(it.bf, 0, max(2, end)), rng, self.aug), self.fcfg)
+
+    def batch(self, idx: list[int], rng: np.random.Generator | None = None) -> tuple[torch.Tensor, torch.Tensor] | None:
+        xs, ys = [], []
+        for i in idx:
+            f = self.features(i, rng)
+            if f is not None:
+                xs.append(f)
+                ys.append(self.labels[i])
+        if len(xs) < 2:
+            return None
+        return torch.from_numpy(np.stack(xs).astype(np.float32)), torch.tensor(ys, dtype=torch.long)
+
+
+def multi_signer_counts(clips: list[Clip]) -> dict[str, set[str]]:
+    """concept -> distinct signer groups (ISLRTC counts as one group)."""
+    out: dict[str, set[str]] = defaultdict(set)
+    for c in clips:
+        if c.concept_id:
+            out[c.concept_id].add(f"{c.source}:{c.group or c.clip_id}")
+    return out

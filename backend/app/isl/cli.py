@@ -36,6 +36,21 @@ artifacts/isl/<profile>/ and build-pack copies them to artifacts/packs/<isl|isl-
                          core list, number rules and offline IndicTrans2 drafts (--translate fills the cache;
                          about 40 min on 2 CPU threads); --merge-local folds reviewed local corrections back in
 
+Phase 2 (all sources; driver: scripts/phase2_train.sh). Model commands accept --all-sources (every labelled word
+source of the profile, linked to concepts, signer-held-out splits, duplicates dropped), --vocab, and the
+training ones --resume / --max-minutes (exit code 75 = stopped with state saved, run again with --resume):
+
+  link-sources           read + link every labelled source -> <work>/multisource.json, sources.json, extra_concepts.jsonl
+  pretrain               self-supervised encoder pre-training (temporal contrastive + masked frames) on every
+                         unlabelled / sentence source of the profile -> <work>/pretrained_encoder.pt
+  train-encoder --init auto
+                         fine-tune from the pre-trained encoder
+  train-oneshot --folds 0 1
+                         E2 encoders with each fold's concepts held out of all supervised training
+  train-fingerspell      letter model from every letter source (+ leave-one-signer-out E5)
+  evaluate --all         E1a/E1b/E1c/E2/E3/E4/E5/E6/E7/E8 -> <work>/eval and <pack>/eval report.json + report.md
+  bench                  CPU seconds per training step for the model sizes (for the time budget)
+
 Gated-dataset ingestion lives in ``scripts/ingest_isl_gated.py`` (CISLR, iSign).
 """
 
@@ -477,10 +492,15 @@ def cmd_dedup(paths: IslPaths, args) -> int:
     from app.isl.data.manifest import write_jsonl
     from app.isl.data.sources import get_adapter
 
+    from app.isl.training.multisource import open_adapter
+
     clips = []
     for s in args.sources:
-        ad = get_adapter(s, paths)
-        if ad.available():
+        try:
+            ad = get_adapter(s, paths)
+        except ValueError:  # phase-2 sources (wslp, isl500, mendeley_*) come from the multi-source registry
+            ad = open_adapter(s, paths)
+        if ad is not None and ad.available():
             clips += list(ad.clips())
     pairs = find_duplicates(clips, threshold=args.threshold,
                             progress=lambda i, n: print(f"  fingerprints {i}/{n}", flush=True))
@@ -510,17 +530,48 @@ def cmd_profiles(paths: IslPaths, args) -> int:
 
 # --------------------------------------------------------------------------------------------- model commands
 
+def _vocab_path(args) -> Path:
+    v = getattr(args, "vocab", None)
+    return Path(v) if v else PACK_DIR / "vocabulary.jsonl"
+
+
+def _record_sources(work: Path, rep: dict, role: str) -> None:
+    """Merge a source report into ``<work>/sources.json`` (build-pack lists every source used, with licence)."""
+    f = work / "sources.json"
+    cur = json.loads(f.read_text()) if f.exists() else {}
+    for name, d in rep.items():
+        if not isinstance(d, dict):
+            continue
+        old = cur.get(name, {})
+        roles = sorted(set(old.get("roles", [])) | ({role} if d.get("available") else set()))
+        cur[name] = {**old, **d, "available": bool(old.get("available") or d.get("available")), "roles": roles,
+                     "role": ",".join(roles)}
+    f.write_text(json.dumps(cur, indent=1, ensure_ascii=False))
+
+
 def _model_ctx(paths: IslPaths, args):
     from app.core.config import get_settings
     from app.isl.profiles import get_profile
     from app.isl.training.common import ISL_FEATURES, load_isl_data, load_vocab, set_threads
+    from app.isl.training.multisource import GlossLinker, attach_all_sources, write_extra_concepts
     from app.isl.training.pipeline import workdir
 
     set_threads(args.threads)
     profile = get_profile(args.profile or get_settings().isl_profile).name
-    vocab = load_vocab()
+    vocab = load_vocab(_vocab_path(args))
     data = load_isl_data(paths, vocab, profile, args.split, max_islrtc=args.max_islrtc or None, seed=args.seed)
-    return profile, data, ISL_FEATURES, workdir(profile)
+    work = workdir(profile)
+    data.linker = GlossLinker.from_vocab(vocab)
+    if getattr(args, "all_sources", False):
+        rep = attach_all_sources(data, paths, vocab, profile, seed=args.seed,
+                                 max_per_source=getattr(args, "max_per_source", 0) or None)
+        write_extra_concepts(data.linker, work / "extra_concepts.jsonl")
+        _record_sources(work, rep.sources, "words")
+        _record_sources(work, {"include": {"available": bool(data.include), "licence": "CC-BY-4.0", "commercial": True},
+                               "islrtc": {"available": bool(data.islrtc), "licence": "GODL-India", "commercial": True}},
+                        "words")
+        (work / "multisource.json").write_text(json.dumps(rep.to_json(), indent=1, default=str))
+    return profile, data, ISL_FEATURES, work
 
 
 def _train_cfg(args, smoke_defaults: dict):
@@ -542,15 +593,21 @@ def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
+EX_PARTIAL = 75  # stopped by --max-minutes with the state saved: run the same command again to continue
+
+
 def cmd_train_classifier(paths: IslPaths, args) -> int:
     from app.isl.training.train_classifier import train_classifier
 
     profile, data, fcfg, work = _model_ctx(paths, args)
     _print({"data": data.summary()})
-    res = train_classifier(data, work / "classifier.pt", fcfg, _train_cfg(args, SMOKE_CLS), smoke=args.smoke,
-                           threads=args.threads, progress=lambda f, m: _log(f"  classifier {m}"))
+    out = Path(args.ckpt) if getattr(args, "ckpt", None) else work / "classifier.pt"
+    res = train_classifier(data, out, fcfg, _train_cfg(args, SMOKE_CLS), smoke=args.smoke,
+                           threads=args.threads, progress=lambda f, m: _log(f"  classifier {m}"),
+                           use_extra=args.all_sources, min_signers=args.min_signers, resume=args.resume,
+                           max_minutes=args.max_minutes, steps_per_epoch=args.batches)
     _print(res)
-    return 0
+    return 0 if res.get("finished", True) else EX_PARTIAL
 
 
 def cmd_train_encoder(paths: IslPaths, args) -> int:
@@ -561,8 +618,199 @@ def cmd_train_encoder(paths: IslPaths, args) -> int:
     res = train_encoder(data, work / "encoder.pt", fcfg, _train_cfg(args, SMOKE_ENC),
                         emb_dim=args.emb_dim or (128 if args.smoke else 256), p=args.p, k=args.k, smoke=args.smoke,
                         threads=args.threads, batches_per_epoch=args.batches or (20 if args.smoke else None),
-                        progress=lambda f, m: _log(f"  encoder {m}"))
+                        progress=lambda f, m: _log(f"  encoder {m}"), init_from=_init_path(args, work),
+                        use_extra=args.all_sources, resume=args.resume, max_minutes=args.max_minutes)
     _print(res)
+    return 0 if res.get("finished", True) else EX_PARTIAL
+
+
+def _init_path(args, work: Path) -> Path | None:
+    v = getattr(args, "init", None)
+    if not v or v == "none":
+        return None
+    if v == "auto":
+        p = work / "pretrained_encoder.pt"
+        return p if p.exists() else None
+    return Path(v)
+
+
+def _eval_clip_ids(data) -> set[str]:
+    return {c.clip_id for c in data.include if data.assign.get(c.clip_id) in ("val", "test")} | {
+        c.clip_id for c in data.extra if data.extra_assign.get(c.clip_id) in ("val", "test")}
+
+
+def cmd_pretrain(paths: IslPaths, args) -> int:
+    """Self-supervised encoder pre-training on every unlabelled / sentence source of the profile."""
+    import random as _r
+
+    from app.isl.training.multisource import pretrain_clips
+    from app.isl.training.pretrain import PretrainConfig, pretrain_encoder
+
+    args.all_sources = True
+    profile, data, fcfg, work = _model_ctx(paths, args)
+    rep: dict = {}
+    clips = pretrain_clips(paths, None, profile, exclude_ids=_eval_clip_ids(data), report=rep)
+    _record_sources(work, rep, "pretraining")
+    if args.max_clips and len(clips) > args.max_clips:
+        clips = _r.Random(args.seed).sample(clips, args.max_clips)
+    d = PretrainConfig()
+    cfg = PretrainConfig(**{**d.__dict__, **({"hidden": 64, "layers": 1, "emb_dim": 128, "batch": 16, "epochs": 2,
+                                               "steps_per_epoch": 10, "val_batches": 1} if args.smoke else {}),
+                            **{k: v for k, v in {"hidden": args.hidden, "layers": args.layers, "emb_dim": args.emb_dim,
+                                                 "batch": args.batch_size, "epochs": args.epochs,
+                                                 "steps_per_epoch": args.batches, "lr": args.lr,
+                                                 "seed": args.seed}.items() if v is not None}})
+    _print({"pretrain_clips": len(clips), "by_source": dict(Counter(c.source for c in clips)), "config": cfg.__dict__})
+    res = pretrain_encoder(clips, work / "pretrained_encoder.pt", fcfg, cfg, profile=profile,
+                           max_minutes=args.max_minutes, fresh=not args.resume, threads=args.threads,
+                           smoke=args.smoke, progress=lambda m: _log(f"  pretrain {m}"))
+    _print(res)
+    return 0 if res.get("finished", True) else EX_PARTIAL
+
+
+def cmd_train_oneshot(paths: IslPaths, args) -> int:
+    """Encoders for the held-out-concept one-shot protocol (E2): one per fold, trained without the fold's
+    concepts (and every concept sharing a headword / synonym with them) in any supervised loss."""
+    from app.isl.evaluation.runners import heldout_set
+    from app.isl.training.train_encoder import train_encoder
+
+    profile, data, fcfg, work = _model_ctx(paths, args)
+    one = paths.splits / "oneshot_concepts.json"
+    if not one.exists():
+        _print({"skipped": True, "reason": "no oneshot_concepts.json: run 'splits' with a vocabulary first"})
+        return 0
+    doc = json.loads(one.read_text())
+    out, code = {}, 0
+    for k in args.folds:
+        fd = next((f for f in doc["protocol"]["folds"] if f["fold"] == k), None)
+        if fd is None or not fd["held_out_concepts"]:
+            out[k] = {"skipped": True}
+            continue
+        held = heldout_set(data.linker, fd["held_out_concepts"])
+        d = work / "oneshot" / f"fold{k}"
+        d.mkdir(parents=True, exist_ok=True)
+        res = train_encoder(data, d / "encoder.pt", fcfg, _train_cfg(args, SMOKE_ENC),
+                            emb_dim=args.emb_dim or (128 if args.smoke else 256), p=args.p, k=args.k,
+                            exclude_concepts=held, smoke=args.smoke, threads=args.threads,
+                            batches_per_epoch=args.batches or (20 if args.smoke else None),
+                            progress=lambda f, m, _k=k: _log(f"  oneshot fold{_k} {m}"),
+                            init_from=_init_path(args, work), use_extra=args.all_sources, resume=args.resume,
+                            max_minutes=args.max_minutes, version=f"isl-enc-1-oneshot{k}")
+        out[k] = {**res, "held_out": len(fd["held_out_concepts"]), "held_out_expanded": len(held)}
+        if not res.get("finished", True):
+            code = EX_PARTIAL
+            break
+    _print(out)
+    return code
+
+
+def cmd_train_fingerspell(paths: IslPaths, args) -> int:
+    from app.isl.fingerspell.lexicon import build_spelling_lexicon
+    from app.isl.profiles import get_profile
+    from app.isl.training.common import set_threads
+    from app.isl.training.pipeline import workdir
+    from app.isl.training.train_fingerspell import letter_data, train_fingerspell
+    from app.packs.vocabulary import Vocabulary
+
+    set_threads(args.threads)
+    profile = get_profile(args.profile or "commercial-safe").name
+    work = workdir(profile)
+    rep: dict = {}
+    ls = letter_data(paths, profile, report=rep)
+    srcs = {}
+    from app.isl.training.multisource import open_adapter
+
+    for n, d in rep.items():
+        ad = open_adapter(n, paths, None, profile) if d.get("available") else None
+        srcs[n] = {**d, "licence": getattr(ad, "licence", ""), "commercial": bool(getattr(ad, "commercial", False))}
+    _record_sources(work, srcs, "letters")
+    words = [w for w, _ in build_spelling_lexicon(Vocabulary.load(_vocab_path(args)).rows)]
+    res = train_fingerspell(ls, work / "letters.pt", profile=profile, epochs=args.epochs or (5 if args.smoke else 40),
+                            seed=args.seed, lexicon_words=words, smoke=args.smoke)
+    _print({"sources": rep, **res})
+    return 0
+
+
+def cmd_bench(paths: IslPaths, args) -> int:
+    """CPU time per optimisation step for the phase-2 model sizes (synthetic batches, no data needed)."""
+    import time as _t
+
+    import torch
+
+    from app.isl.models.encoder import SignEncoder
+    from app.isl.models.losses import SubCenterArcFace, SupConLoss
+    from app.isl.training.common import ISL_FEATURES, set_threads
+    from app.isl.training.pretrain import _Pretrainer, nt_xent
+    from app.models.networks import build_model
+
+    set_threads(args.threads)
+    fcfg = ISL_FEATURES
+    T, D = fcfg.seq_len, fcfg.dim
+    out = {"threads": args.threads, "seq_len": T, "dim": D}
+    for hidden, layers in [(h, l) for h in args.hidden_sizes for l in (args.layers or 2,)]:
+        enc = SignEncoder(D, hidden=hidden, layers=layers, emb_dim=256)
+        pre = _Pretrainer(enc, D, hidden)
+        opt = torch.optim.AdamW(pre.parameters(), 1e-3)
+        B = args.batch_size or 48
+        xa, xb = torch.randn(B, T, D), torch.randn(B, T, D)
+        times = []
+        for i in range(args.steps + 1):
+            t0 = _t.perf_counter()
+            za, ha = pre.enc.encode(xa)
+            zb, _ = pre.enc.encode(xb)
+            loss = nt_xent(za, zb, 0.1)[0] + ((pre.recon(ha) - xa) ** 2).mean()
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            if i:
+                times.append(_t.perf_counter() - t0)
+        out[f"pretrain_h{hidden}_l{layers}_b{B}x2_s"] = round(float(sum(times) / len(times)), 3)
+        arc = SubCenterArcFace(256, 12000, k=3)
+        sc = SupConLoss(0.1)
+        params = list(enc.parameters()) + list(arc.parameters())
+        opt = torch.optim.AdamW(params, 1e-3)
+        x = torch.randn(64, T, D)
+        y = torch.arange(32).repeat_interleave(2)
+        times = []
+        for i in range(args.steps + 1):
+            t0 = _t.perf_counter()
+            z = enc(x)
+            loss = sc(z, y) + 0.5 * arc(z, y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            if i:
+                times.append(_t.perf_counter() - t0)
+        out[f"encoder_h{hidden}_l{layers}_b64_arc12k_s"] = round(float(sum(times) / len(times)), 3)
+        m = build_model("gru", D, 600, hidden=hidden, layers=layers, bidirectional=True, dropout=0.3)
+        opt = torch.optim.AdamW(m.parameters(), 1e-3)
+        x = torch.randn(32, T, D)
+        y = torch.randint(0, 600, (32,))
+        times = []
+        for i in range(args.steps + 1):
+            t0 = _t.perf_counter()
+            loss = torch.nn.functional.cross_entropy(m(x), y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            if i:
+                times.append(_t.perf_counter() - t0)
+        out[f"classifier_h{hidden}_l{layers}_b32_s"] = round(float(sum(times) / len(times)), 3)
+    # data side: strong augmentation + featurisation of one clip
+    from app.dataset.synthetic import make_sequence
+    from app.features.build import featurize, prepare_body_frame
+    from app.isl.augment import augment_strong
+
+    import numpy as _np
+
+    raw = make_sequence(1, n_frames=60, fps=12.0)
+    rng = _np.random.default_rng(0)
+    t0 = _t.perf_counter()
+    for _ in range(50):
+        featurize(augment_strong(prepare_body_frame(raw, fcfg), rng), fcfg)
+    out["featurize_augment_per_clip_ms"] = round((_t.perf_counter() - t0) / 50 * 1000, 2)
+    out["note"] = "measured on this machine now; other jobs share the CPUs, so times vary"
+    _print(out)
     return 0
 
 
@@ -573,7 +821,9 @@ def cmd_build_index(paths: IslPaths, args) -> int:
     profile, data, fcfg, work = _model_ctx(paths, args)
     enc = EncoderPredictor(work / "encoder.pt")
     include = data.include_part("train") if not args.all_include else [c for c in data.include if c.concept_id]
-    _print(build_index(enc, data.islrtc, include, work / "index", profile))
+    # --all-include (final pack) indexes every reference; otherwise only training parts (evaluation stays clean)
+    extra = [c for c in data.extra if args.all_include or data.extra_assign.get(c.clip_id) == "train"]
+    _print(build_index(enc, data.islrtc, include, work / "index", profile, extra=extra or None))
     return 0
 
 
@@ -582,8 +832,9 @@ def cmd_fit_fusion(paths: IslPaths, args) -> int:
     from app.isl.training.pipeline import load_recognizer
 
     profile, data, fcfg, work = _model_ctx(paths, args)
-    rec = load_recognizer(work, fcfg, profile=profile)
-    params, rep = fit_fusion(rec, data.include_part("val"), profile)
+    rec = load_recognizer(work, fcfg, _vocab_path(args), profile=profile)
+    params, rep = fit_fusion(rec, data.labelled_part("val"), profile)
+    assert set(params.accept) == {"strict", "balanced", "lenient"}, params.accept  # decide() needs all three
     params.save(work / "fusion.json")
     _print(rep)
     return 0
@@ -593,7 +844,18 @@ def cmd_evaluate(paths: IslPaths, args) -> int:
     from app.isl.training.pipeline import evaluate
 
     profile, data, fcfg, work = _model_ctx(paths, args)
-    doc = evaluate(work, data, fcfg, smoke=args.smoke, part=args.part)
+    if getattr(args, "all", False):
+        from app.isl.evaluation.runners import evaluate_all
+        from app.isl.training.pipeline import pack_dir
+
+        outs = [Path(args.out) / "eval"] if args.out else [pack_dir(profile) / "eval"]
+        doc = evaluate_all(work, data, fcfg, profile=profile, smoke=args.smoke, vocab_path=_vocab_path(args),
+                           paths=paths, out_dirs=outs, progress=lambda m: _log(f"  evaluate {m}"))
+        _print({"report": [str(work / "eval" / "report.json")] + [str(o / "report.json") for o in outs],
+                **{k: {"n": v.get("n"), "metrics": v.get("metrics"), "run": v.get("run", True)}
+                   for k, v in doc["protocols"].items()}})
+        return 0
+    doc = evaluate(work, data, fcfg, smoke=args.smoke, part=args.part, vocab_path=_vocab_path(args))
     _print({k: {"n": v.get("n"), "metrics": v.get("metrics")} for k, v in doc["protocols"].items()})
     return 0
 
@@ -627,7 +889,16 @@ def cmd_build_pack(paths: IslPaths, args) -> int:
     from app.isl.training.pipeline import build_pack, workdir
 
     profile = get_profile(args.profile or "commercial-safe").name
-    _print(build_pack(workdir(profile), profile, ISL_FEATURES, Path(args.out) if args.out else None, smoke=args.smoke))
+    _print(build_pack(workdir(profile), profile, ISL_FEATURES, Path(args.out) if args.out else None, smoke=args.smoke,
+                      vocab_path=_vocab_path(args)))
+    return 0
+
+
+def cmd_link_sources(paths: IslPaths, args) -> int:
+    """Read every labelled source of the profile, link glosses to concepts, split signers, drop duplicates."""
+    args.all_sources = True
+    profile, data, fcfg, work = _model_ctx(paths, args)
+    _print({"data": data.summary(), "multisource": data.multisource, "work": str(work)})
     return 0
 
 
@@ -737,11 +1008,17 @@ COMMANDS = {
     "train-classifier": cmd_train_classifier, "train-encoder": cmd_train_encoder, "build-index": cmd_build_index,
     "fit-fusion": cmd_fit_fusion, "evaluate": cmd_evaluate, "train-letters": cmd_train_letters,
     "build-pack": cmd_build_pack, "smoke": cmd_smoke, "hindi": cmd_hindi,
+    "link-sources": cmd_link_sources, "pretrain": cmd_pretrain, "train-oneshot": cmd_train_oneshot,
+    "train-fingerspell": cmd_train_fingerspell, "bench": cmd_bench,
 }
 
 
 def _model_args(sp, train: bool = False) -> None:
     sp.add_argument("--profile", choices=["commercial-safe", "research"], default=None)
+    sp.add_argument("--vocab", help="vocabulary.jsonl (default models/packs/isl/vocabulary.jsonl)")
+    sp.add_argument("--all-sources", action="store_true",
+                    help="phase 2: add every other labelled word source of the profile (ISL500, WSLP, CISLR, ...)")
+    sp.add_argument("--max-per-source", type=int, default=0, help="cap clips per extra source (smoke runs)")
     sp.add_argument("--split", help="INCLUDE split name (default: the primary split, fold 0)")
     sp.add_argument("--threads", type=int, default=2)
     sp.add_argument("--seed", type=int, default=0)
@@ -755,7 +1032,13 @@ def _model_args(sp, train: bool = False) -> None:
         sp.add_argument("--emb-dim", type=int, default=None)
         sp.add_argument("--p", type=int, default=32, help="encoder: concepts per batch")
         sp.add_argument("--k", type=int, default=2, help="encoder: clips per concept in a batch")
-        sp.add_argument("--batches", type=int, default=None, help="encoder: batches per epoch")
+        sp.add_argument("--batches", type=int, default=None, help="batches (steps) per epoch")
+        sp.add_argument("--resume", action="store_true", help="continue from the saved training state")
+        sp.add_argument("--max-minutes", type=float, default=0.0,
+                        help="stop after this long with the state saved (exit code 75); run again with --resume")
+        sp.add_argument("--init", default=None, help="encoder warm start: a checkpoint, 'auto' (pretrained) or 'none'")
+        sp.add_argument("--min-signers", type=int, default=2, help="classifier: signer groups a class needs")
+        sp.add_argument("--ckpt", help="classifier: checkpoint path (default <work>/classifier.pt)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -797,8 +1080,24 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--threshold", type=float, default=0.02)
     sub.add_parser("access")
     sub.add_parser("profiles")
-    for name in ("train-classifier", "train-encoder", "smoke"):
-        _model_args(sub.add_parser(name), train=True)
+    for name in ("train-classifier", "train-encoder", "smoke", "pretrain", "train-oneshot"):
+        spx = sub.add_parser(name)
+        _model_args(spx, train=True)
+        if name == "pretrain":
+            spx.add_argument("--max-clips", type=int, default=0, help="use at most N unlabelled clips (0 = all)")
+        if name == "train-oneshot":
+            spx.add_argument("--folds", type=int, nargs="+", default=[0, 1])
+    lk = sub.add_parser("link-sources")
+    _model_args(lk)
+    fs = sub.add_parser("train-fingerspell")
+    _model_args(fs)
+    fs.add_argument("--epochs", type=int, default=None)
+    bn = sub.add_parser("bench")
+    bn.add_argument("--threads", type=int, default=2)
+    bn.add_argument("--hidden-sizes", type=int, nargs="+", default=[128, 192])
+    bn.add_argument("--layers", type=int, default=2)
+    bn.add_argument("--batch-size", type=int, default=48)
+    bn.add_argument("--steps", type=int, default=5)
     for name in ("build-index", "fit-fusion", "evaluate", "build-pack"):
         sp2 = sub.add_parser(name)
         _model_args(sp2)
@@ -806,6 +1105,8 @@ def build_parser() -> argparse.ArgumentParser:
             sp2.add_argument("--all-include", action="store_true", help="centroids from every INCLUDE clip (final pack)")
         if name == "evaluate":
             sp2.add_argument("--part", default="test", choices=["val", "test"])
+            sp2.add_argument("--all", action="store_true",
+                             help="every protocol (E1a-E8) -> <work>/eval and <pack>/eval report.json + report.md")
     hi = sub.add_parser("hindi")
     hi.add_argument("--translate", action="store_true", help="run IndicTrans2 on CPU for concepts not in the cache")
     hi.add_argument("--limit", type=int, default=0, help="translate at most N new inputs (0 = all)")

@@ -49,6 +49,12 @@ class FusionParams:
     achieved: dict = field(default_factory=dict)  # measured on validation: per policy precision / coverage / n
     enrol: dict = field(default_factory=lambda: {"c_min": 0.5, "min_takes": 3, "max_takes": 5})
 
+    def __post_init__(self):
+        # Every policy must always have a threshold: a fusion.json written with only some policies (or none) made
+        # decide() raise for the missing ones (HTTP 500 in the API). Missing values are filled from the present
+        # ones (or the defaults) and kept ordered strict >= balanced >= lenient.
+        object.__setattr__(self, "accept", normalize_accept(self.accept))
+
     def to_json(self) -> dict:
         return asdict(self)
 
@@ -66,6 +72,30 @@ class FusionParams:
 
     def with_(self, **kw) -> FusionParams:
         return replace(self, **kw)
+
+
+DEFAULT_ACCEPT = {"strict": 0.85, "balanced": 0.7, "lenient": 0.55}
+
+
+def normalize_accept(accept: dict | None) -> dict:
+    """All three policies, strict >= balanced >= lenient. Missing policies take the nearest stricter / more
+    lenient value that is present, else the default; unknown keys are dropped."""
+    a = {k: float(v) for k, v in dict(accept or {}).items() if k in POLICIES and v is not None}
+    if not a:
+        return dict(DEFAULT_ACCEPT)
+    out = {}
+    for pol in POLICIES:
+        if pol in a:
+            out[pol] = a[pol]
+        elif pol == "balanced":
+            out[pol] = a.get("strict", a.get("lenient"))
+        elif pol == "strict":
+            out[pol] = a.get("balanced", a.get("lenient"))
+        else:
+            out[pol] = a.get("balanced", a.get("strict"))
+    out["balanced"] = max(out["balanced"], out["lenient"])
+    out["strict"] = max(out["strict"], out["balanced"])
+    return out
 
 
 def _log_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:

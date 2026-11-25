@@ -14,7 +14,7 @@ import math
 
 import numpy as np
 
-from app.isl.models.fusion import FusionInputs, FusionParams, FusionResult, decide, fuse
+from app.isl.models.fusion import POLICIES, FusionInputs, FusionParams, FusionResult, decide, fuse, normalize_accept
 
 TARGETS = {"strict": 0.98, "balanced": 0.95, "lenient": 0.90}  # on the 95 % lower bound of accepted precision
 SUGGEST_TOP5_TARGET = 0.80
@@ -107,7 +107,9 @@ def summarize(results: list[FusionResult], truths: list[str], params: FusionPara
 
 def fit_thresholds(results: list[FusionResult], truths: list[str], params: FusionParams,
                    targets: dict | None = None, min_accepted: int = 5) -> tuple[FusionParams, dict]:
-    targets = targets or TARGETS
+    # every policy always gets a threshold (a missing one made decide() raise): unknown targets are ignored and
+    # missing ones use the default target
+    targets = {pol: float((targets or {}).get(pol, TARGETS[pol])) for pol in POLICIES}
     rep: dict = {"n": len(results)}
     if not results:
         return params, {**rep, "note": "no validation data: defaults kept (not calibrated)"}
@@ -135,10 +137,7 @@ def fit_thresholds(results: list[FusionResult], truths: list[str], params: Fusio
                 best_t, best_prec = float(t), prec
         accept[pol] = chosen if chosen is not None else (best_t if best_t is not None else params.accept[pol])
         rep[f"{pol}_target_reached"] = chosen is not None
-    # keep strict >= balanced >= lenient
-    accept["balanced"] = max(accept["balanced"], accept["lenient"])
-    accept["strict"] = max(accept["strict"], accept["balanced"])
-    params = params.with_(accept=accept)
+    params = params.with_(accept=normalize_accept(accept))  # all three, strict >= balanced >= lenient
     # "did you mean": smallest top-5 mass with >= 80 % top-5 hits among shown suggestions
     dec = _decisions(results, params.with_(suggest_min_top5_mass=0.0), "balanced")
     idx = [i for i, (d, _) in enumerate(dec) if d == "suggest"]

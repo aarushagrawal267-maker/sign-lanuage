@@ -3,12 +3,17 @@
 Rows: every indexable ISLRTC clip as its first-sign trim (``first_sign``) plus, when the trim found a later
 boundary, the slice up to the first alternative end (``alt_end``, slightly lower weight) so a wrong first cut is
 less harmful; and one centroid per concept of the INCLUDE clips allowed for the index (``centroid``).
+
+Phase 2 (``extra``): every other labelled reference of the profile (ISL500, WSLP, CISLR, Mendeley, ...) with a
+per-source row weight (``multisource.INDEX_WEIGHTS``): sources with several clips of a concept give one centroid
+per (concept, source) plus up to ``max_group_centroids`` per-signer centroids (different signers' forms stay
+separate rows); sources with one clip per concept give one row per clip (``kind = "clip"``).
 """
 
 from __future__ import annotations
 
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -27,8 +32,65 @@ def _embed_feats(enc: EncoderPredictor, feats: list[np.ndarray], batch: int = 12
     return np.concatenate(out) if out else np.zeros((0, enc.dim), np.float32)
 
 
+def _extra_rows(enc: EncoderPredictor, clips: list[Clip], weights: dict, max_group_centroids: int,
+                batch: int = 128) -> tuple[list[np.ndarray], list[dict]]:
+    from app.isl.training.common import LazyClipDataset
+
+    fcfg = enc.feature_config
+    ds = LazyClipDataset(clips, [0] * len(clips), fcfg, train=False, cache_items=0)
+    zs: list[np.ndarray] = []
+    kept: list[Clip] = []
+    buf, bufc = [], []
+    for i, c in enumerate(clips):
+        f = ds.features(i)
+        if f is None:
+            continue
+        buf.append(f)
+        bufc.append(c)
+        if len(buf) >= batch:
+            zs.append(_embed_feats(enc, buf))
+            kept += bufc
+            buf, bufc = [], []
+    if buf:
+        zs.append(_embed_feats(enc, buf))
+        kept += bufc
+    if not kept:
+        return [], []
+    Z = np.concatenate(zs)
+    by = defaultdict(list)
+    for c, z in zip(kept, Z):
+        by[(c.concept_id, c.source)].append((c, z))
+    vecs, rows = [], []
+
+    def unit(v):
+        return v / max(1e-8, float(np.linalg.norm(v)))
+
+    for (cid, src), lst in sorted(by.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        w = float(weights.get(src, 0.95))
+        if len(lst) == 1:
+            c, z = lst[0]
+            vecs.append(unit(z))
+            rows.append({"variant_id": c.variant_id, "concept_id": cid, "source": src, "kind": "clip", "weight": w,
+                         "clip": c.clip_id})
+            continue
+        vecs.append(unit(np.mean([z for _, z in lst], axis=0)))
+        rows.append({"variant_id": lst[0][0].variant_id, "concept_id": cid, "source": src, "kind": "centroid",
+                     "weight": w, "n_clips": len(lst)})
+        groups = defaultdict(list)
+        for c, z in lst:
+            if c.group:
+                groups[c.group].append(z)
+        if len(groups) > 1:
+            for g in sorted(groups, key=lambda g: (-len(groups[g]), g))[:max_group_centroids]:
+                vecs.append(unit(np.mean(groups[g], axis=0)))
+                rows.append({"variant_id": lst[0][0].variant_id, "concept_id": cid, "source": src,
+                             "kind": "signer_centroid", "weight": w, "group": g, "n_clips": len(groups[g])})
+    return vecs, rows
+
+
 def build_index(enc: EncoderPredictor, islrtc: list[Clip], include: list[Clip], out_dir: Path, profile: str,
-                alt_weight: float = 0.95, centroid_weight: float = 1.0) -> dict:
+                alt_weight: float = 0.95, centroid_weight: float = 1.0, extra: list[Clip] | None = None,
+                source_weights: dict | None = None, max_group_centroids: int = 3) -> dict:
     t0 = time.time()
     fcfg = enc.feature_config
     concepts = {c.concept_id for c in islrtc} | {c.concept_id for c in include}
@@ -60,10 +122,21 @@ def build_index(enc: EncoderPredictor, islrtc: list[Clip], include: list[Clip], 
     if cents:
         emb = np.concatenate([emb, np.stack(cents)]) if len(emb) else np.stack(cents)
         rows += crow
+    n_extra = 0
+    if extra:
+        from app.isl.training.multisource import INDEX_WEIGHTS
+
+        vecs, erows = _extra_rows(enc, [c for c in extra if c.concept_id], {**INDEX_WEIGHTS, **(source_weights or {})},
+                                  max_group_centroids)
+        if vecs:
+            emb = np.concatenate([emb, np.stack(vecs)]) if len(emb) else np.stack(vecs)
+            rows += erows
+            n_extra = len(erows)
     if not rows:
         raise RuntimeError("nothing to index")
     idx = EmbeddingIndex.build(emb, rows, enc.version, fcfg.to_dict(), profile)
     idx.save(out_dir)
     return {"rows": len(rows), "concepts": len(idx.concepts), "first_sign": sum(r["kind"] == "first_sign" for r in rows),
-            "alt_end": sum(r["kind"] == "alt_end" for r in rows), "centroids": len(crow),
+            "alt_end": sum(r["kind"] == "alt_end" for r in rows), "centroids": len(crow), "extra_rows": n_extra,
+            "rows_per_source": dict(Counter(r["source"] for r in rows)),
             "seconds": round(time.time() - t0, 1), "dir": str(out_dir)}
