@@ -2489,5 +2489,30 @@ Frontend: `npm run typecheck` pass, `npx vitest run` **81 passed / 1 skipped**, 
    15.6 step 4's "stop OpenHands with SIGINT" is no longer needed (the job now ends tonight).
 6. After each run: `artifacts/isl/<profile>/eval/report.md` must not say PARTIAL DATA or SMOKE, and its "trim-eval:" line
    must say the evaluated trimmer equals the run's (`trim_eval_check ok`).
-Owner decision still open: `mendeley_static` is a 300-per-folder sample (13,800 of 102,470 photos, DATASETS 3.8);
-"all means all" would add about 88.7k images (roughly 3-6 h of queue time on 3 workers) before research is ready.
+Decided (25 Nov 22:54 UTC, `98b4dbd`): `mendeley_static` is ingested in full (102,470 photos, no per-folder cap;
+DATASETS 3.9); the queue now needs about 7-10 h more for it, which moves the commercial-safe estimate above to
+about 26 Nov 13:00-19:00 UTC.
+
+### 15.11 Adversarial review of `3f2ad35` and `98b4dbd` (Code Reviewer, 25 Nov 2026, 23:05-23:35 UTC)
+
+Every change was attacked offline (scratch copies, synthetic zips) and with read-only probes; no job was touched.
+
+| Attack | Result |
+|---|---|
+| `SeekableInflate`: 200 extra fuzz runs (native and zlib fallback; point subsets; `every` 32-97 KB; input chunks 1-16 KB; `meta_cap` 3 pages to 256 MB; LRU of 1-256 pages; reads, `read_range`, restores at any point, scan off/on), then 20 h5py listings after a random pre-positioning | 0 wrong bytes, every cached / zero page at its own offset, listings identical |
+| Fetch failures (15 %) inside `_restore` and `_step` during random reads; ForwardPass with injected stream errors (redo restores, jumps through points) on 60 random pair subsets / windows / steps | 0 wrong bytes or arrays; state consistent after every failure (2 tests added) |
+| ForwardPass speed (101 MB synthetic member, 3 reps, old `6b54c28` vs new) | listing 1.13-1.38 s vs 1.21-1.44 s, forward pass 0.52-0.63 s vs 0.54-0.67 s, plain stream 0.31-0.33 s vs 0.34-0.39 s: parity |
+| `mendeley_static` ids | the old 13,800-item list is a subset of the new 102,470 with identical gloss / meta; the 8 ingested rows are in it; readiness says 8 / 102,470 |
+| `mendeley_static` memory under the queue's `--max-rss-gb 1.5` (scratch root, manifest filled to 101k rows) | peak 0.88 GB (1 worker), 0.60 GB (3 workers): fits |
+| Trim hash re-trim loop | none: rules-only stores `null` and compares equal; every `cli trim` record path sets the hash |
+| E8 false ok / mismatch (`check_report` with unrecorded, mixed, other, rules-only, learned report without hash, changed file) | all as intended |
+
+**Open (not changed here).** (1) 3 byte-identical photo pairs in `mendeley_static` sit in two label folders
+(digits 3/4 and 4/5, teenagers / adults full sleeves); the engine gives the copy a `duplicate_of` row that reuses the
+original's landmarks under the other label, so 3 photos carry two labels. Drop both rows of such pairs in the letter
+set builder, or have the engine fail a duplicate whose gloss differs (engine.py is loaded by every queue chunk).
+(2) `cli trim --learned` (legacy stage-2, no run uses it) writes records without `trim_model_sha256`, so every
+later `cli trim` re-trims those clips and E8 says `mismatch` (correct, but a loop if someone uses `--learned`).
+`trim_bench run` writing the shared sidecar has the same effect once. (3) A sidecar record whose id later leaves
+`_islrtc_records` (n_frames 0 on both the original and the recut row) is never re-trimmed, so its old version /
+missing hash would keep E8 at `mismatch` (0 such records now; the version check had the same gap before).

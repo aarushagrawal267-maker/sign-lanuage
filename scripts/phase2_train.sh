@@ -162,7 +162,7 @@ state_files() {  # training state of a step (removed by --force)
 run_step() {
   local s="$1"
   case "$s" in
-    trim) cli trim ;;  # incremental: only clips without a trim yet
+    trim) cli trim ;;  # incremental: clips without a trim, or whose trim_version, learned-model SHA-256 or landmark file changed
     dedup)
       if [[ $SMOKE == 1 ]]; then cli dedup --sources include wslp mendeley_emergency mendeley_agri; return $?; fi
       cli dedup --sources include islrtc cislr wslp isl500 mendeley_emergency mendeley_agri ;;

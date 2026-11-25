@@ -277,3 +277,64 @@ def test_scanned_intervals_merge():
     assert uns(st, 6, 24) == [] and uns(st, 24, 27) == [(25, 26)]
     mark(st, 0, 100)
     assert (st._sc_lo, st._sc_hi) == ([0], [100])
+
+
+def _flaky(st, rnd, p):
+    """Make the stream's byte fetches fail with ``OSError`` at rate ``p`` (a network give-up)."""
+    real = st.r.read_at
+
+    def read_at(off, k):
+        if rnd.random() < p:
+            raise OSError("injected fetch failure")
+        return real(off, k)
+
+    st.r.read_at = read_at
+
+
+@needs_native
+@pytest.mark.parametrize("seed", range(4))
+def test_fetch_failures_mid_restore_or_step_never_file_wrong_pages(member, seed):
+    """Review of 3f2ad35: a fetch that fails inside ``_restore`` (the byte before a point) or ``_step`` leaves the
+    inflate position, the scan stage and the metadata cache consistent; the next read returns the right bytes."""
+    plain, usize = member.plain, len(member.plain)
+    rnd = random.Random(500 + seed)
+    st = _stream(member, points=sorted(rnd.sample(member.points, len(member.points) // 2)),
+                 chunk=rnd.choice((4 << 10, 16 << 10)))
+    _flaky(st, rnd, 0.15)
+    failed = 0
+    for _ in range(50):
+        p = rnd.choice((rnd.randrange(usize), st.out + rnd.randrange(-3 * MPAGE, 3 * MPAGE), rnd.choice(st.ck_out)))
+        p = max(0, min(p, usize - 1))
+        n = rnd.choice((8, 300, MPAGE, 3 * MPAGE + 1, 300_000))
+        st.seek(p)
+        try:
+            got = st.read(n)
+        except OSError:
+            failed += 1
+        else:
+            assert got == plain[p:p + n], (p, n)
+        _check_invariants(st, plain)
+    assert failed  # the failures really happened
+
+
+@needs_native
+def test_forward_pass_after_listing_with_points_survives_stream_errors(member, monkeypatch):
+    """Listing with persisted points, then the forward pass on the same stream while fetches fail now and then
+    (``redo`` restores and jumps through points): every chunk is exact or carries the fetch error."""
+    monkeypatch.setattr(openhands.time, "sleep", lambda s: None)
+    rnd = random.Random(3)
+    st = _stream(member, points=member.points[::2])
+    assert _listing(st) == member.entries
+    _flaky(st, rnd, 0.03)
+    pairs = [(n, ke[0], ve[0] if ve else None) for n, ke, ve in openhands.iter_pairs(member.entries) if ke is not None]
+    fp = openhands.ForwardPass(st, pairs, window=64 << 10, jump=128 << 10, step=16 << 10, max_stream_errors=10_000,
+                               forgive=1 << 40)
+    got = {name: (kp, vis, err) for name, kp, vis, err in fp}
+    assert set(got) == set(member.arrays) and fp.stats["stream_errors"]
+    for name, (kp, vis) in member.arrays.items():
+        gk, gv, err = got[name]
+        if err is not None:
+            assert isinstance(err, OSError), name  # only a fallback read can surface the injected failure
+            continue
+        np.testing.assert_array_equal(gk, kp)
+        np.testing.assert_array_equal(gv, vis)
