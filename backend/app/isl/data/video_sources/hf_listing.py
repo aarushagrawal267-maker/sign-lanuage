@@ -211,7 +211,7 @@ def list_split(dataset: str, split: str, final_path: Path, partial_path: Path, *
 
     st = load_partial(partial_path, dataset, split)
     start_rows = len(st["rows"])
-    failures, last_req, last_err = 0, None, ""
+    failures, last_req, last_err, name_changes = 0, None, "", 0
 
     def _save(state: str, **extra) -> None:
         _atomic_json(partial_path, st)
@@ -238,6 +238,9 @@ def list_split(dataset: str, split: str, final_path: Path, partial_path: Path, *
                 if st["names"] is None:
                     st["names"] = names
                 elif names != st["names"]:  # the dataset changed under us: start again
+                    name_changes += 1
+                    if name_changes > 2:  # answers flip between class lists: back off like any bad answer
+                        raise ValueError(f"class list changed {name_changes} times during the listing")
                     log.warning("%s %s: class list changed; restarting the listing", dataset, split)
                     st.update(names=names, rows=[], num_rows_total=None)
                     start_rows = 0

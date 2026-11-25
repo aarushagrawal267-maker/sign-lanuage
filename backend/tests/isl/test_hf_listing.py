@@ -302,3 +302,21 @@ def test_hf_alphabets_are_research_only():
         assert s.licence == "unknown" and s.profile == RESEARCH
         assert name in LETTER_SOURCES[RESEARCH] and name not in LETTER_SOURCES[COMMERCIAL]
         assert name not in PROFILES[COMMERCIAL].all_sources() and name in PROFILES[RESEARCH].all_sources()
+
+
+def test_flipping_class_list_backs_off_instead_of_looping(tmp_path):
+    """Answers whose class list changes on every request restart the listing at most twice, then count as failed
+    tries with backoff: the listing stops (progress kept) instead of paging the API every 2 s forever."""
+
+    class Flip(FakeRows):
+        def page(self, off, length):
+            d = super().page(off, length)
+            d["features"][1]["type"]["names"] = [f"c{len(self.calls)}", "y", "z"]
+            return d
+
+    get = Flip(10_000)
+    clock = Clock()
+    with pytest.raises(H.ListingError):
+        _list(tmp_path, get, clock=clock)
+    assert len(get.calls) <= 3 + FAST.max_failures
+    assert any(w >= FAST.base for w in clock.waits)
