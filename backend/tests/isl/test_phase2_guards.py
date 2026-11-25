@@ -427,6 +427,10 @@ def test_fit_fusion_keeps_penalty_without_enough_validation_data():
 
     p, rep = choose_user_mode(_FakeRec(), [], FusionParams())
     assert p.user_cls_mode == "penalty" and "insufficient" in rep["reason"]
+    one_group = [Clip(f"v/{w}/{t}", "include", w, f"isl.{w}", None, None, Path("/x"), group="s1")
+                 for w in ("a", "b") for t in range(4)]
+    p, rep = choose_user_mode(_FakeRec(), one_group, FusionParams())  # one signer group: never compared
+    assert p.user_cls_mode == "penalty" and "1 signer groups" in rep["reason"]
 
 
 def test_fit_fusion_chooses_user_mode_on_validation_e4(monkeypatch):
@@ -443,7 +447,9 @@ def test_fit_fusion_chooses_user_mode_on_validation_e4(monkeypatch):
     import app.isl.evaluation.runners as runners
 
     monkeypatch.setattr(runners, "e4_my_signs", fake_e4)
-    p, rep = ff.choose_user_mode(None, [], FusionParams())
+    val = [Clip(f"v/{g}/{w}/{t}", "isl500", w, f"isl.{w}", None, None, Path("/x"), group=g)
+           for g in ("u1", "u2") for w in ("a", "b") for t in range(4)]
+    p, rep = ff.choose_user_mode(None, val, FusionParams())
     assert p.user_cls_mode == "neutral" and rep["k"] == 3 and set(calls) == {"penalty", "neutral"}
 
     def worse_fa(rec, clips, ks, params, cache, **kw):
@@ -453,5 +459,30 @@ def test_fit_fusion_chooses_user_mode_on_validation_e4(monkeypatch):
         return r
 
     monkeypatch.setattr(runners, "e4_my_signs", worse_fa)
-    p, rep = ff.choose_user_mode(None, [], FusionParams())
+    p, rep = ff.choose_user_mode(None, val, FusionParams())
     assert p.user_cls_mode == "penalty" and rep["false_accept_increase_neutral"] > 0.1
+
+
+def test_sources_json_counts_only_sampled_clips(tmp_path):
+    from collections import Counter
+
+    from app.isl.cli import _record_sources
+
+    work = tmp_path / "w"
+    work.mkdir()
+    _record_sources(work, {"wslp": {"available": True, "clips": 1100, "licence": "x", "commercial": False},
+                           "glosl": {"available": True, "clips": 5000, "licence": "y", "commercial": False}},
+                    "pretraining", Counter({"glosl": 7}))
+    doc = json.loads((work / "sources.json").read_text())
+    assert doc["wslp"]["used"] == {"pretraining": 0} and not doc["wslp"]["contributed"]
+    assert doc["glosl"]["used"] == {"pretraining": 7} and doc["glosl"]["clips_read"] == 5000
+
+
+def test_smoke_islrtc_cap_keeps_dictionary_clips_of_include_concepts(tmp_path):
+    from app.isl.training.common import load_isl_data
+    from app.isl.vocab.build import VocabIndex
+
+    w = make_world(tmp_path)
+    data = load_isl_data(w["paths"], VocabIndex.load(w["vocab"]), "commercial-safe", w["split"], max_islrtc=4)
+    inc = {c.concept_id for c in data.include}
+    assert len(data.islrtc) == 4 and all(c.concept_id in inc for c in data.islrtc)

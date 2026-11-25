@@ -67,12 +67,27 @@ def choose_user_mode(rec, val_clips: list[Clip], params: FusionParams, ks=(3, 1)
     signer groups enrol ``k`` takes of half of their words (the E4 protocol, run on validation, never on test).
     ``neutral`` is chosen only when it raises top-1 on the enrolled words and the false-accept rate of user signs
     on the other words rises by at most ``MAX_FA_INCREASE``; with too little data the default ``penalty`` stays."""
+    from collections import Counter, defaultdict
+
     from app.isl.evaluation.runners import e4_my_signs
 
-    cache: dict = {}
-    res = {m: e4_my_signs(rec, val_clips, ks=ks, params=params.with_(user_cls_mode=m), cache=cache)
-           for m in ("penalty", "neutral")}
     rep: dict = {"modes": {}}
+    # cheap pre-check (no features): signer groups with >= 2 words of >= k+1 takes each
+    takes: dict = defaultdict(Counter)
+    for c in val_clips:
+        if c.concept_id and c.group:
+            takes[c.group][c.concept_id] += 1
+    k_min = min(ks)
+    eligible = [g for g, cnt in takes.items() if sum(1 for n in cnt.values() if n >= k_min + 1) >= 2]
+    if len(eligible) < MIN_E4_GROUPS:
+        rep.update(chosen=params.user_cls_mode, k=None,
+                   reason=f"insufficient validation few-shot data ({len(eligible)} signer groups with repeated takes; "
+                          f"need {MIN_E4_GROUPS}): kept {params.user_cls_mode!r}")
+        return params, rep
+    cache: dict = {}
+    res = {"penalty": e4_my_signs(rec, val_clips, ks=ks, params=params.with_(user_cls_mode="penalty"), cache=cache)}
+    if any((res["penalty"].get("by_k") or {}).get(f"k{k}", {}).get("n", 0) >= MIN_E4_TESTS for k in ks):
+        res["neutral"] = e4_my_signs(rec, val_clips, ks=ks, params=params.with_(user_cls_mode="neutral"), cache=cache)
     k_used = None
     for k in ks:
         a = (res["penalty"].get("by_k") or {}).get(f"k{k}")

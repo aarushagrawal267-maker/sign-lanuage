@@ -266,8 +266,13 @@ def load_isl_data(paths: IslPaths, vocab, profile: str = "commercial-safe", spli
         islrtc, islrtc_stats = resolve_islrtc([c for c in IslrtcAdapter(paths, vocab=vocab).clips() if c.concept_id],
                                               paths)
     if max_islrtc and len(islrtc) > max_islrtc:
+        # smoke runs: keep the dictionary clips of INCLUDE concepts first (the ones E1 / E2 / E3 evaluate), then fill
         rng = random.Random(seed)
-        islrtc = rng.sample(islrtc, max_islrtc)
+        inc = {c.concept_id for c in include if c.concept_id}
+        core = [c for c in islrtc if c.concept_id in inc]
+        rest = [c for c in islrtc if c.concept_id not in inc]
+        rng.shuffle(core)
+        islrtc = core[:max_islrtc] + rng.sample(rest, max(0, min(len(rest), max_islrtc - len(core))))
     name = split_name or primary_split_name(paths)
     split = load_split(paths, name)
     assign = split.get("assign", {})

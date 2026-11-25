@@ -334,3 +334,21 @@ def test_e1b_cross_validation_pools_held_out_signers(phase2, tmp_path):
     assert cv["folds"] == 2 and cv["pooled_n"] == 8 and cv["pooled_groups"] >= 2 and cv["pooled_top1_interval"]
     assert "_hits" not in doc["protocols"]["E1b"]
     assert "E1b cross-validation" in (work / "eval" / "report.md").read_text()
+
+
+def test_e4_runs_with_both_user_sign_classifier_modes(phase2):
+    from app.isl.evaluation.runners import e4_my_signs
+    from app.isl.training.common import ISL_FEATURES
+    from app.isl.training.fit_fusion import choose_user_mode
+    from app.isl.training.pipeline import load_recognizer
+
+    w, data, work = phase2["world"], phase2["data"], phase2["work"]
+    rec = load_recognizer(work, ISL_FEATURES, w["vocab"], profile="research")
+    clips = data.extra_part("train")[:60]  # several real signer groups with 3 takes per word
+    cache: dict = {}
+    out = {m: e4_my_signs(rec, clips, ks=(1,), params=rec.fusion.with_(user_cls_mode=m), cache=cache)
+           for m in ("penalty", "neutral")}
+    assert out["penalty"]["run"] and out["neutral"]["user_cls_mode"] == "neutral"
+    assert out["penalty"]["by_k"]["k1"]["n"] == out["neutral"]["by_k"]["k1"]["n"]  # same tests, shared evidence
+    p, rep = choose_user_mode(rec, clips, rec.fusion, ks=(1,))
+    assert rep["chosen"] in ("penalty", "neutral") and p.user_cls_mode == rep["chosen"]

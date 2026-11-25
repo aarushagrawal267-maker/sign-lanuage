@@ -567,7 +567,7 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
                                  "label": "every fold's held-out signers, each fold's model trained without them",
                                  "per_fold": [{"split": f["label"], "n": f.get("n"), "top1": f["metrics"]["top1"]}
                                               for f in runs]}
-            prot["E1b"]["intervals"]["top1_cv_pooled"] = prot["E1b"]["cv"]["pooled_top1_interval"]
+            prot["E1b"].setdefault("intervals", {})["top1_cv_pooled"] = prot["E1b"]["cv"]["pooled_top1_interval"]
             prot["E1b"].setdefault("interval_groups", {})["top1_cv_pooled"] = len(set(grp))
             if prot["E1b"]["cv"]["pooled_top1_interval_reason"]:
                 prot["E1b"].setdefault("interval_reasons", {})["top1_cv_pooled"] = \
@@ -636,6 +636,11 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
                                   "pre-training list)" if seen_gal is not None else "") + ".",
                       "pretraining_saw_gallery_unlabelled": (seen_gal > 0) if seen_gal is not None else None,
                       "run": bool(full), "n": full.get("n", 0), "n_groups": full.get("n_groups"),
+                      **({} if full else {"reason": "no queries: no held-out concept has both INCLUDE val/test clips "
+                                          "and a dictionary clip in the gallery (smoke runs sample the ISLRTC clips)"
+                                          if any(f.get("run") for f in folds) else
+                                          "; ".join(str(f.get("leakage") or f.get("reason") or "fold not run")
+                                                    for f in folds)}),
                       "metrics": full.get("metrics", {}), "intervals": full.get("intervals", {}),
                       "interval_reasons": full.get("interval_reasons", {}),
                       "interval_groups": full.get("interval_groups", {}),
@@ -700,8 +705,9 @@ def _ci_cell(p: dict, key: str = "top1") -> str:
     if ci:
         n = ng.get(k)
         return f"{ci[0]:.3f}-{ci[1]:.3f} ({tag}{n if n is not None else '?'} groups)"
-    reason = why.get(f"{key}_cv_pooled") or why.get(key)
-    return f"none: {reason}" if reason else "-"
+    if why.get(f"{key}_cv_pooled"):
+        return f"none: {why[f'{key}_cv_pooled']} (cv pooled)"
+    return f"none: {why[key]}" if why.get(key) else "-"
 
 
 def markdown_report(doc: dict) -> str:

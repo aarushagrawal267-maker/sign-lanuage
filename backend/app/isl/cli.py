@@ -616,7 +616,12 @@ def _record_sources(work: Path, rep: dict, role: str, used: dict | None = None) 
         if not isinstance(d, dict):
             continue
         old = cur.get(name, {})
-        n = int((used or {}).get(name, d.get("clips") or 0) if d.get("available") else 0)
+        if not d.get("available"):
+            n = 0
+        elif used is not None:
+            n = int(used.get(name) or 0)  # a source read but not sampled contributed nothing
+        else:
+            n = int(d.get("clips") or 0)
         per_role = {**(old.get("used") or {}), role: n}
         roles = sorted(r for r, k in per_role.items() if k > 0)
         cur[name] = {**old, **{k: v for k, v in d.items() if k != "clips"}, "available": bool(old.get("available") or
