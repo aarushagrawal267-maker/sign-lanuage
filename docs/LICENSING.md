@@ -34,6 +34,13 @@ Citation:
 }
 ```
 
+## Indian Sign Language (ISL) datasets
+
+The ISL sources (INCLUDE, the ISLRTC dictionary, CISLR, iSign), their licences, required attribution and the
+`commercial-safe` / `research` data profiles are documented in [`DATASETS_ISL.md`](DATASETS_ISL.md).
+`models/packs/isl/vocabulary.jsonl` contains only names derived from the ISLRTC dictionary (GODL-India, attribution
+required) and INCLUDE word folders (CC BY 4.0); no ISL video or landmark data is in the repository.
+
 ## Third-party software
 
 | Component | Licence |

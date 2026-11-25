@@ -86,7 +86,7 @@ Decision: a *language pack* is a folder with `pack.json` plus artifacts. ASL is 
 Consequences: ASL code paths untouched; ISL artifacts are versioned and swappable as one unit; the Model Laboratory does not yet train ISL (CLI-driven in phase 2). Reversible: a pack can later be registered as an experiment.
 
 **ADR-ISL-2: Hybrid recognition = closed-set classifier for core words + embedding retrieval for the long tail.**
-Context: INCLUDE gives about 16 clips per word for 263 words (multi-signer); ISLRTC gives **one** clip per entry for about 12k concepts (single signer).
+Context: INCLUDE gives about 16 clips per word for 263 words (multi-signer); ISLRTC gives **one** clip per entry for about 12k concepts (one signer per entry; several different signers across the dictionary, see 5.8).
 Decision: (a) a classifier trained on the core words, (b) a metric-learning encoder plus a nearest-neighbour index over every dictionary entry and every user sign, (c) a calibrated fusion with an abstain rule.
 Consequences: one-shot coverage of the whole dictionary; extra calibration work; two models to keep in sync (the pack versions them together).
 Alternative rejected: a 12k-way classifier (one example per class cannot be learned as a softmax class; no way to add user signs without retraining).
@@ -645,7 +645,7 @@ recognise it when **someone else** signs it?"
     from the supervised losses. (They stay in the gallery; they may appear only as an unlabeled SSL view if self-supervised pretraining is used,
     and the report says so.)
   * Gallery = the full ISLRTC index (all ~12k word concepts, all variants, + CISLR when available and deduplicated).
-  * Queries = all INCLUDE clips of fold-k concepts (signers from Chennai, never the ISLRTC signer).
+  * Queries = all INCLUDE clips of fold-k concepts (signers from Chennai, never the ISLRTC signers).
   * Report top-1/top-5 over (a) the full gallery and (b) a restricted 263-concept gallery, both "unseen class, unseen signer".
 * Also reported: **seen-class retrieval** (concepts whose INCLUDE clips were in training) to show the gap.
 * Honest caveat stated with the number: some INCLUDE signers may use a regional form that differs from the ISLRTC form,
@@ -705,6 +705,51 @@ Backward-compatible additions to `scripts/ingest_isl.py` (only take effect on th
   (the ISLRTC "Alphabet", "Fingerspell", "Numbers_(0-1_Crore)" and regional number videos are longer than the 10 s cap)
   into `data/isl/landmarks/islrtc_full/` with manifest `data/isl/manifests/islrtc_full.jsonl`.
 * A `trim_version`-free manifest: trimming lives only in the sidecar (5.3), so the ingestion format does not change.
+
+### 5.8 Implementation notes and deviations (Data Engineer, 25 Nov 2026)
+
+Implemented in `backend/app/isl/{paths,profiles}.py`, `backend/app/isl/vocab/*`, `backend/app/isl/data/*`,
+`backend/app/isl/cli.py` (data commands), `scripts/ingest_isl_gated.py` and the new `scripts/ingest_isl.py` options.
+Measured numbers and licences are in `docs/DATASETS_ISL.md`. Deviations from sections 5.1-5.7 and 6.1, with reasons:
+
+* **ISLRTC is not single-signer.** Watching sampled dictionary videos showed at least six different signers
+  (one per entry). Adapters still put all ISLRTC clips in one group (`islrtc-signer-1`) because identities are
+  unknown; this only matters if ISLRTC clips are ever used as test queries (they are not: section 5.5 queries are INCLUDE).
+* **Most ISLRTC videos have no title card in the first seconds**: the signer signs the word and then explains it
+  without a cut, often without lowering the hands to the sides. Stage 1 (5.3) therefore gained:
+  * a `dip` boundary: both wrists drop below the waist line (`dip_below = 0.7` shoulder widths under the shoulder
+    line) for `dip_ms = 150` ms - the usual short move between the sign and the explanation;
+  * `active_above = 0.75` for the start: hands clasped at the waist (a common resting pose here) are not "up";
+  * bounded clips (`stop` = `card`, `eof` or `+posegap`) normally hold the sign only, so they keep everything up to
+    the **final** return of the hands (`source_end`); earlier rests/dips become `alternatives` (compound signs such as
+    "Account Closing" drop the hands between their parts). If such a clip is longer than 1.25 x the sign window it
+    is treated like an unbounded one;
+  * a `pause` (both hands still) is only a fallback when no rest/dip exists: on reviewed videos pauses mostly fired
+    on held hand shapes inside the sign;
+  * multiword names get a longer minimum and maximum sign length (+600 ms / +1.5 s per extra word, capped);
+  * methods are `rest | dip | pause | source_end | clip_end | cap | full | empty` (+ `learned` from stage 2).
+* **Stage 2 (`boundary.py`)** uses the per-frame activity features only (not the full feature vector) to keep
+  training to about a minute on CPU. A smoke run on partial data changed little (see DATASETS_ISL.md), so the sidecar
+  keeps stage 1 by default and `trim --learned` is opt-in.
+* **Vocabulary linking**: automatic merges are `exact`, `spelling` (British/American pairs in one WordNet synset),
+  `qualified` (the dictionary has exactly one domain-qualified entry, e.g. INCLUDE "tight" -> "Tight (Clothes)") and
+  `synonym` (member of an ISLRTC synonym-list name); the last two are `needs_review`. **WordNet synonyms are never
+  merged** (a trial produced bird -> skirt, I -> one, blind -> screen): they, ambiguous domain matches, token matches
+  and different senses ("you (plural)" vs "you") become `see_also` suggestions on a separate concept for review.
+  Numbers use the word form as concept id (`Numbers/12_Twelve.mp4` -> `isl.twelve`, `number_value` 12).
+  `vocabulary.jsonl` omits defaults/nulls (7.5 MB instead of 11.5 MB); `VocabEntry.model_validate` restores them.
+* **INCLUDE ids**: the running ingestion job builds ids from the last path parts, which is wrong for the 27 videos in
+  `Extra/` folders. Adapters rebuild canonical ids from the zip member path (`Extra/` removed); `ingest_isl.py` now
+  writes the right gloss/category for them but keeps the old id formula so a restart never processes a video twice.
+* **Pseudo-signer must-link prior**: chaining every session within 30 camera numbers merged consecutive recording
+  passes of different signers. Sessions are now chained into *recording passes* in camera-number order while the gap is
+  <= 30 **and no word repeats** (a signer records each word once per pass); passes are clustered. If the clustering is
+  weak or gives fewer / very uneven groups than folds, `splits` reports the session split as primary.
+* **iSign poses are one ZIP** split into four parts (dataset card), so the primary mode is random access through
+  `RangeFile` (central directory from the end of part_ad, one range request per wanted member). The design's tar/gzip
+  offset log is kept as the `--mode stream` fallback (piped parts; resumable at recorded offsets for zip/tar).
+* **Access check**: verified on 25 Nov 2026 - README returns 206 for a range request on both repos while the probe data
+  files return 403, so `hf_access` reports `pending` for both.
 
 ---
 
