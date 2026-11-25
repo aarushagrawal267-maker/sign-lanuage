@@ -395,8 +395,10 @@ memory with their neighbours, plus the indexes of all-zero pages (Sign Library 1
 enough for h5py to list all 748 datasets without a restart; without the neighbours the 6.1 GB `sub_based` file
 needed hundreds of restarts, which is why the first run was restarted at 14:57 UTC). Pass 1 lists
 the datasets and their object-header addresses with h5py (one streaming pass; the list is cached in
-`raw/openhands_raw/<member>.index.json`), pass 2 parses each small version-1 object header itself and reads the data
-in address order. Network cost about twice the compressed size; no temp files; peak memory about 0.5 GB. Chunks of a
+`raw/openhands_raw/<member>.index.json`), pass 2 parses each small version-1 object header itself
+(`parse_v1_header`) and, since 25 Nov 2026 20:47 UTC, reads every pending chunk in **one forward pass**
+(`openhands.ForwardPass`, section 3.7; before, it sought header -> data -> next header per chunk). Network cost
+about twice the compressed size (listing + forward pass); no temp files; RSS 0.4-0.66 GB measured. Chunks of a
 video already ingested from another file of the same channel are skipped. Sign Library ships two files: `1_min_splits`
 (374 chunks of 76 named YouTube videos, 6.8 h at 25 fps, ingested first) and `sub_based` (9,582 chunks named by
 hashes, about 28 h): the names cannot be matched, so up to 6.8 h may be ingested twice; deduplicate by pose content
@@ -498,7 +500,7 @@ measurements.
 | `ingest_isl.py islrtc-recut --follow` (20244) | 383 records (all ok); 14 card stops and 20 zero-frame clips waiting for its next 30-min scan | follows islrtc | 36 records in 23 min | none | about 30-60 min after the islrtc job ends (one final scan, then it exits) |
 | queue (17314) -> `ingest_isl_video.py run wslp` (chunk PID 1696) | 1,649 of 4,398 ok | 4,398 | 6.3 clips/min (20:03-20:26); 5.4/min over the last 45-min chunk; 1 worker | 0 standing failures (fetch failures are retried) | WSLP about **03:45-05:00, 26 Nov** |
 | rest of the queue (fingerspelling 1,308, Mendeley static 13,800 images, CSLTR 687, agriculture 78, emergency 412, CSLTR words 1,036, two HF alphabet sets, WSLP unlabelled 635) | probe rows only (Mendeley emergency: 3 `superseded` rows to redo) | see 3.3 | not started; per-item times from the probe runs: 0.5 s per image, 4-13 s per video | HF alphabet listings failed with 429 / 503 in the probe runs (no item lists yet) | about **12:00-17:00, 26 Nov** (roughly 11 h on 1 worker, 4-6 h once islrtc has ended and the queue gets 3) |
-| `ingest_isl_pose.py openhands-raw` (13762) | 16,670 chunks; Sign Library, NIOS and the ISH News one-minute file done; ISH News `sub_based` 2,117 of 86,246 | until `landmarks/openhands_raw` = 12 GB (3.62 GB now) | **10.7 chunks/min** (450 in 42 min); landmarks +12 MB in 20 min; 5-8 MB/s downloaded, i.e. ~30 MB fetched per ~130-frame chunk | none | **not before about 1-2 Dec** for ISH News `sub_based` alone (84,129 chunks left), then MBM; the 12 GB budget is not reached for weeks at this rate. The 17:56 estimate (budget at 06:00-18:00, 26 Nov) was wrong |
+| `ingest_isl_pose.py openhands-raw` (13762) | 16,670 chunks; Sign Library, NIOS and the ISH News one-minute file done; ISH News `sub_based` 2,117 of 86,246 | until `landmarks/openhands_raw` = 12 GB (3.62 GB now) | **10.7 chunks/min** (450 in 42 min); landmarks +12 MB in 20 min; 5-8 MB/s downloaded, i.e. ~30 MB fetched per ~130-frame chunk | none | **not before about 1-2 Dec** for ISH News `sub_based` alone (84,129 chunks left), then MBM; the 12 GB budget is not reached for weeks at this rate. The 17:56 estimate (budget at 06:00-18:00, 26 Nov) was wrong. **Superseded by 3.7**: ISH News `sub_based` finished 21:13 UTC (it had 43,123 chunks, not 86,246: that is the dataset count, two per chunk) |
 | CISLR / iSign | gated, no access (probed by the queue) | - | - | - | ingested automatically if access is granted |
 
 What this means for phase 2 (`python -m app.isl.cli readiness`, ISL_DESIGN 15.6): **commercial-safe** never reads
@@ -510,6 +512,71 @@ resumable; the manifest rows stay and readiness counts OpenHands raw complete on
 
 Disk: about 31 GB free now; ISLRTC (+0.7 GB), WSLP (+0.4 GB), the rest of the queue (~1 GB) and OpenHands at its
 measured growth (~0.04 GB/h) leave well over the 10 GB floor.
+
+### 3.7 OpenHands raw: one forward pass per member (Data Engineer, 25 Nov 2026 20:30-21:20 UTC) <!-- openhands-forward -->
+
+**Why a chunk was slow (measured).** In these files the object headers of a run of 5-7 chunks are written back to
+back and their data comes later: in ISH News `sub_based` (86,246 datasets = 43,123 chunks), 74,073 of the 86,245
+gaps between consecutive header addresses are under 1,000 bytes, and the headers at 1.806 GB point to data at
+3.650-3.661 GB (1.85 GB further). The old pass 2 read header -> data -> visibility header -> data per chunk, so every
+chunk jumped back to the header region and forward again. A read-only probe on 25 already-ingested chunks (same
+reader settings as the job, 8 MB blocks, 12-block read-ahead) measured per chunk: **3.5 restores, 18.2 MB
+re-inflated, 9.3 MB of compressed input consumed, 180 MB downloaded** (every restore restarted the 12 x 8 MB
+read-ahead and the 6-block LRU dropped it again), 4.1 s, for **0.64 MB of payload** (keypoints + visibility). The
+live job's own network read over 60 s at 20:33 was 2.9 MB/s at 10.7 chunks/min, i.e. about 16 MB per chunk. The
+"~30 MB per chunk" in 3.6 came from the log's "MB/s fetched", which divided bytes that include the 11.84 GB listing
+pass by the time since the data pass started (consumed bytes over the run: 17.4 GB / 2,150 chunks = 8.1 MB). The
+restore points every 9.3 MB (size / 3000) and the 64 MB persisted ones made each jump cost a few MB; nothing else
+was wrong with the stream.
+
+**Fix** (`openhands.ForwardPass`, `scripts/ingest_isl_pose.py`): every wanted byte range (each pending header's 4 KB;
+each dataset's bytes once its header is parsed) waits in a heap ordered by offset and is cut out of the inflated
+stream as it passes; the last 16-32 MB of output are kept so a range that starts just behind the stream is still
+served. Headers always precede their data in these files; anything behind that window, or any odd header / size, is
+read afterwards with the old random-access code, so the bytes are the same either way (0 such chunks on ISH News).
+Long gaps with nothing wanted are skipped by restoring at a persisted access point. Parsed headers are appended to
+`raw/openhands_raw/<member>.headers.jsonl` (flushed every 500 and on exit; a cut line is ignored), so a restart starts
+at the first byte still wanted (measured: 3.23 GB after the first stop, 17.26 GB after the second, first new chunk
+after 3-13 s). Conversion + saving run on `--convert-workers` threads (default 2; 0.017 s per 130-frame chunk).
+Output: the same `.npz` keys, dtypes and bytes and the same manifest record (same keys in the same order; `secs` is
+the conversion time plus the stream time since the previous chunk); rows now arrive in data order, not header order.
+No temp files; the member is never written to disk (ISH News `sub_based` is 27.9 GB inflated, MBM 59.1 GB). Also
+fixed: `range_fetch` did not retry a connection cut mid-body (`urllib3` `ProtocolError`, which `requests` does not wrap
+when streaming `r.raw`); it killed the job once (below).
+
+**Checks.** Offline tests (`backend/tests/isl/test_openhands_forward.py`, synthetic zip + deflated HDF5 with grouped
+headers, an int dataset, a chunked dataset, keypoints without visibility): identical arrays and error strings vs the
+old path (120 restores -> 1), identical manifest records and `.npz` contents vs the old per-chunk loop, a stop after 9
+chunks and a resume that redoes none and reuses the cached headers, the jump at persisted points, the header cache's
+damaged tail, the `ProtocolError` retry. Real data (read-only probe, 20:40 UTC): 40 already-ingested ISH News chunks
+read with the forward pass and converted again: **40 of 40 byte-identical** `.npz` arrays and identical stats, 0.17
+GB downloaded.
+
+**Live run** (same arguments, `nice -n 10`, log `data/isl/logs/ingest_pose_openhands_raw.log`):
+
+| Time (UTC) | Event |
+|---|---|
+| 20:47:38 | SIGINT to PID 13762, clean exit in 4 s; restarted 20:47:44 as **PID 19108** |
+| 20:48:53 | the memory guard stopped it (RSS 1.52 GB > 1.5 GB cap): the pass kept every finished chunk's arrays (0.3 MB each). Fixed in the code within the minute; the guard's own respawn (same PID, `execv`) loaded the fix at 20:49:34 |
+| 21:01:16 | crash on a cut Zenodo connection (`ProtocolError`, see above); 21,500 chunks done by then |
+| 21:03:08 | restarted with the retry fix as **PID 25287**; resumed at 17.26 GB inflated |
+| 21:13:02 | **ISH News `sub_based` done**: last 16,462 chunks in 591 s (10.64 GB inflated, 4.61 GB downloaded, 0 fallbacks, 0 stream errors) |
+| 21:13:11 | MBM Vadodara listing pass started (`corrected_pose_videos_chunked_1_min.h5`, 23.32 GB compressed, 59.07 GB raw) |
+
+Measured over 20:49-21:13 (manifest samples every 60 s): **1,550-2,050 chunks/min** (27.9-30.8/s in the job log)
+against 10.7/min before, i.e. about 170 times faster; 7.8-9.1 MB/s downloaded, 18-21 MB/s inflated (the job is
+CPU-bound at load 13-16: about one core for inflate + conversion); RSS 0.40-0.66 GB; landmarks +95-110 MB/min.
+Manifest at 21:15: **57,676 chunks, all ok, no duplicate id** (Sign Library 9,956, NIOS 1,936, ISH News 45,784;
+about 349 h at 25 fps); `landmarks/openhands_raw` 5.93 GB; 29 GB free.
+
+**ETA (estimates from these rates).** MBM listing 27-35 min (the 27.9 GB ISH News listing took 751 s) -> about 21:45;
+its forward pass 59 GB at 18-21 MB/s -> about 22:35-22:45, adding about 4.8 GB of landmarks (81 MB per inflated GB
+on ISH News) -> about 10.7 GB. NewzHook (61.2 GB zip, probably about 150 GB inflated) then needs its own listing pass
+(about 65-85 min at 15 MB/s) and the job stops at the **12 GB budget** after roughly 16 GB of its 150 GB inflated:
+**about 00:00-01:00 UTC, 26 Nov**, with about 12 % of NewzHook ingested. Ingesting all of NewzHook would need a budget
+of about 23 GB (about +12 GB) and about 2.3 h more of forward pass; with the other jobs' growth that would bring free
+disk to about 10 GB, under this job's 12 GB `--min-free-gb` floor, so it would stop near 90 % of NewzHook anyway. The
+budget was not changed (owner decision).
 
 ---
 

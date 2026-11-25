@@ -28,6 +28,13 @@ offset + last 32 KB of output, :mod:`~app.isl.data.pose_sources.zran`), and ever
 appended to ``raw/openhands_raw/<member>.points``. A restarted job loads them and seeks straight to the point
 before its next chunk (measured on ISH News: a chunk at 4.7 GB read with 27 MB of downloads instead of
 re-streaming the member from byte 0).
+
+One forward pass per member (26 Nov 2026, :class:`ForwardPass`): the object headers of a group of chunks sit
+together and their data comes much later (ISH News ``sub_based``: headers at 1.81 GB, data at 3.65 GB), so the
+per-chunk reads (header, data, next header ...) restored 3.5 times and re-inflated about 18 MB per 0.64 MB chunk
+(measured on 25 real chunks: 9.3 MB of compressed input consumed and 180 MB downloaded per chunk with the
+12-block read-ahead). The forward pass cuts every wanted range out of the stream as it goes by and keeps the parsed
+headers in ``raw/openhands_raw/<member>.headers.jsonl`` so a restart resumes near where it stopped.
 """
 
 from __future__ import annotations
@@ -71,6 +78,7 @@ def range_fetch(url: str, start: int, end: int, retries: int = 10, timeout: floa
     slower than ``min_rate`` bytes/s on average (after ``grace`` seconds) is abandoned and retried: Zenodo
     connections (about 0.8 MB/s each) sometimes stall without closing."""
     import requests
+    from urllib3.exceptions import HTTPError as Urllib3Error
 
     s = session or _session()
     err = None
@@ -104,7 +112,9 @@ def range_fetch(url: str, start: int, end: int, retries: int = 10, timeout: floa
             if isinstance(e, PermissionError) or "ignored the Range" in str(e):
                 raise
             err = f"{type(e).__name__}: {e}"
-        except requests.RequestException as e:
+        except (requests.RequestException, Urllib3Error) as e:
+            # urllib3 errors raised while streaming ``r.raw`` (IncompleteRead -> ProtocolError, read timeouts) are
+            # not wrapped by requests: uncaught, one broke connection killed the job (25 Nov 2026 21:01 UTC)
             err = f"{type(e).__name__}: {e}"
         time.sleep(min(60, 2 ** i))
     raise OSError(f"range fetch failed after {retries} tries ({url} {start}-{end}): {err}")
@@ -134,8 +144,16 @@ class PrefetchReader:
         self.pool = ThreadPoolExecutor(max(1, ahead)) if ahead > 0 else None
         self.futs: OrderedDict[int, object] = OrderedDict()
         self.last = -10
-        self.fetched_bytes = 0
+        self.fetched_bytes = 0  # bytes handed to callers
+        self.downloaded_bytes = 0  # bytes actually downloaded (whole blocks, read-ahead included)
         self.lock = threading.Lock()
+        self._dl_lock = threading.Lock()
+
+    def _fetch_counted(self, s: int, e: int) -> bytes:
+        b = self.fetch(s, e)
+        with self._dl_lock:
+            self.downloaded_bytes += len(b)
+        return b
 
     def _submit(self, k: int):
         s = k * self.block
@@ -144,9 +162,9 @@ class PrefetchReader:
             from concurrent.futures import Future
 
             f: Future = Future()
-            f.set_result(self.fetch(s, e))
+            f.set_result(self._fetch_counted(s, e))
             return f
-        return self.pool.submit(self.fetch, s, e)
+        return self.pool.submit(self._fetch_counted, s, e)
 
     def _get(self, k: int) -> bytes:
         with self.lock:
@@ -536,15 +554,364 @@ def parse_v1_header(buf: bytes) -> dict:
     return out
 
 
-def read_contiguous(stream: SeekableInflate, hdr: dict) -> np.ndarray:
+def data_nbytes(hdr: dict) -> int:
+    """Byte length of a contiguous float dataset; :class:`HeaderError` for anything else."""
     if hdr.get("dclass") != 1 or hdr["itemsize"] not in (4, 8):
         raise HeaderError(f"unexpected datatype class {hdr.get('dclass')} size {hdr.get('itemsize')}")
     n = int(np.prod(hdr["shape"])) * hdr["itemsize"]
     if hdr["size"] != n:
         raise HeaderError(f"layout size {hdr['size']} != {n}")
-    raw = stream.read_range(hdr["address"], n)
+    return n
+
+
+def array_from(hdr: dict, raw: bytes) -> np.ndarray:
     dt = np.dtype(("<" if hdr["little"] else ">") + ("f8" if hdr["itemsize"] == 8 else "f4"))
     return np.frombuffer(raw, dtype=dt).reshape(hdr["shape"])
+
+
+def read_contiguous(stream: SeekableInflate, hdr: dict) -> np.ndarray:
+    n = data_nbytes(hdr)
+    return array_from(hdr, stream.read_range(hdr["address"], n))
+
+
+# --------------------------------------------------------------------------------------------- forward pass
+
+class HeaderCache:
+    """Parsed object headers of one member (``address -> header dict`` or a :class:`HeaderError` message),
+    persisted append-only as JSON lines so a restarted forward pass does not re-read headers it has already
+    passed. A line cut by a kill is ignored; a file of another member (first line) is replaced."""
+
+    def __init__(self, path, key: str, usize: int, flush_every: int = 500):
+        from pathlib import Path
+
+        self.path, self.key, self.usize = Path(path) if path else None, key, int(usize)
+        self.items: dict[int, dict | str] = {}
+        self._buf: list[str] = []
+        self.flush_every = flush_every
+        self._head = json_dumps({"key": key, "usize": self.usize})
+        self._valid = False
+
+    def load(self) -> HeaderCache:
+        import json
+
+        if self.path is None or not self.path.exists():
+            return self
+        lines = self.path.read_bytes().split(b"\n")
+        if not lines or lines[0].decode("utf-8", "replace") != self._head:
+            return self
+        self._valid = True
+        good = len(lines[0]) + 1
+        for ln in lines[1:]:
+            if not ln:
+                continue
+            try:
+                r = json.loads(ln)
+                a = int(r["a"])
+                v = r["e"] if "e" in r else dict(r["h"], shape=tuple(r["h"]["shape"]))
+            except (ValueError, KeyError, TypeError):
+                break
+            self.items[a] = v
+            good += len(ln) + 1
+        size = self.path.stat().st_size
+        if good < size:  # cut the damaged tail so later appends stay readable
+            with self.path.open("r+b") as fh:
+                fh.truncate(good)
+        return self
+
+    def get(self, addr: int):
+        return self.items.get(int(addr))
+
+    def add(self, addr: int, value: dict | str) -> None:
+        addr = int(addr)
+        if addr in self.items:
+            return
+        self.items[addr] = value
+        if self.path is None:
+            return
+        self._buf.append(json_dumps({"a": addr, "e": value} if isinstance(value, str)
+                                    else {"a": addr, "h": dict(value, shape=list(value["shape"]))}))
+        if len(self._buf) >= self.flush_every:
+            self.flush()
+
+    def flush(self) -> None:
+        if self.path is None or not self._buf:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if not self._valid:
+                tmp = self.path.with_name(self.path.name + ".tmp")
+                tmp.write_text(self._head + "\n")
+                tmp.replace(self.path)
+                self._valid = True
+            with self.path.open("a") as fh:
+                fh.write("\n".join(self._buf) + "\n")
+            self._buf.clear()
+        except OSError as e:  # a full disk must not stop the stream (the cache only saves work on restart)
+            log.warning("could not persist object headers: %s", e)
+
+
+def json_dumps(obj) -> str:
+    import json
+
+    return json.dumps(obj, separators=(",", ":"), sort_keys=True)
+
+
+class _Req:
+    __slots__ = ("s", "e", "kind", "name", "role", "buf", "hdr")
+
+    def __init__(self, s, e, kind, name, role, hdr=None):
+        self.s, self.e, self.kind, self.name, self.role, self.hdr = int(s), int(e), kind, name, role, hdr
+        self.buf = bytearray()
+
+
+class ForwardPass:
+    """Read many chunks of one member in **one forward pass** over the inflated stream.
+
+    Why: in the OpenHands files the object headers of a group of chunks sit together and their data comes much
+    later (ISH News ``sub_based``: headers at 1.81 GB, data at 3.65 GB), so reading chunk by chunk (header,
+    data, next header ...) jumped back and forth: 3.5 restores and about 18 MB of re-inflation per 0.64 MB
+    chunk. Here every wanted byte range (each pending header's 4 KB, then each dataset once its header is
+    parsed) waits in a heap ordered by offset and is cut out of the stream as it goes by. Headers always come
+    before their data in these files; a range that lies behind the kept ``window`` (or anything unusual) is
+    read afterwards with the old random-access path (``fallback``), so the result is always the same bytes.
+
+    ``pairs`` = [(name, keypoints header address, visibility header address or None)]. Yields
+    ``(name, keypoints, visibility, error)``: arrays exactly as :func:`read_contiguous` returns them, or the
+    exception the old per-chunk path would have raised (``HeaderError`` / ``OSError`` / ``EOFError`` /
+    ``ValueError``). Chunks come in data order, not header order. Parsed headers go to ``headers``
+    (:class:`HeaderCache`); a long gap with nothing wanted is skipped by restoring at a persisted access point.
+    """
+
+    HEADER_BYTES = 4096
+
+    def __init__(self, stream: SeekableInflate, pairs, headers: HeaderCache | None = None, window: int = 16 << 20,
+                 jump: int = 64 << 20, step: int = 1 << 20, max_stream_errors: int = 5):
+        import heapq
+
+        self._heapq = heapq
+        self.st = stream
+        self.headers = headers if headers is not None else HeaderCache(None, "", stream.usize)
+        self.window, self.jump, self.step, self.max_stream_errors = int(window), int(jump), int(step), max_stream_errors
+        self.heap: list = []
+        self._seq = 0
+        self.active: list[_Req] = []
+        self.chunks: dict[str, dict] = {}
+        self.ready: list = []
+        self.fallback: list[str] = []
+        self.pairs = {}
+        self.win = bytearray()
+        self.win_start = stream.out
+        self.stats = {"chunks": 0, "fallback": 0, "jumps": 0, "stream_errors": 0, "header_cache_hits": 0,
+                      "inflated": 0}
+        for name, kp_addr, vis_addr in pairs:
+            self.pairs[name] = (kp_addr, vis_addr)
+            c = {"kp": None, "vis": None if vis_addr is not None else ("ok", None), "done": False}
+            self.chunks[name] = c
+            for role, addr in (("kp", kp_addr), ("vis", vis_addr)):
+                if addr is None:
+                    continue
+                h = self.headers.get(addr)
+                if h is None:
+                    self._push(_Req(addr, min(int(addr) + self.HEADER_BYTES, stream.usize), "hdr", name, role))
+                else:
+                    self.stats["header_cache_hits"] += 1
+                    self._got_header(name, role, h)
+                if c["done"]:
+                    break
+
+    # -- bookkeeping
+    def _push(self, r: _Req) -> None:
+        self._seq += 1
+        self._heapq.heappush(self.heap, (r.s, self._seq, r))
+
+    def _to_fallback(self, name: str) -> None:
+        c = self.chunks[name]
+        if not c["done"]:
+            c["done"] = True
+            c["kp"] = c["vis"] = None  # the old path reads both again
+            self.fallback.append(name)
+
+    def _resolve(self, name: str, role: str, state: tuple) -> None:
+        c = self.chunks[name]
+        if c["done"]:
+            return
+        c[role] = state
+        kp, vis = c["kp"], c["vis"]
+        if kp is not None and kp[0] == "err":  # the old path stops at the first keypoints error
+            c["done"] = True
+            self.ready.append((name, None, None, kp[1]))
+        elif kp is not None and vis is not None:
+            c["done"] = True
+            if vis[0] == "err":
+                self.ready.append((name, None, None, vis[1]))
+            else:
+                self.ready.append((name, kp[1], vis[1], None))
+        if c["done"]:
+            self.stats["chunks"] += 1
+            c["kp"] = c["vis"] = None  # the arrays now live only in ``ready`` (kept here they leaked ~0.3 MB a chunk)
+
+    def _got_header(self, name: str, role: str, h) -> None:
+        if isinstance(h, str):
+            self._resolve(name, role, ("err", HeaderError(h)))
+            return
+        try:
+            n = data_nbytes(h)
+        except HeaderError as e:
+            self._resolve(name, role, ("err", e))
+            return
+        a = int(h["address"])
+        if a < 0 or a + n > self.st.usize:  # odd layout: let the old path produce its exact result
+            self._to_fallback(name)
+            return
+        self._push(_Req(a, a + n, "data", name, role, hdr=h))
+
+    def _complete(self, r: _Req) -> None:
+        if self.chunks[r.name]["done"]:
+            return
+        if r.kind == "hdr":
+            try:
+                h = parse_v1_header(bytes(r.buf))
+            except HeaderError as e:
+                self.headers.add(r.s, str(e))
+                self._resolve(r.name, r.role, ("err", e))
+                return
+            except Exception:  # noqa: BLE001 - anything unexpected: the old path decides
+                self._to_fallback(r.name)
+                return
+            self.headers.add(r.s, h)
+            self._got_header(r.name, r.role, h)
+        else:
+            try:
+                arr = array_from(r.hdr, bytes(r.buf))
+            except ValueError:
+                self._to_fallback(r.name)
+                return
+            self._resolve(r.name, r.role, ("ok", arr))
+
+    # -- stream
+    def _activate(self) -> None:
+        out = self.st.out
+        while self.heap and self.heap[0][0] <= out:
+            _, _, r = self._heapq.heappop(self.heap)
+            if self.chunks[r.name]["done"]:
+                continue
+            if r.s < self.win_start:
+                self._to_fallback(r.name)
+                continue
+            hi = min(r.e, out)
+            r.buf += self.win[r.s - self.win_start:hi - self.win_start]
+            if r.s + len(r.buf) >= r.e:
+                self._complete(r)
+            else:
+                self.active.append(r)
+
+    def _feed(self, o: int, piece: bytes) -> None:
+        self.win += piece
+        end = o + len(piece)
+        active, self.active = self.active, []
+        for r in active:
+            if self.chunks[r.name]["done"]:
+                continue
+            need = r.s + len(r.buf)  # by position: bytes streamed twice (after a re-positioning) are not doubled
+            lo, hi = max(need, o), min(r.e, end)
+            if hi > lo:
+                r.buf += piece[lo - o:hi - o]
+            if r.s + len(r.buf) >= r.e:
+                self._complete(r)
+            else:
+                self.active.append(r)
+        self._activate()  # ranges starting in this piece (and data ranges of headers just parsed), before trimming
+        if len(self.win) > 2 * self.window:
+            cut = len(self.win) - self.window
+            del self.win[:cut]
+            self.win_start += cut
+
+    def _restore_before(self, p: int) -> None:
+        i = bisect.bisect_right(self.st.ck_out, p) - 1
+        self.st._restore(i)
+        self.win = bytearray()
+        self.win_start = self.st.out
+
+    def _maybe_jump(self) -> None:
+        if self.active or not self.heap:
+            return
+        target = self.heap[0][0]
+        if target - self.st.out < self.jump:
+            return
+        i = bisect.bisect_right(self.st.ck_out, target) - 1
+        if self.st.ck_out[i] > self.st.out + self.window:
+            self._restore_before(target)
+            self.stats["jumps"] += 1
+
+    def __iter__(self):
+        try:
+            yield from self._run()
+        finally:
+            self.headers.flush()
+
+    def _run(self):
+        st = self.st
+        st.pages.clear()
+        st.meta.clear()
+        st.meta_bytes, st.meta_cap = 0, 0  # no metadata scanning: headers are read from the stream directly
+        # start at the access point before the first wanted byte (a restart: the point saved near where the last
+        # run stopped), unless the stream already stands between that point and the byte
+        first = self.heap[0][0] if self.heap else st.out
+        i = bisect.bisect_right(st.ck_out, first) - 1
+        if first < st.out or st.ck_out[i] > st.out:
+            self._restore_before(first)
+        else:
+            self.win, self.win_start = bytearray(), st.out
+        errors = 0
+        while self.heap or self.active:
+            self._maybe_jump()
+            self._activate()
+            while self.ready:
+                yield self.ready.pop(0)
+            if not self.heap and not self.active:
+                break
+            if st.out >= st.usize:
+                break
+            o = st.out
+            try:
+                piece = st._step(self.step)
+            except EOFError:
+                break
+            except OSError as e:  # network gave up after its retries: re-position and try again
+                errors += 1
+                self.stats["stream_errors"] += 1
+                if errors > self.max_stream_errors:
+                    raise
+                log.warning("forward pass: stream error at %d (%s); restoring (%d of %d)", o, e, errors,
+                            self.max_stream_errors)
+                time.sleep(min(60, 5 * errors))
+                self._restore_before(o)
+                continue
+            self.stats["inflated"] += len(piece)
+            self._feed(o, piece)
+            while self.ready:
+                yield self.ready.pop(0)
+        # anything still wanted (stream ended early) is left to the old path
+        for _, _, r in self.heap:
+            self._to_fallback(r.name)
+        for r in self.active:
+            self._to_fallback(r.name)
+        self.heap, self.active = [], []
+        while self.ready:
+            yield self.ready.pop(0)
+        self.stats["fallback"] = len(self.fallback)
+        if self.fallback:
+            log.info("forward pass: %d chunks left to the random-access path", len(self.fallback))
+        for name in self.fallback:
+            kp_addr, vis_addr = self.pairs[name]
+            try:
+                kp = read_contiguous(st, parse_v1_header(st.read_range(kp_addr, self.HEADER_BYTES)))
+                vis = (read_contiguous(st, parse_v1_header(st.read_range(vis_addr, self.HEADER_BYTES)))
+                       if vis_addr is not None else None)
+            except (OSError, EOFError, ValueError) as e:  # HeaderError is a ValueError
+                yield name, None, None, e
+                continue
+            yield name, kp, vis, None
 
 
 def list_datasets(h5file, groups: tuple[str, ...] = ("keypoints", "visibility")) -> list[tuple[int, str, str]]:

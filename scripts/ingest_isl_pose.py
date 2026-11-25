@@ -540,7 +540,8 @@ def run_openhands_raw(args) -> int:
                     log.info("openhands-raw: %s: %d datasets listed in %.0f s (%.2f GB fetched)", mkey, len(entries),
                              time.time() - t0, reader.fetched_bytes / 1e9)
                 n_new += _openhands_member(args, stream, entries, channel, mkey, info.filename, man, out_dir, guard,
-                                           member_of_video)
+                                           member_of_video,
+                                           headers_file=raw_dir / (common.safe_name(mkey) + ".headers.jsonl"))
                 with members_done_f.open("a") as fh:
                     fh.write(mkey + "\n")
                 members_done.add(mkey)
@@ -558,28 +559,14 @@ def run_openhands_raw(args) -> int:
     return 0
 
 
-def _openhands_member(args, stream, entries, channel, mkey, member, man, out_dir, guard, member_of_video) -> int:
-    hdr_cache: dict[int, dict] = {}
-
-    def header(addr: int) -> dict:
-        if addr not in hdr_cache:
-            hdr_cache[addr] = openhands.parse_v1_header(stream.read_range(addr, 4096))
-        return hdr_cache[addr]
-
-    n = 0
-    t0 = time.time()
+def _openhands_member(args, stream, entries, channel, mkey, member, man, out_dir, guard, member_of_video,
+                      headers_file: Path | None = None) -> int:
+    """Ingest the pending chunks of one member in **one forward pass** (``openhands.ForwardPass``): headers and
+    data are cut out of the inflated stream as it goes by, instead of seeking header -> data -> next header
+    (3.5 restores and ~18 MB of re-inflation per chunk on ISH News). Conversion + saving run on
+    ``--convert-workers`` threads. Records are the same as before; they come in data order."""
     stride = common.stride_for(openhands.ASSUMED_FPS, args.target_fps)
-
-    def relief() -> None:  # memory guard: page cache, metadata pages (pass 2 reads headers directly), read-ahead
-        stream.pages.clear()
-        stream.meta.clear()
-        stream.meta_bytes = 0
-        stream.meta_cap = 0
-        stream.r.ahead = max(2, stream.r.ahead // 2)
-        hdr_cache.clear()
-
-    if MEM is not None:
-        MEM.relief = [relief]
+    pending = []
     for name, kp_e, vis_e in openhands.iter_pairs(entries):
         cid = f"openhands_raw/{channel}/{name}"
         video = openhands.video_key(name)
@@ -588,15 +575,33 @@ def _openhands_member(args, stream, entries, channel, mkey, member, man, out_dir
         prev = member_of_video.get((channel, video))
         if prev is not None and prev != member:  # same video already ingested from another file of this channel
             continue
-        guard.check()
-        mem_check()
-        out = out_dir / channel / (common.safe_name(name) + ".npz")
-        rec = {"id": cid, "source": "openhands_raw", "gloss": "", "channel": channel, "video": video, "member": member,
-               "path": rel(out), "licence": openhands.LICENCE}
+        pending.append((name, kp_e[0], vis_e[0] if vis_e is not None else None))
+    if not pending:
+        return 0
+    hcache = openhands.HeaderCache(headers_file, mkey, stream.usize).load()
+    fp = openhands.ForwardPass(stream, pending, headers=hcache)
+    log.info("openhands-raw: %s: %d chunks pending, %d headers cached, first wanted byte at %.2f GB of %.2f GB", mkey,
+             len(pending), len(hcache.items), (fp.heap[0][0] if fp.heap else stream.usize) / 1e9, stream.usize / 1e9)
+
+    def relief() -> None:  # memory guard: page cache, metadata pages, read-ahead
+        stream.pages.clear()
+        stream.meta.clear()
+        stream.meta_bytes = 0
+        stream.meta_cap = 0
+        stream.r.ahead = max(2, stream.r.ahead // 2)
+
+    if MEM is not None:
+        MEM.relief = [relief]
+
+    def convert(name, kp, vis, err, t_read) -> dict:
         t1 = time.time()
+        video = openhands.video_key(name)
+        out = out_dir / channel / (common.safe_name(name) + ".npz")
+        rec = {"id": f"openhands_raw/{channel}/{name}", "source": "openhands_raw", "gloss": "", "channel": channel,
+               "video": video, "member": member, "path": rel(out), "licence": openhands.LICENCE}
         try:
-            kp = openhands.read_contiguous(stream, header(kp_e[0]))
-            vis = openhands.read_contiguous(stream, header(vis_e[0])) if vis_e is not None else None
+            if err is not None:
+                raise err
             asp = common.hand_aspect(openhands.hands_nan(kp[:: max(1, len(kp) // 1500)]))
             aspect = openhands.snap_aspect(asp[0] if asp else None) or 16 / 9
             seq = openhands.openhands_to_raw(kp, vis, aspect=aspect)
@@ -612,16 +617,54 @@ def _openhands_member(args, stream, entries, channel, mkey, member, man, out_dir
             rec.update({"ok": False, "error": f"HeaderError: {e}"[:300]})
         except (OSError, EOFError, ValueError) as e:
             rec.update({"ok": False, "error": f"{type(e).__name__}: {e}"[:300]})
-        rec["secs"] = round(time.time() - t1, 2)
+        rec["secs"] = round(time.time() - t1 + t_read, 2)
         man.add(rec)
-        n += 1
-        if n == 1:  # how far the restart had to inflate / download to reach its first new chunk
-            log.info("openhands-raw: %s: first new chunk at %.2f GB (inflated): %.2f GB downloaded, %d restores, "
-                     "%.0f s", mkey, kp_e[0] / 1e9, stream.r.fetched_bytes / 1e9, stream.restores, time.time() - t0)
-        if n % 50 == 0:
-            log.info("openhands-raw: %s: %d chunks this run, %.1f MB/s fetched, free %.1f GB", mkey, n,
-                     stream.r.fetched_bytes / 1e6 / max(1.0, time.time() - t0), common.free_gb(DATA))
+        return rec
+
+    n = 0
+    t0 = time.time()
+    dl0 = stream.r.downloaded_bytes
+    workers = max(1, int(getattr(args, "convert_workers", 2) or 1))
+    it = iter(fp)
+    t_prev = time.time()
+    try:
+        with ThreadPoolExecutor(workers) as pool:
+            running: set = set()
+            for name, kp, vis, err in it:
+                guard.check()
+                mem_check()
+                now = time.time()
+                running.add(pool.submit(convert, name, kp, vis, err, min(now - t_prev, 60.0)))
+                t_prev = now
+                del kp, vis
+                if len(running) >= workers * 4:
+                    done, running = wait(running, return_when=FIRST_COMPLETED)
+                    for f in done:
+                        f.result()
+                        n += 1
+                        _openhands_progress(n, mkey, stream, fp, t0, dl0)
+            for f in running:
+                f.result()
+                n += 1
+                _openhands_progress(n, mkey, stream, fp, t0, dl0)
+    finally:
+        it.close()
+    log.info("openhands-raw: %s: forward pass done: %d chunks, %.2f GB inflated, %.2f GB downloaded, %d jumps, "
+             "%d random-access fallbacks, %d stream errors, %.0f s", mkey, n, fp.stats["inflated"] / 1e9,
+             (stream.r.downloaded_bytes - dl0) / 1e9, fp.stats["jumps"], fp.stats["fallback"],
+             fp.stats["stream_errors"], time.time() - t0)
     return n
+
+
+def _openhands_progress(n, mkey, stream, fp, t0, dl0) -> None:
+    if n == 1:  # how far the (re)start had to inflate / download to reach its first new chunk
+        log.info("openhands-raw: %s: first new chunk after %.2f GB downloaded, %d restores, %.0f s", mkey,
+                 (stream.r.downloaded_bytes - dl0) / 1e9, stream.restores, time.time() - t0)
+    if n % 500 == 0:
+        dt = max(1.0, time.time() - t0)
+        log.info("openhands-raw: %s: %d chunks this run (%.1f/s), at %.2f of %.2f GB inflated, %.1f MB/s downloaded, "
+                 "free %.1f GB", mkey, n, n / dt, stream.out / 1e9, stream.usize / 1e9,
+                 (stream.r.downloaded_bytes - dl0) / 1e6 / dt, common.free_gb(DATA))
 
 
 # --------------------------------------------------------------------------------------------- OpenHands fingerspelling
@@ -704,6 +747,8 @@ def main() -> None:
     ap.add_argument("--min-free-gb", type=float, default=common.MIN_FREE_GB)
     ap.add_argument("--budget-gb", type=float, default=12.0, help="openhands-raw: max size of its landmark folder")
     ap.add_argument("--only", nargs="+", help="openhands-raw: zip names to process (e.g. Sign_Library.zip)")
+    ap.add_argument("--convert-workers", type=int, default=2,
+                    help="openhands-raw: threads converting / saving chunks while the stream is read")
     ap.add_argument("--max-rss-gb", type=float, default=common.DEFAULT_MAX_RSS_GB,
                     help="soft memory cap of this process: drop caches, then stop cleanly (exit 5); 0 = off")
     ap.add_argument("--respawn-on-memory", type=int, default=3,
