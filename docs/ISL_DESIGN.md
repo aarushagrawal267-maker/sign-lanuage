@@ -1694,7 +1694,7 @@ Checked from a clean clone of `claude/indian-sign-language` (commit `fc1745a`) i
 
 ### 15.1 What phase 2 must do (in order)
 
-1. **Confirm ingestion finished**: `pgrep -af ingest_isl` empty; `include.jsonl` has 4,292 rows and `islrtc.jsonl` 13,665
+1. **Confirm ingestion finished**: `pgrep -af 'ingest_isl.py '` empty (the bare `ingest_isl` pattern also matches the pose / video ingesters); `include.jsonl` has 4,292 rows and `islrtc.jsonl` 13,665
    (count `ok: false` and 0-frame rows; re-run the script, which resumes, for any failures). Do not delete `data/isl`.
 2. **Refresh the data layer** (from `backend/`, `nice -n 10`, 4 threads once ingestion is done):
    `python -m app.isl.cli wordnet` (if missing), `trim`, `trim-eval`, `trim-review` (look at the sheet), `splits --fetch`,
