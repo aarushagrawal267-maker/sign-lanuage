@@ -36,6 +36,10 @@ type TrimEval = {
   include_active_kept?: { n?: number; mean?: number; frac_ge_90pct?: number };
   learned?: boolean;
 };
+/** E8: does the trim-eval report describe the trimmer this run used (backend app/isl/data/trim_eval.check_report)? */
+type TrimEvalCheck = { status?: string; reason?: string | null; trim_version?: string | null; written_at?: string | null; file_mtime_utc?: string };
+/** What the data guard saw at the run's start (backend readiness_summary): non-blocking warnings included. */
+type DataReadiness = { checked?: string; ready?: boolean; reasons?: string[]; warnings?: string[]; partial_gated?: Record<string, unknown>; error?: string };
 export type Protocol = IntervalBlock & {
   label?: string; kind?: string; run?: boolean; reason?: string; leakage?: string;
   n?: number; n_classes?: number; n_groups?: number | null; gallery_concepts?: number;
@@ -49,6 +53,7 @@ export type Protocol = IntervalBlock & {
   load_average?: number; stages_p50_ms?: Record<string, number>;
   sha256?: string; unchanged_in_git?: boolean;
   trims?: number; method_mix?: Record<string, number>; low_confidence_frac?: number; trim_eval?: TrimEval;
+  trim_eval_check?: TrimEvalCheck;
 };
 type PretrainCheck = {
   excludes_eval_clips?: boolean | null; reason?: string; pretrain_clips?: number; eval_clips_and_duplicates?: number;
@@ -66,6 +71,7 @@ export type Results = {
   data?: Record<string, unknown> & {
     split?: string; split_label?: string; include?: Record<string, number>; islrtc?: number; include_concepts?: number;
     extra_sources?: Record<string, Record<string, number>>;
+    readiness?: DataReadiness | null;
   };
   leakage_guards?: LeakageGuards;
   protocols?: Record<string, Protocol>;
@@ -430,8 +436,18 @@ function E8Details({ p }: { p: Protocol }) {
   const s = p.trim_eval?.synthetic;
   const a = p.trim_eval?.include_active_kept;
   const mix = Object.entries(p.method_mix ?? {}).sort((x, y) => y[1] - x[1]);
+  const chk = p.trim_eval_check;
   return (
     <>
+      {chk?.status && chk.status !== "ok" && (
+        <p className="mt-1 text-sm text-warn" data-testid="e8-trim-check">
+          <span className="font-medium">{t("eval.trimCheckNotShown", { status: chk.status.toUpperCase() })}</span>{" "}
+          {chk.reason && <En>{chk.reason}</En>}
+        </p>
+      )}
+      {chk?.status === "ok" && chk.trim_version && (
+        <Kv k={t("eval.trimEvaluated")} v={<En>{chk.trim_version}{chk.written_at ? ` · ${chk.written_at}` : ""}</En>} />
+      )}
       {s && (
         <Section title={t("eval.synthetic")}>
           {s.n !== undefined && <Kv k={t("eval.n")} v={num(s.n)} />}
@@ -608,6 +624,7 @@ export function IslReport({ r }: { r: Results }) {
   const phase1 = (r.schema ?? 1) < 2;
   const ids = [...ORDER.filter((k) => k in P || (!phase1 && PHASE2.includes(k))), ...Object.keys(P).filter((k) => !ORDER.includes(k))];
   const partialOnly = !!r.partial_data && !r.smoke;
+  const guardWarnings = r.data?.readiness?.warnings ?? [];
   return (
     <div className="flex min-w-0 flex-col gap-5">
       {r.smoke && (
@@ -621,6 +638,12 @@ export function IslReport({ r }: { r: Results }) {
         <Notice tone="danger" title={t("eval.partialTitle")}>
           <span className="block">{t("eval.partialBody")}</span>
           {r.label && <span className="mt-1 block font-medium text-fg"><En>{r.label}</En></span>}
+        </Notice>
+      )}
+      {guardWarnings.length > 0 && (
+        <Notice tone="warn" title={t("eval.guardWarningsTitle")}>
+          <span className="block">{t("eval.guardWarningsBody")}</span>
+          <ul className="mt-1 list-disc pl-5">{guardWarnings.map((w) => <li key={w}><En>{w}</En></li>)}</ul>
         </Notice>
       )}
       {phase1 && <Notice tone="info" title={t("eval.phase1Title")}>{t("eval.phase1Body")}</Notice>}

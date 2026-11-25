@@ -221,6 +221,50 @@ describe("Hindi interface", () => {
   });
 });
 
+describe("E8 trim check and data-guard warnings (review of d5b488e / 0b54985)", () => {
+  const withChecks = (status: "ok" | "mismatch") => {
+    const r = phase2();
+    const e8 = r.protocols!.E8;
+    e8.trim_eval_check = status === "ok"
+      ? { status: "ok", reason: null, trim_version: "trim-2+trim-learned-1", written_at: "2026-11-25T22:09:42Z" }
+      : { status: "mismatch", reason: "trim-eval evaluated trim-2 but the run's trims are trim-2+trim-learned-1" };
+    if (status !== "ok") delete e8.trim_eval;
+    r.data = { ...r.data, readiness: { ready: true, reasons: [], warnings: ["cislr: partial (gated; job not running): 120/4765 rows, used as they are"] } };
+    return r;
+  };
+
+  it("says when the synthetic trim check is not shown, and why, in both languages", () => {
+    const { unmount } = wrap(withChecks("mismatch"));
+    const line = screen.getByTestId("e8-trim-check");
+    expect(line).toHaveTextContent("Synthetic trim check not shown (MISMATCH)");
+    expect(within(line).getByText(/trim-eval evaluated trim-2/)).toHaveAttribute("lang", "en");
+    unmount();
+    wrap(withChecks("mismatch"), "hi");
+    expect(screen.getByTestId("e8-trim-check")).toHaveTextContent("कृत्रिम कटाई जाँच नहीं दिखाई गई (MISMATCH)");
+  });
+
+  it("names the evaluated trimmer when the check is ok", () => {
+    wrap(withChecks("ok"));
+    expect(screen.queryByTestId("e8-trim-check")).not.toBeInTheDocument();
+    expect(screen.getByText("Trimmer evaluated")).toBeInTheDocument();
+    expect(screen.getByText(/trim-2\+trim-learned-1 · 2026-11-25T22:09:42Z/)).toBeInTheDocument();
+  });
+
+  it("shows partly ingested gated sources that did not block the run", () => {
+    const { unmount } = wrap(withChecks("ok"));
+    expect(screen.getByText("Some data was used as it is")).toBeInTheDocument();
+    expect(screen.getByText(/cislr: partial \(gated; job not running\)/)).toHaveAttribute("lang", "en");
+    unmount();
+    wrap(withChecks("ok"), "hi");
+    expect(screen.getByText("कुछ डेटा जैसा था वैसा ही इस्तेमाल हुआ")).toBeInTheDocument();
+  });
+
+  it("shows no warning notice when the guard had none", () => {
+    wrap(phase2());
+    expect(screen.queryByText("Some data was used as it is")).not.toBeInTheDocument();
+  });
+});
+
 describe("LanguageEvaluation page", () => {
   afterEach(() => vi.unstubAllGlobals());
   const page = () => render(<MemoryRouter><UiLangProvider initial="en"><LanguageEvaluation /></UiLangProvider></MemoryRouter>);

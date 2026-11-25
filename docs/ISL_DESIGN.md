@@ -2287,3 +2287,39 @@ model `trim_boundary.pt` (16:20:46, SHA-256 `4c0efb82...`), **Learned trim model
 300 ms 0.717, median 0 ms, late 0.083, early 0.200 (3 learned ends); INCLUDE active frames kept 1.000 (smoke-sized
 samples, not the full run's numbers). The same sidecar against the old 11:00 `artifacts/reports/trim_eval.json`
 gives `mismatch` ("the report records no trim_version ... learned=False").
+
+### 15.9 Adversarial review of `d5b488e`, `0b54985`, `8827aa2` (Code Reviewer, 25 Nov 2026, 22:25-22:45 UTC)
+
+Each change was attacked with targeted offline tests and read-only probes of the real process table, logs and
+manifests. No job was stopped or restarted; nothing was trained.
+
+**Held up.** E8: `trim_eval.trim_one` makes the same calls as `cmd_trim` (stage 1, `refine_cap` for non-phrases,
+phrases whole); a rules-only, unversioned, mixed-version or model-changed report is refused; the driver step runs with
+`$ROOTARG`, so smoke runs read their private sidecar. Queue parsing: a restarted queue reads only lines after its own
+`queue start (pid N)` line; an empty `SOURCES` in the environment falls back to the default, as bash does; a
+different list, a repeated name, no start line or an unreadable log block both profiles; a stopped queue's left-over
+chunk is a process of its own and blocks its source's profiles. The real check at 22:30 UTC: commercial-safe is held
+by islrtc, the recut job and the queue's four commercial-safe sources; research also by WSLP and OpenHands raw (PID
+861, restarted 22:24). HF rows: one paced request per page (>= 2 s), a refused image refreshes its page at most once
+and only when it is older than 2 min, and fetch failures are not counted as progress, so a refusing server ends in
+exit 2 and the queue's 5 tries, not an endless loop of chunks.
+
+**Fixed (tests: `backend/tests/isl/test_readiness_review3.py`, `test_hf_fetch_and_headers.py`,
+`frontend/src/pages/LanguageEvaluation.test.tsx`):**
+
+| Gap | Effect | Fix |
+|---|---|---|
+| option values before the source were read as the source | `ingest_isl_pose.py --budget-gb 26 openhands-raw` wrote source "26", `ingest_isl_video.py run --workers auto wslp` source "auto": no profile reads those, so the job blocked nothing (fail open; argparse accepts both orders) | every value-taking option of the four scripts is skipped, and only known names count (catalog / pose choices); anything else is unknown and blocks every profile. `isl500-links` counts as ISL500 (it writes `derived/isl500_links.jsonl`) |
+| OpenHands raw counted as complete once its job was gone | the 22:06 crash (h5py "bad symbol table node signature" while listing NewzHook) would have let research start with ~8 % of NewzHook | complete only when the last line of `logs/ingest_pose_openhands_raw.log` is a normal end: `all members done`, the disk guard's `stopping:` (budget / min free) or `KeyboardInterrupt` (the documented `kill -INT`, 15.6 command 4). A traceback, a kill or a memory give-up keeps it incomplete ("did not end normally ...: restart it, it resumes; or --allow-partial") |
+| `parse_v1_header` turned `TypeError` / `OverflowError` into `HeaderError` | a reader bug handing it something that is not bytes would have become one quiet failed row per chunk | only `struct.error` / `IndexError` from malformed bytes are converted; a non-bytes argument raises `TypeError` |
+| E8 mismatch and the guard's warnings were not on the page | a `mismatch` / `missing` E8 showed only in the English subtitle; a partly ingested gated source (`data.readiness.warnings`) was in `report.md` only | the E8 card says "Synthetic trim check not shown (STATUS)" with the reason, or names the evaluated trimmer; a "Some data was used as it is" notice lists the warnings (English + Hindi) |
+
+**Still open.** (1) The trim sidecar records `trim_version`, not the learned model's hash, and `cli trim` re-trims
+only on a version change, so a retrained `trim_boundary.pt` would leave a sidecar trimmed by two models under one
+version, and E8 would check the newer one; record the model's SHA-256 per trim record and re-trim on change before
+retraining that model. (2) HF rows: a page the datasets-server keeps refusing (8 tries, ~20 min) stops the run at that
+item; every later chunk starts at the same item, so one persistently broken page (e.g. a 500 for one offset) would end
+the source after the queue's 5 tries with the rest of its items not attempted (fail closed: readiness keeps research
+blocked; re-run the source, or skip that page's items). Not changed now because `engine.py` is loaded by every new
+queue chunk. (3) The disk guard's `stopping:` counts as a normal end for OpenHands raw whether the landmark budget or
+`--min-free-gb` stopped it.
