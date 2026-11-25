@@ -313,6 +313,15 @@ def test_parse_v1_header_malformed_is_header_error(bad):
         openhands.parse_v1_header(bad)
 
 
+def test_parse_v1_header_reader_bug_is_not_hidden():
+    """Only malformed bytes become a HeaderError (a failed row); a caller handing it no bytes is a bug and raises."""
+    for not_bytes in (None, 123, "abc"):
+        with pytest.raises(TypeError):
+            openhands.parse_v1_header(not_bytes)
+    assert openhands.parse_v1_header(bytearray(_header(*_good())))["shape"] == (10, 3)
+    assert openhands.parse_v1_header(memoryview(_header(*_good())))["shape"] == (10, 3)
+
+
 def test_data_nbytes_does_not_wrap_on_absurd_shapes():
     space = bytes([1, 2, 0, 0]) + b"\0" * 4 + struct.pack("<2Q", 2 ** 40, 2 ** 40)  # np.prod would wrap to 0
     msgs = _good()

@@ -520,12 +520,16 @@ def parse_v1_header(buf: bytes) -> dict:
     "little", "layout", "address", "size"}``. Raises :class:`HeaderError` for anything unexpected
     (continuation blocks, version 2 headers, chunked layout ...): the caller then falls back to h5py.
     A malformed header (a message shorter than its fields, an absurd rank ...) is a :class:`HeaderError` too,
-    never a bare ``struct.error`` / ``IndexError``, so the job records that chunk as failed instead of crashing."""
+    never a bare ``struct.error`` / ``IndexError``, so the job records that chunk as failed instead of crashing.
+    Only the errors that malformed *bytes* can cause are converted: a caller passing something that is not bytes
+    (a reader bug) still raises ``TypeError``, so a bug cannot turn every chunk into a quiet failed row."""
+    if not isinstance(buf, (bytes, bytearray, memoryview)):
+        raise TypeError(f"parse_v1_header needs bytes, got {type(buf).__name__}")
     try:
         return _parse_v1_header(buf)
     except HeaderError:
         raise
-    except (struct.error, IndexError, TypeError, OverflowError) as e:
+    except (struct.error, IndexError) as e:
         raise HeaderError(f"malformed header ({type(e).__name__}: {e})"[:200]) from None
 
 
