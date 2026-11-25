@@ -15,6 +15,14 @@ running, partial data). Every number below says when and on how much data it was
 | ISLRTC Hugging Face re-encode (`silentone0725/Indian_Sign_Language_Data.gov_Rencoded`) | HEVC mirror of the above, used for downloading | labelled MIT by the uploader | mirror only: does not replace the GODL attribution | both | public |
 | **CISLR** (Exploration-Lab) | about 4,700 ISL words, 7,050 videos collected from online ISL videos | AFL-3.0 in the Hugging Face metadata, but the dataset README (HF and GitHub) says CC BY-NC 4.0, "do not use our dataset for any commercial purposes" | **no**: treat as non-commercial (the README wins over the metadata tag) | research only | gated (`pending` on 25 Nov 2026) |
 | **iSign** (Exploration-Lab) | 118k ISL video - English sentence pairs; MediaPipe Holistic poses in pose-format | CC BY-NC-SA 4.0; the access form adds "research use only, no commercial use, no redistribution" | **no** | research only (pre-training) | gated (`pending` on 25 Nov 2026) |
+| **WSLP 2025 word recognition** (Exploration-Lab, `Exploration-Lab/WSLP`, `Shared_task_WR/`) <!-- video-sources --> | 4,398 labelled single-word clips, 4,361 words (train split; CISLR-like, our CISLR substitute); 635 unlabelled val/test clips | CC BY-NC-ND 4.0 (dataset card) | **no** (and no redistribution of derivatives) | research only | public |
+| **ISL-Fingerspelling** (`kirandevraj/ISL-Fingerspelling`) | 1,308 continuous fingerspelling segments, 14,685 letters with frame boundaries, 3 signers, signer-independent split | CC BY-NC 4.0 | **no** | research only | public |
+| **ISL-CSLTR** (Mendeley `kcmpdxky7p` v1, Elakkiya & Natarajan) | 687 sentence videos of 100 sentences (7 signers) with gloss sequences; 1,036 word-level still frames | CC BY 4.0 | yes, with attribution | commercial-safe + research | public |
+| **ISL emergency words** (Mendeley `2vfdm42337` v1, Adithya & Rajesh) | 8 words x 26 people x 2 takes (412 raw videos), hands only (signer behind a board) | CC BY 4.0 | yes, with attribution | commercial-safe + research | public |
+| **ISL agricultural words** (Mendeley `6v53kfxf46` v1, Adithya & Rajesh) | 13 words, 3 deaf farmers outdoors; 78 original videos (the crop1/2/3 folders are crops of the same recordings, not used) | CC BY 4.0 | yes, with attribution | commercial-safe + research | public |
+| **Static ISL alphabet, Hindi vowels, numerals** (Mendeley `7tsw22y96w` v1, Singh et al.) | 102,470 photos, 46 classes (A-Z with two E signs, 8 Hindi vowels, 0-9 with two 9 signs), kids / teens / adults; we use a balanced sample of 300 per class (13,800) | CC BY 4.0 | yes, with attribution | commercial-safe + research | public |
+| `Hemg/Indian_sign_language_dataset`, `akritRihal/Indian_Sign_Language_dataset` (Hugging Face) | alphabet + digit images (42,745 hand crops / 10,752 photos); 300 per class sampled | **none stated**, no provenance | **no** (unknown) | research only | public |
+| MediaPipe HandLandmarker (`hand_landmarker.task`) | hand landmarks where Holistic finds none (hands-only videos, still images) | Apache-2.0 | yes | both | downloaded to `assets/mediapipe/` (git-ignored) |
 | WLASL (existing ASL model) | ASL, 100 words | C-UDA 1.0 | **no** | research only (warm start) | see `docs/LICENSING.md` |
 | WordNet 3.0 (via NLTK data) | synonym lists, part of speech, coarse categories | WordNet licence (permissive) | yes | both | public |
 | MediaPipe Holistic | landmark extractor | Apache-2.0 | yes | both | bundled |
@@ -44,6 +52,18 @@ claim and does not change this.
 * Research profile only: "CISLR: A. Joshi et al., EMNLP 2022" and "iSign: A. Joshi et al., 2024 (arXiv 2407.05404),
   CC BY-NC-SA 4.0". iSign-derived data (landmarks, models pre-trained on it) inherit NC and share-alike terms.
 
+* Commercial-safe video sources (CC BY 4.0, attribution required): "R. Elakkiya, B. Natarajan, ISL-CSLTR: Indian Sign
+  Language Dataset for Continuous Sign Language Translation and Recognition, Mendeley Data V1, doi:10.17632/kcmpdxky7p.1";
+  "V. Adithya, R. Rajesh, A Video Dataset of the Hand Gestures of Indian Sign Language Words used in Emergency Situations,
+  Mendeley Data V1, doi:10.17632/2vfdm42337.1"; "V. Adithya, R. Rajesh, A video dataset on agricultural words in Indian
+  sign language, Mendeley Data V1, doi:10.17632/6v53kfxf46.1"; "A. Singh, S. K. Singh, A. Mittal, B. B. Gupta, Static
+  gestures of Indian Sign Language (ISL) for English Alphabet, Hindi Vowels and Numerals, Mendeley Data V1,
+  doi:10.17632/7tsw22y96w.1".
+* Research profile only (video sources): "WSLP 2025 shared tasks, Exploration-Lab (IIT Kanpur), CC BY-NC-ND 4.0,
+  https://huggingface.co/datasets/Exploration-Lab/WSLP"; "Continuous Fingerspelling Dataset for Indian Sign Language,
+  WSLP @ AACL-IJCNLP 2025, CC BY-NC 4.0, https://huggingface.co/datasets/kirandevraj/ISL-Fingerspelling"; the two Hugging
+  Face alphabet image sets have no licence, so nothing derived from them may leave the research profile.
+
 ### Data profiles (`backend/app/isl/profiles.py`)
 
 | Profile | Training / index / calibration sources | Pre-training only | Commercial |
@@ -70,6 +90,8 @@ User data never enters a global model in either profile. The profile name is wri
 | `raw/{cislr,isign}/*.csv` | `scripts/ingest_isl_gated.py` | the gated datasets' small CSV files |
 | `nltk_data/` | `python -m app.isl.cli wordnet` | WordNet (10 MB) |
 | `manifests/islrtc_full.jsonl`, `landmarks/islrtc_full/*.npz` | `scripts/ingest_isl.py islrtc --only ... --full --max-s 120 --out-subdir islrtc_full` (25 Nov, 7 entries) | full-length re-extraction of `A/Alphabet`, `F/Fingerspell` and the five `Numbers_*` compilation videos. Finding: `Alphabet` and `Fingerspell` (3.8 s / 3.4 s) are the signs for those *words*, not A-Z sequences, so the open data has **no fingerspelling letters**; see ISL_DESIGN.md 6.7 |
+| `manifests/<source>.jsonl`, `landmarks/<source>/*.npz`, `manifests/<source>_items.json`, `raw/<source>/`, `raw/mendeley/` | `scripts/ingest_isl_video.py run <source>` (queue: `scripts/isl_queue.sh`) | video / image sources of section 3.3 (`wslp`, `isl_fingerspelling`, `isl_csltr`, `isl_csltr_words`, `mendeley_emergency`, `mendeley_agri`, `mendeley_static`, `hf_hemg_alphabet`, `hf_akrit_alphabet`; `cislr` shares `cislr.jsonl`). `_items.json` = the exact item list (sample) of the last run; `raw/` = cached CSVs and listings |
+| `logs/queue.log`, `logs/video_<source>.{log,out}` | `scripts/isl_queue.sh` | one line per chunk; per-source progress |
 | `../my_signs/<pack>/` | the app (My signs) | users' own signs as landmarks, `alphabet.npz` letter calibration; local only |
 
 Model build outputs (git-ignored, `artifacts/`): `artifacts/isl/<profile>/` (classifier.pt, encoder.pt, index/,
@@ -129,6 +151,79 @@ python scripts/ingest_isl_gated.py isign --mode stream           # fallback: par
   `extractor_version = "isign-pose-format"`. **Open check once data arrives**: whether the older Holistic used by
   iSign labels hands from the camera's view (then run with `--swap-hands`); compare one iSign clip with our own
   extraction of the same video before pre-training.
+
+### 3.3 Video and image sources with our own extraction (`scripts/ingest_isl_video.py`, queue `scripts/isl_queue.sh`)
+
+Owner: Data Engineer, 25 Nov 2026. Code: `backend/app/isl/data/video_sources/` (catalogue, listings, fetch, extract,
+engine, adapters); tests `backend/tests/isl/test_video_sources.py` (no network).
+
+```
+python scripts/ingest_isl_video.py sources | status | probe [SOURCE ...]
+python scripts/ingest_isl_video.py run SOURCE [--workers N|auto] [--limit N] [--max-minutes M] [--per-class N]
+python scripts/ingest_isl_video.py islrtc-full            # ISLRTC alphabet / fingerspell / number compilations, full length
+setsid nohup bash scripts/isl_queue.sh >> data/isl/logs/queue.log 2>&1 < /dev/null &   # everything, in order
+```
+
+**How it works.** A zip is never downloaded whole: its central directory is read with HTTP range requests
+(`RangeFile`), members are streamed one at a time in archive order into a `mkstemp` temp file (descriptor closed at once,
+SHA-256 computed on the way), converted, deleted. Single files (Mendeley, ISL-Fingerspelling) and Hugging Face dataset
+rows (signed image URLs from the datasets-server rows API) work the same way. Member names are only labels: names that
+are absolute or contain `..` are skipped, members over 2 GB or with a zip-bomb ratio are refused. A manifest row per item
+(`id, source, gloss, licence, profile, sha256, bytes, [crc32], path, n_frames, fps, hands_frac, extractor_version, ok,
+error, secs` + source fields) makes every source resumable; failed items are retried on the next run. Byte-identical
+files (same SHA-256) are extracted once; later copies get a row with `duplicate_of` (adapters skip them by default). The
+free disk under `data/isl` must stay above 10 GB (checked before every item; the queue waits otherwise).
+
+**Extraction modes** (`video_sources/extract.py`):
+
+| Mode | Used for | What |
+|---|---|---|
+| `full` | WSLP, CISLR, ISL-CSLTR sentences, ISL-Fingerspelling | `scripts/ingest_isl.py extract_full` itself (HolisticExtractor, max side 640): identical to INCLUDE. 15 fps, max 20 s (CSLTR: 60 s). Fingerspelling: **every frame** (30 fps source, step 1, max 60 s) so the letter boundaries map 1:1 onto `t_ms` |
+| `hands` | Mendeley emergency and agricultural words | `full` + MediaPipe HandLandmarker (VIDEO mode, 2 hands, confidences 0.5) for frames where Holistic found no hand of that side. Needed because Holistic finds hands only through the body pose: on the emergency videos (signer behind a black board, only forearms visible) Holistic found a hand in 0-5% of frames. A HandLandmarker hand at the position of a Holistic hand is never copied to the other side. Handedness check on sample clips: where both models saw the same hand, the left/right labels agreed in 42 of 42 frames (per clip: `hl_agree`). `extractor_version` = `holistic-v1+hands` when hands were filled (`hands_filled` frames) |
+| `image` | static alphabet / digit photos, CSLTR word frames, HF image sets | one-frame `RawSequence` (`t_ms = [0]`): Holistic in IMAGE mode (same confidences) for pose/face/hands, HandLandmarker (IMAGE mode) for the hands Holistic missed. On 15 sample photos Holistic alone found a hand in 2, HandLandmarker in 11. `extractor_version = image-holistic-v1+hands`; letter features are computed from frame 0 (`letter_frame_features`) |
+
+**Sources** (sizes checked 25 Nov 2026; `profile` = where the data may be used):
+
+| Source (`run` name) | Items | Labels | Profile | Notes |
+|---|---|---|---|---|
+| `wslp` | 4,398 clips (train.zip 5.01 GB, ~1.1 MB/clip) | 4,361 words (`train_WR.csv` `uid,word`) | research | CISLR-like word clips: our CISLR substitute until CISLR access. **Dedupe against CISLR** later by gloss + SHA-256 (stored now) and CRC32 |
+| `wslp_unlabelled` | 635 clips (val 109 + test 526) | none published | research | same manifest `wslp.jsonl`, `labelled: false`; pre-training only |
+| `cislr` | ~7,050 clips (1.17 GB zip) | `dataset.csv` | research | gated (pending); probed by the queue (1-byte request for the zip) and ingested as soon as it answers; same ids/paths/manifest as `scripts/ingest_isl_gated.py cislr`, plus `sha256`/`crc32` |
+| `isl_fingerspelling` | 1,308 segments (1.3 GB) | letters (authoritative letter annotations), per-letter `start_frame`/`end_frame`, signer, signer-independent and standard splits | research | `adapters.letter_samples()` maps letter boundaries to our frame indices for the letter classifier |
+| `isl_csltr` | 687 sentence videos (7.57 GB inside one 8.9 GB zip) | sentence (folder) + sign-gloss sequence (`ISL Corpus sign glosses.csv`) | commercial-safe | continuous signing, 100 sentences, 7 signers; some folders hold word clips (`free (2).MP4`): `file_hint` keeps the file name |
+| `isl_csltr_words` | 1,036 still frames | word (folder) | commercial-safe | one frame of a mostly dynamic sign: hand-shape hints only |
+| `mendeley_emergency` | 412 raw videos (8 zips, 2.58 GB; the cropped copies are not used) | 8 words | commercial-safe | hands only. Some takes are byte-identical (e.g. `call_001_01` = `call_001_02`): kept once (`duplicate_of`) |
+| `mendeley_agri` | 78 videos (the `Original` folders; crop1/2/3 are crops of the same recordings) | 13 words (`Cococnut` -> coconut) | commercial-safe | outdoor, faces often cut off at the top -> `hands` mode. Subject 1's `Original` folder actually holds the `crop1` files (same names and sizes as its `cropped1` folder) |
+| `mendeley_static` | 13,800 of 102,470 photos (300 per folder, round-robin over kids/teens/adults x full/half sleeves, seed 13) | A-Z (`E1`/`E2` -> E, kept as `variant`), 8 Hindi vowels, 0-9 (`9a`/`9b` -> 9) | commercial-safe | `--per-class N` for more; the selected list is in `manifests/mendeley_static_items.json`; Mendeley SHA-256 verified per file |
+| `hf_akrit_alphabet` | up to 300 per class of 10,752 (33 classes, no h/j/v) | letters, digits | research | licence unknown |
+| `hf_hemg_alphabet` | up to 300 per class of 42,745 (35 classes, 128x128 hand crops) | letters 1-9 + A-Z | research | licence unknown; probably augmented copies of few originals |
+| `islrtc-full` | ISLRTC compilations not yet in `islrtc_full.jsonl`: `A/Ancient_Alphabets`, `G/Greek_Alphabets` (the 7 others were done on 25 Nov) | as ISLRTC | as ISLRTC | runs `scripts/ingest_isl.py`'s own `run_islrtc` (`--only --full --max-s 180 --out-subdir islrtc_full`) in-process, so no second `ingest_isl.py islrtc` process appears |
+
+**Decided not to ingest.** WSLP `Shared_task_WPP` query videos: all 2,541 (train 1,410, val 576, test 555) are
+byte-identical copies (same CRC32 and size, same uid) of WR clips, so they add no word labels; the WPP sentence videos
+have only "is this word present" labels (no text) and stay out. WSLP `Shared_task_MT` (sentence videos + poses) is
+the iSign-style translation task: left for the pose-source owner. Cropped copies of the Mendeley videos (duplicates).
+
+**Throughput measured 25 Nov 2026** (1 worker at nice 10 while INCLUDE, ISLRTC and other agents' jobs kept the 4 CPUs
+busy, load average about 10; first few items of each source): WSLP 7.1 s/clip, ISL-Fingerspelling 8.9 s/segment
+(every frame), emergency 3.9 s, agriculture 6.4 s, static photos 0.26 s + download, CSLTR word frames 0.3 s; CSLTR
+sentence videos not measured on the large 1080p files yet (estimate 20-40 s). Landmarks: about 110 KB per WSLP clip.
+
+**Queue** (`scripts/isl_queue.sh`, started 25 Nov 2026 detached): order `islrtc-full, wslp, isl_fingerspelling,
+mendeley_static, isl_csltr, mendeley_agri, mendeley_emergency, isl_csltr_words, hf_akrit_alphabet, hf_hemg_alphabet,
+wslp_unlabelled`, then CISLR polling every 6 h for 14 days. Each source runs in 45-minute chunks with `--workers auto`
+(1 worker while `ingest_isl.py include` or `islrtc` runs, 3 once both have finished), so the long INCLUDE/ISLRTC jobs
+keep their CPUs. Only one queue runs at a time (`flock` on `data/isl/logs/queue.lock`; PID in `queue.pid`).
+
+**Adapters** (`video_sources/adapters.py`, `VIDEO_ADAPTERS`): one `Clip` reader per manifest (quality filter
+`n_frames >= 8` for videos, `>= 1` for images, `hands_frac >= 0.2`; unlabelled and `duplicate_of` rows skipped by
+default). They are **not yet registered** in `sources.ADAPTERS` / `profiles.py` (owned by the model code): add the
+commercial-safe ones (`isl_csltr`, `isl_csltr_words`, `mendeley_*`) to both profiles and the research ones (`wslp`,
+`isl_fingerspelling`, `hf_*_alphabet`) to `research` only; `catalog.profile_sources()` returns these lists.
+
+Open checks: CSLTR sentence-level glosses need alignment before they can label single signs; whether the mostly
+hand-only emergency clips help a full-body webcam model is untested; the HF image sets are likely augmented duplicates
+(SHA-256 dedupe only catches byte copies).
 
 ---
 
