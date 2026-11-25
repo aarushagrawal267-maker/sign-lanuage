@@ -42,6 +42,7 @@ from __future__ import annotations
 import bisect
 import io
 import logging
+import math
 import re
 import struct
 import threading
@@ -517,7 +518,18 @@ class HeaderError(ValueError):
 def parse_v1_header(buf: bytes) -> dict:
     """Minimal HDF5 version-1 object header parser for a plain dataset: ``{"shape", "itemsize", "dclass",
     "little", "layout", "address", "size"}``. Raises :class:`HeaderError` for anything unexpected
-    (continuation blocks, version 2 headers, chunked layout ...): the caller then falls back to h5py."""
+    (continuation blocks, version 2 headers, chunked layout ...): the caller then falls back to h5py.
+    A malformed header (a message shorter than its fields, an absurd rank ...) is a :class:`HeaderError` too,
+    never a bare ``struct.error`` / ``IndexError``, so the job records that chunk as failed instead of crashing."""
+    try:
+        return _parse_v1_header(buf)
+    except HeaderError:
+        raise
+    except (struct.error, IndexError, TypeError, OverflowError) as e:
+        raise HeaderError(f"malformed header ({type(e).__name__}: {e})"[:200]) from None
+
+
+def _parse_v1_header(buf: bytes) -> dict:
     if len(buf) < 16:
         raise HeaderError("short header")
     ver, _res, nmsg, _ref, hsize = struct.unpack_from("<BBHII", buf, 0)
@@ -561,7 +573,7 @@ def data_nbytes(hdr: dict) -> int:
     """Byte length of a contiguous float dataset; :class:`HeaderError` for anything else."""
     if hdr.get("dclass") != 1 or hdr["itemsize"] not in (4, 8):
         raise HeaderError(f"unexpected datatype class {hdr.get('dclass')} size {hdr.get('itemsize')}")
-    n = int(np.prod(hdr["shape"])) * hdr["itemsize"]
+    n = math.prod(int(d) for d in hdr["shape"]) * hdr["itemsize"]  # Python ints: np.prod wraps (2**40 x 2**40 -> 0)
     if hdr["size"] != n:
         raise HeaderError(f"layout size {hdr['size']} != {n}")
     return n

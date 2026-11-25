@@ -10,9 +10,12 @@ delete the temp file, append a manifest row.
 * ``max_minutes``: stop taking new items after that long (pending items finish), so a queue can re-plan worker
   counts between chunks.
 * ``max_rss_gb``: soft memory cap per process (this one and every extraction worker). Above it the caches are
-  dropped (``gc``, ``malloc_trim``, the HF row-URL cache); if a process stays above, the run stops taking items
+  dropped (``gc``, ``malloc_trim``, the HF row-page cache); if a process stays above, the run stops taking items
   (``stopped: "memory"``, fetched but unstarted items are deleted and retried next run) and
   ``scripts/isl_queue.sh`` restarts the source in fresh processes. All ingestion jobs share one ~14 GB memory group.
+* Remote refusal: an HF rows page the server keeps refusing (``hf_listing.RemoteRefused``) gives that item a
+  ``fetch:`` row and stops the run (``stopped: "remote"``, ``remote_permanent``, ``remote_error``); the remaining
+  items are not touched, so a refusal never turns into thousands of failed rows.
 """
 
 from __future__ import annotations
@@ -32,25 +35,27 @@ from pathlib import Path
 from app.isl.data.manifest import append_jsonl, read_manifest
 from app.isl.data.video_sources.catalog import SourceSpec
 from app.isl.data.video_sources.fetch import temp_path, url_to_file, zip_member_to_file
+from app.isl.data.video_sources.hf_listing import Policy, RemoteRefused, RowPages
 from app.isl.data.video_sources.listings import Item, safe_name
 from app.isl.paths import IslPaths
 
 log = logging.getLogger(__name__)
 
-HF_ROWS = "https://datasets-server.huggingface.co/rows"
-
-
 class Fetcher:
     """Fetch an :class:`Item` to a local temp file. ``archives`` maps an archive key to an open ``ZipFile``
-    (or a factory returning one); ``get`` replaces ``requests.get`` in tests."""
+    (or a factory returning one); ``get`` replaces ``requests.get`` in tests. HF rows (kind ``hfrow``) get their
+    image URL from :class:`hf_listing.RowPages` (one paced, backed-off request per 100-row page; ``hf_policy``,
+    ``clock`` and ``rnd`` are passed to it); a page the server keeps refusing raises
+    :class:`hf_listing.RemoteRefused`, which stops the run (``stopped: "remote"``)."""
 
     def __init__(self, archives: dict[str, zipfile.ZipFile | Callable[[], zipfile.ZipFile]] | None = None, get=None,
-                 sleep=time.sleep):
+                 sleep=time.sleep, clock=time.monotonic, hf_policy: Policy | None = None, rnd=None):
         self._archives = dict(archives or {})
         self._open: dict[str, zipfile.ZipFile] = {}
         self.get = get
         self.sleep = sleep
-        self._rows: dict[tuple[str, str, int], str] = {}  # (dataset, split, row) -> image src (signed, ~1 h)
+        kw = {"rnd": rnd} if rnd is not None else {}
+        self.rows = RowPages(self._get, sleep=sleep, clock=clock, policy=hf_policy or Policy(), **kw)
 
     def _zip(self, key: str) -> zipfile.ZipFile:
         if key not in self._open:
@@ -65,32 +70,16 @@ class Fetcher:
             except Exception:  # noqa: BLE001
                 pass
 
+    def drop_caches(self) -> None:
+        """Memory guard: forget cached HF row pages (they are re-requested when needed)."""
+        self.rows.clear()
+
     def _get(self):
         if self.get is None:
             from app.isl.data.remote import session
 
             self.get = session().get
         return self.get
-
-    def _hf_row_src(self, dataset: str, split: str, row: int) -> str:
-        key = (dataset, split, row)
-        if key not in self._rows:
-            off = row - row % 100
-            for i in range(6):  # the rows API rate-limits (429) and has 503 spells
-                r = self._get()(HF_ROWS, params={"dataset": dataset, "config": "default", "split": split,
-                                                 "offset": off, "length": 100}, timeout=120)
-                if r.status_code == 200:
-                    break
-                if r.status_code != 429 and r.status_code < 500:
-                    raise OSError(f"rows API HTTP {r.status_code}")
-                self.sleep(min(120, 5 * 2 ** i))
-            else:
-                raise OSError(f"rows API HTTP {r.status_code} after retries")
-            for rr in r.json().get("rows", []):
-                img = (rr.get("row") or {}).get("image") or {}
-                if img.get("src"):
-                    self._rows[(dataset, split, int(rr["row_idx"]))] = img["src"]
-        return self._rows.pop(key)
 
     def fetch(self, item: Item, dest: Path) -> dict:
         f = item.fetch
@@ -106,13 +95,15 @@ class Fetcher:
                 raise OSError(f"sha256 mismatch (expected {exp[:12]}..., got {sha[:12]}...)")
             return {"sha256": sha, "bytes": n}
         if kind == "hfrow":
+            ds, split, row = f["dataset"], f["split"], int(f["row"])
+            src = self.rows.src(ds, split, row)
             try:
-                src = self._hf_row_src(f["dataset"], f["split"], int(f["row"]))
                 sha, n = url_to_file(src, dest, get=self._get(), sleep=self.sleep)
-            except PermissionError:  # signed asset URL expired: refresh the page once
-                self._rows.pop((f["dataset"], f["split"], int(f["row"])), None)
-                src = self._hf_row_src(f["dataset"], f["split"], int(f["row"]))
-                sha, n = url_to_file(src, dest, get=self._get(), sleep=self.sleep)
+            except PermissionError:  # signed asset URL refused (expired?): re-request its page once, unless fresh
+                src2 = self.rows.src(ds, split, row, refresh=True)
+                if src2 == src:
+                    raise
+                sha, n = url_to_file(src2, dest, get=self._get(), sleep=self.sleep)
             return {"sha256": sha, "bytes": n}
         raise ValueError(f"unknown fetch kind {kind}")
 
@@ -194,6 +185,11 @@ def run(spec: SourceSpec, items: list[Item], paths: IslPaths, fetcher: Fetcher, 
                     meta = base_meta(it)
                     meta.update({"ok": False, "error": f"fetch: {type(e).__name__}: {e}"[:300]})
                     q.put(("failed", it, meta, None))
+                    if isinstance(e, RemoteRefused):  # the server keeps refusing: stop, the rest stays to do
+                        stats["stopped"], stats["remote_permanent"] = "remote", bool(e.permanent)
+                        stats["remote_error"] = str(e)[:300]
+                        log.warning("%s: stopping: %s", spec.name, e)
+                        break
                     continue
                 q.put(("ok", it, finfo, dest))
         finally:
@@ -221,7 +217,9 @@ def run(spec: SourceSpec, items: list[Item], paths: IslPaths, fetcher: Fetcher, 
             return False
         import gc
 
-        fetcher._rows.clear()
+        drop = getattr(fetcher, "drop_caches", None)
+        if drop:
+            drop()
         gc.collect()
         malloc_trim()
         gb2, pid = worst_rss()

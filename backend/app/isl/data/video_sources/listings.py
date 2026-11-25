@@ -333,12 +333,17 @@ def hf_label(name: str) -> tuple[str, str]:
 
 
 def hf_rows_items(prefix: str, dataset: str, split: str, labels: list[tuple[int, int]], names: list[str],
-                  per_class: int = 300, seed: int = 13) -> list[Item]:
-    """``labels`` = [(row_idx, label_idx)] from the datasets-server rows API; balanced sample per class."""
+                  per_class: int | None = 300, seed: int = 13) -> list[Item]:
+    """``labels`` = [(row_idx, label_idx)] from the datasets-server rows API. ``per_class`` N: a deterministic
+    sample of up to N rows per class; ``None`` (or <= 0): every row. Either way the items are ordered by class,
+    then row (the engine fetches them in row order, so each 100-row page of the rows API is read once)."""
     by_class: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
     for row, lab in labels:
         by_class[str(lab)]["all"].append(str(row))
-    picked = balanced_sample(by_class, per_class, seed)
+    if per_class is None or per_class <= 0:
+        picked = {cls: list(g["all"]) for cls, g in by_class.items()}
+    else:
+        picked = balanced_sample(by_class, per_class, seed)
     out = []
     for lab in sorted(picked, key=int):
         name = names[int(lab)] if int(lab) < len(names) else str(lab)

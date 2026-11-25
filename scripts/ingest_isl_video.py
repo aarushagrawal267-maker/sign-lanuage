@@ -17,7 +17,9 @@ Exit codes of `run`: 0 finished, 10 stopped after --max-minutes (more to do), 4 
 3 gated dataset not accessible yet, 5 stopped for memory (--max-rss-gb; resumable, the queue restarts it),
 6 another run of the same manifest is active (lock manifests/<manifest>.lock or a process scan), 2 error.
 An HF alphabet listing that Hugging Face keeps refusing (429 / 503) exits 10 when it saved new rows (resumes next
-chunk) and 2 when it made no progress; raw/<source>/listing_status.json says how far it got.
+chunk) and 2 when it made no progress; raw/<source>/listing_status.json says how far it got. The same holds for the
+rows pages the run reads to fetch the images (engine stopped "remote"): 10 if this run extracted rows, else 2.
+HF alphabet sets take every row (no per-class cap) unless --per-class N is given.
 CISLR has exactly one ingestion path: this `run cislr` (the queue runs it as soon as the 1-byte probe of
 dataset.csv answers); scripts/ingest_isl_gated.py cislr delegates here and shares the lock.
 --workers auto: 1 while INCLUDE (1 worker) and ISLRTC (3 workers) ingestion run, otherwise the CPUs they leave free
@@ -387,15 +389,28 @@ def _run_locked(args, paths, spec, engine) -> int:
                        min_free_gb=args.min_free_gb, progress=log.info,
                        max_rss_gb=getattr(args, "max_rss_gb", 0.0) or 0.0)
     log.info("%s run finished: %s", spec.name, stats)
+    rows = getattr(fetcher, "rows", None)
+    if rows is not None and rows.stats["requests"]:
+        log.info("%s: HF rows API: %s", spec.name, rows.stats)
     if stats["stopped"] == "memory":
         return EXIT_MEMORY
     if stats["stopped"] == "disk":
         return EXIT_DISK
     if stats["stopped"] == "time":
         return EXIT_MORE
+    if stats["stopped"] == "remote":
+        return remote_rc(stats)
     if args.limit and stats["todo"] >= args.limit:
         return EXIT_MORE
     return 0
+
+
+def remote_rc(stats: dict) -> int:
+    """Exit code after the HF rows API kept refusing during a run (engine ``stopped: "remote"``): 10 (more to do;
+    the queue starts the next chunk, which backs off again before giving up) when this run wrote at least one
+    extracted row and the refusal was not permanent, else 2 (the queue counts a failed try and waits)."""
+    progressed = stats.get("ok", 0) + stats.get("failed", 0) + stats.get("duplicates", 0) > 0
+    return EXIT_MORE if progressed and not stats.get("remote_permanent") else EXIT_ERR
 
 
 def _listing_rc(e: OSError) -> int | None:
@@ -517,7 +532,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--max-minutes", type=float, default=0.0, help="stop taking new items after this long (exit 10)")
     p.add_argument("--min-free-gb", type=float, default=10.0)
-    p.add_argument("--per-class", type=int, default=None, help="image sets: sample size per class")
+    p.add_argument("--per-class", type=int, default=None,
+                   help="image sets: sample size per class (HF alphabet sets: default every row)")
     p.add_argument("--max-rss-gb", type=float, default=1.5,
                    help="soft memory cap per process (this one and each worker); stop with exit 5 above it; 0 = off")
     p = sub.add_parser("list", help="write manifests/<source>_items.json only (no fetch / extraction)")

@@ -21,7 +21,7 @@ running, partial data). Every number below says when and on how much data it was
 | **ISL emergency words** (Mendeley `2vfdm42337` v1, Adithya & Rajesh) | 8 words x 26 people x 2 takes (412 raw videos), hands only (signer behind a board) | CC BY 4.0 | yes, with attribution | commercial-safe + research | public |
 | **ISL agricultural words** (Mendeley `6v53kfxf46` v1, Adithya & Rajesh) | 13 words, 3 deaf farmers outdoors; 78 original videos (the crop1/2/3 folders are crops of the same recordings, not used) | CC BY 4.0 | yes, with attribution | commercial-safe + research | public |
 | **Static ISL alphabet, Hindi vowels, numerals** (Mendeley `7tsw22y96w` v1, Singh et al.) | 102,470 photos, 46 classes (A-Z with two E signs, 8 Hindi vowels, 0-9 with two 9 signs), kids / teens / adults; we use a balanced sample of 300 per class (13,800) | CC BY 4.0 | yes, with attribution | commercial-safe + research | public |
-| `Hemg/Indian_sign_language_dataset`, `akritRihal/Indian_Sign_Language_dataset` (Hugging Face) | alphabet + digit images (42,745 hand crops / 10,752 photos); 300 per class sampled | **none stated**, no provenance (re-checked 25 Nov 2026 20:40 UTC: no `license:` tag in either card, Hemg's card says "More Information needed", akrit's README is only the `dataset_info` block) | **no** (unknown) | research only (`profiles.LETTER_SOURCES["research"]`; in no commercial-safe list) | public |
+| `Hemg/Indian_sign_language_dataset`, `akritRihal/Indian_Sign_Language_dataset` (Hugging Face) | alphabet + digit images (42,745 hand crops / 10,752 photos); **every row** (no per-class cap since 25 Nov 2026 22:21 UTC; 300 per class before) | **none stated**, no provenance (re-checked 25 Nov 2026 20:40 UTC: no `license:` tag in either card, Hemg's card says "More Information needed", akrit's README is only the `dataset_info` block) | **no** (unknown) | research only (`profiles.LETTER_SOURCES["research"]`; in no commercial-safe list) | public |
 | MediaPipe HandLandmarker (`hand_landmarker.task`) | hand landmarks where Holistic finds none (hands-only videos, still images) | Apache-2.0 | yes | both | downloaded to `assets/mediapipe/` (git-ignored) |
 | WLASL (existing ASL model) | ASL, 100 words | C-UDA 1.0 | **no** | research only (warm start) | see `docs/LICENSING.md` |
 | WordNet 3.0 (via NLTK data) | synonym lists, part of speech, coarse categories | WordNet licence (permissive) | yes | both | public |
@@ -277,8 +277,8 @@ free disk under `data/isl` must stay above 10 GB (checked before every item; the
 | `mendeley_emergency` | 412 raw videos (8 zips, 2.58 GB; the cropped copies are not used) | 8 words | commercial-safe | hands only. Some takes are byte-identical (e.g. `call_001_01` = `call_001_02`): kept once (`duplicate_of`) |
 | `mendeley_agri` | 78 videos (the `Original` folders; crop1/2/3 are crops of the same recordings) | 13 words (`Cococnut` -> coconut) | commercial-safe | outdoor, faces often cut off at the top -> `hands` mode. Subject 1's `Original` folder actually holds the `crop1` files (same names and sizes as its `cropped1` folder) |
 | `mendeley_static` | 13,800 of 102,470 photos (300 per folder, round-robin over kids/teens/adults x full/half sleeves, seed 13) | A-Z (`E1`/`E2` -> E, kept as `variant`), 8 Hindi vowels, 0-9 (`9a`/`9b` -> 9) | commercial-safe | `--per-class N` for more; the selected list is in `manifests/mendeley_static_items.json`; Mendeley SHA-256 verified per file |
-| `hf_akrit_alphabet` | up to 300 per class **and split** of 10,752 (33 classes, no h/j/v): 10,118 items (train 8,505, test 1,613 = all of test) | letters, digits | research | licence unknown. Item list written 25 Nov 2026 20:43 UTC by `ingest_isl_video.py list` (nothing fetched; the queue's run reuses the cached labels) |
-| `hf_hemg_alphabet` | up to 300 per class of 42,745 (35 classes, 128x128 hand crops) | letters 1-9 + A-Z | research | licence unknown; probably augmented copies of few originals. Item list written 25 Nov 2026 21:08 UTC by `ingest_isl_video.py list`: 10,500 items (35 classes x 300; 1,200-1,447 images per class) |
+| `hf_akrit_alphabet` | **all 10,752 rows** (train 9,139 + test 1,613; 33 classes, no h/j/v, 300-798 per class) | letters, digits | research | licence unknown; no signer ids. Item list rewritten 25 Nov 2026 22:21 UTC by `ingest_isl_video.py list` without the cap (was 10,118 = 300 per class and split). **Near-duplicate risk:** the uploader's train / test split is not by signer or take, and photos of one take (or flips / crops of one photo) can sit on both sides; never use its `test` rows as a held-out test, keep the whole set on one side of any split (or cluster near-duplicates first), see 3.8 |
+| `hf_hemg_alphabet` | **all 42,745 rows** (35 classes, 128x128 hand crops, 1,200-1,447 per class) | letters 1-9 + A-Z | research | licence unknown; probably augmented copies of few originals (byte-identical copies get `duplicate_of` rows; near-identical ones do not). Item list rewritten 25 Nov 2026 22:21 UTC without the cap (was 10,500 = 35 x 300). Same split rule as akrit (3.8) |
 | `islrtc-full` | ISLRTC compilations not yet in `islrtc_full.jsonl`: `A/Ancient_Alphabets`, `G/Greek_Alphabets` (the 7 others were done on 25 Nov) | as ISLRTC | as ISLRTC | runs `scripts/ingest_isl.py`'s own `run_islrtc` (`--only --full --max-s 180 --out-subdir islrtc_full`) in-process, so no second `ingest_isl.py islrtc` process appears |
 
 **HF alphabet listings** (`app.isl.data.video_sources.hf_listing`, since 25 Nov 2026). The labels come from the
@@ -291,11 +291,12 @@ failed tries in a row. `raw/<source>/listing_status.json` says per split `comple
 `failed`, rows / total and the last error. A refused `run` exits 10 (more to do, the queue resumes it next chunk
 without counting a failed try) when it saved new rows, else 2 (the queue's 5 tries). Measured 25 Nov 20:35-21:08:
 a 429 every 28-30 pages (17 times over both sets), each cleared after 1-4 retries (at most 90 s); akrit (110
-pages) took 8 min, Hemg (428 pages) 25 min. Both listings are complete; readiness now expects 10,118 / 10,500 items
-(0 ingested: the queue runs them after WSLP and the sources before them).
+pages) took 8 min, Hemg (428 pages) 25 min. Both listings are complete; since 22:21 UTC readiness expects every row,
+10,752 / 42,745 items (0 ingested: the queue runs them after WSLP and the sources before them).
 `python scripts/ingest_isl_video.py list SOURCE` writes `manifests/<source>_items.json` without fetching anything
-(holds the manifest lock, so a queue run of the same source waits, exit 6). The images themselves are still fetched
-through the rows API page of each item (`engine.Fetcher`, kind `hfrow`, its own 6-try backoff).
+(holds the manifest lock, so a queue run of the same source waits, exit 6). The images are fetched through the rows
+API page of each item (`engine.Fetcher`, kind `hfrow`), since 25 Nov 22:30 UTC with the listing's own rules
+(`hf_listing.RowPages`, 3.8): one request per 100-row page, paced and backed off like the listing.
 
 **Decided not to ingest.** WSLP `Shared_task_WPP` query videos: all 2,541 (train 1,410, val 576, test 555) are
 byte-identical copies (same CRC32 and size, same uid) of WR clips, so they add no word labels; the WPP sentence videos
@@ -602,6 +603,62 @@ modes 7,500-7,552 = 5 min at 25 fps, despite the `chunked_1_min` name); MBM land
 21:57:14 at about 17-20 MB/s (ends about 22:45-23:05), after which the 12 GB budget leaves about 1 GB of landmarks:
 about the first 8 % of NewzHook in file order. **Job end: about 22:50-23:30 UTC, 25 Nov** (estimate; the 00:00-01:00
 above assumed a slower MBM pass).
+
+### 3.8 HF alphabet sets in full, `hfrow` fetch rules, OpenHands header errors (Data Engineer, 25 Nov 2026 22:10-22:40 UTC) <!-- hf-full -->
+
+**All rows.** `catalog.py` now has `per_class: None` for `hf_hemg_alphabet` and `hf_akrit_alphabet`:
+`listings.hf_rows_items` takes every listed row (class order, then row order, as before; `--per-class N` still
+samples N per class). The item lists were rewritten at 22:21 UTC with `ingest_isl_video.py list` from the finished
+label lists (no request to Hugging Face; the queue was still on WSLP, neither source had a manifest): **akrit 10,752**
+(train 9,139 + test 1,613, 33 classes, 300-798 per class; was 10,118) and **Hemg 42,745** (35 classes, 1,200-1,447 per
+class; was 10,500), unique ids. `readiness` now expects 10,752 / 42,745 (`expected_from` = the item lists).
+`mendeley_static` keeps its 300-per-folder sample (13,800 of 102,470 photos); it is outside this change.
+
+**Splits (for the split builder).** Neither set has signer, session or take ids. akrit's `train` / `test` (kept as the
+`split` field) is the uploader's split: frames or re-crops of one take can sit on both sides, so its `test` rows are
+**not** a held-out test set. Hemg looks like augmented copies of few originals (flips / shifts / brightness of one
+photo are near-identical but not byte-identical, so the engine's SHA-256 `duplicate_of` catches only exact copies).
+Rule: use both sets for letter training only. Today this holds: `train_fingerspell` groups still images by source
+(`clip.group or clip.source`), E5 evaluates on ISL-Fingerspelling signers only and the temperature hold-out is an
+ISL-Fingerspelling signer (a random 10 % only when no signer ids exist, which would mix copies - keep it that way).
+If any split, calibration hold-out or validation set ever draws from them, put a whole source on one side (one group
+per source), or first cluster near-duplicates (landmark distance after normalisation, or a perceptual hash of the
+image) and split by cluster.
+
+**`hfrow` fetch (`hf_listing.RowPages`, used by `engine.Fetcher`).** The old path made up to 6 tries per page,
+ignored `Retry-After`, slept at most 120 s and dropped a page's cached URLs one by one (a memory-guard drop or a
+resumed run re-requested pages). Now: one request per 100-row page, kept in an LRU of 8 pages until 5 min before the
+signed URLs' `Expires` (the `cached-assets` URLs carry `Expires`, `Signature`, `Key-Pair-Id`; 30 min when absent);
+the listing's `Policy` (>= 2 s between requests, backoff 5 s doubling to 10 min with jitter, never shorter than
+`Retry-After`, 8 failed tries in a row or a `Retry-After` above 30 min = refused). A refused image URL re-requests
+its page once, unless the page is under 2 min old. Failures:
+* an image download that fails (`url_to_file`'s 5 tries) -> a `fetch: ...` row (retry_pending in readiness), the run
+  goes on;
+* the rows API keeps refusing (`RemoteRefused`) -> that item gets a `fetch: RemoteRefused ...` row and the run stops
+  (`stopped: "remote"`): exit 10 if the run extracted rows and the refusal was not a permanent 4xx (the next chunk
+  backs off again), else exit 2 (the queue counts a try, waits 5-20 min, gives up after 5); no item after it is
+  touched, so an outage cannot write thousands of failed rows. The run log prints the page stats
+  (`HF rows API: {'requests', 'pages', 'retries', 'waited_s'}`).
+
+**Live check** (scratch data root, not the real manifests; 22:21 UTC, load 11-13): `run hf_akrit_alphabet --limit 300
+--workers 1` -> 300 ok, 0 failed, **4 page requests** for 300 items (train and test pages interleave in row order),
+38.9 s = **0.13 s per image** end to end on 1 worker (fetch ~0.04 s, 4 KB per image; extraction ~0.05-0.07 s;
+mean `secs` 0.07), 232 of 300 with `hands_frac` >= 0.2; landmarks 4 KB per image. A separate probe of 20 Hemg + 20
+akrit rows: page request 0.4-0.6 s, image 0.04-0.08 s, extraction 0.05-0.06 s (Hemg 20 / 20 with a hand, akrit 17 / 20).
+
+**Extraction time for the 53,497 images (estimate).** 1 worker (while the islrtc job runs): 53,497 x 0.13 s = **about
+1.9 h**; 3 workers (`--workers auto` once islrtc has ended, the likely case when the queue reaches these sources):
+the single fetch thread (~0.05 s per image) becomes the limit, **about 0.8-1.2 h**; plus 535 page requests (the 2 s
+pacing never binds: a page's 100 images take ~5-13 s) and the 429 spells seen in the listing (one every ~30 pages,
+up to 90 s each: about 10-30 min). Total **about 1.2-2.5 h** of queue time, ~0.2 GB of landmarks. This is far below
+the 10 h threshold, so the worker policy is unchanged (no extra workers for image sources).
+
+**OpenHands `parse_v1_header`.** A malformed object header (a message shorter than its fields, an absurd rank) raised
+`struct.error` / `IndexError`, which neither the forward pass (it sent such a chunk to the fallback) nor the fallback
+(`except (OSError, EOFError, ValueError)`) caught, so the job would crash instead of recording a failed row. It now
+raises `HeaderError("malformed header (...)")`, recorded as a failed row like every other header error;
+`data_nbytes` multiplies the shape with Python integers (`np.prod` wrapped 2^40 x 2^40 to 0, which could have passed
+the size check). Takes effect at the job's next start; the job was not restarted for this.
 
 ---
 

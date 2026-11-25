@@ -132,14 +132,18 @@ SOURCES: dict[str, SourceSpec] = {s.name: s for s in [
         "hf_hemg_alphabet", "Hemg/Indian_sign_language_dataset (alphabet + digits images)", "unknown", RESEARCH,
         "https://huggingface.co/datasets/Hemg/Indian_sign_language_dataset", "Hugging Face user Hemg (no card)",
         "image", "image", id_prefix="hf_hemg",
-        extra={"dataset": "Hemg/Indian_sign_language_dataset", "splits": ["train"], "per_class": 300},
-        notes="42,745 128x128 hand crops, 35 classes, no licence or provenance -> research only."),
+        extra={"dataset": "Hemg/Indian_sign_language_dataset", "splits": ["train"], "per_class": None},
+        notes="42,745 128x128 hand crops, 35 classes, no licence or provenance -> research only. Every row is "
+              "ingested (per_class None = no cap; --per-class N still samples); probably augmented copies of "
+              "few originals, so any split must not put copies on both sides (docs/DATASETS_ISL.md 3.8)."),
     SourceSpec(
         "hf_akrit_alphabet", "akritRihal/Indian_Sign_Language_dataset (alphabet + digits images)", "unknown",
         RESEARCH, "https://huggingface.co/datasets/akritRihal/Indian_Sign_Language_dataset",
         "Hugging Face user akritRihal (no card)", "image", "image", id_prefix="hf_akrit",
-        extra={"dataset": "akritRihal/Indian_Sign_Language_dataset", "splits": ["train", "test"], "per_class": 300},
-        notes="10,752 images, 33 classes (no h, j, v), no licence or provenance -> research only."),
+        extra={"dataset": "akritRihal/Indian_Sign_Language_dataset", "splits": ["train", "test"], "per_class": None},
+        notes="10,752 images, 33 classes (no h, j, v), no licence or provenance -> research only. Every row of both "
+              "splits is ingested (no cap); its train / test split is the uploader's and may hold near-duplicate "
+              "photos on both sides (docs/DATASETS_ISL.md 3.8)."),
 ]}
 
 

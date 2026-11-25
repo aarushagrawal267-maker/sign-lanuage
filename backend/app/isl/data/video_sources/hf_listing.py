@@ -17,7 +17,9 @@ resumably:
   written as ``labels_<split>.json``.
 
 Everything takes ``get`` / ``sleep`` / ``clock`` so the logic is unit-tested offline. The image of a row is fetched
-later by the engine (``Fetcher``, kind ``hfrow``); item ids are ``<prefix>/<split>/<row>`` (``listings.hf_rows_items``).
+later by the engine (``Fetcher``, kind ``hfrow``) through :class:`RowPages`, which uses the same pacing, backoff and
+``Retry-After`` rules and fetches each 100-row page once (its signed image URLs are cached until shortly before they
+expire); item ids are ``<prefix>/<split>/<row>`` (``listings.hf_rows_items``).
 """
 
 from __future__ import annotations
@@ -26,7 +28,10 @@ import email.utils
 import json
 import logging
 import random
+import threading
 import time
+import urllib.parse
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -316,7 +321,8 @@ def list_source(name: str, extra: dict, raw: Path, *, get, sleep=time.sleep, clo
 
 def build_hf_items(spec, raw: Path, per_class: int | None = None, *, get=None, sleep=time.sleep,
                    clock=time.monotonic, policy: Policy = Policy()) -> list:
-    """Items of an HF alphabet source (balanced sample per class, ``listings.hf_rows_items``)."""
+    """Items of an HF alphabet source (``listings.hf_rows_items``): every row when neither ``per_class`` nor the
+    catalog's ``per_class`` is set (the default for both sets since 25 Nov 2026), else a sample per class."""
     from app.isl.data.video_sources.listings import hf_rows_items
 
     if get is None:
@@ -328,8 +334,127 @@ def build_hf_items(spec, raw: Path, per_class: int | None = None, *, get=None, s
     for split in spec.extra["splits"]:
         lab = labels[split]
         items += hf_rows_items(spec.prefix, spec.extra["dataset"], split, [tuple(x) for x in lab["rows"]],
-                               lab["names"], per_class=per_class or spec.extra["per_class"])
+                               lab["names"], per_class=per_class or spec.extra.get("per_class"))
     return items
+
+
+class RemoteRefused(OSError):
+    """The rows API keeps refusing (``max_failures`` failed requests in a row, or a ``Retry-After`` above
+    ``max_retry_after``), or refused for good (``permanent``: a 4xx other than 429). The engine stops the run: the
+    item that hit it gets a ``fetch:`` row (retry_pending), the items after it are not touched."""
+
+    def __init__(self, msg: str, *, permanent: bool = False):
+        super().__init__(msg)
+        self.permanent = permanent
+
+
+def url_expiry(url: str) -> float | None:
+    """Epoch seconds of a signed URL's ``Expires`` query parameter (the datasets-server ``cached-assets`` URLs are
+    CloudFront-signed: ``?Expires=...&Signature=...&Key-Pair-Id=...``); None when absent."""
+    try:
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+        return float(q["Expires"][0])
+    except (KeyError, IndexError, ValueError, TypeError):
+        return None
+
+
+class RowPages:
+    """Image URLs of HF dataset rows for ``engine.Fetcher`` (kind ``hfrow``), one rows-API page (100 rows) at a time.
+
+    * Each page is requested once and kept (LRU, ``max_pages``) until shortly before its signed URLs expire
+      (``Expires`` - ``expiry_margin``; ``ttl`` when the URLs carry no expiry), so items fetched in row order cost one
+      request per 100 rows, not one per item.
+    * Requests are paced and retried exactly like the listing (:class:`Policy`: >= ``min_interval`` between two
+      requests, exponential backoff with jitter, never shorter than ``Retry-After``). When the server keeps refusing
+      it raises :class:`RemoteRefused` instead of an endless wait.
+    * ``refresh`` re-requests a page whose URL was refused (expired signature), but not a page fetched less than
+      ``fresh_s`` ago: a refused image of a fresh page is that image's own failure, not an expired page.
+
+    ``get_fn`` returns the ``get`` function (lazy, so the HTTP session is created on first use)."""
+
+    def __init__(self, get_fn: Callable[[], Callable], *, sleep=time.sleep, clock=time.monotonic, wall=time.time,
+                 policy: Policy = Policy(), rnd: Callable[[], float] = random.random, max_pages: int = 8,
+                 ttl: float = 1800.0, expiry_margin: float = 300.0, fresh_s: float = 120.0, config: str = "default"):
+        self.get_fn, self.sleep, self.clock, self.wall, self.policy, self.rnd = get_fn, sleep, clock, wall, policy, rnd
+        self.max_pages, self.ttl, self.expiry_margin, self.fresh_s, self.config = (max_pages, ttl, expiry_margin,
+                                                                                   fresh_s, config)
+        self.pages: OrderedDict[tuple[str, str, int], dict] = OrderedDict()
+        self.last_req: float | None = None
+        self.stats = {"requests": 0, "pages": 0, "retries": 0, "waited_s": 0.0}
+        self._lock = threading.Lock()
+
+    def clear(self) -> None:
+        with self._lock:
+            self.pages.clear()
+
+    def src(self, dataset: str, split: str, row: int, *, refresh: bool = False) -> str:
+        """The image URL of one row. ``refresh``: the cached URL was refused; re-request its page unless fresh."""
+        key = (dataset, split, row - row % PAGE)
+        with self._lock:
+            page = self.pages.get(key)
+            now = self.clock()
+            if page is None or now >= page["valid_until"] or (refresh and now - page["fetched"] >= self.fresh_s):
+                page = self._fetch(*key)
+                self.pages[key] = page
+                while len(self.pages) > self.max_pages:
+                    self.pages.popitem(last=False)
+            self.pages.move_to_end(key)
+            url = page["src"].get(row)
+        if url is None:
+            raise OSError(f"rows API: no image URL for {dataset} {split} row {row}")
+        return url
+
+    def _pace(self) -> None:
+        if self.last_req is not None:
+            gap = self.policy.min_interval - (self.clock() - self.last_req)
+            if gap > 0:
+                self.sleep(gap)
+                self.stats["waited_s"] += gap
+
+    def _fetch(self, dataset: str, split: str, off: int) -> dict:
+        failures, err = 0, ""
+        while True:
+            self._pace()
+            self.last_req = self.clock()
+            self.stats["requests"] += 1
+            ra = None
+            try:
+                r = self.get_fn()(HF_ROWS, params={"dataset": dataset, "config": self.config, "split": split,
+                                                   "offset": off, "length": PAGE}, timeout=self.policy.timeout)
+                code = int(r.status_code)
+                if code == 200:
+                    src: dict[int, str] = {}
+                    for x in r.json().get("rows") or []:
+                        img = (x.get("row") or {}).get("image")
+                        if isinstance(img, dict) and img.get("src"):
+                            src[int(x["row_idx"])] = str(img["src"])
+                    if not src:
+                        raise ValueError(f"page at offset {off} has no image URLs")
+                    exp = [e for e in (url_expiry(u) for u in src.values()) if e is not None]
+                    now = self.clock()
+                    life = (min(exp) - self.wall() - self.expiry_margin) if exp else self.ttl
+                    self.stats["pages"] += 1
+                    return {"src": src, "fetched": now, "valid_until": now + max(0.0, min(life, self.ttl * 4))}
+                err = f"HTTP {code}"
+                ra = retry_after_s(getattr(r, "headers", None))
+                if code != 429 and code < 500:
+                    raise RemoteRefused(f"rows API {err} for {dataset} {split} offset {off} (not retryable)",
+                                        permanent=True)
+            except RemoteRefused:
+                raise
+            except Exception as e:  # noqa: BLE001 - connection errors, bad JSON, empty pages: retry
+                err = f"{type(e).__name__}: {e}"[:300]
+            failures += 1
+            if failures >= self.policy.max_failures or (ra is not None and ra > self.policy.max_retry_after):
+                why = (f"Retry-After {ra:.0f} s" if ra is not None and ra > self.policy.max_retry_after
+                       else f"{failures} failed tries in a row")
+                raise RemoteRefused(f"rows API refused {dataset} {split} offset {off} after {why}; last error {err}")
+            wait = backoff_s(failures, ra, self.policy, self.rnd)
+            self.stats["retries"] += 1
+            self.stats["waited_s"] += wait
+            log.info("%s %s: rows page %d: %s; waiting %.0f s (try %d of %d)", dataset, split, off, err, wait,
+                     failures, self.policy.max_failures)
+            self.sleep(wait)
 
 
 def listing_status(raw: Path) -> dict | None:
