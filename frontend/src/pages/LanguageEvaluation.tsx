@@ -92,7 +92,9 @@ const METRICS: Record<string, StringKey> = {
 export type Status = "measured" | "not_run" | "refused" | "missing";
 export function statusOf(p: Protocol | undefined): Status {
   if (!p) return "missing";
-  if (p.run === false) return p.leakage || /^refused/i.test(p.reason ?? "") ? "refused" : "not_run";
+  // E2 refused fold by fold (each encoder failed its leakage check) carries the refusals only in its folds
+  const foldsRefused = !!p.folds?.length && p.folds.every((f) => f.run === false) && p.folds.some((f) => f.leakage);
+  if (p.run === false) return p.leakage || foldsRefused || /^refused/i.test(p.reason ?? "") ? "refused" : "not_run";
   return "measured";
 }
 const reasonOf = (p: Protocol) => p.reason ?? (p.leakage ? `refused: ${p.leakage}` : undefined);
@@ -282,7 +284,7 @@ function E2Details({ p }: { p: Protocol }) {
         <Section title={t("eval.foldsTitle")}>
           <ul className="text-xs text-fg-3">
             {p.folds!.map((f) => (
-              <li key={f.fold} className="py-0.5">
+              <li key={f.fold} className={`py-0.5 ${f.leakage ? "text-danger" : ""}`}>
                 {f.run === false
                   ? <>{t("eval.foldNotRun", { k: f.fold })} <En>{f.leakage ?? f.reason ?? ""}</En></>
                   : t("eval.foldLine", { k: f.fold, held: f.held_out_concepts ?? "?", gallery: f.gallery_concepts ?? "?" })}

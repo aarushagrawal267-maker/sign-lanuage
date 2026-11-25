@@ -131,6 +131,19 @@ describe("refusals and leakage", () => {
     expect(sec).toHaveTextContent(why);
   });
 
+  it("E2 whose every fold was refused by the encoder leakage check is shown as refused, not just not measured", () => {
+    // runners.py: a LeakageError per fold gives {fold, run: false, leakage}; E2 then has run: false and the joined
+    // leakage messages as its reason, but no top-level `leakage` key
+    const r = phase2();
+    const why = "encoder fold0 was trained on held-out concept clips";
+    r.protocols!.E2 = { run: false, n: 0, reason: why, folds: [{ fold: 0, run: false, leakage: why }] };
+    expect(statusOf(r.protocols!.E2)).toBe("refused");
+    expect(statusOf({ run: false, reason: "empty gallery", folds: [{ fold: 0, run: false, reason: "empty gallery" }] })).toBe("not_run");
+    wrap(r);
+    expect(row("E2")).toHaveTextContent("refused by a leakage guard");
+    expect(row("E2")).toHaveTextContent(why);
+  });
+
   it("warns loudly when pre-training saw evaluation clips", () => {
     const r = phase2();
     r.leakage_guards!.pretraining_excludes_eval_clips = false;
