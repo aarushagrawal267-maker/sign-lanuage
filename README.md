@@ -217,7 +217,7 @@ cd frontend; npx playwright install chromium; npx playwright test
 
 `E2E_FAKE_VIDEO=<file.y4m>` feeds a video file as the fake camera.
 
-GitHub Actions (`.github/workflows/ci.yml`) runs the backend pytest suite and the frontend typecheck, Vitest and production build on every push and pull request.
+GitHub Actions (`.github/workflows/ci.yml`) runs the backend pytest suite, the frontend typecheck, Vitest and production build, and a gitleaks secret scan of the git history on every push and pull request.
 
 Backend tests run against an isolated temporary data directory with **synthetic landmark sequences** (procedurally generated, clearly flagged). They verify the pipeline's wiring and logic, not ASL accuracy.
 

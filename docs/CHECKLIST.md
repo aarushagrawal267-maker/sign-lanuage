@@ -39,7 +39,7 @@ Verification environment for this build: Linux container (4 CPU cores, no GPU), 
 | 38 | Linux / macOS scripts | ✅ | `setup.sh`, `start.sh`, `stop.sh` (verified on Linux, 2026-11-24; macOS not run) |
 | 39 | LICENSE | ✅ | MIT for code; WLASL data and derived weights remain C-UDA (non-commercial) |
 | 40 | Static export dependencies | ✅ | `backend/requirements-deploy.txt` (onnx, onnxruntime, huggingface_hub); `export_static.py` + `npm run build:static` verified 2026-11-24, ONNX parity max diff < 1e-4 |
-| 41 | Continuous integration | ✅ | `.github/workflows/ci.yml`: backend pytest (CPU torch) + frontend typecheck, Vitest and build on every push / PR |
+| 41 | Continuous integration | ✅ | `.github/workflows/ci.yml`: backend pytest (CPU torch) + frontend typecheck, Vitest and build + gitleaks secret scan of the full history on every push / PR |
 
 ## Final acceptance criteria
 
