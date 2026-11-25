@@ -604,6 +604,31 @@ modes 7,500-7,552 = 5 min at 25 fps, despite the `chunked_1_min` name); MBM land
 about the first 8 % of NewzHook in file order. **Job end: about 22:50-23:30 UTC, 25 Nov** (estimate; the 00:00-01:00
 above assumed a slower MBM pass).
 
+**Status at 22:47 UTC, budget 26 GB (Reality Checker, ISL_DESIGN 15.10; read-only).** The main session stopped the
+job at 22:02 (SIGINT) and restarted it with `--budget-gb 26 --min-free-gb 8` so that all of NewzHook fits. That run
+loaded 158 persisted NewzHook restore points and crashed at 22:06 in the h5py listing ("bad symbol table node
+signature"); the points file was moved to `raw/openhands_raw/NewzHook.points.bad_2205` and the job restarted at
+22:24:09 as **PID 861** (listing from byte 0, no points loaded). Cause (reproduced offline, not fixed): the points are
+byte-identical to the ones re-created since (271 of 271); the bug is `SeekableInflate`'s metadata cache, which files
+bytes from a forward jump through a persisted point under the old scan position, so h5py later reads wrong metadata.
+It affects only a listing pass with persisted points ahead; **a restart before the NewzHook listing ends must move the
+`.points` file aside first** (fix proposed in ISL_DESIGN 15.10).
+
+| Measure | Value |
+|---|---|
+| NewzHook listing progress | 42.35 GB inflated at 22:36:38 -> 74.17 at 22:47:22 -> **85.87 of 159.48 GB at 22:50:30** (32.96 of 61.24 GB compressed) |
+| Rate | 23.3-25.6 MB/s compressed, 60-66 MB/s inflated (`/proc/861/io` and restore points) |
+| RSS | 0.59-0.75 GB (peak 0.80 GB), guard 1.5 GB |
+| Deleted-but-open files | 0 in every process |
+| `df` used vs `du -xsB1 /` | 43.069 GB = 43.069 GB; free **30.74 GB** |
+| Landmarks `openhands_raw` | **10.99 GB** (Sign Library 0.65, NIOS 2.24, ISH News 3.32, MBM 4.77); manifest 63,745 rows, all ok |
+| Landmark density | 81 (MBM) - 88 (ISH News) MB per inflated GB |
+| Projected NewzHook landmarks | 12.9-14.0 GB -> **23.9-25.0 GB in total**, under the 26 GB budget |
+| Projected free disk | about 16-17 GB at the job's end; about 15-16 GB after the rest of the queue |
+| ETA (estimate) | listing ends about 23:08-23:20 UTC; forward pass 45-75 min (MBM ran 56.6 MB/s inflated); **job ends about 00:00-00:40 UTC, 26 Nov**, with all of NewzHook (or stopped by the budget in its last few percent) |
+
+So OpenHands raw no longer limits research readiness; the video queue does (about 08:00-11:30 UTC, 26 Nov).
+
 ### 3.8 HF alphabet sets in full, `hfrow` fetch rules, OpenHands header errors (Data Engineer, 25 Nov 2026 22:10-22:40 UTC) <!-- hf-full -->
 
 **All rows.** `catalog.py` now has `per_class: None` for `hf_hemg_alphabet` and `hf_akrit_alphabet`:

@@ -2323,3 +2323,130 @@ the source after the queue's 5 tries with the rest of its items not attempted (f
 blocked; re-run the source, or skip that page's items). Not changed now because `engine.py` is loaded by every new
 queue chunk. (3) The disk guard's `stopping:` counts as a normal end for OpenHands raw whether the landmark budget or
 `--min-free-gb` stopped it.
+
+### 15.10 Pre-run fixes (25 Nov night): reality check (Reality Checker, 25 Nov 2026, 22:36-23:05 UTC, at `b3f8aac`)
+
+(Asked for as "15.8"; 15.8 and 15.9 were already taken by the E8 fix and its review, so this is 15.10.) Read-only
+re-check of `d5b488e` (E8), `0b54985` + `2f7d69e` (readiness), `8827aa2` + `0a5d016` (HF alphabets in full, OpenHands
+headers) and `b3f8aac` (eval page), with live evidence. No job was stopped, restarted or signalled; nothing was trained;
+the shared smoke work folders and stamps were not touched.
+
+**Verdicts.** Commercial-safe full run: **NEEDS WORK only on data** - code ready, data guard exit 4 and blocked only by
+what it reads; estimate **ready 26 Nov 05:30-09:00 UTC**. Research full run: **NEEDS WORK** - code ready, data guard
+exit 4, and one new latent OpenHands bug (below) that a restart during the NewzHook listing would hit again; data
+estimate **26 Nov 08:00-12:00 UTC** if the OpenHands job is not restarted before its listing ends; it starts after the
+commercial-safe run anyway (one profile at a time).
+
+**(1) OpenHands raw (PID 861, restarted 22:24:09 UTC after the 22:06 crash, points file moved aside; `--budget-gb 26
+--min-free-gb 8`).**
+* Progress (restore points written by the listing pass, `/proc/861/io`): inflated 42.35 GB at 22:36:38, 48.21 at
+  22:40:22, 54.17 at 22:41:52, **74.17 GB of 159.48 GB at 22:47:22**, 85.87 GB at 22:50:30; compressed input 28.47 -> 32.96 of 61.24 GB. Rate
+  **23.3-25.6 MB/s compressed** (60-66 MB/s inflated). The listing ends about **23:08-23:20 UTC**; the forward data pass
+  over 159.48 GB at the MBM rate (56.6 MB/s inflated) takes about 45-75 min, so the job should end about **00:00-00:40
+  UTC, 26 Nov** with all of NewzHook (estimate).
+* RSS 0.59-0.75 GB (peak 0.80 GB) against the 1.5 GB guard; 13 threads; **0 deleted-but-open files** in any process on
+  the machine; `du -xsB1 /` = 43.069 GB = `df` used (43.069 GB), so nothing is hidden. Free disk **30.74 GB**.
+* Landmarks `openhands_raw` **10.99 GB** allocated (Sign Library 0.65, NIOS 2.24, ISH News 3.32, MBM 4.77); manifest
+  63,745 rows, all ok. Density measured so far: 81 MB (MBM) to 88 MB (ISH News) of landmarks per inflated GB, so
+  NewzHook adds about **12.9-14.0 GB -> 23.9-25.0 GB** in total: under the 26 GB budget (by 1-2 GB; if NewzHook is
+  denser the budget stops it in its last few percent, which readiness accepts as a normal end). Free disk at the end
+  of the job about **16-17 GB**, and about 15-16 GB after the rest of the queue (ISLRTC, WSLP, Mendeley, HF ~ +1.5 GB):
+  above both the job's 8 GB floor and the queue's 10 GB.
+* **Root cause of the 22:06 crash (found here, not fixed).** The 22:02 restart loaded 158 persisted restore points of
+  NewzHook (up to 16.81 GB) and the h5py listing died 4 min later ("bad symbol table node signature"). The points are
+  *not* corrupt: all 271 points of the renamed file `raw/openhands_raw/NewzHook.points.bad_2205` are byte-identical
+  (same `out`, `inp`, `bits`, window) to the ones the current run re-created. The bug is in `SeekableInflate`'s metadata
+  retention: `_step` calls `_scan(out[max(0, scan_pos - out):])`, which assumes the stream never moves ahead of
+  `scan_pos`. With persisted points ahead of it, a forward seek (`_goto`: `p - out > every`) restores at a point far
+  ahead, and those bytes are filed as metadata pages at the *old* `scan_pos`; later h5py reads of early metadata
+  (`readinto` -> `_from_meta`) then get bytes from elsewhere. Reproduced offline (scratch probe, synthetic 12 MB
+  member, 20 persisted points): 2 of 7 reads return wrong bytes; the same reads with the points dropped: 0 wrong. It
+  only matters while h5py lists a member (the data pass reads with `read_range`, which bypasses the cache, which is
+  why the ISH News / MBM restarts with points were byte-identical). Consequence: if PID 861 is restarted or respawned
+  by its memory guard **before the NewzHook listing ends (~23:10-23:20)**, it loads the ~400 new points and will very
+  likely crash the same way. Workaround: move `NewzHook.zip_NewzHook_newshook_dataset.h5.points` aside before such a
+  restart (what was done at 22:24). Fix for the ingestion owner: in `_restore` (or `_step`), when the restored `out`
+  is past `scan_pos`, drop `stage` / `_prev` and restart the scan at the next 4 KB page boundary at or after `out`
+  (or do not scan at all after a forward jump); plus a test that seeks ahead through persisted points and re-reads
+  early metadata. Readiness fails closed here (a traceback keeps research blocked, 15.9), so this cannot let a run
+  start early; it can only cost a listing pass (~40 min).
+
+**(2) Data guard on real data, 22:42 UTC** (`scripts/phase2_train.sh --profile X --check-only`):
+* commercial-safe: **exit 4**. Reasons: islrtc job (6785), islrtc-recut (20244), the queue (17314) "still to process
+  for commercial-safe: mendeley_static, isl_csltr, mendeley_agri, mendeley_emergency", manifests islrtc 8,607 / 13,665,
+  mendeley_emergency 0 / 412 (3 to retry), mendeley_agri 2 / 78, isl_csltr 2 / 687, mendeley_static 8 / 13,800.
+  OpenHands raw (861) and the WSLP chunk (30308) are listed as **not blocking**. The profile reads exactly include,
+  islrtc, isl_csltr and the three Mendeley sets (`sources` in its `data_readiness.json`), so **it now waits only on
+  what it reads**.
+* research: **exit 4**. The same plus openhands-raw (861), the WSLP chunk (30308), the queue's research list (wslp,
+  isl_fingerspelling, the four above, both HF sets, wslp_unlabelled, cislr, isign), manifests wslp 2,820 / 4,398,
+  wslp_unlabelled 3 / 635, isl_fingerspelling 4 / 1,308, hf_hemg_alphabet 0 / **42,745**, hf_akrit_alphabet 0 /
+  **10,752**, openhands_raw 63,745 / ? (budget-limited). `isl_csltr_words` is in the queue but in neither profile
+  (one still frame per word, `profiles.py`), so it blocks nothing - correct. Cosmetic: the openhands_raw reason still
+  says "complete once its ingestion job has ended"; since `2f7d69e` it means "ended normally" (the module docstring
+  says so).
+
+**(3) E8 on a scratch copy** (`artifacts/isl/phase2-smoke/research` + `isl_root_research` copied to the session
+scratchpad, private logs; `SLR_ISL_WORKDIR` pointed there; the real smoke folder, stamps and
+`artifacts/reports/trim_eval*.json` unchanged, mtimes checked):
+* no `<work>/trim_eval.json` -> `trim_eval_check.status = missing`, no numbers, label "NOT SHOWN (MISSING)";
+* the old 11:00 global `trim_eval.json` copied in -> `mismatch` ("records no trim_version ... learned=False");
+* `cli trim-eval --learned-model auto --out <work>/trim_eval.json --n 60` -> exit 0 in **10 s**; report: `trim_version
+  trim-2+trim-learned-1`, model `artifacts/isl/trim_boundary.pt` (SHA-256 `4c0efb82...`, 16:20:46), sidecar 6,521
+  records all `trim-2+trim-learned-1`; synthetic n 60: within 300 ms **0.717**, median 0 ms, late 0.083, early 0.200,
+  **learned_ends 3**; INCLUDE active kept 1.000 (n 60) -> E8 `ok`, numbers shown, label names the trimmer and time;
+* the same with a scratch copy of the model -> `ok`; copy changed -> `mismatch` ("changed after trim-eval"); copy
+  deleted -> `mismatch` ("no longer exists"); `--learned-model none` -> `mismatch` ("evaluated trim-2 but the run's
+  trims are trim-2+trim-learned-1").
+* `evaluate --all` on the scratch copy (the driver's smoke arguments): exit 0 in **296 s** (load 17-20). `report.json`
+  E8: `trim_eval_check ok`, `trim_version trim-2+trim-learned-1`, run's trims {trim-2+trim-learned-1: 6,521}, model
+  SHA-256 recorded, `learned: true`; `report.md` prints "trim-eval: **ok** - file ... (written 22:44:09Z), evaluated
+  trim-2+trim-learned-1" and "synthetic end error: within 300 ms 0.717 ... (n 60, learned ends 3)"; the overview row
+  names the trimmer. SMOKE and PARTIAL DATA labels kept. So E8 now reports the learned trimmer correctly.
+* Side observation (not an E8 problem): with the same models, the re-run changed E3 top-1 from 0.082 to **0.209**
+  (same n 890, 6 groups), E2 n 120 -> 154 and E4 n 84 -> 93, because `evaluate` reads the *current* manifests (ISLRTC
+  grew from about 6,500 to 8,600 rows since 20:28, i.e. more dictionary references). A work folder's report is
+  therefore only reproducible in the data state it was trained in: never re-run `evaluate` alone on a full-run work
+  folder after more data has arrived (re-run the driver `--from trim` instead). The data guard keeps this true for the
+  full runs, since nothing a profile reads may still be ingesting when it starts.
+Note for reading the full run's E8: the synthetic set exercises the learned end on only 3 of 60 clips (it replaces
+only `cap` ends), so the synthetic numbers mostly describe the rules; with the full run's default n they cover more
+learned ends (default `--n 300`), but the learned model's own quality is in its training report (16:20), not in E8.
+
+**(4) HF item lists.** `manifests/hf_akrit_alphabet_items.json` **10,752** items (train 9,139 + test 1,613, 33 classes,
+300-798 per class), `hf_hemg_alphabet_items.json` **42,745** (35 classes, 1,200-1,447), ids unique, written 22:21:18-19;
+`listing_status.json` "complete"; readiness expects exactly these. Neither source has started (no manifest); the queue
+(17314) is still on WSLP (chunk 30308: 200 / 1,798 this run at 22:40, 6.65-6.99 s per item on 1 worker).
+
+**(5) Checks.** Backend suite **499 passed** (64.6 s, `SLR_TORCH_THREADS=2`, nice 10, clean tree at `b3f8aac`).
+Frontend: `npm run typecheck` pass, `npx vitest run` **81 passed / 1 skipped**, `npm run build` pass.
+
+**Readiness ETAs (estimates from the rates measured 21:34-22:47).**
+* islrtc: 7,597 (21:34) -> 8,122 (22:12) -> 8,607 (22:42): 15-16 / min, 5,058 left -> **04:00-04:30 UTC**; the recut
+  job's final scan 30-60 min later.
+* WSLP: 2,213 -> 2,547 -> 2,820: 9 / min, 1,578 left -> **about 01:40-02:00 UTC**.
+* then the queue: ISL-Fingerspelling 1,304 videos (8.8 s each; 1 worker until islrtc ends, then 3) -> about
+  04:30-05:00; Mendeley static 13,792 images, CSLTR 685, agriculture 76, emergency 412 (3 workers) -> **about
+  05:30-07:30**: commercial-safe's last blocker. Then CSLTR words, the HF sets (53,497 images, 1.2-2.5 h, DATASETS 3.8)
+  and WSLP unlabelled (632 videos) -> **about 08:00-11:30**: research's last queue blocker.
+
+**For the main session (unchanged from 15.6 except where marked).**
+1. Do not restart OpenHands raw before its NewzHook listing has ended (log line `NewzHook.zip:...: <N> datasets
+   listed in <s> s`, about 23:10-23:20). If it stops before that, move
+   `data/isl/raw/openhands_raw/NewzHook.zip_NewzHook_newshook_dataset.h5.points` aside, then start it with the same
+   command from the repository root (`nohup nice -n 10 .venv/bin/python scripts/ingest_isl_pose.py openhands-raw
+   --workers 12 --budget-gb 26 --min-free-gb 8 >> data/isl/logs/ingest_pose_openhands_raw.log 2>&1 &`). After the
+   listing (`<member>.index.json` written), a restart is safe.
+2. Ready check: `scripts/phase2_train.sh --profile commercial-safe --check-only; echo $?` must print 0 (15.6 command 1).
+3. `mv artifacts/isl/commercial-safe artifacts/isl/commercial-safe.phase1_1157` (still the phase-1 smoke folder of
+   11:57: classifier, encoder, index, results.json, smoke_report.json).
+4. `nohup scripts/phase2_train.sh --profile commercial-safe --threads 4 >> data/isl/logs/phase2_driver.out 2>&1 &`
+   (13-24 h; now includes the `trim_eval` step before `evaluate`).
+5. Research, after the commercial-safe run has finished: `scripts/phase2_train.sh --profile research --check-only`
+   must print 0 (it does only after OpenHands raw ends *normally*), then
+   `nohup scripts/phase2_train.sh --profile research --threads 4 >> data/isl/logs/phase2_driver.out 2>&1 &`.
+   15.6 step 4's "stop OpenHands with SIGINT" is no longer needed (the job now ends tonight).
+6. After each run: `artifacts/isl/<profile>/eval/report.md` must not say PARTIAL DATA or SMOKE, and its "trim-eval:" line
+   must say the evaluated trimmer equals the run's (`trim_eval_check ok`).
+Owner decision still open: `mendeley_static` is a 300-per-folder sample (13,800 of 102,470 photos, DATASETS 3.8);
+"all means all" would add about 88.7k images (roughly 3-6 h of queue time on 3 workers) before research is ready.
