@@ -17,6 +17,14 @@ Sources:
 Usage:
   python scripts/ingest_isl.py include --workers 2
   python scripts/ingest_isl.py islrtc --workers 2 [--limit N]
+  # re-extract specific long ISLRTC entries in full (no title-card cut) into their own folder/manifest:
+  python scripts/ingest_isl.py islrtc --only A/Alphabet.mp4 Numbers/Numbers_(0-1_Crore).mp4 \
+      --full --max-s 120 --out-subdir islrtc_full
+
+Options added after the first run (backward compatible: the default behaviour, ids and manifest format are
+unchanged): --only, --max-s, --out-subdir, --full. INCLUDE videos stored one level deeper in an Extra/
+folder now get the right gloss/category fields; their ids keep the original formula so a restarted job
+does not process them twice (the ISL adapters rebuild canonical ids from the member path).
 """
 
 from __future__ import annotations
@@ -178,10 +186,13 @@ def _cut_at_card(frames, stop):
         yield f, t
 
 
-def work_item(kind: str, src: str, out: str) -> dict:
+def work_item(kind: str, src: str, out: str, max_s: float | None = None) -> dict:
     t0 = time.time()
     try:
-        info = extract_full(src, out) if kind == "full" else extract_opening_sign(src, out)
+        if kind == "full":
+            info = extract_full(src, out) if max_s is None else extract_full(src, out, max_s=max_s)
+        else:
+            info = extract_opening_sign(src, out) if max_s is None else extract_opening_sign(src, out, max_s=max_s)
         info["ok"] = True
     except Exception as e:  # keep the job going; failures are listed in the manifest
         info = {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]}
@@ -261,11 +272,15 @@ def run_include(args) -> None:
                 futs = []
                 for m in members:
                     parts = Path(m).parts
-                    # <Category>/<NN. Word>/<file>
+                    # <Category>/<NN. Word>/<file>; the id keeps this original formula (resume compatibility)
                     word_dir = parts[-2] if len(parts) >= 2 else ""
                     category = parts[-3] if len(parts) >= 3 else z["key"].split("_")[0]
-                    gloss = word_dir.split(".", 1)[1].strip() if "." in word_dir else word_dir
                     vid = f"include/{category}/{word_dir}/{Path(m).stem}".replace(" ", "_")
+                    # gloss/category ignore an "Extra" folder level (<Category>/<NN. Word>/Extra/<file>)
+                    dirs = [p for p in parts[:-1] if p.lower() != "extra"]
+                    if len(dirs) >= 2:
+                        category, word_dir = dirs[-2], dirs[-1]
+                    gloss = word_dir.split(".", 1)[1].strip() if "." in word_dir else word_dir
                     if vid in man.done:
                         continue
                     out = out_dir / (vid.split("/", 1)[1].replace("/", "__") + ".npz")
@@ -298,9 +313,12 @@ def _hf_list(folder: str) -> list[dict]:
 
 
 def run_islrtc(args) -> None:
-    out_dir = DATA / "landmarks" / "islrtc"
+    sub = getattr(args, "out_subdir", None) or "islrtc"
+    out_dir = DATA / "landmarks" / sub
     out_dir.mkdir(parents=True, exist_ok=True)
-    man = Manifest(DATA / "manifests" / "islrtc.jsonl")
+    man = Manifest(DATA / "manifests" / f"{sub}.jsonl")
+    kind = "full" if getattr(args, "full", False) else "opening"
+    max_s = getattr(args, "max_s", None)
     index_path = DATA / "manifests" / "islrtc_index.json"
     if index_path.exists():
         files = json.loads(index_path.read_text())
@@ -313,13 +331,21 @@ def run_islrtc(args) -> None:
             log.info("indexed %s: %d files so far", folder, len(files))
         index_path.write_text(json.dumps(files))
     todo = [f for f in files if f"islrtc/{f['path']}" not in man.done]
+    only = getattr(args, "only", None)
+    if only:
+        want = {o.removeprefix("islrtc/") for o in only}
+        todo = [f for f in todo if f["path"] in want]
+        missing = want - {f["path"] for f in files}
+        if missing:
+            log.warning("--only: %d ids not in the ISLRTC index: %s", len(missing), sorted(missing)[:10])
     if args.limit:
         todo = todo[: args.limit]
     log.info("islrtc: %d of %d videos to process", len(todo), len(files))
     tmp_root = Path(args.tmp)
     tmp_root.mkdir(parents=True, exist_ok=True)
-    for stale in tmp_root.glob("islrtc_*"):
-        stale.unlink(missing_ok=True)
+    if sub == "islrtc":  # never delete the temp files of a concurrently running default job otherwise
+        for stale in tmp_root.glob("islrtc_*"):
+            stale.unlink(missing_ok=True)
 
     # Prefetch downloads in a thread so the CPU workers never wait on the network.
     import queue
@@ -353,7 +379,9 @@ def run_islrtc(args) -> None:
             meta = {"id": f"islrtc/{rel}", "source": "islrtc", "gloss": _gloss_from_name(rel),
                     "category": "number" if folder == "Numbers" else "dictionary",
                     "path": str(out.relative_to(ROOT))}
-            pending.append((meta, dest, pool.submit(work_item, "opening", str(dest), str(out))))
+            if kind == "full":
+                meta["stop"] = "full"
+            pending.append((meta, dest, pool.submit(work_item, kind, str(dest), str(out), max_s)))
             while len(pending) >= args.workers * 2 or (pending and pending[0][2].done()):
                 meta, d, fut = pending.pop(0)
                 meta.update(fut.result())
@@ -375,6 +403,11 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--tmp", default=str(DATA / "tmp"))
+    ap.add_argument("--only", nargs="+", help="ISLRTC: process only these paths (e.g. A/Alphabet.mp4)")
+    ap.add_argument("--max-s", type=float, default=None, help="seconds kept per video (default 10 / 20)")
+    ap.add_argument("--out-subdir", default=None,
+                    help="ISLRTC: landmarks/<name>/ and manifests/<name>.jsonl instead of islrtc")
+    ap.add_argument("--full", action="store_true", help="ISLRTC: keep the whole clip (no title-card cut)")
     args = ap.parse_args()
     Path(args.tmp).mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

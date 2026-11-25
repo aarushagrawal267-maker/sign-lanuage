@@ -1,0 +1,15 @@
+# Manual fixes for the ISL vocabulary (docs/ISL_DESIGN.md section 6.1, rule 11). Tracked in git.
+# Each entry: match = regular expression searched in the source path ("islrtc/<Folder>/<File>.mp4",
+# "include/<Category>/<NN. Word>", "cislr/<word>"); set = ParsedName fields to overwrite
+# (headword, synonyms, sense, domain, region, sign_no, kind, number_value, text) or flags_add: [..].
+# Overrides win over every automatic rule. Keep a short reason next to each entry.
+
+# Long multi-sign reference videos (alphabet / number charts): not one sign, never indexed.
+- match: '^islrtc/A/Alphabet\.mp4$'
+  set: {kind: compilation}
+- match: '^islrtc/G/Greek_Alphabets\.mp4$'
+  set: {kind: compilation}
+- match: '^islrtc/A/Ancient_Alphabets\.mp4$'
+  set: {kind: compilation}
+- match: '^islrtc/Numbers/Numbers'
+  set: {kind: compilation}
