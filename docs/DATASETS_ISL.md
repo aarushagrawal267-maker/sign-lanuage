@@ -27,6 +27,11 @@ running, partial data). Every number below says when and on how much data it was
 | WordNet 3.0 (via NLTK data) | synonym lists, part of speech, coarse categories | WordNet licence (permissive) | yes | both | public |
 | MediaPipe Holistic | landmark extractor | Apache-2.0 | yes | both | bundled |
 | pose-format (only for reading iSign; our reader is self-contained) | `.pose` file layout | MIT | yes | research | optional |
+| **GloSL-ISL** (`pedroodb/glosl-isl`, Hugging Face) <!-- pose-sources --> | iSign / ISLTranslate MediaPipe Holistic poses re-packaged per clip: 126,846 sentence clips, 269 h, English text, source-video-disjoint splits (101,481 / 12,683 / 12,682) | CC BY-NC 4.0 (card); iSign author's permission to include the poses recorded in `card.json` (8 Oct 2026: poses only, no video clips, cite five papers) | **no** | research only (pre-training, sentence data, negatives) | public |
+| **ISL500 / ISL-DATA** (`ISL500/ISL-DATA`, Hugging Face) <!-- pose-sources --> | 500 words x 15 signers (Goa); 86,760 landmark clips (MediaPipe hands `.h5` + MMPose COCO-WholeBody `.npy`), 7,500 MP4s | "research and academic use only; contact the authors for commercial use" (card), no SPDX licence | **no** | research only | public |
+| **OpenHands raw ISL poses** (AI4Bharat, zenodo record 5558897) <!-- pose-sources --> | about 1,129 h unlabelled MediaPipe Holistic poses (pose + hands, no face) from five Indian deaf-community YouTube channels (Sign Library, NIOS, ISH News, MBM Vadodara, NewzHook) | CC BY 4.0 (zenodo metadata), but derived from third-party YouTube videos | undecided: **research only until the owner decides** | research only (pre-training) | public |
+| **OpenHands Indian fingerspelling** (AI4Bharat, zenodo record 6731224, `Indian.zip`) <!-- pose-sources --> | 172 clips of 36 glosses (a-z, zero-nine), 123 train / 49 test | CC BY 4.0 (zenodo metadata); origin of the clips undocumented | undecided: research only until the origin is known | research only (fingerspelling smoke tests) | public |
+| h5py <!-- pose-sources --> | reads the ISL500 / OpenHands HDF5 files (`scripts/ingest_isl_pose.py`) | BSD-3-Clause | yes | both | pip (`.venv`) |
 | **IndicTrans2** en-indic distilled 200M (AI4Bharat), `ai4bharat/indictrans2-en-indic-dist-200M` | offline English -> Hindi drafts for `lexicon_hi.jsonl` (section 10); never shipped with or run by the app | MIT (model card + `LICENSE`, checked 25 Nov 2026) | yes; the Hindi rows it drafts are ours to license with the repository | both | official repo is "gated: auto" (contact details); fetched from a byte-identical public mirror verified against the official git object ids (`backend/app/isl/text/mt.py`) |
 | Hindi core word list (`backend/app/isl/text/data/hindi_core.tsv`) | about 990 hand-written everyday words and senses (870 match an ISL concept, all 100 WLASL glosses) | project licence (written for this repository) | yes | both | tracked |
 | User sign packs ("My signs") | user recordings as landmarks | chosen by the author at export (default CC BY 4.0) | per pack | never in global training | local |
@@ -64,6 +69,14 @@ claim and does not change this.
   WSLP @ AACL-IJCNLP 2025, CC BY-NC 4.0, https://huggingface.co/datasets/kirandevraj/ISL-Fingerspelling"; the two Hugging
   Face alphabet image sets have no licence, so nothing derived from them may leave the research profile.
 
+* Research profile only (pose-native sources) <!-- pose-sources -->: "GloSL-ISL (pedroodb/glosl-isl), CC BY-NC 4.0: iSign
+  (A. Joshi et al., Findings of ACL 2024), ISLTranslate (A. Joshi et al., Findings of ACL 2023), CISLR (EMNLP 2022),
+  PoseStitch-SLT (EMNLP 2025), WSLP 2025 overview"; "ISL-DATA / ISL500, https://huggingface.co/datasets/ISL500/ISL-DATA,
+  research and academic use only"; "P. Selvaraj, G. NC, P. Kumar, M. Khapra, OpenHands: Making Sign Language Recognition
+  Accessible with Pose-based Pretrained Models across Languages, ACL 2022; raw ISL poses https://zenodo.org/records/5558897
+  and fingerspelling poses https://zenodo.org/records/6731224, CC BY 4.0 (zenodo label)". GloSL inherits iSign's
+  non-commercial terms; models pre-trained on it stay research-only.
+
 ### Data profiles (`backend/app/isl/profiles.py`)
 
 | Profile | Training / index / calibration sources | Pre-training only | Commercial |
@@ -72,6 +85,11 @@ claim and does not change this.
 | `research` | INCLUDE, ISLRTC, CISLR, iSign | WLASL, iSign | no |
 
 User data never enters a global model in either profile. The profile name is written into every derived artifact.
+
+Pose-native sources (section 3.4) are not yet registered in `profiles.py` / `sources.ADAPTERS` (that is the model
+owner's call); `app.isl.data.pose_sources.PROFILE_SOURCES` says where they belong <!-- pose-sources -->: `research`
+gains `isl500` and `openhands_fs` (labelled) and `glosl`, `openhands_raw` (pre-training only); `commercial-safe` gains
+nothing. `pose_sources.register(ADAPTERS)` adds the adapters to a registry.
 
 ---
 
@@ -92,6 +110,7 @@ User data never enters a global model in either profile. The profile name is wri
 | `manifests/islrtc_full.jsonl`, `landmarks/islrtc_full/*.npz` | `scripts/ingest_isl.py islrtc --only ... --full --max-s 120 --out-subdir islrtc_full` (25 Nov, 7 entries) | full-length re-extraction of `A/Alphabet`, `F/Fingerspell` and the five `Numbers_*` compilation videos. Finding: `Alphabet` and `Fingerspell` (3.8 s / 3.4 s) are the signs for those *words*, not A-Z sequences, so the open data has **no fingerspelling letters**; see ISL_DESIGN.md 6.7 |
 | `manifests/<source>.jsonl`, `landmarks/<source>/*.npz`, `manifests/<source>_items.json`, `raw/<source>/`, `raw/mendeley/` | `scripts/ingest_isl_video.py run <source>` (queue: `scripts/isl_queue.sh`) | video / image sources of section 3.3 (`wslp`, `isl_fingerspelling`, `isl_csltr`, `isl_csltr_words`, `mendeley_emergency`, `mendeley_agri`, `mendeley_static`, `hf_hemg_alphabet`, `hf_akrit_alphabet`; `cislr` shares `cislr.jsonl`). `_items.json` = the exact item list (sample) of the last run; `raw/` = cached CSVs and listings |
 | `logs/queue.log`, `logs/video_<source>.{log,out}` | `scripts/isl_queue.sh` | one line per chunk; per-source progress |
+| `manifests/{glosl,isl500,openhands_raw,openhands_fs}.jsonl`, `landmarks/<source>/**/*.npz`, `raw/<source>/`, `derived/glosl_isign_uids.txt`, `derived/isl500_links.jsonl`, `manifests/openhands_raw_members_done.txt`, `logs/ingest_pose_<source>.log` <!-- pose-sources --> | `scripts/ingest_isl_pose.py` (section 3.4) | pose-native sources converted to `RawSequence` (float16, about 15 fps); `raw/` holds the small CSV/JSON files, the HF revision used and (OpenHands) per-member dataset indexes |
 | `../my_signs/<pack>/` | the app (My signs) | users' own signs as landmarks, `alphabet.npz` letter calibration; local only |
 
 Model build outputs (git-ignored, `artifacts/`): `artifacts/isl/<profile>/` (classifier.pt, encoder.pt, index/,
@@ -225,6 +244,83 @@ Open checks: CSLTR sentence-level glosses need alignment before they can label s
 hand-only emergency clips help a full-body webcam model is untested; the HF image sets are likely augmented duplicates
 (SHA-256 dedupe only catches byte copies).
 
+### 3.4 Pose-native sources (`scripts/ingest_isl_pose.py`) <!-- pose-sources -->
+
+Owner: Data Engineer, 25 Nov 2026. Code: `backend/app/isl/data/pose_sources/` (`common` storage / quality / disk
+guard, `posefmt` pose-format reader, `glosl`, `isl500`, `openhands`, `fingerspell`; the package is not called
+`sources/` because `app/isl/data/sources.py` exists). Tests: `backend/tests/isl/test_pose_sources.py` (synthetic, no
+network). These sources ship landmarks, so ingestion is a format conversion with no MediaPipe run (except the tiny
+fingerspelling set) and little CPU; the jobs are network-bound.
+
+```
+nice -n 10 .venv/bin/python scripts/ingest_isl_pose.py glosl --workers 8
+nice -n 10 .venv/bin/python scripts/ingest_isl_pose.py isl500 --workers 6
+nice -n 10 .venv/bin/python scripts/ingest_isl_pose.py openhands-raw --workers 8 --budget-gb 12
+nice -n 10 .venv/bin/python scripts/ingest_isl_pose.py openhands-fs
+.venv/bin/python scripts/ingest_isl_pose.py isl500-links   # ISL500 glosses -> vocabulary (derived/isl500_links.jsonl)
+.venv/bin/python scripts/ingest_isl_pose.py status        # counts, frames, disk per source
+```
+
+Conventions shared with `scripts/ingest_isl.py`: manifest `manifests/<source>.jsonl` (id, source, gloss, path relative
+to the repo, n_frames, fps, hands_frac, ok, error, secs, plus per-source fields), resumable (ok ids are skipped),
+failures retried on the next run. Every job holds a lock (`manifests/<source>.lock`) so a second copy exits, and
+stops cleanly (exit code 3) before free disk drops under 12 GB (`--min-free-gb`). Nothing is downloaded to disk except
+small CSV/JSON files and the 28 MB fingerspelling zip; pose files are converted in memory.
+
+**Storage.** Landmark arrays are saved as **float16** (`--dtype float32` keeps full precision) and strided to about
+**15 fps** (`--target-fps`, same rule as INCLUDE: step = round(fps / 15); 25/29/30 fps -> step 2). `t_ms` stays
+float64 and keeps the real timestamps. The `.npz` keys are the usual `RawSequence` keys (plus `storage`), so
+`RawSequence.load` reads them; the adapters yield `PoseClip`s whose `load()` upcasts to float32. float16 error on a
+real GloSL clip: at most 0.0009 (normalised units) on pose points, 0.0002 on hands. Measured size: 531 bytes per
+stored frame (GloSL), about 360 bytes (OpenHands, no face).
+
+| Source | Input (inspected 25 Nov 2026) | Conversion -> `RawSequence` | Parity check | `extractor_version` |
+|---|---|---|---|---|
+| `glosl` | `poses/<NNNN>/<id>.pose`, pose-format v0.2, 543 points (pose 33, face 468, hands 21+21), x/y pixels of the header size, **z raw**, missing = (0,0,0) conf 0, fps 25 (57,042 clips) / 29 (69,490) / 30 / 12 | `posefmt.holistic_pose_to_raw`: x/W, y/H, z copied (pose-format's Holistic writer does not scale z), visibility = confidence, a part is present in a frame when any of its points has confidence > 0, face = `FACE_IDX` of the 468 mesh points (same first 468 as our 478), `t_ms = i * 1000 / fps` | real clips: the left hand's wrist lies on pose point 15 (median 0.017 vs 0.33 for point 16), as in our INCLUDE extractions (0.011 vs 0.18), so no hand swap; z ranges (pose median -0.72, hands -0.03..0.004, face -0.04..0.08) are raw MediaPipe values like ours, not pixels. Most headers say 300x300; the hand-bone aspect estimate on 14 of them gives 0.85-1.07, i.e. square signer crops, and 0.82 / 0.85 on two files with real crop sizes 620x712 / 584x672 (0.87); kept as is, per-clip `aspect_est` in the manifest. No GloSL video is available to compare frame by frame (the card forbids using the clips) | `glosl-pose-format` |
+| `isl500` | `Landmarks/MediaPipe/ISL_DATA_USER0NN/*.h5` (86,760 files, 2.5 GB): one dataset `intermediate` (T, 2, 21, 3) = MediaPipe **hands only** (index 0 = signer's left), 30 fps; `Landmarks/Pose/User0NN/[Round1/]*.npy` (about 21 GB): MMPose COCO-WholeBody (T, 133, 3) px + score | hands from the h5 as they are; pose 33 from WholeBody body/feet points mapped to MediaPipe indices (eyes inner/outer and mouth from the 68-point face, pinky/index/thumb from the WholeBody hand knuckles), z = 0, visibility = score, present when nose or a shoulder score >= 0.3; face `FACE_IDX` from iBUG-68 equivalents (z = 0); frame size from the two views of the same hand (WholeBody px / MediaPipe normalised) snapped to a standard size | our `HolisticExtractor` on the released MP4 `USER001/Absent__session106__clip014` (2560x1440, same 166 frames; errors in shoulder widths): hands 0.012-0.019 at lag 0, nose / shoulders / elbows 0.02-0.05, wrists 0.07-0.09 when the hand is visible (0.4 when off-screen: both models guess), face points 0.004-0.035; size estimate 2556x1442 -> 2560x1440. Close, not identical: pose z is 0 and some face points are approximations, so the version tag keeps the clips separable | `isl500-mphands+mmpose-wb` |
+| `openhands_raw` | 5 zips (3.0 / 11.2 / 15.7 / 23.3 / 61.2 GB), each with one or two deflated HDF5 files; groups `keypoints/<chunk>` (T, 75, 3) float64 and `visibility/<chunk>` (T, 75), contiguous, in file order; 75 = pose 33 + left hand + right hand, normalised x/y, raw z, missing = zeros; no fps, no frame size, no face | `openhands.openhands_to_raw`: pose / hands copied, visibility as pose channel 4, face all missing, fps 25 (what OpenHands' own sampler assumes; 1-minute chunks hold 1,536 frames = 25.6 fps), width/height from the per-chunk hand-bone aspect snapped to 16:9 / 4:3 / 1:1 / 3:4 / 9:16 when within 20 % (Sign Library: estimates 1.5-1.8) | left hand on pose point 15 (median 0.018 vs 0.21), same convention as ours | `openhands-raw-mp-holistic` |
+| `openhands_fs` | `Indian.zip`: MP4 + pickled poses | the pickles are never loaded (untrusted pickle = code execution); our own extractor runs on the 172 MP4s (`ingest_isl.extract_full`, 15 fps, float32) | exact (same extractor) | `holistic-v1` |
+
+**Streaming the OpenHands archives** (`openhands.SeekableInflate`): the zip member is inflated from HTTP range
+requests with parallel read-ahead (Zenodo gives about 1 MB/s per connection; 8 parallel 8 MB blocks gave 6 MB/s).
+While inflating, a `zlib` snapshot is kept every max(4 MB, size / 3000) of output so backward seeks restart nearby,
+and 4 KB pages that look like HDF5 metadata (a block signature, or under 99 % plausible float64 words) are kept in
+memory (Sign Library 1-minute file: 195 of 357,076 pages, enough for h5py to list all 748 datasets). Pass 1 lists
+the datasets and their object-header addresses with h5py (one streaming pass; the list is cached in
+`raw/openhands_raw/<member>.index.json`), pass 2 parses each small version-1 object header itself and reads the data
+in address order. Network cost about twice the compressed size; no temp files; peak memory about 0.5 GB. Chunks of a
+video already ingested from another file of the same channel (Sign Library ships `1_min_splits` and `sub_based`) are
+skipped. Zips are processed smallest first until `landmarks/openhands_raw/` reaches `--budget-gb` (12 GB): at about
+360 B per stored frame that is roughly Sign Library + NIOS + ISH News and part of MBM Vadodara (estimate).
+
+**GloSL and iSign overlap.** The GloSL `id` is the iSign / ISLTranslate `uid`: 30,648 of the 31,221 public
+ISLTranslate uids (`ISLTranslate.csv`, GitHub) are GloSL ids (iSign itself is still gated, so the rest is
+unverified). The manifest keeps `isign_uid` and `in_isltranslate`; `derived/glosl_isign_uids.txt` lists all 126,846
+ids. Any future iSign ingest must drop `isign/<uid>` for those uids (`glosl.isign_duplicates`), otherwise the same
+poses enter pre-training twice. GloSL also ships `diagnostics/joint_train_exclude.csv` (flag `joint_train_exclude`).
+
+**ISL500 details.** Ids `isl500/<userNNN>/<clip>`; some files carry an export-path prefix
+(`_mnt_..._R2_Clips_R2_user001_Absent__session7__clip000`, `R2_..._user002_...`), stripped by `isl500.clip_key` (4 ids
+collide after stripping: the first file wins). Gloss = file name before `__` without an `R2_` prefix (500 glosses).
+`group = isl500-userNNN` (true signer ids: 15 signers) so splits can be signer-independent; the shipped
+`PersonDependentTrain/Test.csv` split is kept as `pd_split`. 6,391 clips have no WholeBody file and are skipped
+(hands only, no body to normalise). Hands are visible in only about 30 % of the raw frames (long rests), so each
+record stores `active_start/active_end` (first..last hand frame +- 2) and the adapter slices to it.
+Vocabulary links (`isl500-links`, vocabulary linker of `vocab/build.py`, 25 Nov 2026): 483 exact, 8 synonym-list
+(Author, Cheap, Clean, Cry, House, Marry, Upset, Woman), 3 domain-qualified (Old, Rain, Tight), 6 unlinked (Fine,
+Little: ambiguous; Photgraph: source typo; Wanted; Washface; Washhands). Plan if the hybrid features prove too
+different: re-extract the 7,500 released MP4s (one per word and signer, about 21 MB each, 159 GB) one file at a time
+with our extractor once the CPU is free (estimate 8-10 CPU hours).
+
+**Jobs started 25 Nov 2026** (detached, `nice -n 10`, logs `data/isl/logs/ingest_pose_<source>.log`): `glosl`
+(8 download threads, 12.6 clips/s, ETA about 17:40 UTC), `isl500` (6 threads, 5.8 clips/s, ETA about 19:00 UTC),
+`openhands-raw` (8 read-ahead, 6 MB/s, budget 12 GB, ETA about 20:30 UTC), `openhands-fs` (minutes). Measured on the
+first 1-3k items; every count in this section must be refreshed when the jobs finish.
+
+**Not done / open**: none of these sources is registered in `profiles.py` yet; no model has been trained on them, so
+nothing here says anything about accuracy.
+
+
 ---
 
 ## 4. Vocabulary (`python -m app.isl.cli vocab`)
@@ -326,6 +422,13 @@ python -m app.isl.cli hindi --merge-local            # fold reviewed local Hindi
 * CISLR licence review (videos collected from third-party online sources) before any commercial use.
 * iSign hand labelling (left/right) to be verified on real data.
 * Hindi lexicon: curated rows await a native-speaker teacher; machine rows are unreviewed drafts (section 10).
+* Pose-native sources (3.4) <!-- pose-sources -->: register them in `profiles.py` / `sources.ADAPTERS`; decide the
+  OpenHands raw corpus (CC BY label on third-party YouTube content) and fingerspelling set before any commercial use;
+  ISL500 signs were recorded in Goa and 14 of its 500 words link only through a synonym / domain rule or not at all
+  (`derived/isl500_links.jsonl`), so check sign forms against ISLRTC before mixing them into one class; frame aspect
+  of GloSL / OpenHands is a hand-bone estimate (about +-10 %).
+* `isign.pose_to_raw` divides z by the frame width, but pose-format's Holistic writer stores raw MediaPipe z (and our
+  extractor stores raw z): fix it (or use `pose_sources.posefmt.holistic_pose_to_raw`) before the iSign job runs.
 
 ---
 
