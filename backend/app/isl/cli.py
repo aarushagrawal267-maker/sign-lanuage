@@ -1,4 +1,4 @@
-"""ISL command-line interface (data commands; model commands are added by later phases).
+"""ISL command-line interface: data commands (Data Engineer) and model commands (AI Engineer).
 
 Run from the backend folder:  python -m app.isl.cli <command> [options]
 (heavy commands: prefix with ``nice -n 10`` while the ingestion jobs run)
@@ -18,6 +18,20 @@ Run from the backend folder:  python -m app.isl.cli <command> [options]
                          near-duplicate clips across/within sources -> data/isl/derived/duplicates.jsonl
   access                 Hugging Face access check for CISLR and iSign (exit 0 = all granted, 3 = pending)
   profiles               print the data profiles (commercial-safe, research)
+
+Model commands (heavy: run with ``nice -n 10``; ``--threads`` defaults to 2 while ingestion runs). Every command
+takes ``--profile commercial-safe|research`` (default: $SLR_ISL_PROFILE or commercial-safe); outputs go to
+artifacts/isl/<profile>/ and build-pack copies them to artifacts/packs/<isl|isl-research>/ (git-ignored).
+
+  train-classifier       closed-set core-word classifier (INCLUDE + ISLRTC clips of the same concepts)
+  train-encoder          metric-learning encoder (SupCon + sub-centre ArcFace) over every concept with clips
+  build-index            nearest-neighbour index over ISLRTC first-sign trims (+ alt ends) and INCLUDE centroids
+  train-letters --clips A.npz [B.npz ...] [--letters ABC...]
+                         letter model from in-order alphabet recordings (none exist in the open data yet)
+  fit-fusion             fusion weights, temperature, accept/suggest thresholds, out-of-vocabulary guard (val fold)
+  evaluate               E1/E2/E3/E6 on the test fold -> results.json (+ results.md)
+  build-pack             assemble the language pack the app loads
+  smoke                  all of the above with tiny settings (a few CPU minutes) on whatever data is on disk
 
 Gated-dataset ingestion lives in ``scripts/ingest_isl_gated.py`` (CISLR, iSign).
 """
@@ -491,11 +505,196 @@ def cmd_profiles(paths: IslPaths, args) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------------------------- model commands
+
+def _model_ctx(paths: IslPaths, args):
+    from app.core.config import get_settings
+    from app.isl.profiles import get_profile
+    from app.isl.training.common import ISL_FEATURES, load_isl_data, load_vocab, set_threads
+    from app.isl.training.pipeline import workdir
+
+    set_threads(args.threads)
+    profile = get_profile(args.profile or get_settings().isl_profile).name
+    vocab = load_vocab()
+    data = load_isl_data(paths, vocab, profile, args.split, max_islrtc=args.max_islrtc or None, seed=args.seed)
+    return profile, data, ISL_FEATURES, workdir(profile)
+
+
+def _train_cfg(args, smoke_defaults: dict):
+    from app.training.trainer import TrainConfig
+
+    d = dict(smoke_defaults) if args.smoke else {}
+    for k in ("epochs", "hidden", "layers", "batch_size", "lr", "patience"):
+        v = getattr(args, k, None)
+        if v is not None:
+            d[k] = v
+    return TrainConfig(**d)
+
+
+SMOKE_CLS = {"hidden": 64, "layers": 1, "epochs": 8, "batch_size": 32, "patience": 8, "lr": 3e-3}
+SMOKE_ENC = {"hidden": 64, "layers": 1, "epochs": 4, "batch_size": 32, "patience": 4, "lr": 2e-3}
+
+
+def _log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def cmd_train_classifier(paths: IslPaths, args) -> int:
+    from app.isl.training.train_classifier import train_classifier
+
+    profile, data, fcfg, work = _model_ctx(paths, args)
+    _print({"data": data.summary()})
+    res = train_classifier(data, work / "classifier.pt", fcfg, _train_cfg(args, SMOKE_CLS), smoke=args.smoke,
+                           threads=args.threads, progress=lambda f, m: _log(f"  classifier {m}"))
+    _print(res)
+    return 0
+
+
+def cmd_train_encoder(paths: IslPaths, args) -> int:
+    from app.isl.training.train_encoder import train_encoder
+
+    profile, data, fcfg, work = _model_ctx(paths, args)
+    _print({"data": data.summary()})
+    res = train_encoder(data, work / "encoder.pt", fcfg, _train_cfg(args, SMOKE_ENC),
+                        emb_dim=args.emb_dim or (128 if args.smoke else 256), p=args.p, k=args.k, smoke=args.smoke,
+                        threads=args.threads, batches_per_epoch=args.batches or (20 if args.smoke else None),
+                        progress=lambda f, m: _log(f"  encoder {m}"))
+    _print(res)
+    return 0
+
+
+def cmd_build_index(paths: IslPaths, args) -> int:
+    from app.isl.models.encoder import EncoderPredictor
+    from app.isl.training.build_index import build_index
+
+    profile, data, fcfg, work = _model_ctx(paths, args)
+    enc = EncoderPredictor(work / "encoder.pt")
+    include = data.include_part("train") if not args.all_include else [c for c in data.include if c.concept_id]
+    _print(build_index(enc, data.islrtc, include, work / "index", profile))
+    return 0
+
+
+def cmd_fit_fusion(paths: IslPaths, args) -> int:
+    from app.isl.training.fit_fusion import fit_fusion
+    from app.isl.training.pipeline import load_recognizer
+
+    profile, data, fcfg, work = _model_ctx(paths, args)
+    rec = load_recognizer(work, fcfg, profile=profile)
+    params, rep = fit_fusion(rec, data.include_part("val"), profile)
+    params.save(work / "fusion.json")
+    _print(rep)
+    return 0
+
+
+def cmd_evaluate(paths: IslPaths, args) -> int:
+    from app.isl.training.pipeline import evaluate
+
+    profile, data, fcfg, work = _model_ctx(paths, args)
+    doc = evaluate(work, data, fcfg, smoke=args.smoke, part=args.part)
+    _print({k: {"n": v.get("n"), "metrics": v.get("metrics")} for k, v in doc["protocols"].items()})
+    return 0
+
+
+def cmd_train_letters(paths: IslPaths, args) -> int:
+    import string
+
+    from app.isl.training.pipeline import workdir
+    from app.isl.training.train_letters import examples_from_sequence, train_letter_model
+    from app.landmarks.raw import RawSequence
+
+    letters = list(args.letters or string.ascii_uppercase)
+    X, y, noise = [], [], []
+    for c in args.clips or []:
+        x1, y1, n1 = examples_from_sequence(RawSequence.load(Path(c)), letters)
+        X += x1
+        y += y1
+        noise += n1
+    if not X:
+        _print({"skipped": True, "reason": "no in-order alphabet recordings given (--clips) or no holds aligned. The "
+                "ISLRTC dictionary has no A-Z video; spelling mode uses each user's alphabet calibration instead."})
+        return 0
+    out = workdir(args.profile or "commercial-safe") / "letters.pt"
+    _print(train_letter_model(X, y, noise, out, n_signers=args.signers, source=",".join(args.clips)))
+    return 0
+
+
+def cmd_build_pack(paths: IslPaths, args) -> int:
+    from app.isl.profiles import get_profile
+    from app.isl.training.common import ISL_FEATURES
+    from app.isl.training.pipeline import build_pack, workdir
+
+    profile = get_profile(args.profile or "commercial-safe").name
+    _print(build_pack(workdir(profile), profile, ISL_FEATURES, Path(args.out) if args.out else None, smoke=args.smoke))
+    return 0
+
+
+def cmd_smoke(paths: IslPaths, args) -> int:
+    """End-to-end smoke run on the data on disk: classifier, encoder, index, fusion, evaluation, pack."""
+    import time
+
+    from app.isl.models.encoder import EncoderPredictor
+    from app.isl.training.build_index import build_index
+    from app.isl.training.fit_fusion import fit_fusion
+    from app.isl.training.pipeline import build_pack, evaluate, load_recognizer
+    from app.isl.training.train_classifier import train_classifier
+    from app.isl.training.train_encoder import train_encoder
+
+    args.smoke = True
+    t0 = time.time()
+    # first-sign trims for dictionary clips ingested since the last run (incremental, a few ms per clip)
+    cmd_trim(paths, argparse.Namespace(redo=False, limit=0, learned=False))
+    profile, data, fcfg, work = _model_ctx(paths, args)
+    report: dict = {"data": data.summary(), "work": str(work)}
+    _log(f"[smoke] data: {report['data']}")
+    report["classifier"] = train_classifier(data, work / "classifier.pt", fcfg, _train_cfg(args, SMOKE_CLS), smoke=True,
+                                            threads=args.threads, progress=lambda f, m: _log(f"  classifier {m}"))
+    _log(f"[smoke] classifier: {report['classifier']}")
+    report["encoder"] = train_encoder(data, work / "encoder.pt", fcfg, _train_cfg(args, SMOKE_ENC), emb_dim=128, p=args.p,
+                                      k=args.k, smoke=True, threads=args.threads, batches_per_epoch=args.batches or 20,
+                                      progress=lambda f, m: _log(f"  encoder {m}"))
+    _log(f"[smoke] encoder: {report['encoder']}")
+    report["index"] = build_index(EncoderPredictor(work / "encoder.pt"), data.islrtc, data.include_part("train"),
+                                  work / "index", profile)
+    _log(f"[smoke] index: {report['index']}")
+    rec = load_recognizer(work, fcfg, profile=profile)
+    params, report["fusion"] = fit_fusion(rec, data.include_part("val"), profile)
+    params.save(work / "fusion.json")
+    _log(f"[smoke] fusion: {report['fusion'].get('weights')} {report['fusion'].get('thresholds')}")
+    doc = evaluate(work, data, fcfg, smoke=True)
+    report["evaluation"] = {k: {"n": v.get("n"), "metrics": v.get("metrics")} for k, v in doc["protocols"].items()}
+    report["pack"] = build_pack(work, profile, fcfg, Path(args.out) if args.out else None, smoke=True)
+    report["seconds"] = round(time.time() - t0, 1)
+    (work / "smoke_report.json").write_text(json.dumps(report, indent=1, default=str))
+    _print(report)
+    return 0
+
+
 COMMANDS = {
     "status": cmd_status, "wordnet": cmd_wordnet, "vocab": cmd_vocab, "trim": cmd_trim,
     "trim-review": cmd_trim_review, "trim-eval": cmd_trim_eval, "splits": cmd_splits, "dedup": cmd_dedup,
     "access": cmd_access, "profiles": cmd_profiles,
+    "train-classifier": cmd_train_classifier, "train-encoder": cmd_train_encoder, "build-index": cmd_build_index,
+    "fit-fusion": cmd_fit_fusion, "evaluate": cmd_evaluate, "train-letters": cmd_train_letters,
+    "build-pack": cmd_build_pack, "smoke": cmd_smoke,
 }
+
+
+def _model_args(sp, train: bool = False) -> None:
+    sp.add_argument("--profile", choices=["commercial-safe", "research"], default=None)
+    sp.add_argument("--split", help="INCLUDE split name (default: the primary split, fold 0)")
+    sp.add_argument("--threads", type=int, default=2)
+    sp.add_argument("--seed", type=int, default=0)
+    sp.add_argument("--max-islrtc", type=int, default=0, help="use at most N ISLRTC clips (0 = all)")
+    sp.add_argument("--smoke", action="store_true", help="tiny settings; results are labelled as a smoke run")
+    sp.add_argument("--out", help="build-pack / smoke: pack output folder")
+    if train:
+        for k, t in (("epochs", int), ("hidden", int), ("layers", int), ("batch-size", int), ("lr", float),
+                     ("patience", int)):
+            sp.add_argument(f"--{k}", type=t, default=None)
+        sp.add_argument("--emb-dim", type=int, default=None)
+        sp.add_argument("--p", type=int, default=32, help="encoder: concepts per batch")
+        sp.add_argument("--k", type=int, default=2, help="encoder: clips per concept in a batch")
+        sp.add_argument("--batches", type=int, default=None, help="encoder: batches per epoch")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -537,6 +736,20 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--threshold", type=float, default=0.02)
     sub.add_parser("access")
     sub.add_parser("profiles")
+    for name in ("train-classifier", "train-encoder", "smoke"):
+        _model_args(sub.add_parser(name), train=True)
+    for name in ("build-index", "fit-fusion", "evaluate", "build-pack"):
+        sp2 = sub.add_parser(name)
+        _model_args(sp2)
+        if name == "build-index":
+            sp2.add_argument("--all-include", action="store_true", help="centroids from every INCLUDE clip (final pack)")
+        if name == "evaluate":
+            sp2.add_argument("--part", default="test", choices=["val", "test"])
+    tl = sub.add_parser("train-letters")
+    tl.add_argument("--clips", nargs="*", help="RawSequence .npz files of the alphabet signed in order")
+    tl.add_argument("--letters", help="letters in the recordings, in order (default A-Z)")
+    tl.add_argument("--signers", type=int, default=1)
+    tl.add_argument("--profile", choices=["commercial-safe", "research"], default=None)
     return p
 
 

@@ -14,6 +14,15 @@ Two modes
     enough and at least two of the three crops agree. Provisional predictions
     are shown while the sign is in progress but never emitted as text.
 
+``spell`` (language packs with fingerspelling, e.g. ISL)
+    Letters are holds; the word ends when the hands are down for ``spell_end_ms``. Live letter posteriors and
+    lexicon suggestions are reported in ``state.spell``; the finished word arrives as a ``segment_result`` with
+    candidates whose ``source`` is ``"spelling"``.
+
+With a ``Recognizer`` (language packs, docs/ISL_DESIGN.md 4.3) a finished segment gets a three-way decision
+(``accept`` / ``suggest`` top-5 / ``abstain``), candidates with English and Hindi text and a ``segment_id``
+that the client can answer with ``choose`` / ``reject``. Without one, the engine behaves exactly as before.
+
 ``sliding``
     Continuous classification of the last ``window_ms`` every ``interval_ms``.
     Probabilities are smoothed with an exponential moving average; a word is
@@ -32,8 +41,14 @@ from dataclasses import asdict, dataclass
 import numpy as np
 
 from app.features.build import FeatureError, build_features
-from app.landmarks.raw import RawSequence, fill_frame
+from app.landmarks.raw import RawSequence
 from app.models.checkpoint import Predictor
+
+MODES = ("segment", "sliding", "spell")
+POLICIES = ("strict", "balanced", "lenient")
+# Fields only used with a language-pack recogniser; left out of ``describe()`` for the classic (ASL) engine so
+# its hello/config_ack messages stay exactly as before.
+RECOGNIZER_FIELDS = ("policy", "use_my_signs", "spell_end_ms", "max_spell_ms")
 
 
 @dataclass
@@ -53,6 +68,10 @@ class EngineConfig:
     agree_n: int = 3
     cooldown_ms: float = 700.0
     top_k: int = 5
+    policy: str = "balanced"  # strict | balanced | lenient (maps to the pack's fitted thresholds)
+    use_my_signs: bool = True
+    spell_end_ms: float = 600.0
+    max_spell_ms: float = 15000.0
 
     @classmethod
     def from_dict(cls, d: dict | None) -> EngineConfig:
@@ -61,9 +80,16 @@ class EngineConfig:
         for k, v in d.items():
             if k in cls.__dataclass_fields__ and v is not None:
                 ftype = type(getattr(out, k)) if getattr(out, k) is not None else float
+                if ftype is bool:
+                    if not isinstance(v, bool):
+                        raise ValueError(f"{k} must be true or false")
+                    setattr(out, k, v)
+                    continue
                 setattr(out, k, ftype(v) if ftype in (int, float, str) else v)
-        if out.mode not in ("segment", "sliding"):
-            raise ValueError("mode must be 'segment' or 'sliding'")
+        if out.mode not in MODES:
+            raise ValueError("mode must be 'segment', 'sliding' or 'spell'")
+        if out.policy not in POLICIES:
+            raise ValueError("policy must be 'strict', 'balanced' or 'lenient'")
         return out
 
 
@@ -77,10 +103,31 @@ class _Frame:
 
 class RecognitionEngine:
     def __init__(self, predictor: Predictor | None, width: int = 640, height: int = 480,
-                 config: EngineConfig | None = None):
+                 config: EngineConfig | None = None, recognizer=None):
         self.predictor = predictor
+        self.recognizer = recognizer
         self.cfg = config or EngineConfig()
         self.width, self.height = width, height
+        self.segment_seq = 0
+        self.recent: dict[int, dict] = {}  # segment_id -> {"candidates": [...], "t": ...} for choose / reject
+        self.validate(self.cfg)
+        self.reset()
+
+    @property
+    def available(self) -> bool:
+        return self.predictor is not None or self.recognizer is not None
+
+    def validate(self, cfg: EngineConfig) -> None:
+        if cfg.mode == "spell" and (self.recognizer is None or not hasattr(self.recognizer, "spell")
+                                    or getattr(self.recognizer, "speller", None) is None):
+            raise ValueError("spelling mode is not available for this language")
+        if cfg.mode == "sliding" and self.recognizer is not None and self.predictor is None \
+                and getattr(self.recognizer, "classifier", True) is None:
+            raise ValueError("sliding mode needs a closed-set classifier, which this language pack does not have")
+
+    def configure(self, cfg: EngineConfig) -> None:
+        self.validate(cfg)
+        self.cfg = cfg
         self.reset()
 
     # ------------------------------------------------------------------ state
@@ -98,11 +145,17 @@ class RecognitionEngine:
         self.streak = 0
         self.status = "waiting_for_hands"
         self.last_prediction: dict | None = None
+        self.spell_last_t = -1e18
 
     @property
     def threshold(self) -> float:
         if self.cfg.threshold is not None:
             return float(self.cfg.threshold)
+        if self.predictor is None and self.recognizer is not None:
+            acc = getattr(getattr(self.recognizer, "fusion", None), "accept", None)
+            if isinstance(acc, dict) and self.cfg.policy in acc:
+                return float(acc[self.cfg.policy])
+            return float(self.recognizer.recommended_threshold)
         return self.predictor.recommended_threshold if self.predictor else 0.6
 
     def set_size(self, width: int, height: int) -> None:
@@ -115,9 +168,27 @@ class RecognitionEngine:
     def _raw(self, frames: list[_Frame]) -> RawSequence:
         return RawSequence.from_frames([f.data for f in frames], self.width, self.height)
 
+    @staticmethod
+    def _crops(frames: list[_Frame], tta: bool) -> list[list[_Frame]]:
+        crops = [frames]
+        n = len(frames)
+        if tta and n >= 12:
+            k = max(1, n // 10)
+            crops += [frames[k:], frames[:-k]]
+        return crops
+
     def _classify(self, frames: list[_Frame], tta: bool) -> dict | None:
         if self.predictor is None:
-            return None
+            if self.recognizer is None:
+                return None
+            r = self.recognizer.class_probs([self._raw(c) for c in self._crops(frames, tta)])
+            if r is None:
+                return {"error": "no body detected or no classifier in this language pack"}
+            probs, self._class_names, feat_ms, inf_ms = r
+            avg = probs.mean(axis=0)
+            top1 = int(avg.argmax())
+            agree = int(sum(int(p.argmax()) == top1 for p in probs))
+            return {"probs": avg, "agree": agree, "crops": len(probs), "feature_ms": feat_ms, "inference_ms": inf_ms}
         fcfg = self.predictor.feature_config
         t0 = time.perf_counter()
         crops = [frames]
@@ -137,9 +208,27 @@ class RecognitionEngine:
         return {"probs": avg, "agree": agree, "crops": len(crops), "feature_ms": feat_ms, "inference_ms": inf_ms}
 
     def _topk(self, probs: np.ndarray) -> list[dict]:
+        if self.predictor is None and self.recognizer is not None:
+            return self._topk_concepts(probs)
         names = self.predictor.class_names
         idx = np.argsort(-probs)[: self.cfg.top_k]
         return [{"class_index": int(i), "gloss": names[i], "prob": float(probs[i])} for i in idx]
+
+    def _topk_concepts(self, probs: np.ndarray) -> list[dict]:
+        """Closed-set top-k of a pack classifier (sliding mode) as candidate dicts."""
+        names = self._class_names
+        vocab = getattr(self.recognizer, "vocab", None)
+        out = []
+        for i in np.argsort(-probs)[: self.cfg.top_k]:
+            cid = names[i]
+            en = vocab.english(cid) if vocab is not None else cid
+            hi, rev = (None, None)
+            if getattr(self.recognizer, "lexicon", None) is not None:
+                hi, rev = self.recognizer.lexicon.text(cid)
+            out.append({"concept_id": cid, "class_index": vocab.index_of(cid) if vocab is not None else int(i),
+                        "gloss": en, "prob": float(probs[i]), "text": {"en": en, "hi": hi}, "hi_review": rev,
+                        "source": "classifier", "variant_id": None, "region": None, "origin": None})
+        return out
 
     def _decision(self, probs: np.ndarray, agree_ok: bool) -> tuple[bool, str]:
         srt = np.sort(probs)[::-1]
@@ -169,10 +258,12 @@ class RecognitionEngine:
             self.last_hand_t = t
 
         msg: dict = {"type": "state", "t": t, "hands": hands, "pose": pose}
-        if self.predictor is None:
+        if not self.available:
             self.status = "unavailable"
         elif self.cfg.mode == "segment":
             msg.update(self._push_segment(f))
+        elif self.cfg.mode == "spell":
+            msg.update(self._push_spell(f))
         else:
             msg.update(self._push_sliding(f))
         msg["status"] = self.status
@@ -214,6 +305,14 @@ class RecognitionEngine:
         self.status = "collecting"
         if len(self.segment) >= c.min_frames and f.t - self.last_infer_t >= c.interval_ms:
             self.last_infer_t = f.t
+            if self.recognizer is not None and self.predictor is None:
+                rec = self.recognizer.recognize([self._raw(self.segment)], top_k=c.top_k, policy=c.policy,
+                                                use_my_signs=c.use_my_signs)
+                if rec.candidates:
+                    self.status = "analyzing"
+                    out["provisional"] = {"top": [x.to_json() for x in rec.candidates], "feature_ms": rec.feature_ms,
+                                          "inference_ms": rec.inference_ms}
+                return out
             r = self._classify(self.segment, tta=False)
             if r and "probs" in r:
                 self.status = "analyzing"
@@ -227,6 +326,10 @@ class RecognitionEngine:
         if len(frames) < c.min_frames or hand_ratio < c.min_hand_ratio * 0.6:
             self.status = "waiting_for_hands"
             return {"segment_result": {"accepted": False, "reason": "too_short", "frames": len(frames)}}
+        if self.recognizer is not None and self.predictor is None:
+            rec = self.recognizer.recognize([self._raw(x) for x in self._crops(frames, True)], top_k=c.top_k,
+                                            policy=c.policy, use_my_signs=c.use_my_signs)
+            return self._emit_recognition(rec, frames, t)
         r = self._classify(frames, tta=True)
         if r is None or "error" in r:
             self.status = "no_body"
@@ -248,6 +351,99 @@ class RecognitionEngine:
         else:
             self.status = "uncertain"
         self.last_prediction = res
+        return out
+
+    # ------------------------------------------------------- recogniser results
+    def _emit_recognition(self, rec, frames: list[_Frame], t: float, cooldown: bool = True) -> dict:
+        c = self.cfg
+        decision, reason = rec.decision, rec.reason
+        if decision == "accept" and cooldown and t - self.last_commit_t < c.cooldown_ms:
+            decision, reason = "suggest", "cooldown"
+        if not rec.candidates and decision != "abstain":
+            decision, reason = "abstain", reason
+        self.segment_seq += 1
+        sid = self.segment_seq
+        top = [x.to_json() for x in rec.candidates]
+        res = {"segment_id": sid, "accepted": decision == "accept", "decision": decision, "reason": reason,
+               "confidence": rec.confidence, "frames": len(frames),
+               "duration_ms": (frames[-1].t - frames[0].t) if frames else 0.0,
+               "agreement": f"{rec.agree}/{rec.crops}", "top": top, "candidates": top,
+               "feature_ms": rec.feature_ms, "inference_ms": rec.inference_ms}
+        if "spell" in rec.detail:
+            res["spell"] = rec.detail["spell"]
+        self.recent[sid] = {"candidates": top, "t": t, "committed": None}
+        for old in [k for k in self.recent if k <= sid - 32]:
+            self.recent.pop(old, None)
+        out: dict = {"segment_result": res}
+        if decision == "accept":
+            self.last_commit_t = t
+            self.last_commit_class = top[0]["class_index"]
+            self.status = "recognized"
+            out["commit"] = self._commit_from(top[0], sid, t, chosen=False)
+            self.recent[sid]["committed"] = top[0]["concept_id"]
+        else:
+            self.status = "uncertain" if decision == "suggest" else "not_sure"
+        self.last_prediction = res
+        return out
+
+    @staticmethod
+    def _commit_from(cand: dict, sid: int, t: float, chosen: bool) -> dict:
+        return {"gloss": cand["gloss"], "class_index": cand["class_index"], "score": cand["prob"], "t": t,
+                "concept_id": cand["concept_id"], "text": cand.get("text"), "hi_review": cand.get("hi_review"),
+                "source": cand.get("source"), "segment_id": sid, "chosen_by_user": chosen}
+
+    def choose(self, segment_id: int, concept_id: str) -> dict:
+        """The user picked a candidate from "did you mean". Returns the commit (``chosen_by_user: true``)."""
+        seg = self.recent.get(int(segment_id))
+        if seg is None:
+            raise ValueError(f"unknown or expired segment_id {segment_id}")
+        cand = next((x for x in seg["candidates"] if x["concept_id"] == concept_id), None)
+        if cand is None:
+            raise ValueError(f"{concept_id!r} was not offered for segment {segment_id}")
+        seg["committed"] = concept_id
+        self.last_commit_t = seg["t"]
+        return self._commit_from(cand, int(segment_id), seg["t"], chosen=True)
+
+    def reject(self, segment_id: int) -> dict:
+        """The user said an accepted word was wrong. Returns what was rejected."""
+        seg = self.recent.get(int(segment_id))
+        if seg is None:
+            raise ValueError(f"unknown or expired segment_id {segment_id}")
+        was, seg["committed"] = seg["committed"], None
+        return {"segment_id": int(segment_id), "rejected": was}
+
+    # ------------------------------------------------------------- spell mode
+    def _push_spell(self, f: _Frame) -> dict:
+        c = self.cfg
+        out: dict = {}
+        if not self.active:
+            self.hand_streak = self.hand_streak + 1 if f.hands else 0
+            if self.hand_streak >= c.start_frames:
+                self.active = True
+                self.segment = [x for x in self.buf if x.t >= f.t - c.pre_roll_ms]
+                self.status = "spelling"
+            else:
+                self.status = "waiting_for_hands" if f.pose else "no_body"
+            return out
+        self.segment.append(f)
+        absent_for = f.t - (self.last_hand_t if self.last_hand_t is not None else f.t)
+        dur = f.t - self.segment[0].t
+        if absent_for >= c.spell_end_ms or dur >= c.max_spell_ms:
+            frames = [x for x in self.segment if x.t <= (self.last_hand_t or f.t) + 120]
+            self.active, self.segment, self.hand_streak = False, [], 0
+            if len(frames) < c.min_frames:
+                self.status = "waiting_for_hands"
+                out["segment_result"] = {"accepted": False, "reason": "too_short", "frames": len(frames)}
+                return out
+            rec = self.recognizer.spell_recognition(self._raw(frames), top_k=c.top_k)
+            out.update(self._emit_recognition(rec, frames, f.t, cooldown=False))
+            return out
+        self.status = "spelling"
+        if f.t - self.spell_last_t >= max(c.interval_ms, 300.0) and len(self.segment) >= c.min_frames:
+            self.spell_last_t = f.t
+            sr = self.recognizer.spell(self._raw(self.segment), k=c.top_k)
+            if sr is not None:
+                out["spell"] = sr.to_json()
         return out
 
     def _push_sliding(self, f: _Frame) -> dict:
@@ -288,6 +484,9 @@ class RecognitionEngine:
             self.last_commit_t, self.last_commit_class = f.t, cls
             self.status = "recognized"
             out["commit"] = {"gloss": top[0]["gloss"], "class_index": cls, "score": top[0]["prob"], "t": f.t}
+            if "concept_id" in top[0]:  # language-pack classifier: same extra fields as segment-mode commits
+                out["commit"].update({k: top[0][k] for k in ("concept_id", "text", "hi_review", "source")},
+                                     segment_id=None, chosen_by_user=False)
         else:
             self.status = "analyzing" if reason in ("unstable",) else "uncertain"
         return out
@@ -301,4 +500,8 @@ class RecognitionEngine:
         return {}
 
     def describe(self) -> dict:
-        return {"config": asdict(self.cfg), "threshold": self.threshold}
+        cfg = asdict(self.cfg)
+        if self.recognizer is None:
+            for k in RECOGNIZER_FIELDS:
+                cfg.pop(k, None)
+        return {"config": cfg, "threshold": self.threshold}

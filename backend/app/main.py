@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api import dataset, experiments, recognition, system
+from app.api import dataset, experiments, languages, recognition, system
 from app.core.config import get_settings
 from app.core.jobs import recover_stale_jobs
 from app.db.session import get_engine
@@ -78,12 +78,13 @@ def create_app() -> FastAPI:
 
         @app.middleware("http")
         async def read_only_guard(request: Request, call_next):
-            if request.method in ("POST", "PUT", "PATCH", "DELETE") and request.url.path not in allowed:
+            if (request.method in ("POST", "PUT", "PATCH", "DELETE") and request.url.path not in allowed
+                    and not languages.demo_allowed(request.url.path)):
                 return JSONResponse({"detail": "Disabled in the public demo. Run the project locally to download data or train models."},
                                     status_code=403)
             return await call_next(request)
 
-    for r in (system.router, dataset.router, experiments.router, recognition.router):
+    for r in (system.router, dataset.router, experiments.router, recognition.router, languages.router):
         app.include_router(r)
     s.assets_dir.mkdir(parents=True, exist_ok=True)
     app.mount("/assets/mediapipe", StaticFiles(directory=s.assets_dir / "mediapipe", check_dir=False), name="mediapipe-model")

@@ -31,6 +31,9 @@ def get_engine() -> Engine:
             cur.close()
 
         Base.metadata.create_all(_engine)
+        from app.db.migrate import ensure_columns
+
+        ensure_columns(_engine)
         _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
     return _engine
 

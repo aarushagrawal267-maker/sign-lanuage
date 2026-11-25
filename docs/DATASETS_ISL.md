@@ -55,6 +55,11 @@ User data never enters a global model in either profile. The profile name is wri
 | `splits/*.json`, `splits/include_groups.json`, `splits/oneshot_concepts.json`, `splits/splits_report.json` | `splits` | split assignments with leakage reports, session / pseudo-signer groups, one-shot folds |
 | `raw/{cislr,isign}/*.csv` | `scripts/ingest_isl_gated.py` | the gated datasets' small CSV files |
 | `nltk_data/` | `python -m app.isl.cli wordnet` | WordNet (10 MB) |
+| `manifests/islrtc_full.jsonl`, `landmarks/islrtc_full/*.npz` | `scripts/ingest_isl.py islrtc --only ... --full --max-s 120 --out-subdir islrtc_full` (25 Nov, 7 entries) | full-length re-extraction of `A/Alphabet`, `F/Fingerspell` and the five `Numbers_*` compilation videos. Finding: `Alphabet` and `Fingerspell` (3.8 s / 3.4 s) are the signs for those *words*, not A-Z sequences, so the open data has **no fingerspelling letters**; see ISL_DESIGN.md 6.7 |
+| `../my_signs/<pack>/` | the app (My signs) | users' own signs as landmarks, `alphabet.npz` letter calibration; local only |
+
+Model build outputs (git-ignored, `artifacts/`): `artifacts/isl/<profile>/` (classifier.pt, encoder.pt, index/,
+fusion.json, results.json, smoke_report.json) and `artifacts/packs/<isl|isl-research>/` (the pack the app loads).
 
 Tracked in git: `models/packs/isl/vocabulary.jsonl` (built from file names and split lists only, 7.5 MB), the code,
 `backend/app/isl/vocab/overrides.yaml`. Never committed: videos, landmarks, manifests, splits, model weights.

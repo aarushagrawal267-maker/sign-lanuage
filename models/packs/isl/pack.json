@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "id": "isl",
+  "kind": "isl-hybrid",
+  "version": "2026.11.0-data",
+  "sign_language": "ISL",
+  "standard": "ISLRTC",
+  "display_name": {"en": "Indian Sign Language (ISL)", "hi": "भारतीय सांकेतिक भाषा"},
+  "output_languages": ["en", "hi"],
+  "capabilities": ["words", "retrieval", "spelling", "my_signs", "sentence"],
+  "profile": "commercial-safe",
+  "feature_config": {"seq_len": 48, "use_face": true, "use_velocity": true, "max_gap": 5, "canonical_hand": true},
+  "vocabulary": "vocabulary.jsonl",
+  "lexicons": {"hi": "lexicon_hi.jsonl"},
+  "components": {
+    "classifier": {"checkpoint": "classifier.pt", "label_space": "concept_id"},
+    "encoder": {"checkpoint": "encoder.pt", "version": "isl-enc-1", "dim": 256},
+    "index": {"dir": "index", "encoder_version": "isl-enc-1"},
+    "fingerspelling": {"checkpoint": "letters.pt", "lexicon": "spelling_lexicon.txt"},
+    "fusion": "fusion.json"
+  },
+  "results": "results.json",
+  "licences": [
+    {"source": "include", "licence": "CC-BY-4.0", "commercial": true},
+    {"source": "islrtc", "licence": "GODL-India", "commercial": true}
+  ],
+  "note": "Tracked copy: vocabulary only. Model files are built locally into artifacts/packs/isl (python -m app.isl.cli build-pack), which overrides this folder."
+}

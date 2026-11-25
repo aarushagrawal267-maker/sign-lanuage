@@ -166,6 +166,10 @@ class RecognitionEvent(Base):
     class_index: Mapped[int] = mapped_column(Integer)
     score: Mapped[float] = mapped_column(Float)
     experiment_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Language pack id and pack-specific details (concept_id, text, source, decision, chosen_by_user).
+    # Added by db/migrate.py to databases created before language packs existed.
+    language: Mapped[str] = mapped_column(String(32), default="asl-wlasl100", server_default="asl-wlasl100")
+    detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class MetaKV(Base):

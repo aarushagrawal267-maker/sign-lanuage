@@ -1,0 +1,139 @@
+"""The streaming engine with a language-pack recogniser (accept / suggest / abstain, choose, cooldown, spell)."""
+
+from __future__ import annotations
+
+import pytest
+
+from app.dataset.synthetic import frames_for_stream, idle_frames, make_sequence
+from app.features.spec import FeatureConfig
+from app.inference.engine import EngineConfig, RecognitionEngine
+from app.inference.recognizer import Candidate, ClassifierRecognizer, Recognition
+
+
+class FakeSpell:
+    def __init__(self):
+        self.letters, self.buffer, self.suggestions = [{"letter": "I", "prob": 0.9}], "I", []
+
+    def to_json(self):
+        return {"letters": self.letters, "buffer": self.buffer, "suggestions": self.suggestions}
+
+
+class FakeRecognizer:
+    language = "isl"
+    feature_config = FeatureConfig(canonical_hand=True)
+    recommended_threshold = 0.7
+    classifier = None
+    speller = object()
+
+    def __init__(self, decision="accept"):
+        self.decision = decision
+        self.calls = []
+
+    def _cands(self):
+        return [Candidate("isl.pencil", 7, "pencil", 0.8, {"en": "pencil", "hi": "पेंसिल"}, "reviewed", "classifier+retrieval"),
+                Candidate("isl.pen", 6, "pen", 0.1, {"en": "pen", "hi": None}, None, "retrieval")]
+
+    def recognize(self, crops, top_k=5, policy="balanced", use_my_signs=True):
+        self.calls.append((len(crops), policy, use_my_signs))
+        reason = {"accept": "ok", "suggest": "ambiguous", "abstain": "out_of_vocabulary"}[self.decision]
+        return Recognition(self._cands(), self.decision, reason, 0.8, 3, len(crops))
+
+    def class_probs(self, crops):
+        return None
+
+    def spell(self, raw, k=5):
+        return FakeSpell()
+
+    def spell_recognition(self, raw, top_k=5):
+        c = Candidate("isl.indore", 3, "Indore", 0.7, {"en": "Indore", "hi": "इंदौर"}, "machine", "spelling")
+        return Recognition([c], "suggest", "spelling", 0.7, 1, 1, detail={"spell": FakeSpell().to_json()})
+
+
+def _run(eng, labels=(4,), gap=12):
+    t, states = 0.0, []
+    for cls in labels:
+        for f in idle_frames(gap, t):
+            states.append(eng.push(f))
+        t += gap * 40
+        seq = make_sequence(cls, 2, n_frames=40)
+        for f in frames_for_stream(seq, t):
+            states.append(eng.push(f))
+        t += len(seq) * 40
+    for f in idle_frames(gap * 2, t):
+        states.append(eng.push(f))
+    return states
+
+
+def test_accept_commits_with_bilingual_text():
+    rec = FakeRecognizer("accept")
+    eng = RecognitionEngine(None, recognizer=rec, config=EngineConfig(policy="strict", use_my_signs=False))
+    states = _run(eng)
+    res = [s["segment_result"] for s in states if "segment_result" in s and "decision" in s["segment_result"]]
+    commits = [s["commit"] for s in states if "commit" in s]
+    assert len(res) == 1 and res[0]["decision"] == "accept" and res[0]["segment_id"] == 1
+    assert commits[0]["concept_id"] == "isl.pencil" and commits[0]["text"]["hi"] == "पेंसिल"
+    assert commits[0]["chosen_by_user"] is False and commits[0]["segment_id"] == 1
+    assert rec.calls[-1] == (3, "strict", False)  # three crops, engine policy and My-signs switch passed through
+    assert any("provisional" in s for s in states)
+    assert eng.describe()["config"]["policy"] == "strict"
+    rej = eng.reject(1)
+    assert rej == {"segment_id": 1, "rejected": "isl.pencil"}
+
+
+def test_cooldown_turns_accept_into_suggest():
+    rec = FakeRecognizer("accept")
+    eng = RecognitionEngine(None, recognizer=rec, config=EngineConfig(cooldown_ms=10_000_000))
+    states = _run(eng, labels=(1, 2))
+    res = [s["segment_result"] for s in states if "segment_result" in s and "decision" in s["segment_result"]]
+    assert [r["decision"] for r in res] == ["accept", "suggest"] and res[1]["reason"] == "cooldown"
+
+
+@pytest.mark.parametrize("decision,status", [("suggest", "uncertain"), ("abstain", "not_sure")])
+def test_suggest_and_abstain_never_commit(decision, status):
+    eng = RecognitionEngine(None, recognizer=FakeRecognizer(decision))
+    states = _run(eng)
+    assert not any("commit" in s for s in states)
+    seg = next(s for s in states if "segment_result" in s and "decision" in s["segment_result"])
+    assert seg["segment_result"]["decision"] == decision and seg["status"] == status
+    commit = eng.choose(seg["segment_result"]["segment_id"], "isl.pen")
+    assert commit["chosen_by_user"] is True and commit["concept_id"] == "isl.pen" and commit["text"]["en"] == "pen"
+    with pytest.raises(ValueError):
+        eng.choose(999, "isl.pen")
+
+
+def test_spell_mode_reports_letters_and_word():
+    eng = RecognitionEngine(None, recognizer=FakeRecognizer(), config=EngineConfig(mode="spell", spell_end_ms=400))
+    states = _run(eng)
+    assert any("spell" in s for s in states) and "spelling" in {s["status"] for s in states}
+    seg = next(s["segment_result"] for s in states if "segment_result" in s and "decision" in s["segment_result"])
+    assert seg["candidates"][0]["source"] == "spelling" and seg["decision"] == "suggest" and "spell" in seg
+
+
+def test_spell_and_policy_validation():
+    with pytest.raises(ValueError):
+        EngineConfig.from_dict({"policy": "risky"})
+    with pytest.raises(ValueError):
+        EngineConfig.from_dict({"use_my_signs": "yes"})
+    with pytest.raises(ValueError):
+        RecognitionEngine(None, config=EngineConfig(mode="spell"))  # ASL / no speller
+    eng = RecognitionEngine(None, recognizer=FakeRecognizer())
+    with pytest.raises(ValueError):
+        eng.configure(EngineConfig(mode="sliding"))  # no closed-set classifier in this pack
+
+
+def test_classifier_recognizer_matches_engine_rule(tmp_path):
+    from app.models.checkpoint import Predictor, save_checkpoint
+    from app.models.networks import build_model
+
+    fcfg = FeatureConfig(seq_len=16)
+    names = [f"g{i}" for i in range(6)]
+    save_checkpoint(tmp_path / "m.pt", build_model("gru", fcfg.dim, 6, hidden=8, layers=1),
+                    {"architecture": "gru", "model_kwargs": {"hidden": 8, "layers": 1}, "feature_config": fcfg.to_dict(),
+                     "class_names": names, "recommended_threshold": 0.0})
+    p = Predictor(tmp_path / "m.pt")
+    r = ClassifierRecognizer(p, threshold=0.0, min_margin=0.0)
+    rec = r.recognize([make_sequence(4, 7)] * 3)
+    assert rec.decision == "accept" and len(rec.candidates) == 5 and rec.crops == 3 and rec.agree == 3
+    assert rec.candidates[0].concept_id == rec.candidates[0].gloss and rec.candidates[0].gloss in names
+    strict = ClassifierRecognizer(p, threshold=1.01).recognize([make_sequence(4, 7)])
+    assert strict.decision == "suggest" and strict.reason == "low_confidence"

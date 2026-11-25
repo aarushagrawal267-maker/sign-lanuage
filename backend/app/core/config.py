@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     # Register the pretrained WLASL100 model in models/ on first start so live recognition works
     # straight after setup (no dataset download or training needed).
     import_bundled_model: bool = True
+    # Sign-language packs (docs/ISL_DESIGN.md section 4.1): extra pack roots (os.pathsep-separated), searched
+    # after models/packs (tracked) and <artifacts>/packs (local builds); later roots override earlier ones.
+    packs_dirs: str = ""
+    default_language: str = "asl-wlasl100"
+    # Data profile used by ISL build commands by default (commercial-safe | research).
+    isl_profile: str = "commercial-safe"
 
     @property
     def annotations_dir(self) -> Path:
@@ -67,6 +73,10 @@ class Settings(BaseSettings):
     @property
     def reports_dir(self) -> Path:
         return self.artifacts_dir / "reports"
+
+    @property
+    def my_signs_dir(self) -> Path:
+        return self.data_dir / "my_signs"
 
     @property
     def holistic_model_path(self) -> Path:

@@ -1,0 +1,364 @@
+"""Personal and regional signs ("My signs", docs/ISL_DESIGN.md section 7).
+
+Storage (local, git-ignored)::
+
+    data/my_signs/<pack_id>/signs.jsonl         one row per sign version (last row per sign_id wins; deletes are tombstones)
+    data/my_signs/<pack_id>/takes/<id>/<n>.npz  RawSequence of each take (landmarks only, never video)
+    data/my_signs/<pack_id>/emb_<version>.npy   cached embeddings (+ emb_<version>.rows.json)
+
+Embeddings depend on the encoder version, so takes are always kept as landmarks and re-embedded lazily when the
+pack's encoder changes. Rows also carry ``gloss`` and ``takes`` (relative paths) so the data layer's
+``MySignsAdapter`` can read them.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import threading
+import uuid
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+
+import numpy as np
+
+from app.features.build import FeatureError, sequence_quality
+from app.isl.models.index import EmbeddingIndex
+from app.landmarks.raw import RawSequence
+
+MAX_TAKE_FRAMES = 300
+MIN_TAKE_MS, MAX_TAKE_MS = 300.0, 4000.0
+MIN_HAND_RATE = 0.5
+TEXT_LIMITS = {"text_en": 80, "text_hi": 80, "region": 80, "note": 300, "author": 80}
+_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+SIGN_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def clean_text(value: str | None, limit: int) -> str | None:
+    if value is None:
+        return None
+    v = _CTRL.sub(" ", str(value)).strip()
+    v = re.sub(r"\s+", " ", v)[:limit]
+    return v or None
+
+
+def now_iso() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@dataclass
+class MySign:
+    sign_id: str
+    pack: str
+    concept_id: str | None
+    text_en: str
+    text_hi: str | None = None
+    region: str | None = None
+    note: str | None = None
+    n_takes: int = 0
+    origin: str = "recorded"  # recorded | imported:<pack title>
+    author: str | None = None
+    created: str = ""
+    enabled: bool = True
+    deleted: bool = False
+    theta: float | None = None  # per-sign acceptance cosine (lowest leave-one-out self-similarity - margin)
+    licence: str | None = None
+
+    def to_json(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_json(cls, d: dict) -> MySign:
+        return cls(**{k: d[k] for k in cls.__dataclass_fields__ if k in d})
+
+
+@dataclass
+class AddResult:
+    sign: MySign | None
+    take_quality: list[dict]
+    consistency: float | None
+    conflicts: list[dict]
+    self_test: dict
+    accepted: bool
+    message: str
+
+    def to_json(self) -> dict:
+        return {"sign": self.sign.to_json() if self.sign else None, "take_quality": self.take_quality,
+                "consistency": self.consistency, "conflicts": self.conflicts, "self_test": self.self_test,
+                "accepted": self.accepted, "message": self.message}
+
+
+def take_quality(raw: RawSequence) -> dict:
+    q = sequence_quality(raw)
+    dur = float(raw.t_ms[-1] - raw.t_ms[0]) if len(raw) > 1 else 0.0
+    q["duration_ms"] = dur
+    problems = []
+    if len(raw) > MAX_TAKE_FRAMES:
+        problems.append(f"too long ({len(raw)} frames, at most {MAX_TAKE_FRAMES})")
+    if not q["usable"]:
+        problems.append("body or hands not detected well enough")
+    if q["any_hand_rate"] < MIN_HAND_RATE:
+        problems.append("hands visible in less than half of the recording")
+    if not (MIN_TAKE_MS <= dur <= MAX_TAKE_MS):
+        problems.append(f"duration {dur / 1000:.1f} s (needs 0.3 to 4 s)")
+    q["problems"] = problems
+    q["ok"] = not problems
+    return q
+
+
+def _pairwise_mean(z: np.ndarray) -> float:
+    n = len(z)
+    if n < 2:
+        return 1.0
+    s = z @ z.T
+    return float((s.sum() - np.trace(s)) / (n * (n - 1)))
+
+
+class MySignsStore:
+    def __init__(self, root: Path, pack_id: str):
+        self.pack_id = pack_id
+        self.dir = Path(root) / pack_id
+        self.file = self.dir / "signs.jsonl"
+        self._lock = threading.RLock()
+        self._cache: dict = {}
+
+    # ------------------------------------------------------------------ rows
+    def _rows(self) -> dict[str, dict]:
+        rows: dict[str, dict] = {}
+        if not self.file.exists():
+            return rows
+        for ln in self.file.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                r = json.loads(ln)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(r, dict) and r.get("sign_id"):
+                rows[r["sign_id"]] = r
+        return rows
+
+    def _append(self, sign: MySign) -> None:
+        row = sign.to_json()
+        row["gloss"] = sign.text_en
+        row["takes"] = [f"takes/{sign.sign_id}/{i}.npz" for i in range(sign.n_takes)]
+        self.dir.mkdir(parents=True, exist_ok=True)
+        with self.file.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    def list(self, include_disabled: bool = True) -> list[MySign]:
+        with self._lock:
+            out = [MySign.from_json(r) for r in self._rows().values()]
+        out = [s for s in out if not s.deleted and (include_disabled or s.enabled)]
+        return sorted(out, key=lambda s: (s.text_en.lower(), s.created))
+
+    def get(self, sign_id: str) -> MySign | None:
+        r = self._rows().get(sign_id)
+        if r is None:
+            return None
+        s = MySign.from_json(r)
+        return None if s.deleted else s
+
+    def takes(self, sign_id: str) -> list[RawSequence]:
+        s = self.get(sign_id)
+        if s is None:
+            return []
+        return [RawSequence.load(self.dir / "takes" / sign_id / f"{i}.npz") for i in range(s.n_takes)
+                if (self.dir / "takes" / sign_id / f"{i}.npz").exists()]
+
+    def stamp(self) -> tuple:
+        try:
+            st = self.file.stat()
+            return (st.st_mtime_ns, st.st_size)
+        except FileNotFoundError:
+            return (0, 0)
+
+    # --------------------------------------------------------------- writes
+    def save_sign(self, sign: MySign, takes: list[RawSequence]) -> MySign:
+        """Store a sign and its takes as given (no checks: used by ``add`` and by pack import)."""
+        with self._lock:
+            d = self.dir / "takes" / sign.sign_id
+            d.mkdir(parents=True, exist_ok=True)
+            for i, raw in enumerate(takes):
+                raw.save(d / f"{i}.npz")
+            sign.n_takes = len(takes)
+            self._append(sign)
+        return sign
+
+    def update(self, sign_id: str, **fields) -> MySign:
+        with self._lock:
+            s = self.get(sign_id)
+            if s is None:
+                raise KeyError(sign_id)
+            for k, v in fields.items():
+                if v is None or k not in ("text_en", "text_hi", "region", "note", "enabled", "concept_id"):
+                    continue
+                if k in TEXT_LIMITS:
+                    v = clean_text(v, TEXT_LIMITS[k])
+                    if k == "text_en" and not v:
+                        raise ValueError("text_en must not be empty")
+                setattr(s, k, bool(v) if k == "enabled" else v)
+            self._append(s)
+            return s
+
+    def delete(self, sign_id: str) -> None:
+        with self._lock:
+            s = self.get(sign_id)
+            if s is None:
+                raise KeyError(sign_id)
+            s.deleted = True
+            self._append(s)
+            shutil.rmtree(self.dir / "takes" / sign_id, ignore_errors=True)
+
+    def delete_all(self) -> int:
+        n = 0
+        for s in self.list():
+            self.delete(s.sign_id)
+            n += 1
+        return n
+
+    # ------------------------------------------------------------ embedding
+    def user_index(self, embedder, include_disabled: bool = False) -> EmbeddingIndex | None:
+        """Index over every take of every enabled sign; row ``concept_id`` = ``mysign:<sign_id>``.
+        Cached in memory and on disk per (encoder version, signs.jsonl stamp)."""
+        key = (embedder.version, self.stamp(), include_disabled)
+        with self._lock:
+            if self._cache.get("key") == key:
+                return self._cache["index"]
+            signs = self.list(include_disabled=include_disabled)
+            signs = [s for s in signs if include_disabled or s.enabled]
+            rows, _embs = [], []
+            disk = self.dir / f"emb_{re.sub(r'[^A-Za-z0-9_.-]', '_', embedder.version)}.npy"
+            disk_rows = disk.with_suffix(".rows.json")
+            cached: dict[str, np.ndarray] = {}
+            if disk.exists() and disk_rows.exists():
+                try:
+                    old = json.loads(disk_rows.read_text())
+                    arr = np.load(disk, allow_pickle=False)
+                    cached = {k: arr[i] for i, k in enumerate(old) if i < len(arr)}
+                except (ValueError, OSError):
+                    cached = {}
+            keys = []
+            for s in signs:
+                todo = []
+                for i in range(s.n_takes):
+                    k = f"{s.sign_id}/{i}"
+                    p = self.dir / "takes" / s.sign_id / f"{i}.npz"
+                    if not p.exists():
+                        continue
+                    if k not in cached:
+                        todo.append((k, RawSequence.load(p)))
+                    keys.append(k)
+                    rows.append({"variant_id": f"mysign:{s.sign_id}", "concept_id": f"mysign:{s.sign_id}",
+                                 "linked_concept": s.concept_id, "source": "mysigns", "kind": "take", "weight": 1.0})
+                if todo:
+                    try:
+                        z = embedder.embed_raws([r for _, r in todo])
+                    except FeatureError:
+                        z = np.zeros((len(todo), embedder.dim), np.float32)
+                    for (k, _), v in zip(todo, z):
+                        cached[k] = v
+            if not rows:
+                idx = None
+            else:
+                emb = np.stack([cached[k] for k in keys])
+                idx = EmbeddingIndex.build(emb, rows, embedder.version, profile="user")
+                try:
+                    self.dir.mkdir(parents=True, exist_ok=True)
+                    np.save(disk, emb.astype(np.float32))
+                    disk_rows.write_text(json.dumps(keys))
+                except OSError:
+                    pass
+            self._cache = {"key": key, "index": idx}
+            return idx
+
+    # -------------------------------------------------------------- enrolment
+    def add(self, text_en: str, takes: list[RawSequence], *, embedder=None, text_hi: str | None = None,
+            concept_id: str | None = None, region: str | None = None, note: str | None = None,
+            author: str | None = None, dry_run: bool = False, global_search=None, s_min: float = -1.0,
+            c_min: float = 0.5, min_takes: int = 3, max_takes: int = 5, theta_margin: float = 0.05,
+            describe_concept=None) -> AddResult:
+        """Enrolment with the rules of docs/ISL_DESIGN.md 7.2.
+
+        ``global_search(z) -> list[(concept_id, cosine)]`` (best first) searches the pack's dictionary index;
+        ``describe_concept(concept_id) -> str`` names a concept for messages."""
+        text_en = clean_text(text_en, TEXT_LIMITS["text_en"]) or ""
+        tq = [take_quality(t) for t in takes]
+        base = dict(take_quality=tq, consistency=None, conflicts=[], self_test={"hits": 0, "n": 0})
+        if not text_en:
+            return AddResult(None, accepted=False, message="Please type the English word for this sign.", **base)
+        if not (min_takes <= len(takes) <= max_takes) and not (dry_run and len(takes) >= 1):
+            return AddResult(None, accepted=False,
+                             message=f"Please record the sign {min_takes} to {max_takes} times (you recorded {len(takes)}).",
+                             **base)
+        bad = [i + 1 for i, q in enumerate(tq) if not q["ok"]]
+        if bad:
+            return AddResult(None, accepted=False, message=(
+                f"Recording {', '.join(map(str, bad))} could not be used: "
+                + "; ".join(sorted({p for i in bad for p in tq[i - 1]["problems"]}))
+                + ". Please record again with your hands and upper body in view."), **base)
+        if embedder is None:
+            return AddResult(None, accepted=False, message="Sign embedding is not available for this language.", **base)
+        try:
+            z = embedder.embed_raws(takes)
+        except FeatureError as e:
+            return AddResult(None, accepted=False, message=f"Could not read the recordings: {e}", **base)
+        cons = _pairwise_mean(z)
+        base["consistency"] = cons
+        # conflicts: global dictionary + other user signs
+        own_concept = concept_id
+        hits: dict[str, float] = {}
+        if global_search is not None:
+            for zi in z:
+                for cid, sc in global_search(zi[None, :])[:5]:
+                    if cid != own_concept:
+                        hits[cid] = max(hits.get(cid, -1.0), sc)
+        uidx = self.user_index(embedder)
+        if uidx is not None:
+            cm = uidx.concept_matrix(z).mean(0)
+            for j, cid in enumerate(uidx.concepts):
+                hits[cid] = max(hits.get(cid, -1.0), float(cm[j]))
+        conflicts = []
+        for cid, sc in sorted(hits.items(), key=lambda kv: -kv[1]):
+            if sc >= cons and len(conflicts) < 5:
+                name = None
+                if cid.startswith("mysign:"):
+                    other = self.get(cid.removeprefix("mysign:"))
+                    name = f"{other.text_en} (My signs)" if other else cid
+                elif describe_concept is not None:
+                    name = describe_concept(cid)
+                conflicts.append({"concept_id": cid, "score": sc, "name": name or cid})
+        base["conflicts"] = conflicts
+        # leave-one-out self test against this sign's other takes, user signs and the dictionary
+        n = len(z)
+        loo = []
+        hits_n = 0
+        if n >= 2:
+            S = z @ z.T
+            for i in range(n):
+                own = max(S[i, j] for j in range(n) if j != i)
+                loo.append(float(own))
+                rivals = [sc for cid, sc in hits.items()] if hits else [-1.0]
+                hits_n += int(own >= max(rivals))
+        base["self_test"] = {"hits": hits_n, "n": n if n >= 2 else 0}
+        theta = max(min(loo) - theta_margin, s_min) if loo else None
+        if n >= 2 and cons < c_min:
+            return AddResult(None, accepted=False, message=(
+                "Your recordings look different from each other. Please sign the same way each time."), **base)
+        if dry_run:
+            msg = "Looks good." if not conflicts else (
+                f"This looks like '{conflicts[0]['name']}'. Save anyway as your own version?")
+            return AddResult(None, accepted=len(takes) >= min_takes, message=msg, **base)
+        sign = MySign(sign_id=str(uuid.uuid4()), pack=self.pack_id, concept_id=concept_id, text_en=text_en,
+                      text_hi=clean_text(text_hi, TEXT_LIMITS["text_hi"]), region=clean_text(region, TEXT_LIMITS["region"]),
+                      note=clean_text(note, TEXT_LIMITS["note"]), author=clean_text(author, TEXT_LIMITS["author"]),
+                      created=now_iso(), theta=theta)
+        self.save_sign(sign, takes)
+        msg = f"Saved. Recognised {hits_n} of {n} recordings in the self-test."
+        if conflicts:
+            msg += f" Note: it looks similar to '{conflicts[0]['name']}'."
+        return AddResult(sign, accepted=True, message=msg, **base)
+

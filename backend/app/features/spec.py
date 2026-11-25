@@ -50,9 +50,15 @@ class FeatureConfig:
     use_face: bool = True
     use_velocity: bool = True
     max_gap: int = 5  # interpolate hand/pose gaps up to this many frames
+    # Opt-in (ISL): mirror the body frame when the signer's LEFT hand is dominant so every clip is
+    # "right-handed". Same layout and dimension; off by default so ASL checkpoints are unchanged.
+    canonical_hand: bool = False
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        if not self.canonical_hand:  # keep the stored/served config of existing (ASL) models byte-identical
+            d.pop("canonical_hand")
+        return d
 
     @classmethod
     def from_dict(cls, d: dict | None) -> FeatureConfig:

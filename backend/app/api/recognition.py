@@ -27,15 +27,31 @@ from app.features.build import FeatureError, build_features, sequence_quality
 from app.inference import registry
 from app.inference.engine import EngineConfig, RecognitionEngine
 from app.landmarks.raw import RawSequence
+from app.packs.registry import UnknownLanguage, get_registry
 
 router = APIRouter(tags=["recognition"])
 
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 
 
-def _record(gloss: str, class_index: int, score: float, source: str, exp_id: int | None) -> None:
+def _record(gloss: str, class_index: int, score: float, source: str, exp_id: int | None,
+            language: str | None = None, detail: dict | None = None) -> None:
     with session_scope() as db:
-        db.add(RecognitionEvent(gloss=gloss, class_index=class_index, score=score, source=source, experiment_id=exp_id))
+        ev = RecognitionEvent(gloss=gloss[:64], class_index=class_index, score=score, source=source, experiment_id=exp_id)
+        if language is not None:
+            ev.language = language
+        if detail is not None:
+            ev.detail = detail
+        db.add(ev)
+
+
+def _record_commit(commit: dict, source: str, exp_id: int | None, language: str | None) -> None:
+    """ASL commits are stored exactly as before; language-pack commits also keep concept/text/decision."""
+    detail = None
+    if "concept_id" in commit:
+        detail = {k: commit.get(k) for k in ("concept_id", "text", "source", "segment_id", "chosen_by_user")}
+        detail["decision"] = "chosen" if commit.get("chosen_by_user") else "accept"
+    _record(commit["gloss"], commit["class_index"], commit["score"], source, exp_id, language, detail)
 
 
 @router.get("/api/vocabulary", summary="WLASL100 vocabulary with data and per-class performance")
@@ -79,10 +95,14 @@ def vocabulary(db: Session = Depends(get_db)):
 
 
 @router.get("/api/recognition/events", summary="Recently recognised signs (gloss + score only)")
-def events(limit: int = 50, db: Session = Depends(get_db)):
-    rows = list(db.scalars(select(RecognitionEvent).order_by(RecognitionEvent.id.desc()).limit(min(limit, 500))))
+def events(limit: int = 50, language: str | None = None, db: Session = Depends(get_db)):
+    q = select(RecognitionEvent)
+    if language:
+        q = q.where(RecognitionEvent.language == language)
+    rows = list(db.scalars(q.order_by(RecognitionEvent.id.desc()).limit(min(limit, 500))))
     return [{"id": e.id, "gloss": e.gloss, "class_index": e.class_index, "score": e.score, "source": e.source,
-             "experiment_id": e.experiment_id, "created_at": e.created_at} for e in rows]
+             "experiment_id": e.experiment_id, "created_at": e.created_at, "language": e.language,
+             **({"detail": e.detail} if e.detail else {})} for e in rows]
 
 
 @router.delete("/api/recognition/events", summary="Clear recognition history")
@@ -91,19 +111,59 @@ def clear_events(db: Session = Depends(get_db)):
     return {"deleted": n}
 
 
+def _language_session(pack_id: str | None, width: int = 640, height: int = 480, engine_cfg: dict | None = None):
+    """Build the engine for one language. Returns (engine, model_info, problem, pack_info, exp_id).
+
+    The ASL pack (``experiment-registry``) builds exactly the engine of earlier versions (predictor, no
+    recogniser) so its messages are unchanged; other packs pass their recogniser."""
+    reg = get_registry()
+    pack = reg.get(pack_id)
+    cfg = EngineConfig.from_dict(engine_cfg) if engine_cfg else None
+    if pack.info.kind == "experiment-registry":
+        predictor, info, problem = registry.load_active()
+        eng = RecognitionEngine(predictor, width, height, cfg)
+        exp_id = info["experiment_id"] if info else None
+    else:
+        rec, info, problem = pack.recognizer()
+        eng = RecognitionEngine(None, width, height, cfg, recognizer=rec)
+        exp_id = None
+    return eng, info, problem, pack.info.to_json(), exp_id
+
+
+def _languages() -> list[dict]:
+    return [i.to_json() for i in get_registry().list()]
+
+
+def _hello(engine: RecognitionEngine, info, problem, lang: dict) -> dict:
+    return {"type": "hello", "model": info, "engine": engine.describe(), "message": problem,
+            "language": {k: lang[k] for k in ("id", "display_name", "output_languages", "capabilities", "profile",
+                                               "status", "sign_language")},
+            "languages": [{k: x[k] for k in ("id", "display_name", "sign_language", "status", "profile")}
+                          for x in _languages()]}
+
+
 @router.websocket("/api/ws/recognize")
-async def ws_recognize(ws: WebSocket):
+async def ws_recognize(ws: WebSocket, language: str | None = None):
     """Protocol (JSON):
-    client -> {"type":"config","width":W,"height":H,"engine":{...}}
+    client -> {"type":"config","width":W,"height":H,"engine":{...},"language":"isl"?}
               {"type":"frame","t":ms,"pose":[[x,y,z,v]*33]|null,"left":[[x,y,z]*21]|null,"right":...,"face":[[x,y,z]*K]|null}
+              {"type":"choose","segment_id":N,"concept_id":"isl.pen"} | {"type":"reject","segment_id":N}
               {"type":"reset"} | {"type":"ping","t":ms}
-    server -> {"type":"hello",...} | {"type":"state",...} | {"type":"pong"} | {"type":"error","message":...}
+    server -> {"type":"hello",...} | {"type":"state",...} | {"type":"choice_ack",...} | {"type":"reject_ack",...}
+              | {"type":"config_ack",...} | {"type":"pong"} | {"type":"error","message":...}
+    ``language`` (query string or config message) selects a language pack; default ASL (unchanged behaviour).
     """
     await ws.accept()
-    predictor, info, problem = await asyncio.to_thread(registry.load_active)
-    engine = RecognitionEngine(predictor)
-    await ws.send_json({"type": "hello", "model": info, "engine": engine.describe(), "message": problem})
-    exp_id = info["experiment_id"] if info else None
+    lang_error = None
+    try:
+        engine, info, problem, lang, exp_id = await asyncio.to_thread(_language_session, language)
+    except UnknownLanguage as e:
+        lang_error = str(e)
+        engine, info, problem, lang, exp_id = await asyncio.to_thread(_language_session, None)
+    await ws.send_json(_hello(engine, info, problem, lang))
+    if lang_error:
+        await ws.send_json({"type": "error", "message": lang_error})
+    lang_id = lang["id"]
     try:
         while True:
             try:
@@ -125,18 +185,58 @@ async def ws_recognize(ws: WebSocket):
                 state["server_ms"] = (time.perf_counter() - t0) * 1000
                 commit = state.get("commit")
                 if commit:
-                    await asyncio.to_thread(_record, commit["gloss"], commit["class_index"], commit["score"], "live", exp_id)
+                    await asyncio.to_thread(_record_commit, commit, "live", exp_id,
+                                            None if lang_id == "asl-wlasl100" else lang_id)
                 await ws.send_json(state)
             elif kind == "config":
+                new_lang = msg.get("language")
+                if new_lang is not None and new_lang != lang_id:
+                    if not isinstance(new_lang, str):
+                        await ws.send_json({"type": "error", "message": "language must be a string"})
+                        continue
+                    try:
+                        eng_cfg = msg.get("engine") if isinstance(msg.get("engine"), dict) else None
+                        w = int(msg.get("width", engine.width))
+                        h = int(msg.get("height", engine.height))
+                        new = await asyncio.to_thread(_language_session, new_lang, engine.width, engine.height, eng_cfg)
+                        new[0].set_size(w, h)
+                    except UnknownLanguage as e:
+                        await ws.send_json({"type": "error", "message": str(e)})
+                        continue
+                    except (ValueError, TypeError, OverflowError) as e:
+                        await ws.send_json({"type": "error", "message": f"invalid config: {e}"})
+                        continue
+                    engine, info, problem, lang, exp_id = new
+                    lang_id = lang["id"]
+                    await ws.send_json(_hello(engine, info, problem, lang))
+                    continue
                 try:
                     if "width" in msg and "height" in msg:
                         engine.set_size(int(msg["width"]), int(msg["height"]))
                     if "engine" in msg:
-                        engine.cfg = EngineConfig.from_dict({**engine.describe()["config"], **(msg["engine"] or {})})
-                        engine.reset()
+                        engine.configure(EngineConfig.from_dict({**engine.describe()["config"], **(msg["engine"] or {})}))
                     await ws.send_json({"type": "config_ack", "engine": engine.describe()})
                 except (ValueError, TypeError, OverflowError) as e:  # OverflowError: int(Infinity)
                     await ws.send_json({"type": "error", "message": f"invalid config: {e}"})
+            elif kind == "choose":
+                try:
+                    commit = engine.choose(int(msg.get("segment_id")), str(msg.get("concept_id")))
+                except (ValueError, TypeError, OverflowError) as e:
+                    await ws.send_json({"type": "error", "message": f"invalid choice: {e}"})
+                    continue
+                await asyncio.to_thread(_record_commit, commit, "live", exp_id, lang_id)
+                await ws.send_json({"type": "choice_ack", "commit": commit})
+            elif kind == "reject":
+                try:
+                    rej = engine.reject(int(msg.get("segment_id")))
+                except (ValueError, TypeError, OverflowError) as e:
+                    await ws.send_json({"type": "error", "message": f"invalid reject: {e}"})
+                    continue
+                if rej["rejected"]:
+                    await asyncio.to_thread(_record, rej["rejected"], -1, 0.0, "feedback", exp_id, lang_id,
+                                            {"segment_id": rej["segment_id"], "decision": "rejected_by_user",
+                                             "concept_id": rej["rejected"]})
+                await ws.send_json({"type": "reject_ack", **rej})
             elif kind == "reset":
                 engine.reset()
                 await ws.send_json({"type": "reset_ack"})
@@ -159,8 +259,8 @@ def _classify_whole(predictor, seq: RawSequence) -> dict:
             "inference_ms": ms}
 
 
-def _run_engine(predictor, seq: RawSequence, engine_cfg: dict | None) -> dict:
-    eng = RecognitionEngine(predictor, seq.width, seq.height, EngineConfig.from_dict(engine_cfg))
+def _run_engine(predictor, seq: RawSequence, engine_cfg: dict | None, recognizer=None) -> dict:
+    eng = RecognitionEngine(predictor, seq.width, seq.height, EngineConfig.from_dict(engine_cfg), recognizer=recognizer)
     segments, commits = [], []
     for i in range(len(seq)):
         st = eng.push(seq.frame_to_json(i))
@@ -178,8 +278,20 @@ def _run_engine(predictor, seq: RawSequence, engine_cfg: dict | None) -> dict:
 
 @router.post("/api/analyze/video", summary="Offline analysis of a local video file (not live recognition)")
 async def analyze_video(file: UploadFile = File(...), mode: str = Form("segment"), threshold: float | None = Form(None),
-                        whole_clip: bool = Form(True)):
-    predictor, info, problem = await asyncio.to_thread(registry.load_active)
+                        whole_clip: bool = Form(True), language: str | None = Form(None)):
+    recognizer = None
+    if language and language != "asl-wlasl100":
+        try:
+            pack = get_registry().get(language)
+        except UnknownLanguage as e:
+            raise HTTPException(404, str(e)) from e
+        if pack.info.kind == "experiment-registry":
+            predictor, info, problem = await asyncio.to_thread(registry.load_active)
+        else:
+            predictor = None
+            recognizer, info, problem = await asyncio.to_thread(pack.recognizer)
+    else:
+        predictor, info, problem = await asyncio.to_thread(registry.load_active)
     suffix = Path(file.filename or "video.mp4").suffix or ".mp4"
     fd, tmp = tempfile.mkstemp(suffix=suffix)
     size = 0
@@ -218,20 +330,26 @@ async def analyze_video(file: UploadFile = File(...), mode: str = Form("segment"
         "quality": sequence_quality(seq), "landmarks": {"frame_step": step, "frames": [seq.frame_to_json(i) for i in range(0, len(seq), step)]},
         "model": info, "whole_clip": None, "stream": None,
     }
-    if predictor is None:
+    if predictor is None and recognizer is None:
         result["message"] = f"Landmarks extracted, but no model is available for classification. {problem}"
         return result
     if whole_clip:
-        result["whole_clip"] = await asyncio.to_thread(_classify_whole, predictor, seq)
+        if recognizer is not None:
+            result["whole_clip"] = (await asyncio.to_thread(recognizer.recognize, [seq])).to_json()
+        else:
+            result["whole_clip"] = await asyncio.to_thread(_classify_whole, predictor, seq)
     cfg = {"mode": mode}
     if threshold is not None:
         cfg["threshold"] = threshold
     try:
-        result["stream"] = await asyncio.to_thread(_run_engine, predictor, seq, cfg)
+        result["stream"] = await asyncio.to_thread(_run_engine, predictor, seq, cfg, recognizer)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     for c in result["stream"]["commits"]:
-        _record(c["gloss"], c["class_index"], c["score"], "video", info["experiment_id"])
+        if recognizer is not None:
+            _record_commit(c, "video", None, language)
+        else:
+            _record(c["gloss"], c["class_index"], c["score"], "video", info["experiment_id"])
     return result
 
 
@@ -239,10 +357,16 @@ class LandmarkClip(BaseModel):
     width: int = Field(gt=0)
     height: int = Field(gt=0)
     frames: list[dict]
+    language: str | None = None
+    policy: str = "balanced"
 
 
 @router.post("/api/analyze/landmarks", summary="Classify a landmark clip recorded in the browser")
 def analyze_landmarks(clip: LandmarkClip):
+    if clip.language and clip.language != "asl-wlasl100":
+        from app.api.languages import analyze_clip_for_language
+
+        return analyze_clip_for_language(clip.language, clip)
     predictor, info, problem = registry.load_active()
     if predictor is None:
         raise HTTPException(409, problem)

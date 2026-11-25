@@ -117,6 +117,90 @@ def evaluate_partition(exp: Experiment, data: LoadedData, partition: str, device
     return m
 
 
+@dataclass
+class FitResult:
+    best_epoch: int
+    best_metric: float
+    history: list[dict]
+    checkpoint: Path
+
+
+@torch.no_grad()
+def classification_val_metrics(model: nn.Module, val_loader: DataLoader, fcfg: FeatureConfig, device: str) -> dict:
+    """val_loss / val_acc / val_macro_f1 of a classifier (the metrics ``run_training`` has always logged)."""
+    from sklearn.metrics import f1_score
+
+    vp, vy, vloss = predict_loader(model, val_loader, fcfg, device)
+    if len(vy) == 0:
+        return {"val_loss": float("nan"), "val_acc": 0.0, "val_macro_f1": 0.0}
+    vpred = vp.argmax(1)
+    vf1 = float(f1_score(vy, vpred, labels=sorted(set(vy.tolist())), average="macro", zero_division=0))
+    return {"val_loss": vloss, "val_acc": float((vpred == vy).mean()), "val_macro_f1": vf1}
+
+
+def fit(model: nn.Module, train_loader: DataLoader, val_fn: Callable[[nn.Module], dict], loss_fn: Callable,
+        cfg: TrainConfig, ckpt_path: Path, meta: dict, select_key: str = "val_macro_f1", *, device: str = "cpu",
+        steps_per_epoch: int | None = None, params=None, save_module: nn.Module | None = None,
+        on_epoch: Callable[[list[dict]], None] | None = None,
+        epoch_progress: Callable[[int, dict], None] | None = None,
+        progress: Callable[[float, str], None] | None = None,
+        should_stop: Callable[[], bool] | None = None) -> FitResult:
+    """The DB-free epoch loop (docs/ISL_DESIGN.md 6.6), shared by ``run_training`` and the ISL trainers.
+
+    ``loss_fn(model, x, y) -> (loss, logits | None)``; ``val_fn(model) -> dict`` with ``select_key`` (and
+    optionally ``val_acc`` as the tie-breaker). AdamW + warm-up/cosine schedule, gradient clipping at 1.0, early
+    stopping after ``cfg.patience`` epochs without improvement. The best epoch's ``save_module`` (default: the
+    model) is saved with ``save_checkpoint(ckpt_path, ..., {**meta, "best_epoch": epoch})``."""
+    params = list(params) if params is not None else list(model.parameters())
+    opt = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    spe = steps_per_epoch if steps_per_epoch is not None else max(1, len(train_loader))
+    steps = max(1, cfg.epochs * spe)
+    warm = max(1, steps // 20)
+    sched = torch.optim.lr_scheduler.LambdaLR(
+        opt, lambda s: min(1.0, (s + 1) / warm) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / steps)))
+    )
+    history: list[dict] = []
+    best = (-math.inf, -math.inf)
+    best_epoch, bad = -1, 0
+    for epoch in range(1, cfg.epochs + 1):
+        if should_stop and should_stop():
+            raise Cancelled()
+        model.train()
+        t0 = time.time()
+        tl, tc, tn = 0.0, 0, 0
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+            loss, logits = loss_fn(model, x, y)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(params, 1.0)
+            opt.step()
+            sched.step()
+            tl += float(loss.detach()) * len(y)
+            if logits is not None:
+                tc += int((logits.argmax(-1) == y).sum())
+            tn += len(y)
+        vm = val_fn(model)
+        row = {"epoch": epoch, "train_loss": tl / max(1, tn), "train_acc": tc / max(1, tn), **vm,
+               "lr": opt.param_groups[0]["lr"], "seconds": time.time() - t0}
+        history.append(row)
+        score = (float(vm.get(select_key, 0.0)), float(vm.get("val_acc", 0.0)))
+        if score > best:
+            best, best_epoch, bad = score, epoch, 0
+            save_checkpoint(ckpt_path, save_module if save_module is not None else model, {**meta, "best_epoch": epoch})
+        else:
+            bad += 1
+        if on_epoch:
+            on_epoch(history)
+        if epoch_progress:
+            epoch_progress(epoch, row)
+        elif progress:
+            progress(epoch / cfg.epochs, f"epoch {epoch}/{cfg.epochs} - {select_key} {score[0]:.3f}")
+        if bad >= cfg.patience:
+            break
+    return FitResult(best_epoch, best[0], history, ckpt_path)
+
+
 def run_training(exp_id: int, progress: Callable[[float, str], None] | None = None,
                  should_stop: Callable[[], bool] | None = None) -> dict:
     settings = get_settings()
@@ -153,12 +237,6 @@ def run_training(exp_id: int, progress: Callable[[float, str], None] | None = No
 
     weight = class_weights(data.samples["train"], n_classes).to(device) if cfg.class_weighting == "balanced" else None
     crit = nn.CrossEntropyLoss(weight=weight, label_smoothing=cfg.label_smoothing)
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    steps = max(1, cfg.epochs * math.ceil(len(train_ds) / cfg.batch_size))
-    warm = max(1, steps // 20)
-    sched = torch.optim.lr_scheduler.LambdaLR(
-        opt, lambda s: min(1.0, (s + 1) / warm) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / steps)))
-    )
 
     ckpt_path = settings.checkpoints_dir / f"exp{exp_id:04d}_{cfg.architecture}.pt"
     meta = {
@@ -170,55 +248,32 @@ def run_training(exp_id: int, progress: Callable[[float, str], None] | None = No
         "split": split.name,
         "train_config": asdict(cfg),
     }
-    history: list[dict] = []
-    best = (-1.0, -1.0)
-    best_epoch, bad = -1, 0
     t_start = time.time()
-    for epoch in range(1, cfg.epochs + 1):
-        if should_stop and should_stop():
-            raise Cancelled()
-        model.train()
-        t0 = time.time()
-        tl, tc, tn = 0.0, 0, 0
-        for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
-            logits = model(x, frame_mask(x, fcfg))
-            loss = crit(logits, y)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            sched.step()
-            tl += float(loss.detach()) * len(y)
-            tc += int((logits.argmax(-1) == y).sum())
-            tn += len(y)
-        vp, vy, vloss = predict_loader(model, val_loader, fcfg, device)
-        vpred = vp.argmax(1)
-        from sklearn.metrics import f1_score
 
-        vf1 = float(f1_score(vy, vpred, labels=sorted(set(vy.tolist())), average="macro", zero_division=0))
-        vacc = float((vpred == vy).mean())
-        row = {
-            "epoch": epoch, "train_loss": tl / max(1, tn), "train_acc": tc / max(1, tn), "val_loss": vloss,
-            "val_acc": vacc, "val_macro_f1": vf1, "lr": opt.param_groups[0]["lr"], "seconds": time.time() - t0,
-        }
-        history.append(row)
-        improved = (vf1, vacc) > best
-        if improved:
-            best, best_epoch, bad = (vf1, vacc), epoch, 0
-            save_checkpoint(ckpt_path, model, {**meta, "best_epoch": epoch})
-        else:
-            bad += 1
+    def loss_fn(m: nn.Module, x: torch.Tensor, y: torch.Tensor):
+        logits = m(x, frame_mask(x, fcfg))
+        return crit(logits, y), logits
+
+    def val_fn(m: nn.Module) -> dict:
+        return classification_val_metrics(m, val_loader, fcfg, device)
+
+    def on_epoch(history: list[dict]) -> None:
         with session_scope() as db:
             e = db.get(Experiment, exp_id)
             e.history = list(history)
             e.n_params = n_params
             e.device = device
             e.checkpoint_path = str(ckpt_path)
+
+    def epoch_progress(epoch: int, row: dict) -> None:
         if progress:
-            progress(epoch / cfg.epochs, f"epoch {epoch}/{cfg.epochs} - val acc {vacc:.3f}, macro F1 {vf1:.3f}")
-        if bad >= cfg.patience:
-            break
+            progress(epoch / cfg.epochs,
+                     f"epoch {epoch}/{cfg.epochs} - val acc {row['val_acc']:.3f}, macro F1 {row['val_macro_f1']:.3f}")
+
+    res = fit(model, train_loader, val_fn, loss_fn, cfg, ckpt_path, meta, device=device,
+              steps_per_epoch=math.ceil(len(train_ds) / cfg.batch_size), on_epoch=on_epoch,
+              epoch_progress=epoch_progress, should_stop=should_stop)
+    best_epoch = res.best_epoch
 
     # Final validation metrics with the best checkpoint; derive the rejection threshold.
     with session_scope() as db:

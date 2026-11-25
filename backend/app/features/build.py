@@ -151,6 +151,45 @@ def to_body_frame(raw: RawSequence, max_gap: int = 5) -> BodyFrame:
     return bf
 
 
+def mirror_body_frame(bf: BodyFrame) -> BodyFrame:
+    """The same sign performed with the other dominant hand (left/right swapped, x negated). In place."""
+    bf.pose = bf.pose[:, POSE_MIRROR].copy()
+    bf.pose[..., 0] *= -1
+    bf.face = bf.face[:, FACE_MIRROR].copy()
+    bf.face[..., 0] *= -1
+    bf.left, bf.right = bf.right.copy(), bf.left.copy()
+    bf.left[..., 0] *= -1
+    bf.right[..., 0] *= -1
+    bf.present["left"], bf.present["right"] = bf.present["right"].copy(), bf.present["left"].copy()
+    return bf
+
+
+def dominant_hand(bf: BodyFrame) -> str | None:
+    """'left' / 'right' = the hand whose wrist travels further (summed path length over frames where it is
+    present in two consecutive frames); None on a tie (including no hands)."""
+    lens = {}
+    for name in ("left", "right"):
+        w = getattr(bf, name)[:, 0, :2]
+        ok = bf.present[name][1:] & bf.present[name][:-1]
+        d = np.linalg.norm(np.diff(w, axis=0), axis=1)
+        lens[name] = float(d[ok].sum()) if len(d) else 0.0
+    if abs(lens["left"] - lens["right"]) < 1e-9:
+        return None
+    return "left" if lens["left"] > lens["right"] else "right"
+
+
+def canonicalize(bf: BodyFrame) -> BodyFrame:
+    """Mirror when the left hand is dominant (``FeatureConfig.canonical_hand``)."""
+    return mirror_body_frame(bf.copy()) if dominant_hand(bf) == "left" else bf
+
+
+def prepare_body_frame(raw: RawSequence, cfg: FeatureConfig) -> BodyFrame:
+    """``to_body_frame`` plus the opt-in canonical handedness: the one entry point used by training caches,
+    offline analysis and live inference."""
+    bf = to_body_frame(raw, cfg.max_gap)
+    return canonicalize(bf) if getattr(cfg, "canonical_hand", False) else bf
+
+
 # --- augmentation -------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -186,14 +225,7 @@ def augment(bf: BodyFrame, rng: np.random.Generator, cfg: AugmentConfig = Augmen
             bf.t = np.sort(bf.t) + np.arange(len(bf)) * 1e-3
     # mirror = same sign performed with the other dominant hand
     if rng.random() < cfg.p_mirror:
-        bf.pose = bf.pose[:, POSE_MIRROR].copy()
-        bf.pose[..., 0] *= -1
-        bf.face = bf.face[:, FACE_MIRROR].copy()
-        bf.face[..., 0] *= -1
-        bf.left, bf.right = bf.right.copy(), bf.left.copy()
-        bf.left[..., 0] *= -1
-        bf.right[..., 0] *= -1
-        bf.present["left"], bf.present["right"] = bf.present["right"].copy(), bf.present["left"].copy()
+        mirror_body_frame(bf)
     # global similarity transform in the image plane
     th = np.deg2rad(rng.uniform(-cfg.rotate_deg, cfg.rotate_deg))
     sc = 1.0 + rng.uniform(-cfg.scale, cfg.scale)
@@ -285,7 +317,7 @@ def featurize(bf: BodyFrame, cfg: FeatureConfig) -> np.ndarray:
 
 def build_features(raw: RawSequence, cfg: FeatureConfig, rng: np.random.Generator | None = None,
                    aug: AugmentConfig | None = None) -> np.ndarray:
-    bf = to_body_frame(raw, cfg.max_gap)
+    bf = prepare_body_frame(raw, cfg)
     if rng is not None:
         bf = augment(bf, rng, aug or AugmentConfig())
     return featurize(bf, cfg)

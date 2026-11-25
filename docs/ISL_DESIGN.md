@@ -1043,6 +1043,71 @@ def fit(model: nn.Module, train_loader: DataLoader, val_fn: Callable[[nn.Module]
 ISL trainers call `fit` with their own datasets (`isl/training/common.py: ClipDataset(clips, fcfg, train, aug)` with an
 in-memory cache of `BodyFrame`s in float32; about 1.2 GB for INCLUDE + trimmed ISLRTC).
 
+### 6.7 Implementation notes and deviations (AI Engineer, models and My signs, 25 Nov 2026)
+
+Implemented: `inference/recognizer.py`, the engine's `recognizer=` option, `packs/*` (registry, ASL and ISL packs,
+runtime `Vocabulary`), `api/languages.py`, the language-aware WebSocket and analyze routes, `db/migrate.py`,
+`training/trainer.fit`, `isl/augment.py`, `isl/models/*`, `isl/fingerspell/*`, `isl/mysigns/*`, a minimal
+`isl/text/lexicon.py` (reader + local corrections only), `isl/recognizer.py`, `isl/training/*`, `isl/evaluation/*` and
+the model commands of `isl/cli.py` (`train-classifier`, `train-encoder`, `build-index`, `train-letters`, `fit-fusion`,
+`evaluate`, `build-pack`, `smoke`). Deviations from sections 4, 6 and 7, with reasons:
+
+* **ASL stays byte-identical.** `FeatureConfig.to_dict()` leaves `canonical_hand` out when it is false, and the engine's
+  `describe()` leaves the recogniser-only fields (`policy`, `use_my_signs`, `spell_end_ms`, `max_spell_ms`) out when there
+  is no recogniser, so ASL checkpoints, `/api/features/spec`, `hello` and `config_ack` are unchanged (`hello` only gains
+  `language` and `languages`). The ASL WebSocket keeps the original predictor engine path; `ClassifierRecognizer` reproduces
+  the same rule for the language API and future packs.
+* **`canonical_hand`** is applied in one place, `features.build.prepare_body_frame` (used by `build_features`, the training
+  cache and the letter features), so training, offline analysis and live inference cannot diverge.
+* **Pack ids**: `isl` (commercial-safe) and `isl-research`. `SLR_ISL_PROFILE` is the default profile of the build commands,
+  not a runtime switch; both packs are listed when both are built. The tracked `models/packs/isl` holds `pack.json` and the
+  vocabulary only (status `missing_models`); `build-pack` writes the full pack to `artifacts/packs/<id>` (git-ignored),
+  which overrides it. No smoke weights are committed.
+* **`missing_models` still recognises My signs.** Without a classifier and an index the pack builds a recogniser that only
+  searches the user's signs (the UI message says so). Because a softmax over a few user signs cannot say "none of them",
+  a user sign is accepted only when its cosine passes the sign's own threshold `theta` (lowest leave-one-out
+  self-similarity at enrolment minus 0.05, floored at `s_min`); otherwise it is "suggest" or "abstain".
+* **My signs without an encoder** use a model-free embedding (`FeatureStatsEmbedder`, version `featstats-1`: per-dimension
+  mean and standard deviation of the feature sequence). Takes are re-embedded automatically when the pack's encoder appears.
+* **Fusion details** not fixed by 6.3: the softmax is taken over the union of candidates (classifier top-50, retrieval
+  top-50, all user signs); concepts outside the classifier get `noncore_logp = log(1e-3)`; concepts with no index row get the
+  50th-best retrieval score as a neutral floor; the retrieval softmax includes user signs with `user_bonus` (logit units).
+  When a precision target cannot be reached on validation, the threshold with the best measured precision is used, all
+  policies may collapse to one value, and the measured numbers are stored in `fusion.json` `achieved` (the UI must show
+  these, never the targets).
+* **Fingerspelling data does not exist yet.** The ISLRTC `A/Alphabet.mp4` and `F/Fingerspell.mp4` entries are the signs for
+  the *words* (about 3.8 s each, re-extracted in full into `data/isl/landmarks/islrtc_full/`), not A-Z sequences. So:
+  (1) `train-letters` trains the letter MLP from in-order alphabet recordings when someone records them (monotonic
+  alignment of holds to letters); (2) until then spelling uses a **per-user alphabet calibration** in My signs
+  (`GET/POST/DELETE /api/languages/{lang}/my-signs/alphabet`, one recording per letter, nearest-prototype letter
+  posteriors, at least 5 letters); (3) spelled words are always `suggest` (never auto-accepted) and the decoder prefers a
+  lexicon word reachable by one edit over an out-of-lexicon string (`oov_pen`). The spelling lexicon is vocabulary headwords
+  plus Indian states/cities with all Madhya Pradesh districts; SCOWL is not added yet.
+* **Feedback**: `reject` is stored as a recognition event with `source: "feedback"`; `choose` commits are stored with
+  `detail.chosen_by_user: true`. Neither is used for training.
+* **Not done here** (owned by later tasks or phase 2): the sentence endpoint and Hindi generation (only the lexicon reader
+  exists, so `text.hi` is null until `lexicon_hi.jsonl` is generated); conflict reports on sign-pack import (enrolment does
+  check conflicts); research-profile pre-training (WLASL warm start, iSign contrastive); the per-fold held-out-concept
+  one-shot protocol (E2 in the smoke run is the "seen-class" variant, labelled as such); E4/E5/E8 runners.
+* **Test note**: the backend suite is CPU-bound; while the ingestion jobs saturate the CPUs, run it with
+  `SLR_TORCH_THREADS=2` (otherwise torch's default threads fight MediaPipe's and GRU training slows down about 30x).
+
+**Smoke run on partial data** (`python -m app.isl.cli smoke`, 2 threads, `nice -n 10`, 90 s in total including the
+incremental trim, while ingestion used the CPUs; split `include-session-cv5-fold0`, session-independent, **not**
+signer-independent): INCLUDE 623 clips of 51 words in the split (373 train / 125 val / 125 test; 168 newer clips not yet
+in any split), ISLRTC 2,023 dictionary clips (entries A to about B), all but 5 trimmed. Classifier (hidden 64, 1 layer,
+8 epochs, 11 s): 43 classes, val top-1 0.40, top-5 0.82. Encoder (hidden 64, 128-d, 4 x 20 batches, 29 s): 1,849
+concepts, val recall@1 0.22, @5 0.51. Index: 3,239 rows. Fusion: no precision target is supported by the validation
+data (balanced accept threshold 0.73 for every policy). Test fold: E1 top-1 0.50, top-5 0.79, macro F1 0.43 (n = 84);
+E2 (INCLUDE vs ISLRTC rows only, seen-class) top-1 0.00 (n = 15); E3 coverage 0.06, accepted precision 0.63 (5 of 8),
+silent error rate 0.02, suggest 0.57 (true word in the top 5 for 0.69 of them), abstain 0.37 (n = 125); E6 p50 114 ms,
+p95 207 ms per segment under full CPU load (about 15-20 ms when the CPU is free). **These numbers only prove the pipeline
+runs end to end; they are not the app's accuracy.** The results file carries the same label.
+
+* **Thresholds use the 95 % Wilson lower bound** of accepted precision, not the point estimate: an earlier smoke run
+  picked 0.85 because 5 of 5 validation clips above it were right, and then accepted 1 of 4 correctly on test.
+  With the lower bound a target counts as reached only when the amount of data supports it.
+
 ---
 
 ## 7. Personal and regional signs: "My signs" (task 5)
