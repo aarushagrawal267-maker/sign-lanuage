@@ -22,7 +22,7 @@ import zipfile
 import numpy as np
 
 from app.features.spec import N_FACE, N_HAND, N_POSE
-from app.isl.mysigns.store import SIGN_ID_RE, TEXT_LIMITS, MySign, MySignsStore, clean_text, now_iso
+from app.isl.mysigns.store import SIGN_ID_RE, TEXT_LIMITS, MySign, MySignsStore, calibrate_theta, clean_text, now_iso
 from app.landmarks.raw import RawSequence
 
 FORMAT = "sign-pack"
@@ -32,6 +32,9 @@ MAX_SIGNS = 2000
 MAX_TAKES = 5
 MAX_FRAMES = 300
 MAX_UNCOMPRESSED = 400 * 1024 * 1024
+# One take of MAX_FRAMES frames with face points is about 2.2 MB of float32; the .npz members are compressed
+# zips themselves, so their own declared sizes are checked too (a small member must not expand to gigabytes).
+MAX_TAKE_UNCOMPRESSED = 8 * 1024 * 1024
 MEMBER_RE = re.compile(r"^(manifest\.json|signs\.jsonl|embeddings\.npy|takes/[0-9a-f-]{36}/[0-9]\.npz)$")
 CONSENT_TEXT = ("This file contains body and hand movement points of the people who recorded these signs (no video). "
                 "Share it only with their permission.")
@@ -79,7 +82,19 @@ def export_pack(store: MySignsStore, ids: list[str] | None = None, *, title: str
     return out.getvalue()
 
 
+def _npz_size(data: bytes, name: str) -> int:
+    """Total uncompressed size declared by the members of an .npz (itself a zip). Python's zip reader never
+    returns more than the declared size, so bounding it bounds the memory ``np.load`` can use."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as inner:
+            return sum(i.file_size for i in inner.infolist())
+    except zipfile.BadZipFile:
+        raise PackError(f"{name}: not a valid landmark file (BadZipFile)") from None
+
+
 def _check_raw(data: bytes, name: str) -> RawSequence:
+    if _npz_size(data, name) > MAX_TAKE_UNCOMPRESSED:
+        raise PackError(f"{name}: landmark file is too large")
     try:
         npz = np.load(io.BytesIO(data), allow_pickle=False)
         arrs = {k: npz[k] for k in ("pose", "left", "right", "face", "t_ms", "width", "height")}
@@ -96,7 +111,10 @@ def _check_raw(data: bytes, name: str) -> RawSequence:
             raise PackError(f"{name}: '{k}' has shape {a.shape}, expected {shp}")
         if np.isinf(a).any() or (k == "t_ms" and np.isnan(a).any()):
             raise PackError(f"{name}: '{k}' contains invalid numbers")
-    w, h = int(arrs["width"]), int(arrs["height"])
+    try:
+        w, h = int(arrs["width"]), int(arrs["height"])
+    except (TypeError, ValueError, OverflowError):
+        raise PackError(f"{name}: invalid frame size") from None
     if not (0 < w <= 10000 and 0 < h <= 10000):
         raise PackError(f"{name}: invalid frame size {w}x{h}")
     return RawSequence(arrs["pose"].astype(np.float32), arrs["left"].astype(np.float32),
@@ -129,6 +147,7 @@ def read_pack(data: bytes) -> tuple[dict, list[tuple[MySign, list[RawSequence]]]
         raise PackError("not a sign pack of a supported version")
     out = []
     seen = set()
+    take_bytes = 0
     for ln in z.read("signs.jsonl").decode("utf-8", "replace").splitlines():
         if not ln.strip():
             continue
@@ -142,15 +161,19 @@ def read_pack(data: bytes) -> tuple[dict, list[tuple[MySign, list[RawSequence]]]
         if not SIGN_ID_RE.match(sid) or sid in seen:
             raise PackError(f"invalid or repeated sign id {sid[:40]!r}")
         seen.add(sid)
-        n = int(row.get("n_takes") or 0)
-        if not (1 <= n <= MAX_TAKES):
+        n = row.get("n_takes")
+        if isinstance(n, bool) or not isinstance(n, int) or not (1 <= n <= MAX_TAKES):
             raise PackError(f"sign {sid}: {n} takes (1 to {MAX_TAKES} allowed)")
         takes = []
         for i in range(n):
             mn = f"takes/{sid}/{i}.npz"
             if mn not in names:
                 raise PackError(f"missing {mn}")
-            takes.append(_check_raw(z.read(mn), mn))
+            raw = z.read(mn)
+            take_bytes += _npz_size(raw, mn)
+            if take_bytes > MAX_UNCOMPRESSED:
+                raise PackError("sign pack expands to more than 400 MB")
+            takes.append(_check_raw(raw, mn))
         cid = row.get("concept_id")
         sign = MySign(sign_id=sid, pack=str(manifest.get("pack") or ""),
                       concept_id=clean_text(cid, 120) if isinstance(cid, str) else None,
@@ -175,7 +198,12 @@ def read_pack(data: bytes) -> tuple[dict, list[tuple[MySign, list[RawSequence]]]
     return manifest, out
 
 
-def import_pack(store: MySignsStore, data: bytes, mode: str = "merge", encoder_version: str | None = None) -> dict:
+def import_pack(store: MySignsStore, data: bytes, mode: str = "merge", encoder_version: str | None = None, *,
+                embedder=None, s_min: float = -1.0, c_min: float = 0.5) -> dict:
+    """Validate and store a pack. The acceptance threshold (``theta``) stored in the file is never trusted: it was
+    computed by another installation, possibly with another encoder, and a low value would let any movement be
+    taken as that sign. It is recomputed from the takes with ``embedder``; without one (or when the takes are
+    inconsistent) it is ``None``, so the sign is only ever offered under "did you mean", never accepted directly."""
     if mode not in ("merge", "replace"):
         raise PackError("mode must be 'merge' or 'replace'")
     manifest, signs = read_pack(data)
@@ -193,6 +221,7 @@ def import_pack(store: MySignsStore, data: bytes, mode: str = "merge", encoder_v
         sign.pack = store.pack_id
         sign.origin = f"imported:{title}"
         sign.enabled = True
+        sign.theta = calibrate_theta(takes, embedder, s_min=s_min, c_min=c_min)
         store.save_sign(sign, takes)
         imported += 1
     return {"imported": imported, "skipped": skipped, "title": title, "licence": manifest.get("licence"),

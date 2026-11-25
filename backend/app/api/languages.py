@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import re
 import threading
+from typing import Annotated
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
@@ -16,6 +17,10 @@ from app.landmarks.raw import RawSequence
 from app.packs.registry import UnknownLanguage, get_registry
 
 router = APIRouter(tags=["languages"])
+
+# Longest landmark clip accepted by the analysis routes: 10 minutes at 30 fps. Without a bound, a small request of
+# empty frames ({"t": 0} each) would make the server allocate gigabytes of NaN-filled landmark arrays.
+MAX_CLIP_FRAMES = 18000
 
 
 def _pack(lang: str):
@@ -130,15 +135,20 @@ def _preview(entry: dict, max_frames: int = 48) -> dict | None:
 
     try:
         recs, trims = _islrtc_paths()
-    except OSError:
+    except (OSError, ValueError):
         return None
     for v in entry.get("variants", []):
         for cid in v.get("clips", []):
             if cid in recs and Path(recs[cid]).exists():
-                raw = RawSequence.load(Path(recs[cid]))
-                tr = trims.get(cid)
-                if tr and tr.get("method") != "empty":
-                    raw = raw.slice(int(tr["start"]), int(tr["end"]))
+                try:  # local data that is still being ingested: a bad file or trim row skips the preview
+                    raw = RawSequence.load(Path(recs[cid]))
+                    tr = trims.get(cid)
+                    if tr and tr.get("method") != "empty":
+                        raw = raw.slice(int(tr["start"]), int(tr["end"]))
+                except Exception:  # noqa: BLE001
+                    continue
+                if len(raw) == 0:
+                    continue
                 step = max(1, len(raw) // max_frames)
                 return {"clip": cid, "variant_id": v.get("variant_id"), "width": raw.width, "height": raw.height,
                         "frames": [raw.frame_to_json(i) for i in range(0, len(raw), step)]}
@@ -246,7 +256,7 @@ def build_sentence_route(lang: str, body: SentenceIn):
 
 class LexiconPatch(BaseModel):
     hi: str = Field(min_length=1, max_length=120)
-    hi_alt: list[str] = Field(default_factory=list, max_length=10)
+    hi_alt: list[Annotated[str, Field(max_length=120)]] = Field(default_factory=list, max_length=10)
     review: str = "reviewed"
     reviewer: str | None = Field(None, max_length=80)
 
@@ -256,6 +266,8 @@ def patch_lexicon(lang: str, concept_id: str, body: LexiconPatch):
     pack = _isl_pack(lang)
     if pack.vocabulary().get(concept_id) is None:
         raise HTTPException(404, f"unknown concept {concept_id!r}")
+    if not body.hi.strip():
+        raise HTTPException(422, "the Hindi text must not be empty")
     try:
         return pack.lexicon().set_local(concept_id, body.hi, body.hi_alt, body.review, body.reviewer,
                                         english=pack.vocabulary().english(concept_id))
@@ -268,7 +280,7 @@ def patch_lexicon(lang: str, concept_id: str, body: LexiconPatch):
 class ClipIn(BaseModel):
     width: int = Field(gt=0)
     height: int = Field(gt=0)
-    frames: list[dict]
+    frames: list[dict] = Field(max_length=MAX_CLIP_FRAMES)
     policy: str = "balanced"
     top_k: int = Field(5, ge=1, le=20)
     spell: bool = False
@@ -413,6 +425,8 @@ def reset_alphabet(lang: str):
 @router.patch("/api/languages/{lang}/my-signs/{sign_id}", summary="Rename, translate or enable/disable a sign")
 def patch_my_sign(lang: str, sign_id: str, body: MySignPatch):
     pack = _isl_pack(lang)
+    if body.concept_id and pack.vocabulary().get(body.concept_id) is None:  # "" unlinks
+        raise HTTPException(404, f"unknown concept {body.concept_id!r}")
     try:
         return pack.my_signs().update(sign_id, **body.model_dump()).to_json()
     except KeyError:
@@ -460,14 +474,21 @@ async def import_my_signs(lang: str, file: UploadFile = File(...), mode: str = F
         raise HTTPException(413, "sign pack larger than 50 MB")
     rec, _, _ = pack.recognizer()
     try:
-        out = import_pack(pack.my_signs(), data, mode, encoder_version=rec.user_embedder.version if rec else None)
+        out = import_pack(pack.my_signs(), data, mode, encoder_version=rec.user_embedder.version if rec else None,
+                          embedder=rec.user_embedder if rec else None,
+                          s_min=rec.fusion.s_min if rec else -1.0,
+                          c_min=float(rec.fusion.enrol.get("c_min", 0.5)) if rec else 0.5)
     except PackError as e:
         raise HTTPException(422, str(e)) from e
     out["conflicts"] = []  # conflicts are shown per sign on the My signs page (same check as enrolment)
     return out
 
 
+_DEMO_ALLOWED = re.compile(r"^/api/languages/[^/]+/(analyze/landmarks|sentence)$")
+
+
 def demo_allowed(path: str) -> bool:
-    """Write routes that stay enabled in the public read-only demo (pure analysis, nothing stored)."""
-    return path.startswith("/api/languages/") and (path.endswith("/analyze/landmarks") or path.endswith("/sentence"))
+    """Write routes that stay enabled in the public read-only demo (pure analysis, nothing stored). Exact route
+    shapes only: a suffix test would also let through e.g. ``DELETE /api/languages/isl/my-signs/sentence``."""
+    return bool(_DEMO_ALLOWED.match(path))
 

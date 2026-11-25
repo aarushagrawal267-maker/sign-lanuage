@@ -137,3 +137,13 @@ def test_classifier_recognizer_matches_engine_rule(tmp_path):
     assert rec.candidates[0].concept_id == rec.candidates[0].gloss and rec.candidates[0].gloss in names
     strict = ClassifierRecognizer(p, threshold=1.01).recognize([make_sequence(4, 7)])
     assert strict.decision == "suggest" and strict.reason == "low_confidence"
+
+
+def test_repeated_choice_is_marked_duplicate():
+    eng = RecognitionEngine(None, recognizer=FakeRecognizer("suggest"))
+    seg = next(s for s in _run(eng) if "segment_result" in s and "decision" in s["segment_result"])
+    sid = seg["segment_result"]["segment_id"]
+    assert "duplicate" not in eng.choose(sid, "isl.pen")
+    assert eng.choose(sid, "isl.pen")["duplicate"] is True  # double tap: the word is added once
+    eng.reject(sid)
+    assert "duplicate" not in eng.choose(sid, "isl.pen")  # chosen again after "wrong word"

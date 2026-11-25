@@ -1,7 +1,9 @@
 """Data profiles: which sources a model build may use (docs/ISL_DESIGN.md section 10.1).
 
-``commercial-safe`` excludes non-commercial data (iSign, WLASL) and anything whose licence is still under
-review (CISLR). The profile name is recorded in every derived artifact so components built from different
+``commercial-safe`` excludes non-commercial data (iSign, WLASL, CISLR: its README says CC BY-NC 4.0). It still
+uses the ISLRTC dictionary, whose publisher forbids resale and profiteering (ISLRTC FAQ Q.23): fine for a free,
+non-profit app with acknowledgement, but a paid release needs ISLRTC's permission (docs/DATASETS_ISL.md). The
+profile name is recorded in every derived artifact so components built from different
 profiles are never mixed.
 """
 

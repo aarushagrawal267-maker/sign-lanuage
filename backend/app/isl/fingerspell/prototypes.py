@@ -7,6 +7,7 @@ to the user's own hands, camera and regional letter forms. Stored at ``data/my_s
 from __future__ import annotations
 
 import threading
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,15 @@ from app.isl.fingerspell.model import LETTERS, NOISE
 from app.landmarks.raw import RawSequence
 
 MIN_LETTERS = 5
+# ``IslPack.alphabet()`` makes a new store per request, so the lock must be shared per file, not per instance:
+# two letters recorded at once would otherwise both read-modify-write the file and one would be lost.
+_FILE_LOCKS: dict[str, threading.Lock] = {}
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+def _file_lock(path: Path) -> threading.Lock:
+    with _FILE_LOCKS_GUARD:
+        return _FILE_LOCKS.setdefault(str(Path(path).resolve()), threading.Lock())
 
 
 def hold_features(raw: RawSequence, min_ms: float = 150.0, v_max: float = 0.45) -> tuple[np.ndarray, float] | None:
@@ -70,14 +80,22 @@ class PrototypeLetters:
 class AlphabetStore:
     def __init__(self, folder: Path):
         self.path = Path(folder) / "alphabet.npz"
-        self._lock = threading.Lock()
+        self._lock = _file_lock(self.path)
 
     def load(self) -> dict[str, list[np.ndarray]]:
+        """The calibration, or {} when there is none or the file is unreadable (the language list and the
+        recogniser read it on every request, so a damaged file must not turn into server errors)."""
         if not self.path.exists():
             return {}
-        z = np.load(self.path, allow_pickle=False)
+        try:
+            with np.load(self.path, allow_pickle=False) as z:
+                labels, feats = z["labels"].tolist(), np.asarray(z["feats"], np.float32)
+        except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
+            return {}
+        if feats.ndim != 2 or feats.shape[1:] != (LETTER_DIM,):
+            return {}
         out: dict[str, list[np.ndarray]] = {}
-        for lab, f in zip(z["labels"].tolist(), z["feats"]):
+        for lab, f in zip(labels, feats):
             out.setdefault(str(lab), []).append(f)
         return out
 
@@ -101,12 +119,13 @@ class AlphabetStore:
         labels = [k for k, v in d.items() for _ in v]
         feats = [f for v in d.values() for f in v]
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name("alphabet.tmp.npz")
+        tmp = self.path.with_name(f"alphabet.{threading.get_ident()}.tmp.npz")
         np.savez(tmp, labels=np.array(labels, dtype="U8"), feats=np.stack(feats).astype(np.float32))
         tmp.replace(self.path)
 
     def reset(self) -> None:
-        self.path.unlink(missing_ok=True)
+        with self._lock:
+            self.path.unlink(missing_ok=True)
 
     def model(self) -> PrototypeLetters | None:
         d = self.load()

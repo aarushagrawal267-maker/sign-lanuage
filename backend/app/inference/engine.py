@@ -408,9 +408,13 @@ class RecognitionEngine:
         cand = next((x for x in seg["candidates"] if x["concept_id"] == concept_id), None)
         if cand is None:
             raise ValueError(f"{concept_id!r} was not offered for segment {segment_id}")
+        commit = self._commit_from(cand, int(segment_id), seg["t"], chosen=True)
+        if seg["committed"] == concept_id:  # a repeated tap / resend: the word is already in the text
+            commit["duplicate"] = True
+            return commit
         seg["committed"] = concept_id
         self.last_commit_t = seg["t"]
-        return self._commit_from(cand, int(segment_id), seg["t"], chosen=True)
+        return commit
 
     def reject(self, segment_id: int) -> dict:
         """The user said an accepted word was wrong. Returns what was rejected."""

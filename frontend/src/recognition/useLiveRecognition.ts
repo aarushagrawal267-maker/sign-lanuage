@@ -130,6 +130,8 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
       } else if (msg.type === "config_ack") {
         setServerError(null);
       } else if (msg.type === "choice_ack") {
+        // A repeated choice for the same segment (double tap) comes back marked duplicate: add the word once.
+        if (msg.duplicate) return;
         const c = msg.commit as Commit;
         setTranscript((tr) => [...tr, transcriptItem(idRef.current++, c)]);
       } else if (msg.type === "state") {

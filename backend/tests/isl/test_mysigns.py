@@ -132,3 +132,124 @@ def test_signpack_import_rejects_unsafe_content(tmp_path):
     np.savez(buf, pose=good.pose, left=good.left, right=good.right, face=good.face, t_ms=good.t_ms, width=640, height=480)
     with pytest.raises(PackError, match="is for"):
         import_pack(st, _zip({"manifest.json": other, "signs.jsonl": row, f"takes/{sid}/0.npz": buf.getvalue()}))
+
+
+# ------------------------------------------------------------------------------------- code-review fixes
+
+def _good_npz(width=640) -> bytes:
+    good = RawSequence.from_frames([{"t": 0}], 640, 480)
+    buf = io.BytesIO()
+    np.savez(buf, pose=good.pose, left=good.left, right=good.right, face=good.face, t_ms=good.t_ms, width=width,
+             height=480)
+    return buf.getvalue()
+
+
+SID = "12345678-1234-1234-1234-123456789abc"
+MAN = json.dumps({"format": "sign-pack", "version": 1, "pack": "isl", "title": "t"}).encode()
+
+
+@pytest.mark.parametrize("n_takes", ["abc", [1], "1", 1.5, True, None, 9])
+def test_signpack_bad_take_count_is_a_pack_error(n_takes):
+    """Malformed rows must give a clear PackError (HTTP 422), never an unhandled ValueError/TypeError (500)."""
+    row = json.dumps({"sign_id": SID, "text_en": "x", "n_takes": n_takes}).encode()
+    with pytest.raises(PackError, match="takes"):
+        read_pack(_zip({"manifest.json": MAN, "signs.jsonl": row, f"takes/{SID}/0.npz": _good_npz()}))
+
+
+@pytest.mark.parametrize("width", [np.array([1, 2]), np.float64("nan"), "abc"])
+def test_signpack_bad_frame_size_is_a_pack_error(width):
+    row = json.dumps({"sign_id": SID, "text_en": "x", "n_takes": 1}).encode()
+    with pytest.raises(PackError):
+        read_pack(_zip({"manifest.json": MAN, "signs.jsonl": row, f"takes/{SID}/0.npz": _good_npz(width)}))
+
+
+def test_signpack_rejects_compressed_bomb_inside_take():
+    """A take's .npz is a zip of its own: a tiny member that expands to a huge array is refused before loading."""
+    inner = io.BytesIO()
+    with zipfile.ZipFile(inner, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("pose.npy", b"\0" * (20 * 1024 * 1024))
+    row = json.dumps({"sign_id": SID, "text_en": "x", "n_takes": 1}).encode()
+    data = _zip({"manifest.json": MAN, "signs.jsonl": row, f"takes/{SID}/0.npz": inner.getvalue()})
+    assert len(data) < 200_000
+    with pytest.raises(PackError, match="too large"):
+        read_pack(data)
+
+
+def test_imported_theta_is_recomputed_not_trusted(tmp_path):
+    """A pack that claims theta=-1 would otherwise let any movement be accepted as that sign."""
+    a = MySignsStore(tmp_path / "a", "isl")
+    emb = _emb()
+    s1 = a.add("Sarafa", _takes(3), embedder=emb).sign
+    data = export_pack(a, None, title="evil")
+    zin = zipfile.ZipFile(io.BytesIO(data))
+    members = {n: zin.read(n) for n in zin.namelist()}
+    row = json.loads(members["signs.jsonl"].decode().splitlines()[0])
+    row["theta"] = -1.0
+    members["signs.jsonl"] = (json.dumps(row) + "\n").encode()
+    tampered = _zip(members)
+
+    b = MySignsStore(tmp_path / "b", "isl")
+    import_pack(b, tampered, "merge", embedder=emb)
+    got = b.get(s1.sign_id).theta
+    assert got is not None and got > 0.5 and abs(got - s1.theta) < 0.01  # same takes (minus face points), same embedder
+
+    c = MySignsStore(tmp_path / "c", "isl")
+    import_pack(c, tampered, "merge")  # no embedder: never accepted directly, only suggested
+    assert c.get(s1.sign_id).theta is None
+
+
+def test_replace_import_refreshes_cached_embeddings(tmp_path):
+    """Re-importing a sign id with different takes must not reuse the old takes' cached embeddings."""
+    emb = _emb()
+    a = MySignsStore(tmp_path / "a", "isl")
+    s = a.add("Sign", _takes(2), embedder=emb).sign
+    old = export_pack(a, None)
+    a.save_sign(s, _takes(8))  # same id, new recordings
+    new = export_pack(a, None)
+    b = MySignsStore(tmp_path / "b", "isl")
+    import_pack(b, old, "merge", embedder=emb)
+    first = b.user_index(emb).emb.copy()
+    import_pack(b, new, "replace", embedder=emb)
+    second = b.user_index(emb).emb
+    fresh = MySignsStore(tmp_path / "c", "isl")
+    import_pack(fresh, new, "merge", embedder=emb)
+    assert not np.allclose(first, second) and np.allclose(second, fresh.user_index(emb).emb)
+
+
+def test_delete_all_and_row_cache(tmp_path):
+    st = MySignsStore(tmp_path, "isl")
+    emb = _emb()
+    ids = [st.add(f"w{i}", _takes(i), embedder=emb).sign.sign_id for i in range(3)]
+    assert st.get(ids[0]).text_en == "w0"
+    st.update(ids[0], text_en="changed")
+    assert st.get(ids[0]).text_en == "changed"  # cache invalidated by the append
+    st.update(ids[0], concept_id="isl.pen")
+    assert st.get(ids[0]).concept_id == "isl.pen"
+    st.update(ids[0], concept_id="")
+    assert st.get(ids[0]).concept_id is None  # "" unlinks
+    n_lines = len(st.file.read_text().splitlines())
+    assert st.delete_all() == 3 and st.list() == []
+    assert len(st.file.read_text().splitlines()) == n_lines + 3
+    assert not any((st.dir / "takes" / i).exists() for i in ids)
+
+
+def test_alphabet_store_survives_bad_file_and_parallel_adds(tmp_path):
+    import threading
+
+    from app.isl.fingerspell.features import LETTER_DIM
+    from app.isl.fingerspell.prototypes import AlphabetStore
+
+    (tmp_path / "alphabet.npz").write_bytes(b"not an npz")
+    assert AlphabetStore(tmp_path).counts() == {} and AlphabetStore(tmp_path).model() is None
+    (tmp_path / "alphabet.npz").unlink()
+    letters = "ABCDEFGHIJ"
+
+    def add(ch):  # a new store per call, like IslPack.alphabet()
+        AlphabetStore(tmp_path).add(ch, np.full(LETTER_DIM, ord(ch), np.float32))
+
+    threads = [threading.Thread(target=add, args=(ch,)) for ch in letters]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert set(AlphabetStore(tmp_path).counts()) == set(letters)

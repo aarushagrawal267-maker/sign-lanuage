@@ -11,9 +11,9 @@ running, partial data). Every number below says when and on how much data it was
 |---|---|---|---|---|---|
 | **INCLUDE** (AI4Bharat), zenodo record 4010759 | 263 ISL words, 4,292 videos, several signers (Chennai), 15 categories | CC BY 4.0 (zenodo metadata) | yes, with attribution | commercial-safe + research | public |
 | INCLUDE split lists (AI4Bharat INCLUDE code repository, `train_test_paths/`) | official train/val/test file lists (3,127 / 348 / 817) | MIT (repository `LICENSE`, checked 25 Nov 2026); downloaded at run time, not redistributed | yes | both | public |
-| **ISLRTC Indian Sign Language Dictionary** (Indian Sign Language Research and Training Centre, Government of India, data.gov.in) | 13,665 videos: about 12,400 dictionary concepts, numbers, phrases; one video per entry, several different signers across entries | Government Open Data Licence - India (GODL-India) | yes, with attribution | both | public |
+| **ISLRTC Indian Sign Language Dictionary** (Indian Sign Language Research and Training Centre, Government of India, data.gov.in) | 13,665 videos: about 12,400 dictionary concepts, numbers, phrases; one video per entry, several different signers across entries | Government Open Data Licence - India (GODL-India); ISLRTC's own FAQ (Q.23) adds: not to be resold or used for profiteering, acknowledge ISLRTC / DEPwD / MoSJE | **free, non-profit use only** with acknowledgement; any paid or ad-funded use needs written permission from ISLRTC (see note below) | both | public |
 | ISLRTC Hugging Face re-encode (`silentone0725/Indian_Sign_Language_Data.gov_Rencoded`) | HEVC mirror of the above, used for downloading | labelled MIT by the uploader | mirror only: does not replace the GODL attribution | both | public |
-| **CISLR** (Exploration-Lab) | about 4,700 ISL words, 7,050 videos collected from online ISL videos | AFL-3.0 on the dataset card | **pending review**: AFL-3.0 allows commercial use, but the videos come from third-party online sources whose rights the licence may not cover | research only until reviewed | gated (`pending` on 25 Nov 2026) |
+| **CISLR** (Exploration-Lab) | about 4,700 ISL words, 7,050 videos collected from online ISL videos | AFL-3.0 in the Hugging Face metadata, but the dataset README (HF and GitHub) says CC BY-NC 4.0, "do not use our dataset for any commercial purposes" | **no**: treat as non-commercial (the README wins over the metadata tag) | research only | gated (`pending` on 25 Nov 2026) |
 | **iSign** (Exploration-Lab) | 118k ISL video - English sentence pairs; MediaPipe Holistic poses in pose-format | CC BY-NC-SA 4.0; the access form adds "research use only, no commercial use, no redistribution" | **no** | research only (pre-training) | gated (`pending` on 25 Nov 2026) |
 | WLASL (existing ASL model) | ASL, 100 words | C-UDA 1.0 | **no** | research only (warm start) | see `docs/LICENSING.md` |
 | WordNet 3.0 (via NLTK data) | synonym lists, part of speech, coarse categories | WordNet licence (permissive) | yes | both | public |
@@ -23,9 +23,18 @@ running, partial data). Every number below says when and on how much data it was
 | Hindi core word list (`backend/app/isl/text/data/hindi_core.tsv`) | about 990 hand-written everyday words and senses (870 match an ISL concept, all 100 WLASL glosses) | project licence (written for this repository) | yes | both | tracked |
 | User sign packs ("My signs") | user recordings as landmarks | chosen by the author at export (default CC BY 4.0) | per pack | never in global training | local |
 
+**What "commercial-safe" means.** The `commercial-safe` profile leaves out every dataset with a
+non-commercial licence (iSign, WLASL, CISLR). It still uses the ISLRTC dictionary, whose publisher allows research,
+teaching and ISL technology but not resale or profiteering (ISLRTC FAQ Q.23, https://islrtc.nic.in/faq/, found by
+the dataset survey on 25 Nov 2026, `docs/ISL_DATASET_SURVEY.md` section 4). So a `commercial-safe` pack is fine for a
+free, non-profit app with acknowledgement; before any paid, subscription or ad-funded release, get written
+permission from ISLRTC or retrain without ISLRTC data. The ISLRTC Hugging Face mirror's "MIT" label is the uploader's
+claim and does not change this.
+
 ### Required attribution (copy into the app's About / Research page and any publication)
 
-* "Indian Sign Language Research and Training Centre (ISLRTC), Government of India - Indian Sign Language
+* "Indian Sign Language Research and Training Centre (ISLRTC), Department of Empowerment of Persons with
+  Disabilities (DEPwD), Ministry of Social Justice and Empowerment (MoSJE), Government of India - Indian Sign Language
   Dictionary, published on data.gov.in under the Government Open Data Licence - India (GODL)."
 * "INCLUDE dataset: A. Sridhar, R. G. Ganesan, P. Kumar, M. Khapra. INCLUDE: A Large Scale Dataset for Indian Sign
   Language Recognition. ACM Multimedia 2020. CC BY 4.0, https://zenodo.org/records/4010759."

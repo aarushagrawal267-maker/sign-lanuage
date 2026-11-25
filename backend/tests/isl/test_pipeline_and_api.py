@@ -357,3 +357,26 @@ def test_db_migration_adds_columns(tmp_path):
 def test_latency_e6_reported(isl_env):
     e6 = isl_env["reports"]["results"]["protocols"]["E6"]
     assert e6["n"] > 0 and e6["metrics"]["p50_ms"] > 0 and np.isfinite(e6["metrics"]["p95_ms"])
+
+
+def test_demo_allow_list_is_exact():
+    from app.api.languages import demo_allowed
+
+    assert demo_allowed("/api/languages/isl/analyze/landmarks") and demo_allowed("/api/languages/isl/sentence")
+    for p in ("/api/languages/isl/my-signs/sentence", "/api/languages/isl/lexicon/sentence",
+              "/api/languages/isl/my-signs/x/analyze/landmarks", "/api/languages/isl/sentence/x"):
+        assert not demo_allowed(p), p
+
+
+def test_clip_frame_limit_and_patch_concept_check(isl_env):
+    from app.api.languages import MAX_CLIP_FRAMES
+
+    c = isl_env["client"]
+    big = {"width": 640, "height": 480, "frames": [{"t": i} for i in range(MAX_CLIP_FRAMES + 1)]}
+    assert c.post("/api/languages/isl/analyze/landmarks", json=big).status_code == 422
+    assert c.post("/api/analyze/landmarks", json={**big, "language": "isl"}).status_code == 422
+    takes = [{"width": 640, "height": 480, "frames": frames_for_stream(make_sequence(9, s, n_frames=40, fps=25.0))}
+             for s in range(3)]
+    sid = c.post("/api/languages/isl/my-signs", json={"text_en": "Tmp", "takes": takes}).json()["sign"]["sign_id"]
+    assert c.patch(f"/api/languages/isl/my-signs/{sid}", json={"concept_id": "isl.nope"}).status_code == 404
+    assert c.delete(f"/api/languages/isl/my-signs/{sid}").status_code == 200

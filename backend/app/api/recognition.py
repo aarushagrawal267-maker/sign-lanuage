@@ -225,8 +225,10 @@ async def ws_recognize(ws: WebSocket, language: str | None = None):
                 except (ValueError, TypeError, OverflowError) as e:
                     await ws.send_json({"type": "error", "message": f"invalid choice: {e}"})
                     continue
-                await asyncio.to_thread(_record_commit, commit, "live", exp_id, lang_id)
-                await ws.send_json({"type": "choice_ack", "commit": commit})
+                if not commit.get("duplicate"):
+                    await asyncio.to_thread(_record_commit, commit, "live", exp_id, lang_id)
+                await ws.send_json({"type": "choice_ack", "commit": commit,
+                                    **({"duplicate": True} if commit.get("duplicate") else {})})
             elif kind == "reject":
                 try:
                     rej = engine.reject(int(msg.get("segment_id")))
@@ -357,7 +359,7 @@ async def analyze_video(file: UploadFile = File(...), mode: str = Form("segment"
 class LandmarkClip(BaseModel):
     width: int = Field(gt=0)
     height: int = Field(gt=0)
-    frames: list[dict]
+    frames: list[dict] = Field(max_length=18000)  # 10 min at 30 fps; bounds the landmark arrays allocated
     language: str | None = None
     policy: str = "balanced"
 

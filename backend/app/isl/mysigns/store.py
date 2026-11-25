@@ -108,6 +108,33 @@ def take_quality(raw: RawSequence) -> dict:
     return q
 
 
+def loo_theta(z: np.ndarray, theta_margin: float = 0.05, s_min: float = -1.0) -> tuple[list[float], float | None]:
+    """Leave-one-out self-similarity of each take (best cosine to the sign's other takes) and the per-sign
+    acceptance cosine derived from it (lowest LOO similarity minus a margin, never below ``s_min``)."""
+    n = len(z)
+    if n < 2:
+        return [], None
+    S = z @ z.T
+    loo = [float(max(S[i, j] for j in range(n) if j != i)) for i in range(n)]
+    return loo, max(min(loo) - theta_margin, s_min)
+
+
+def calibrate_theta(takes: list[RawSequence], embedder, *, s_min: float = -1.0, c_min: float = 0.5,
+                    theta_margin: float = 0.05) -> float | None:
+    """Per-sign acceptance cosine computed with *this* app's embedder (used for imported signs, whose stored
+    value came from another encoder and is untrusted). ``None`` (= never accepted without asking) when the takes
+    cannot be embedded, are fewer than 2, or are not consistent enough to be trusted."""
+    if embedder is None or len(takes) < 2:
+        return None
+    try:
+        z = embedder.embed_raws(takes)
+    except FeatureError:
+        return None
+    if not np.all(np.isfinite(z)) or _pairwise_mean(z) < c_min:
+        return None
+    return loo_theta(z, theta_margin, s_min)[1]
+
+
 def _pairwise_mean(z: np.ndarray) -> float:
     n = len(z)
     if n < 2:
@@ -123,9 +150,22 @@ class MySignsStore:
         self.file = self.dir / "signs.jsonl"
         self._lock = threading.RLock()
         self._cache: dict = {}
+        self._rows_cache: tuple[tuple, dict[str, dict]] | None = None
 
     # ------------------------------------------------------------------ rows
     def _rows(self) -> dict[str, dict]:
+        """Last row per sign_id. Parsed once per (mtime, size) of signs.jsonl: the recogniser looks signs up for
+        every candidate of every segment, so re-reading the whole file each time would not scale. Callers must
+        not mutate the returned rows."""
+        with self._lock:
+            stamp = self.stamp()
+            if self._rows_cache is not None and self._rows_cache[0] == stamp:
+                return self._rows_cache[1]
+            rows = self._read_rows()
+            self._rows_cache = (stamp, rows)
+            return rows
+
+    def _read_rows(self) -> dict[str, dict]:
         rows: dict[str, dict] = {}
         if not self.file.exists():
             return rows
@@ -141,13 +181,17 @@ class MySignsStore:
                 rows[r["sign_id"]] = r
         return rows
 
-    def _append(self, sign: MySign) -> None:
-        row = sign.to_json()
-        row["gloss"] = sign.text_en
-        row["takes"] = [f"takes/{sign.sign_id}/{i}.npz" for i in range(sign.n_takes)]
+    def _append(self, *signs: MySign) -> None:
+        lines = []
+        for sign in signs:
+            row = sign.to_json()
+            row["gloss"] = sign.text_en
+            row["takes"] = [f"takes/{sign.sign_id}/{i}.npz" for i in range(sign.n_takes)]
+            lines.append(json.dumps(row, ensure_ascii=False) + "\n")
         self.dir.mkdir(parents=True, exist_ok=True)
-        with self.file.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        with self._lock, self.file.open("a", encoding="utf-8") as fh:
+            fh.write("".join(lines))
+            self._rows_cache = None
 
     def list(self, include_disabled: bool = True) -> list[MySign]:
         with self._lock:
@@ -156,7 +200,7 @@ class MySignsStore:
         return sorted(out, key=lambda s: (s.text_en.lower(), s.created))
 
     def get(self, sign_id: str) -> MySign | None:
-        r = self._rows().get(sign_id)
+        r = self._rows().get(str(sign_id))
         if r is None:
             return None
         s = MySign.from_json(r)
@@ -200,6 +244,8 @@ class MySignsStore:
                     v = clean_text(v, TEXT_LIMITS[k])
                     if k == "text_en" and not v:
                         raise ValueError("text_en must not be empty")
+                elif k == "concept_id":
+                    v = clean_text(v, 160)  # "" unlinks the sign from its dictionary concept
                 setattr(s, k, bool(v) if k == "enabled" else v)
             self._append(s)
             return s
@@ -214,11 +260,16 @@ class MySignsStore:
             shutil.rmtree(self.dir / "takes" / sign_id, ignore_errors=True)
 
     def delete_all(self) -> int:
-        n = 0
-        for s in self.list():
-            self.delete(s.sign_id)
-            n += 1
-        return n
+        """Tombstone every sign in one append (``delete`` per sign would re-read the file each time)."""
+        with self._lock:
+            signs = self.list()
+            for s in signs:
+                s.deleted = True
+            if signs:
+                self._append(*signs)
+            for s in signs:
+                shutil.rmtree(self.dir / "takes" / s.sign_id, ignore_errors=True)
+            return len(signs)
 
     # ------------------------------------------------------------ embedding
     def user_index(self, embedder, include_disabled: bool = False) -> EmbeddingIndex | None:
@@ -245,10 +296,13 @@ class MySignsStore:
             for s in signs:
                 todo = []
                 for i in range(s.n_takes):
-                    k = f"{s.sign_id}/{i}"
                     p = self.dir / "takes" / s.sign_id / f"{i}.npz"
-                    if not p.exists():
+                    try:
+                        st = p.stat()
+                    except FileNotFoundError:
                         continue
+                    # keyed by file identity: a sign id re-imported with new takes must not reuse old vectors
+                    k = f"{s.sign_id}/{i}@{st.st_mtime_ns}:{st.st_size}"
                     if k not in cached:
                         todo.append((k, RawSequence.load(p)))
                     keys.append(k)
@@ -334,17 +388,10 @@ class MySignsStore:
         base["conflicts"] = conflicts
         # leave-one-out self test against this sign's other takes, user signs and the dictionary
         n = len(z)
-        loo = []
-        hits_n = 0
-        if n >= 2:
-            S = z @ z.T
-            for i in range(n):
-                own = max(S[i, j] for j in range(n) if j != i)
-                loo.append(float(own))
-                rivals = [sc for cid, sc in hits.items()] if hits else [-1.0]
-                hits_n += int(own >= max(rivals))
+        loo, theta = loo_theta(z, theta_margin, s_min)
+        best_rival = max(hits.values()) if hits else -1.0
+        hits_n = sum(int(own >= best_rival) for own in loo)
         base["self_test"] = {"hits": hits_n, "n": n if n >= 2 else 0}
-        theta = max(min(loo) - theta_margin, s_min) if loo else None
         if n >= 2 and cons < c_min:
             return AddResult(None, accepted=False, message=(
                 "Your recordings look different from each other. Please sign the same way each time."), **base)
