@@ -614,6 +614,13 @@ bytes from a forward jump through a persisted point under the old scan position,
 It affects only a listing pass with persisted points ahead; **a restart before the NewzHook listing ends must move the
 `.points` file aside first** (fix proposed in ISL_DESIGN 15.10).
 
+**Fixed (Data Engineer, 23:00 UTC; ISL_DESIGN 15.10 "Status").** `SeekableInflate` now files every metadata page under
+the offset it was inflated at, whichever way a restore moved the stream; tests in
+`backend/tests/isl/test_openhands_meta_cache.py` reproduce the production error on the old code and pass on the new.
+The running PID 861 still has the old code in memory: **until it is restarted on the new code, the "move the
+`.points` file aside" rule above still applies** to a restart during the NewzHook listing; after that, restarts with
+points are safe. No existing `*.index.json` listing was made with loaded points, so none needs re-listing.
+
 | Measure | Value |
 |---|---|
 | NewzHook listing progress | 42.35 GB inflated at 22:36:38 -> 74.17 at 22:47:22 -> **85.87 of 159.48 GB at 22:50:30** (32.96 of 61.24 GB compressed) |

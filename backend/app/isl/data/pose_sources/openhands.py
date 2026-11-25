@@ -258,13 +258,20 @@ class SeekableInflate(io.RawIOBase):
         self.cache_pages = cache_pages
         self.pos = 0
         self.restores = 0
-        # metadata retention: while inflating forward for the first time, 4 KB pages that do not look like
-        # float data (or carry an HDF5 signature) are kept, so h5py's scattered metadata reads need no restart
+        # metadata retention: the first time a 4 KB page is inflated, it is kept if it does not look like float
+        # data (or carries an HDF5 signature), so h5py's scattered metadata reads need no restart. Pages are filed
+        # by the position they were actually inflated at: ``stage`` holds exactly the output bytes
+        # [stage_at, out) (``stage_at`` page-aligned, None = wait for the next page boundary) and every restore,
+        # forward or backward, re-aligns it. (Until 25 Nov 2026 a single ``scan_pos`` assumed the stream never
+        # moved ahead of it: a forward jump through persisted restore points filed the new bytes under the old
+        # position and h5py read wrong metadata, "bad symbol table node signature" on NewzHook, ISL_DESIGN 15.10.)
         self.meta: dict[int, bytes] = {}
         self.meta_bytes = 0
         self.meta_cap = meta_cap
-        self.scan_pos = 0
         self.stage = bytearray()
+        self.stage_at: int | None = 0
+        self._sc_lo: list[int] = []  # scanned pages: disjoint sorted page-index intervals [lo, hi)
+        self._sc_hi: list[int] = []
         self.zero_pages: set[int] = set()  # all-zero pages (served without a restart)
         self._prev: tuple[int, bytes, bool] | None = None  # previous scanned page (index, bytes, kept)
         self._restore(0)
@@ -292,6 +299,21 @@ class SeekableInflate(io.RawIOBase):
         self.inp = inp  # compressed offset (relative to cstart) of the next byte to feed
         self.buf, self.bpos = b"", 0  # fetched compressed bytes starting at self.inp - self.bpos
         self.restores += 1
+        self._realign_scan()
+
+    def _realign_scan(self) -> None:
+        """Point the metadata scan at the current inflate position (after a restore, in any direction). The
+        partial page before ``out`` comes from the restored window (native points hold the 32 KB before them);
+        without it the scan resumes at the next page boundary, and the skipped page is simply never kept."""
+        self.stage = bytearray()
+        r = self.out % self.MPAGE
+        if r == 0:
+            self.stage_at = self.out
+        elif self.native and len(self.win) >= r:
+            self.stage_at = self.out - r
+            self.stage += self.win[-r:]
+        else:
+            self.stage_at = None
 
     def _limit(self) -> int:
         if self.native:
@@ -336,8 +358,11 @@ class SeekableInflate(io.RawIOBase):
         used = len(piece) - len(self.d.unconsumed_tail)
         self.bpos += used
         self.inp += used
-        if out and self.out + len(out) > self.scan_pos and self.meta_cap > 0:
-            self._scan(out[max(0, self.scan_pos - self.out):])
+        if out:
+            if self.meta_cap > 0:
+                self._scan(self.out, out)
+            elif self.stage_at is not None:  # scanning off: re-enabling it later starts at a page boundary
+                self.stage, self.stage_at = bytearray(), None
         self.out += len(out)
         if self.native and out:
             w = zran_window()
@@ -351,30 +376,74 @@ class SeekableInflate(io.RawIOBase):
 
     MPAGE = 4096
 
-    def _scan(self, new: bytes) -> None:
-        self.stage += new
-        self.scan_pos += len(new)
-        n = len(self.stage) // self.MPAGE * self.MPAGE
+    def _scan(self, o: int, new: bytes) -> None:
+        """File the output bytes [o, o + len(new)) page by page. Each page is classified once, the first time it
+        is inflated; bytes are only ever appended to ``stage`` when they continue it exactly."""
+        if self.stage_at is not None and self.stage_at + len(self.stage) != o:
+            # the position moved without a restore re-aligning the scan: never file bytes under another offset
+            self.stage, self.stage_at = bytearray(), None
+        if self.stage_at is None:
+            b = -(-o // self.MPAGE) * self.MPAGE  # next page boundary at or after o
+            if o + len(new) < b:
+                return
+            self.stage_at, self.stage = b, bytearray(new[b - o:])
+        else:
+            tail = (o + len(new)) // self.MPAGE * self.MPAGE  # start of the last, partial page
+            i = bisect.bisect_right(self._sc_lo, self.stage_at // self.MPAGE) - 1
+            if tail > self.stage_at and i >= 0 and self._sc_hi[i] * self.MPAGE >= tail:
+                # re-inflating pages scanned before (a backward restore): keep only the partial last page
+                self.stage = bytearray(new[tail - o:]) if tail >= o else self.stage[tail - self.stage_at:] + new
+                self.stage_at = tail
+                return
+            self.stage += new
+        n = len(self.stage) // self.MPAGE
         if not n:
             return
-        first = (self.scan_pos - len(self.stage)) // self.MPAGE
+        first = self.stage_at // self.MPAGE
         zero = bytes(self.MPAGE)
-        for j in range(n // self.MPAGE):
-            k = first + j
-            pg = bytes(self.stage[j * self.MPAGE:(j + 1) * self.MPAGE])
-            if pg == zero:
-                if len(self.zero_pages) < 4_000_000:
-                    self.zero_pages.add(k)
-                kept = False
-            else:
-                kept = looks_like_metadata(pg)
-                # metadata blocks straddle page boundaries: keep the neighbours of a kept page too
-                if kept or (self._prev is not None and self._prev[2] and self._prev[0] == k - 1):
-                    self._keep(k, pg)
-                if kept and self._prev is not None and self._prev[0] == k - 1 and not self._prev[2]:
-                    self._keep(k - 1, self._prev[1])
-            self._prev = (k, pg, kept)
-        del self.stage[:n]
+        for lo, hi in self._unscanned(first, first + n):
+            for k in range(lo, hi):
+                j = k - first
+                pg = bytes(self.stage[j * self.MPAGE:(j + 1) * self.MPAGE])
+                if pg == zero:
+                    if len(self.zero_pages) < 4_000_000:
+                        self.zero_pages.add(k)
+                    kept = False
+                else:
+                    kept = looks_like_metadata(pg)
+                    # metadata blocks straddle page boundaries: keep the neighbours of a kept page too
+                    if kept or (self._prev is not None and self._prev[2] and self._prev[0] == k - 1):
+                        self._keep(k, pg)
+                    if kept and self._prev is not None and self._prev[0] == k - 1 and not self._prev[2]:
+                        self._keep(k - 1, self._prev[1])
+                self._prev = (k, pg, kept)
+            self._mark_scanned(lo, hi)
+        del self.stage[:n * self.MPAGE]
+        self.stage_at += n * self.MPAGE
+
+    def _unscanned(self, a: int, b: int) -> list[tuple[int, int]]:
+        """Sub-ranges of pages [a, b) not scanned yet."""
+        lo, hi, out = self._sc_lo, self._sc_hi, []
+        i = bisect.bisect_right(hi, a)  # first scanned interval ending after a
+        p = a
+        while p < b:
+            if i < len(lo) and lo[i] <= p:
+                p = max(p, hi[i])
+                i += 1
+                continue
+            e = min(b, lo[i]) if i < len(lo) else b
+            out.append((p, e))
+            p = e
+        return out
+
+    def _mark_scanned(self, a: int, b: int) -> None:
+        lo, hi = self._sc_lo, self._sc_hi
+        i = bisect.bisect_left(hi, a)  # intervals i .. j-1 overlap or touch [a, b)
+        j = bisect.bisect_right(lo, b)
+        if i < j:
+            a, b = min(a, lo[i]), max(b, hi[j - 1])
+        lo[i:j] = [a]
+        hi[i:j] = [b]
 
     def _keep(self, k: int, pg: bytes) -> None:
         if k in self.meta or k in self.zero_pages or self.meta_bytes >= self.meta_cap:
@@ -383,8 +452,7 @@ class SeekableInflate(io.RawIOBase):
         self.meta_bytes += len(pg)
 
     def _from_meta(self, p: int, n: int) -> bytes | None:
-        if p + n > self.scan_pos - len(self.stage):
-            return None
+        # a page is in ``meta`` / ``zero_pages`` only once it has been inflated in full at its own offset
         a, b = p // self.MPAGE, (p + n - 1) // self.MPAGE
         if any(k not in self.meta and k not in self.zero_pages for k in range(a, b + 1)):
             return None
@@ -841,6 +909,10 @@ class ForwardPass:
                 self.active.append(r)
 
     def _feed(self, o: int, piece: bytes) -> None:
+        if o != self.win_start + len(self.win):
+            # the stream moved without ``_restore_before`` (cannot happen today): restart the window at ``o``
+            # rather than file the piece under another offset (the bug class of ISL_DESIGN 15.10)
+            self.win, self.win_start = bytearray(), o
         self.win += piece
         end = o + len(piece)
         active, self.active = self.active, []
@@ -888,6 +960,7 @@ class ForwardPass:
         st = self.st
         st.pages.clear()
         st.meta.clear()
+        st.zero_pages = set()  # only served to h5py's reads, which are over (up to 4 M ints otherwise)
         st.meta_bytes, st.meta_cap = 0, 0  # no metadata scanning: headers are read from the stream directly
         # start at the access point before the first wanted byte (a restart: the point saved near where the last
         # run stopped), unless the stream already stands between that point and the byte

@@ -2370,6 +2370,29 @@ commercial-safe run anyway (one profile at a time).
   (or do not scan at all after a forward jump); plus a test that seeks ahead through persisted points and re-reads
   early metadata. Readiness fails closed here (a traceback keeps research blocked, 15.9), so this cannot let a run
   start early; it can only cost a listing pass (~40 min).
+* **Status (Data Engineer, 25 Nov 2026 23:00 UTC): fixed in code, tested offline; PID 861 not touched** (it keeps
+  the old code in memory until its next start or memory respawn). Root cause confirmed with the scratch probe (2 of 7
+  reads wrong before, 0 after). Fix in `SeekableInflate`: the scan stage now holds exactly the output bytes
+  `[stage_at, out)`; every `_restore` (forward jump, backward seek, `ForwardPass` jump and error-handler re-positioning)
+  re-aligns it (the partial page before the point comes from the point's 32 KB window), `_scan` drops the stage if a
+  piece ever fails to continue it, and scanned pages are tracked as page intervals so each page is classified once,
+  when first inflated, at its own offset (pages skipped by a jump are scanned if a later restore inflates them).
+  Audit of the other paths that move the inflate position: all go through `_restore` (`_goto` forward / backward,
+  `ForwardPass._restore_before` for its start, jumps and `redo` after a stream error); a failed restore changes no
+  state; `ForwardPass` and its fallback read with `read_range` (no metadata cache); the forward pass's 16-32 MB window
+  already re-based at every restore and now also restarts if a piece does not continue it. Also: the forward pass now
+  frees `zero_pages` (up to 4 M ints) with the rest of the listing cache. Existing `*.index.json` listings are all
+  from runs without loaded points (the log shows points loaded only at ISH News restarts, whose index existed, and at
+  the 22:02 NewzHook run, which crashed before writing one), so none is affected. Tests:
+  `backend/tests/isl/test_openhands_meta_cache.py` (31; synthetic zip + deflated HDF5, 260 chunks, metadata spread
+  over the file): listing with 7 point subsets (none, all, first 10 %, first half, far ahead only, every 3rd, random)
+  equals the listing without points, every cached page equals the bytes at its own offset, 400 random metadata reads
+  identical with and without points, a 28-run fuzz over jump patterns (forward / backward, near / far, `_goto`,
+  restores at random points, scanning switched off and on, native and zlib-fallback), listing with points then the
+  forward pass on the same stream. Against the old class the listing tests fail with the production error ("bad symbol
+  table node signature") and 16 of 24 fuzz runs fail. Throughput unchanged (first pass 58-59 MB/s, re-inflation
+  118-126 vs 105-133 MB/s old, 96 MB synthetic, nice 10). Backend suite 534 passed (shared working tree). Once the job runs this code, a
+  restart no longer needs the `.points` file moved aside.
 
 **(2) Data guard on real data, 22:42 UTC** (`scripts/phase2_train.sh --profile X --check-only`):
 * commercial-safe: **exit 4**. Reasons: islrtc job (6785), islrtc-recut (20244), the queue (17314) "still to process
