@@ -45,6 +45,15 @@ const NAV: { group: StringKey; items: { to: string; label: StringKey; icon: Reac
 
 const TITLE_KEYS: Record<string, StringKey> = Object.fromEntries(NAV.flatMap((g) => g.items.map((it) => [it.to, it.label])));
 
+/**
+ * Pages whose text is translated into Hindi. Every other page (and the ASL vocabulary) is still English only, so in
+ * the Hindi interface its content is marked lang="en": screen readers then read it with an English voice instead of
+ * reading English words with Hindi pronunciation rules (WCAG 3.1.2 Language of Parts).
+ */
+export function pageIsTranslated(path: string, isAsl: boolean): boolean {
+  return path === "/live" || path === "/my-signs" || (path === "/vocabulary" && !isAsl);
+}
+
 /** Mobile navigation drawer: modal dialog that takes focus, traps Tab, closes on Escape and returns focus to the menu button. */
 function NavDrawer({ onClose }: { onClose: () => void }) {
   const { t } = useT();
@@ -129,10 +138,10 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
       </nav>
       <div className="mt-auto rounded-xl border border-ink-700 bg-ink-850 p-3 text-[11px] leading-relaxed text-fg-3">
         {isAsl ? (
-          <>
+          <span lang="en">
             Educational &amp; research implementation. Recognises isolated WLASL100 signs as ASL <span className="text-fg-2">gloss labels</span> — not
             sentence translation. Not a replacement for interpreters.
-          </>
+          </span>
         ) : t("sidebar.islDisclaimer")}
       </div>
     </>
@@ -150,7 +159,7 @@ function PackBadge({ info }: { info: LanguageInfo }) {
 }
 
 export function Layout({ children }: { children: ReactNode }) {
-  const { t } = useT();
+  const { t, lang } = useT();
   const sign = useSignLanguage();
   const [open, setOpen] = useState(false);
   const { data: health, error } = useApi<{ ok: boolean }>("/api/health", 10000);
@@ -190,7 +199,7 @@ export function Layout({ children }: { children: ReactNode }) {
           </button>
           <div className="hidden min-w-0 flex-1 items-center gap-2 text-xs text-fg-3 sm:flex">
             <Activity className="size-3.5" aria-hidden />
-            <span className="truncate font-mono">{loc.pathname === "/" ? "overview" : loc.pathname.slice(1)}</span>
+            <span lang="en" className="truncate font-mono">{loc.pathname === "/" ? "overview" : loc.pathname.slice(1)}</span>
           </div>
           <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
             <SignLanguageSwitcher />
@@ -209,20 +218,25 @@ export function Layout({ children }: { children: ReactNode }) {
               className={cx("inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px]", health?.ok && !error ? "border-good/40 text-[#5fd35f]" : "border-danger/40 text-danger")}
               title={error ?? (IS_STATIC ? "Model runs in this browser" : "Backend reachable")}
             >
-              <span className={cx("size-1.5 rounded-full", health?.ok && !error ? "bg-good" : "bg-danger")} />
-              <span className={health?.ok && !error ? "hidden sm:inline" : undefined}>{health?.ok && !error ? (IS_STATIC ? "in-browser" : "backend") : "backend offline"}</span>
+              <span aria-hidden className={cx("size-1.5 rounded-full", health?.ok && !error ? "bg-good" : "bg-danger")} />
+              {/* On narrow screens the green dot is shown alone; its meaning stays available as text (WCAG 1.4.1). */}
+              <span lang="en" className={health?.ok && !error ? "sr-only sm:not-sr-only" : undefined}>{health?.ok && !error ? (IS_STATIC ? "in-browser" : "backend") : "backend offline"}</span>
             </span>
           </div>
         </header>
         {sys?.public_demo && (
-          <div role="note" className="border-b border-warn/30 bg-warn/[0.07] px-4 py-2 text-xs text-fg-2 md:px-8">
+          <div role="note" lang="en" className="border-b border-warn/30 bg-warn/[0.07] px-4 py-2 text-xs text-fg-2 md:px-8">
             <span className="font-medium text-warn">{sys.static ? "Online demo — runs entirely in your browser." : "Public read-only demo."}</span>{" "}
             {sys.static ? "Camera frames, landmarks and the model all stay on your device." : "Your camera is processed in your browser only."}{" "}
             Downloading WLASL data, training{sys.static ? " and video-file analysis" : ""} are disabled here — run the project locally for those.
           </div>
         )}
-        <main id="main" ref={mainRef} tabIndex={-1} className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-6 outline-none md:px-8 md:py-8"><ErrorBoundary resetKey={loc.pathname}>{children}</ErrorBoundary></main>
-        <footer className="border-t border-ink-700 px-4 py-4 text-[11px] text-fg-3 md:px-8">
+        <main id="main" ref={mainRef} tabIndex={-1} className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-6 outline-none md:px-8 md:py-8">
+          <div lang={lang === "hi" && !pageIsTranslated(loc.pathname, sign.isAsl) ? "en" : undefined} data-testid="page-content">
+            <ErrorBoundary resetKey={loc.pathname}>{children}</ErrorBoundary>
+          </div>
+        </main>
+        <footer lang="en" className="border-t border-ink-700 px-4 py-4 text-[11px] text-fg-3 md:px-8">
           {sign.isAsl ? (
             <>
               WLASL data © the WLASL authors, used under the Computational Use of Data Agreement (C-UDA) — academic &amp; computational use only, no

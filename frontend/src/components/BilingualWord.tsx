@@ -16,7 +16,7 @@ export function HindiReviewMark({ review, className }: { review: HiReview | unde
   const m = meta[review];
   if (!m) return null;
   return (
-    <span title={m.long} className={cx("inline-flex items-center whitespace-nowrap rounded-full border px-1.5 py-px text-[10px] font-medium leading-tight", m.cls, className)}>
+    <span title={m.long} className={cx("inline-flex items-center whitespace-nowrap rounded-full border px-1.5 py-px text-[11px] font-medium leading-tight", m.cls, className)}>
       {m.short}
       <span className="sr-only">: {m.long}</span>
     </span>
@@ -40,7 +40,10 @@ export function BilingualWord({ en, hi, review, size = "md", inline = false, ton
   return (
     <span className={cx(inline ? "inline-flex flex-wrap items-baseline gap-x-2" : "flex flex-col", "min-w-0", className)} data-testid="bilingual-word">
       <span lang="en" className={cx("break-words font-semibold uppercase tracking-tight", EN_SIZE[size], toneCls)}>{en}</span>
+      {/* Spaces are explicit text nodes (ignored by flex layout) so accessible names read "water पानी", not "waterपानी". */}
+      {" "}
       {inline && <span aria-hidden className={cx("text-fg-3", EN_SIZE[size])}>/</span>}
+      {" "}
       {hi ? (
         <span className={cx("inline-flex flex-wrap items-center gap-2", !inline && big && "mt-1")}>
           <span lang="hi" className={cx("font-hi break-words font-medium", HI_SIZE[size], toneCls)}>{hi}</span>

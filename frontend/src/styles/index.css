@@ -11,8 +11,10 @@
 
 /* Design tokens - Sign Intelligence Studio (dark, charcoal) */
 @theme {
-  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+  /* Noto Sans Devanagari only covers Devanagari (unicode-range), so Latin text keeps IBM Plex while any Hindi text,
+     even a stray label without lang="hi", gets the bundled Hindi font instead of tofu boxes or a random system font. */
+  --font-sans: "IBM Plex Sans", "Noto Sans Devanagari", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", "Noto Sans Devanagari", ui-monospace, SFMono-Regular, monospace;
 
   --color-ink-950: #0b0d10; /* page */
   --color-ink-900: #111317; /* sidebar */
@@ -186,4 +188,18 @@ body {
 }
 .font-hi {
   font-family: "Noto Sans Devanagari", "Nirmala UI", "Kohinoor Devanagari", "Mangal", "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+}
+
+/* Devanagari readability (accessibility audit, docs/ISL_DESIGN.md section 14). These rules are deliberately outside any
+   layer so they win over Tailwind utilities.
+   - Letter spacing (tracking-*) pulls apart conjuncts and vowel signs: "शब्द" turns into "श ब्द". Hindi never gets it.
+   - Hindi text below 12px loses its vowel signs (matras); tiny captions are raised to 12px in Hindi. */
+[class*="tracking-"]:lang(hi) {
+  letter-spacing: normal;
+}
+.text-\[9px\]:lang(hi),
+.text-\[10px\]:lang(hi),
+.text-\[11px\]:lang(hi) {
+  font-size: 12px;
+  line-height: 1.5;
 }

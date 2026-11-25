@@ -13,7 +13,7 @@ import { STATUS, TONE_CLASS } from "../recognition/status";
 import { useLiveRecognition } from "../recognition/useLiveRecognition";
 import { Badge, Button, Card, Field, Notice, ScrollRegion, Segmented, Toggle, cx, inputCls } from "../components/ui";
 import { BilingualWord } from "../components/BilingualWord";
-import { SignResult } from "../components/SignResult";
+import { ResultAnnouncer, SignResult } from "../components/SignResult";
 import { SentenceBar } from "../components/SentenceBar";
 import { HBars } from "../components/charts/Bars";
 
@@ -70,7 +70,7 @@ export default function LivePage() {
     <div className="fade-in">
       <div className="mb-5 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
         <div>
-          <div className="mb-1 font-mono text-[11px] uppercase tracking-[0.14em] text-accent">{t("live.eyebrow", { lang: sign.info?.sign_language ?? "" })}</div>
+          <div className="mb-1 font-mono text-[11px] uppercase tracking-[0.14em] text-accent [&:lang(hi)]:font-sans">{t("live.eyebrow", { lang: sign.info?.sign_language ?? "" })}</div>
           <h1 className="text-2xl font-semibold tracking-tight">{t("live.title")}</h1>
           <p className="mt-1 max-w-2xl text-sm text-fg-2">
             {pack ? t("live.introIsl") : t("live.introAsl")}
@@ -104,7 +104,7 @@ export default function LivePage() {
       <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_420px]">
         {/* ------------------------------------------------ camera stage */}
         <div className="flex min-w-0 flex-col gap-3">
-          <div className="relative mx-auto w-full overflow-hidden rounded-2xl border border-ink-700 bg-black"
+          <div className={cx("relative mx-auto w-full overflow-hidden rounded-2xl border border-ink-700 bg-black", camera !== "active" && "min-h-72")}
             style={{
               aspectRatio: live.videoSize ? `${live.videoSize.w} / ${live.videoSize.h}` : "16 / 9",
               maxWidth: live.videoSize ? `calc(74vh * ${(live.videoSize.w / live.videoSize.h).toFixed(4)})` : undefined,
@@ -148,7 +148,7 @@ export default function LivePage() {
               </div>
             )}
             {camera === "active" && (
-              <div className="absolute inset-x-3 bottom-3 flex flex-wrap gap-x-4 gap-y-1 rounded-lg bg-black/55 px-3 py-1.5 font-mono text-[11px] text-fg-2 backdrop-blur">
+              <div lang="en" className="absolute inset-x-3 bottom-3 flex flex-wrap gap-x-4 gap-y-1 rounded-lg bg-black/55 px-3 py-1.5 font-mono text-[11px] text-fg-2 backdrop-blur">
                 <span>landmarks {metrics.fps ? `${metrics.fps.toFixed(1)} fps` : "—"}</span>
                 <span>mediapipe {ms(metrics.mpMs)}</span>
                 {recognizing && <span>server {ms(metrics.serverMs)}</span>}
@@ -208,7 +208,7 @@ export default function LivePage() {
                     </div>
                   </>
                 ) : (
-                  <>
+                  <div lang="en" className="contents">
                     <Field label="Recognition mode" group hint={settings.engine.mode === "segment" ? "Classifies each complete sign between hand raise and hand drop (matches training clips)." : "Classifies a sliding window continuously with smoothing."}>
                       <Segmented ariaLabel="Recognition mode" value={settings.engine.mode} onChange={(v) => setEngine({ mode: v })}
                         options={[{ value: "segment", label: "Sign boundaries" }, { value: "sliding", label: "Sliding window" }]} />
@@ -224,7 +224,7 @@ export default function LivePage() {
                     <Field label={`Minimum margin over runner-up: ${pct(settings.engine.min_margin, 0)}`}>
                       <input type="range" min={0} max={0.5} step={0.05} value={settings.engine.min_margin} onChange={(e) => setEngine({ min_margin: Number(e.target.value) })} className="accent-[var(--color-accent)]" aria-label="Minimum margin" />
                     </Field>
-                  </>
+                  </div>
                 )}
                 <Field label={t("live.endDelay", { ms: settings.engine.end_absent_ms })}>
                   <input type="range" min={200} max={1200} step={50} value={settings.engine.end_absent_ms} onChange={(e) => setEngine({ end_absent_ms: Number(e.target.value) })} className="accent-[var(--color-accent)]" aria-label={t("live.endDelayShort")} />
@@ -268,20 +268,21 @@ export default function LivePage() {
         {/* ------------------------------------------------ prediction column */}
         <div className="flex flex-col gap-4">
           <Card title={t("live.currentSign")} subtitle={statusHelp}>
+            <ResultAnnouncer lastResult={lastResult} resolved={resolved} inProgress={inProgress} />
             <SignResult
               lastResult={lastResult} resolved={resolved} inProgress={inProgress} provisionalTop={top} recognizedNow={status === "recognized"}
               pack={pack} threshold={threshold} spellOn={spellOn} spell={live.spell} spellAvailable={spellAvailable} spellExperimental={spellExperimental}
               acceptedItem={acceptedItem} spellHint={spellHint}
               onChoose={actions.choose} onDismiss={actions.dismiss} onReject={actions.rejectWord} onSpell={() => setSpellOn(true)} />
             {lastResult && !inProgress && (
-              <div className="mt-3 text-[11px] text-fg-3">
+              <div className="mt-3 text-xs text-fg-3">
                 {lastResult.accepted ? t("live.accepted") : `${t("live.notShown")}: ${reasonText(lastResult.reason)}`}
                 {lastResult.agreement && ` · ${t("live.cropsAgree", { a: lastResult.agreement })}`}
                 {lastResult.frames ? ` · ${lastResult.frames} frames` : ""}
               </div>
             )}
             {!pack && provisional && provisional.length > 0 && (
-              <div className="mt-5">
+              <div className="mt-5" lang="en">
                 <div className="mb-2 text-[11px] uppercase tracking-[0.14em] text-fg-3">Top-5 class scores</div>
                 <HBars items={provisional.map((p) => ({ label: p.gloss.toUpperCase(), value: p.prob }))} highlightFirst={decision === "accept"} />
               </div>

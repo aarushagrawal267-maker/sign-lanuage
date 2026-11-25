@@ -16,9 +16,11 @@ export class ErrorBoundary extends Component<{ children: ReactNode; resetKey: st
     if (!this.state.error) return this.props.children;
     return (
       <div role="alert" className="rounded-xl border border-danger/40 bg-danger/[0.07] px-4 py-3 text-sm text-fg-2">
-        <div className="font-medium text-fg">This page hit an error / इस पेज में त्रुटि हुई</div>
-        <p className="mt-1">{this.state.error.message}</p>
-        <button type="button" className="mt-2 text-accent underline" onClick={() => this.setState({ error: null })}>Try again / फिर से कोशिश करें</button>
+        <div className="font-medium text-fg"><span lang="en">This page hit an error</span> / <span lang="hi">इस पेज में त्रुटि हुई</span></div>
+        <p className="mt-1" lang="en">{this.state.error.message}</p>
+        <button type="button" className="mt-2 min-h-8 text-accent underline" onClick={() => this.setState({ error: null })}>
+          <span lang="en">Try again</span> / <span lang="hi">फिर से कोशिश करें</span>
+        </button>
       </div>
     );
   }

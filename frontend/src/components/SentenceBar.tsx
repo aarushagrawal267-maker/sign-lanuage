@@ -61,6 +61,10 @@ export function SentenceBar({ items, language, onClear, onRemove, onWrong }: {
     else speak(w.en, "en-IN");
   }, [items, prefs.auto, speakLang]);
 
+  // Removing a word removes the button that had focus: keep focus in the word list instead of losing it (WCAG 2.4.3).
+  const listRef = useRef<HTMLDivElement>(null);
+  const keepFocus = (fn: () => void) => () => { listRef.current?.focus(); fn(); };
+
   const fallbackEn = items.map((x) => wordText(x).en).join(" ");
   const fallbackHi = items.map((x) => wordText(x).hi ?? `[${wordText(x).en}]`).join(" ");
   const enText = sentence?.en.text ?? fallbackEn;
@@ -78,10 +82,11 @@ export function SentenceBar({ items, language, onClear, onRemove, onWrong }: {
       subtitle={t("sentence.subtitle")}
       actions={<>
         <Button size="sm" variant="ghost" icon={<Copy className="size-3.5" />} disabled={!items.length} onClick={() => navigator.clipboard?.writeText(copyText)}>{t("common.copy")}</Button>
-        <Button size="sm" variant="ghost" icon={<Eraser className="size-3.5" />} disabled={!items.length} onClick={onClear}>{t("common.clear")}</Button>
+        <Button size="sm" variant="ghost" icon={<Eraser className="size-3.5" />} disabled={!items.length} onClick={keepFocus(onClear)}>{t("common.clear")}</Button>
       </>}
     >
-      <div data-testid="transcript" className="flex min-h-16 flex-wrap content-start gap-2" aria-live="polite">
+      <div data-testid="transcript" ref={listRef} tabIndex={-1} role="group" aria-label={t("sentence.words")}
+        className="flex min-h-16 flex-wrap content-start gap-2 rounded-lg">
         {items.length === 0 ? (
           <span className="text-sm text-fg-3">{t("sentence.empty")}</span>
         ) : (
@@ -93,12 +98,12 @@ export function SentenceBar({ items, language, onClear, onRemove, onWrong }: {
                 x.chosen ? "border-accent/40 bg-accent-soft/40" : "border-teal/30 bg-teal-soft/50")}>
                 <BilingualWord en={w.en} hi={w.hi} review={x.hi_review} size="sm" inline tone={x.chosen ? "fg" : "teal"} showMark={false} />
                 {isLast && x.segment_id != null && !x.chosen ? (
-                  <button type="button" onClick={() => onWrong(x)} className="rounded p-1 text-fg-3 hover:bg-ink-700 hover:text-danger" aria-label={t("sentence.wrong", { word: w.en })} title={t("sentence.wrong", { word: w.en })}>
-                    <X className="size-3.5" />
+                  <button type="button" onClick={keepFocus(() => onWrong(x))} className="inline-flex size-8 items-center justify-center rounded-md text-fg-3 hover:bg-ink-700 hover:text-danger" aria-label={t("sentence.wrong", { word: w.en })} title={t("sentence.wrong", { word: w.en })}>
+                    <X className="size-4" aria-hidden />
                   </button>
                 ) : (
-                  <button type="button" onClick={() => onRemove(x.id)} className="rounded p-1 text-fg-3 hover:bg-ink-700 hover:text-fg" aria-label={t("sentence.remove", { word: w.en })} title={t("sentence.remove", { word: w.en })}>
-                    <Undo2 className="size-3.5" />
+                  <button type="button" onClick={keepFocus(() => onRemove(x.id))} className="inline-flex size-8 items-center justify-center rounded-md text-fg-3 hover:bg-ink-700 hover:text-fg" aria-label={t("sentence.remove", { word: w.en })} title={t("sentence.remove", { word: w.en })}>
+                    <Undo2 className="size-4" aria-hidden />
                   </button>
                 )}
               </span>
@@ -109,7 +114,7 @@ export function SentenceBar({ items, language, onClear, onRemove, onWrong }: {
 
       {items.length > 0 && (
         <div className="mt-4 rounded-xl border border-ink-700 bg-ink-900 p-3.5" data-testid="sentence">
-          <div className="mb-2 flex flex-wrap items-center gap-2 text-[11px] text-warn">
+          <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-warn">
             <Info className="size-3.5" aria-hidden />
             <span>{t("sentence.approx")}</span>
             {sentence?.en.rules?.length ? <span className="text-fg-3" title={[...sentence.en.rules, ...sentence.hi.rules].join("\n")}>· {t("sentence.rules", { n: sentence.en.rules.length + sentence.hi.rules.length })}</span> : null}
@@ -126,7 +131,7 @@ export function SentenceBar({ items, language, onClear, onRemove, onWrong }: {
           {t("sentence.speak")}
         </Button>
         <Segmented ariaLabel={t("sentence.voice")} value={prefs.lang} onChange={(v) => setPrefs({ ...prefs, lang: v })}
-          options={[{ value: "hi-IN", label: "हिंदी" }, { value: "en-IN", label: "English" }]} />
+          options={[{ value: "hi-IN", label: "हिंदी", lang: "hi" }, { value: "en-IN", label: "English", lang: "en" }]} />
         <Toggle label={t("sentence.autoSpeak")} checked={prefs.auto} onChange={(v) => setPrefs({ ...prefs, auto: v })} />
       </div>
       {!anyVoice ? (

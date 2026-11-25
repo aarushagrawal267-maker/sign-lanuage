@@ -12,6 +12,9 @@ import {
 type Metrics = { fps: number | null; mpMs: number | null; serverMs: number | null; inferenceMs: number | null; e2eMs: number | null; sendFps: number | null };
 
 /** Language pack details the server reports in its hello message (authoritative for what this socket can do). */
+/** How a shown result was settled by the user: picked from "did you mean", "none of these", or "that word was wrong". */
+export type ResolvedHow = "chosen" | "dismissed" | "rejected";
+
 export type HelloLanguage = Pick<LanguageInfo, "id" | "display_name" | "output_languages" | "capabilities" | "profile" | "status" | "sign_language">;
 
 /**
@@ -36,7 +39,8 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
   const [server, setServer] = useState<ServerState | null>(null);
   const [provisional, setProvisional] = useState<Candidate[] | null>(null);
   const [lastResult, setLastResult] = useState<SegmentResult | null>(null);
-  const [resolved, setResolved] = useState<{ segment: SegmentResult; how: "chosen" | "dismissed" } | null>(null);
+  const [resolved, setResolved] = useState<{ segment: SegmentResult; how: ResolvedHow } | null>(null);
+  const lastResultRef = useRef<SegmentResult | null>(null);
   const [spell, setSpell] = useState<SpellState | null>(null);
   const [helloLanguage, setHelloLanguage] = useState<HelloLanguage | null>(null);
   const [serverError, setServerError] = useState<string | null>(null);
@@ -143,6 +147,7 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
         if (st.spell) setSpell(st.spell);
         if (st.segment_result) {
           setLastResult(st.segment_result);
+          lastResultRef.current = st.segment_result;
           setResolved(null);
           setSpell(null);
           if (st.segment_result.inference_ms !== undefined) stats.current.inf.push(st.segment_result.inference_ms + (st.segment_result.feature_ms ?? 0));
@@ -174,6 +179,7 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
     const ws = wsRef.current;
     setProvisional(null);
     setLastResult(null);
+    lastResultRef.current = null;
     setResolved(null);
     setSpell(null);
     setTranscript([]);
@@ -357,6 +363,7 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
     if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.send(JSON.stringify({ type: "reset" }));
     setProvisional(null);
     setLastResult(null);
+    lastResultRef.current = null;
     setResolved(null);
     setSpell(null);
     trail.current = [];
@@ -383,6 +390,9 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
       ws.send(JSON.stringify({ type: "reject", segment_id: item.segment_id }));
     }
     setTranscript((tr) => tr.filter((t) => t.id !== item.id));
+    // If the rejected word is the one on show, stop showing it as "recognised" (it was wrong).
+    const last = lastResultRef.current;
+    if (last && item.segment_id !== null && item.segment_id !== undefined && last.segment_id === item.segment_id) setResolved({ segment: last, how: "rejected" });
   }, []);
   const removeWord = useCallback((id: number) => setTranscript((tr) => tr.filter((t) => t.id !== id)), []);
 

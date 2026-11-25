@@ -1,4 +1,4 @@
-import { useId, type ButtonHTMLAttributes, type KeyboardEvent, type ReactNode } from "react";
+import { useId, type ButtonHTMLAttributes, type KeyboardEvent, type ReactNode, type Ref } from "react";
 import { AlertTriangle, Info, Loader2 } from "lucide-react";
 
 export function cx(...c: (string | false | null | undefined)[]) {
@@ -65,7 +65,7 @@ export function buttonClass(variant: BtnVariant = "secondary", size: BtnSize = "
 }
 
 export function Button({ variant = "secondary", size = "md", icon, loading, children, className, ...rest }: ButtonHTMLAttributes<HTMLButtonElement> & {
-  variant?: BtnVariant; size?: BtnSize; icon?: ReactNode; loading?: boolean;
+  variant?: BtnVariant; size?: BtnSize; icon?: ReactNode; loading?: boolean; ref?: Ref<HTMLButtonElement>;
 }) {
   return (
     <button
@@ -163,7 +163,8 @@ export function Toggle({ checked, onChange, label }: { checked: boolean; onChang
   );
 }
 
-export function Segmented<T extends string>({ value, options, onChange, ariaLabel }: { value: T; options: { value: T; label: string }[]; onChange: (v: T) => void; ariaLabel: string }) {
+/** `lang` on an option marks a label in another language (e.g. "हिंदी" in the English interface, WCAG 3.1.2). */
+export function Segmented<T extends string>({ value, options, onChange, ariaLabel }: { value: T; options: { value: T; label: string; lang?: string }[]; onChange: (v: T) => void; ariaLabel: string }) {
   // WAI-ARIA radio group: one tab stop (the checked option); arrow keys, Home and End move and select.
   const onKeyDown = (e: KeyboardEvent<HTMLButtonElement>, i: number) => {
     const n = options.length;
@@ -185,10 +186,11 @@ export function Segmented<T extends string>({ value, options, onChange, ariaLabe
           type="button"
           role="radio"
           aria-checked={value === o.value}
+          lang={o.lang}
           tabIndex={value === o.value || (!hasChecked && i === 0) ? 0 : -1}
           onClick={() => onChange(o.value)}
           onKeyDown={(e) => onKeyDown(e, i)}
-          className={cx("rounded-md px-3 py-1 text-xs font-medium transition-colors", value === o.value ? "bg-ink-700 text-fg" : "text-fg-3 hover:text-fg")}
+          className={cx("min-h-7 rounded-md px-3 py-1 text-xs font-medium transition-colors", value === o.value ? "bg-ink-700 text-fg" : "text-fg-3 hover:text-fg")}
         >
           {o.label}
         </button>

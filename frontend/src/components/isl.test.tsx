@@ -36,7 +36,7 @@ describe("CandidateList (did you mean)", () => {
     wrap(<CandidateList candidates={many} onChoose={onChoose} onDismiss={() => {}} />);
     expect(screen.getAllByRole("button", { name: /^Choose/ })).toHaveLength(5);
     expect(screen.getByText("My signs")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Choose water पानी, 46 percent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Choose water पानी 46% sure" }));
     expect(onChoose).toHaveBeenCalledWith(water);
   });
   it("is translated in the Hindi interface", () => {

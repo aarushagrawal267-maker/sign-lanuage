@@ -26,7 +26,7 @@ const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 function CameraStage({ rec }: { rec: ReturnType<typeof useLandmarkRecorder> }) {
   const { t } = useT();
   return (
-    <div className="relative w-full overflow-hidden rounded-2xl border border-ink-700 bg-black" style={{ aspectRatio: "16 / 9" }}>
+    <div className={cx("relative w-full overflow-hidden rounded-2xl border border-ink-700 bg-black", rec.camera !== "active" && "min-h-56")} style={{ aspectRatio: "16 / 9" }}>
       <video ref={rec.videoRef} playsInline muted className={cx("absolute inset-0 size-full -scale-x-100 object-contain", rec.camera !== "active" && "opacity-0")} aria-label={t("live.webcam")} />
       <canvas ref={rec.canvasRef} className="pointer-events-none absolute inset-0 size-full" aria-hidden />
       {rec.camera !== "active" ? (
@@ -40,7 +40,8 @@ function CameraStage({ rec }: { rec: ReturnType<typeof useLandmarkRecorder> }) {
           <span data-testid="recorder-status" className={cx("rounded-full border px-3 py-1 text-xs font-medium backdrop-blur",
             rec.phase === "recording" ? "border-danger/60 bg-[#2d1316]/90 text-danger" : rec.phase === "waiting" ? "border-warn/50 bg-[#2b2210]/90 text-warn" : "border-ink-600 bg-ink-800/90 text-fg-2")}>
             {rec.mediapipe !== "ready" ? t("status.mediapipe_loading")
-              : rec.phase === "recording" ? `${t("my.recordingNow")} ${(rec.elapsed / 1000).toFixed(1)} s`
+              // The running time is visual only: inside this live region it would be read out ten times a second.
+              : rec.phase === "recording" ? <>{t("my.recordingNow")} <span aria-hidden>{(rec.elapsed / 1000).toFixed(1)} s</span></>
               : rec.phase === "waiting" ? t("my.raiseHands")
               : rec.body ? t("my.ready") : t("status.no_body")}
           </span>
@@ -123,6 +124,11 @@ function NewSign({ lang, rec, readOnly, onSaved }: { lang: string; rec: ReturnTy
   };
 
   const canSave = !readOnly && takes.length >= MIN_TAKES && en.trim().length > 0 && rec.phase === "idle";
+  // Say why "Check and save" is not available yet instead of leaving a silently disabled button (WCAG 3.3.2).
+  const missing = readOnly ? [] : [
+    ...(takes.length < MIN_TAKES ? [t("my.needTakes", { min: MIN_TAKES, n: takes.length })] : []),
+    ...(en.trim() ? [] : [t("my.needWord")]),
+  ];
   return (
     <Card title={t("my.newTitle")} subtitle={t("my.newSubtitle")}>
       <div className="flex flex-col gap-5">
@@ -157,9 +163,9 @@ function NewSign({ lang, rec, readOnly, onSaved }: { lang: string; rec: ReturnTy
                       className="w-full rounded-lg bg-black" />
                     <div className="mt-1.5 flex items-center justify-between gap-1 text-[11px] text-fg-3">
                       <span>#{i + 1} · {(s.durationMs / 1000).toFixed(1)} s · {t("my.handsPct", { n: Math.round(s.handRate * 100) })}</span>
-                      <button type="button" className="rounded p-0.5 hover:bg-ink-700 hover:text-danger" aria-label={t("my.removeTake", { n: i + 1 })}
+                      <button type="button" className="inline-flex size-8 shrink-0 items-center justify-center rounded-md hover:bg-ink-700 hover:text-danger" aria-label={t("my.removeTake", { n: i + 1 })}
                         onClick={() => { setTakes((ts) => ts.filter((_, j) => j !== i)); setCheck(null); }}>
-                        <X className="size-3.5" />
+                        <X className="size-4" aria-hidden />
                       </button>
                     </div>
                     {problems.length > 0 && <p className="mt-1 text-[11px] text-warn">{problems.join("; ")}</p>}
@@ -210,9 +216,16 @@ function NewSign({ lang, rec, readOnly, onSaved }: { lang: string; rec: ReturnTy
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <Button variant="teal" icon={<Check className="size-4" />} loading={busy} disabled={!canSave} onClick={() => submit({ dryRun: true })}>{t("my.checkSave")}</Button>
+          <Button variant="teal" icon={<Check className="size-4" />} loading={busy} disabled={!canSave} onClick={() => submit({ dryRun: true })}
+            aria-describedby={missing.length ? "save-needs" : undefined}>{t("my.checkSave")}</Button>
           {takes.length > 0 && <Button variant="ghost" onClick={reset} disabled={busy}>{t("my.startOver")}</Button>}
         </div>
+        {missing.length > 0 && (
+          <div id="save-needs" className="-mt-2 text-sm text-fg-2" data-testid="save-needs">
+            <span className="font-medium">{t("my.saveNeeds")}</span>
+            <ul className="mt-1 list-disc pl-5">{missing.map((m) => <li key={m}>{m}</li>)}</ul>
+          </div>
+        )}
         {saved && <p className="text-sm text-teal" role="status">{saved}</p>}
         <ErrorText error={error} />
 
@@ -254,10 +267,23 @@ function SignRow({ s, lang, readOnly, selected, onSelect, onChanged }: {
   const [region, setRegion] = useState(s.region ?? "");
   const [confirmDel, setConfirmDel] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Buttons that swap places (Edit -> form, Delete -> confirm) move focus with them so keyboard users never lose
+  // their place (WCAG 2.4.3).
+  const focusNext = useRef<"edit" | "form" | "confirm" | "delete" | null>(null);
+  const editBtn = useRef<HTMLButtonElement>(null);
+  const firstInput = useRef<HTMLInputElement>(null);
+  const confirmBtn = useRef<HTMLButtonElement>(null);
+  const deleteBtn = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const target = { edit: editBtn, form: firstInput, confirm: confirmBtn, delete: deleteBtn }[focusNext.current ?? "edit"];
+    if (focusNext.current) target.current?.focus();
+    focusNext.current = null;
+  }, [edit, confirmDel]);
+  const go = (next: "edit" | "form" | "confirm" | "delete", fn: () => void) => { focusNext.current = next; fn(); };
   const base = `/api/languages/${encodeURIComponent(lang)}/my-signs/${encodeURIComponent(s.sign_id)}`;
   const patch = async (body: Record<string, unknown>) => {
     setError(null);
-    try { await api.patch(base, body); onChanged(); setEdit(false); } catch (e) { setError(errText(e)); }
+    try { await api.patch(base, body); onChanged(); if (edit) go("edit", () => setEdit(false)); } catch (e) { setError(errText(e)); }
   };
   const del = async () => {
     setError(null);
@@ -268,12 +294,12 @@ function SignRow({ s, lang, readOnly, selected, onSelect, onChanged }: {
     <li className={cx("rounded-xl border bg-ink-900 p-3", s.enabled ? "border-ink-700" : "border-ink-700 opacity-60")} data-testid="my-sign">
       {edit ? (
         <div className="grid gap-2 sm:grid-cols-3">
-          <input className={inputCls} value={en} onChange={(e) => setEn(e.target.value)} aria-label={t("my.englishWord")} maxLength={80} />
+          <input ref={firstInput} className={inputCls} value={en} onChange={(e) => setEn(e.target.value)} aria-label={t("my.englishWord")} maxLength={80} />
           <input lang="hi" className={cx(inputCls, "font-hi")} value={hi} onChange={(e) => setHi(e.target.value)} aria-label={t("my.hindiWord")} maxLength={80} />
           <input className={inputCls} value={region} onChange={(e) => setRegion(e.target.value)} aria-label={t("my.region")} maxLength={80} />
           <div className="flex gap-2 sm:col-span-3">
             <Button size="sm" variant="primary" disabled={!en.trim()} onClick={() => patch({ text_en: en.trim(), text_hi: hi.trim() || null, region: region.trim() || null })}>{t("common.save")}</Button>
-            <Button size="sm" variant="ghost" onClick={() => setEdit(false)}>{t("common.cancel")}</Button>
+            <Button size="sm" variant="ghost" onClick={() => go("edit", () => setEdit(false))}>{t("common.cancel")}</Button>
           </div>
         </div>
       ) : (
@@ -294,14 +320,14 @@ function SignRow({ s, lang, readOnly, selected, onSelect, onChanged }: {
           {!readOnly && (
             <div className="flex flex-wrap items-center gap-1.5">
               <Toggle label={t("my.enabled")} checked={s.enabled} onChange={(v) => patch({ enabled: v })} />
-              <Button size="sm" variant="ghost" icon={<Pencil className="size-3.5" />} onClick={() => setEdit(true)}>{t("common.edit")}</Button>
+              <Button ref={editBtn} size="sm" variant="ghost" icon={<Pencil className="size-3.5" />} onClick={() => go("form", () => setEdit(true))}>{t("common.edit")}</Button>
               {confirmDel ? (
                 <>
-                  <Button size="sm" variant="danger" onClick={del}>{t("my.confirmDelete")}</Button>
-                  <Button size="sm" variant="ghost" onClick={() => setConfirmDel(false)}>{t("common.cancel")}</Button>
+                  <Button ref={confirmBtn} size="sm" variant="danger" onClick={del}>{t("my.confirmDelete")}</Button>
+                  <Button size="sm" variant="ghost" onClick={() => go("delete", () => setConfirmDel(false))}>{t("common.cancel")}</Button>
                 </>
               ) : (
-                <Button size="sm" variant="ghost" icon={<Trash2 className="size-3.5" />} onClick={() => setConfirmDel(true)}>{t("common.delete")}</Button>
+                <Button ref={deleteBtn} size="sm" variant="ghost" icon={<Trash2 className="size-3.5" />} onClick={() => go("confirm", () => setConfirmDel(true))}>{t("common.delete")}</Button>
               )}
             </div>
           )}
@@ -374,7 +400,7 @@ function SharePanel({ lang, signs, selected, readOnly, onImported }: { lang: str
   return (
     <Card title={t("my.shareTitle")} subtitle={t("my.shareSubtitle")}>
       <div className="grid gap-6 lg:grid-cols-2">
-        <div className="flex flex-col gap-3">
+        <div className="flex min-w-0 flex-col gap-3">
           <div className="text-xs font-medium text-fg-2">{t("my.export")}</div>
           <div className="grid gap-3 sm:grid-cols-2">
             <Field label={t("my.packTitle")}><input className={inputCls} value={title} maxLength={60} onChange={(e) => setTitle(e.target.value)} /></Field>
@@ -402,10 +428,10 @@ function SharePanel({ lang, signs, selected, readOnly, onImported }: { lang: str
             </Button>
           </div>
         </div>
-        <div className="flex flex-col gap-3">
+        <div className="flex min-w-0 flex-col gap-3">
           <div className="text-xs font-medium text-fg-2">{t("my.import")}</div>
           <p className="text-xs text-fg-3">{t("my.importHelp")}</p>
-          <input ref={fileRef} type="file" accept=".signpack,application/zip" className="text-sm text-fg-2 file:mr-3 file:rounded-lg file:border file:border-ink-700 file:bg-ink-800 file:px-3 file:py-1.5 file:text-fg"
+          <input ref={fileRef} type="file" accept=".signpack,application/zip" className="w-full max-w-full text-sm text-fg-2 file:mr-3 file:rounded-lg file:border file:border-ink-700 file:bg-ink-800 file:px-3 file:py-1.5 file:text-fg"
             aria-label={t("my.chooseFile")} />
           <Field label={t("my.importMode")} group hint={mode === "replace" ? t("my.replaceWarning") : t("my.mergeHelp")}>
             <Segmented<"merge" | "replace"> ariaLabel={t("my.importMode")} value={mode} onChange={setMode}
@@ -431,6 +457,8 @@ function AlphabetPanel({ lang, rec, readOnly, onChanged }: { lang: string; rec: 
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
+  const confirmResetBtn = useRef<HTMLButtonElement>(null);
+  useEffect(() => { if (confirmReset) confirmResetBtn.current?.focus(); }, [confirmReset]);
 
   const recordLetter = async (letter: string) => {
     setMsg(null);
@@ -470,7 +498,7 @@ function AlphabetPanel({ lang, rec, readOnly, onChanged }: { lang: string; rec: 
               className={cx("flex h-12 w-full flex-col items-center justify-center rounded-lg border font-mono text-base font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-45",
                 busy === L ? "border-danger text-danger" : counts[L] ? "border-teal/50 bg-teal-soft/40 text-teal" : "border-ink-600 bg-ink-800 text-fg hover:border-accent")}>
               {L}
-              {counts[L] ? <span className="text-[9px] font-normal">{counts[L]}</span> : null}
+              {counts[L] ? <span className="text-[11px] font-normal">{counts[L]}</span> : null}
             </button>
           </li>
         ))}
@@ -480,7 +508,7 @@ function AlphabetPanel({ lang, rec, readOnly, onChanged }: { lang: string; rec: 
         {data?.trained_model && <Badge tone="accent">{t("my.trainedLetters")}</Badge>}
         {n > 0 && !readOnly && (confirmReset ? (
           <>
-            <Button size="sm" variant="danger" onClick={resetAll}>{t("my.confirmReset")}</Button>
+            <Button ref={confirmResetBtn} size="sm" variant="danger" onClick={resetAll}>{t("my.confirmReset")}</Button>
             <Button size="sm" variant="ghost" onClick={() => setConfirmReset(false)}>{t("common.cancel")}</Button>
           </>
         ) : <Button size="sm" variant="ghost" onClick={() => setConfirmReset(true)}>{t("my.resetAlphabet")}</Button>)}
@@ -528,7 +556,7 @@ export default function MySignsPage() {
         </Card>
       ) : (
         <div className="flex flex-col gap-5">
-          <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_420px]">
+          <div className="grid grid-cols-[minmax(0,1fr)] gap-5 xl:grid-cols-[minmax(0,1fr)_420px]">
             <NewSign lang={lang} rec={rec} readOnly={readOnly} onSaved={reload} />
             <Card title={t("my.listTitle", { n: signs.length })} subtitle={t("my.listSubtitle")}>
               {error && <Notice tone="danger">{error}</Notice>}

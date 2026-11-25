@@ -35,7 +35,7 @@ export function UiLanguageSwitcher() {
       ariaLabel={t("switch.uiLanguage")}
       value={lang}
       onChange={setLang}
-      options={[{ value: "en", label: "EN" }, { value: "hi", label: "हिंदी" }]}
+      options={[{ value: "en", label: "EN", lang: "en" }, { value: "hi", label: "हिंदी", lang: "hi" }]}
     />
   );
 }

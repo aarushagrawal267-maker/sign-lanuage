@@ -1,11 +1,11 @@
 // Vocabulary of a language pack (ISL): every dictionary concept, searchable in English and Hindi, with the Hindi
 // review state, a landmark preview of the dictionary sign and a local Hindi correction form (docs/ISL_DESIGN.md 4.4, 8.1).
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, Flag, Search, Volume2, X } from "lucide-react";
 import {
   IS_STATIC, api, type LanguageVocabEntry, type LanguageVocabRow, type SystemInfo,
 } from "../api/client";
-import { useT } from "../i18n";
+import { useT, type StringKey } from "../i18n";
 import { useApi } from "../lib/hooks";
 import { speak, speechAvailable } from "../lib/speech";
 import { useSignLanguage } from "../state/language";
@@ -15,6 +15,12 @@ import { Badge, Button, Card, Empty, ErrorText, Field, Kv, Notice, PageHeader, S
 
 const PAGE = 60;
 type Kind = "" | "word" | "multiword" | "phrase" | "number";
+// Entry-type badges in the interface language (they were raw English codes such as "multiword" in the Hindi interface).
+const KIND_KEYS: Record<string, StringKey> = { word: "vocab.kindWord", multiword: "vocab.kindMulti", phrase: "vocab.kindPhrase", number: "vocab.kindNumber" };
+function useKindLabel() {
+  const { t } = useT();
+  return (k: string) => (KIND_KEYS[k] ? t(KIND_KEYS[k]) : k);
+}
 
 type LexiconSummary = {
   available: boolean; concepts: number; entries: number; coverage?: number; reviewed?: number;
@@ -86,7 +92,12 @@ function HindiEditor({ lang, entry, onSaved, readOnly }: { lang: string; entry: 
 
 function DetailPanel({ lang, conceptId, onClose, readOnly }: { lang: string; conceptId: string; onClose: () => void; readOnly: boolean }) {
   const { t } = useT();
+  const kindLabel = useKindLabel();
   const { data: e, error, reload } = useApi<LanguageVocabEntry>(`/api/languages/${encodeURIComponent(lang)}/vocabulary/${encodeURIComponent(conceptId)}`);
+  // The panel opens above the word grid: move focus to it so keyboard and screen-reader users find it (WCAG 2.4.3).
+  const regionRef = useRef<HTMLDivElement>(null);
+  const loaded = !!e;
+  useEffect(() => { if (loaded) regionRef.current?.focus({ preventScroll: false }); }, [loaded, conceptId]);
   if (error) return <Card><Notice tone="danger">{error}</Notice></Card>;
   if (!e) return <Card><p className="text-sm text-fg-3">{t("common.loading")}</p></Card>;
   const en = e.display?.en || e.headword;
@@ -95,18 +106,19 @@ function DetailPanel({ lang, conceptId, onClose, readOnly }: { lang: string; con
   const alts = e.hindi?.hi_alt ?? [];
   const trustedAlts = review === "reviewed" || review === "curated";
   return (
+    <div ref={regionRef} tabIndex={-1} role="region" aria-label={`${t("vocab.detailTitle")}: ${en}`} className="rounded-2xl outline-none" data-testid="word-detail">
     <Card
       title={t("vocab.detailTitle")}
       subtitle={e.concept_id}
-      actions={<button onClick={onClose} className="rounded-md p-1 text-fg-3 hover:bg-ink-800 hover:text-fg" aria-label={t("common.close")}><X className="size-4" /></button>}
+      actions={<button type="button" onClick={onClose} className="inline-flex size-9 items-center justify-center rounded-md text-fg-3 hover:bg-ink-800 hover:text-fg" aria-label={t("common.close")}><X className="size-5" aria-hidden /></button>}
     >
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
         <div className="flex min-w-0 flex-col gap-4">
           <BilingualWord en={en} hi={hi} review={review} size="xl" />
           <div className="flex flex-wrap gap-2">
-            <Button size="sm" variant="ghost" icon={<Volume2 className="size-3.5" />} disabled={!speechAvailable("en-IN")} onClick={() => speak(en, "en-IN")}>English</Button>
+            <Button size="sm" variant="ghost" icon={<Volume2 className="size-3.5" />} disabled={!speechAvailable("en-IN")} onClick={() => speak(en, "en-IN")} lang="en">English</Button>
             <Button size="sm" variant="ghost" icon={<Volume2 className="size-3.5" />} disabled={!hi || !speechAvailable("hi-IN")} onClick={() => hi && speak(hi, "hi-IN")}
-              title={speechAvailable("hi-IN") ? undefined : t("sentence.noHindiVoice")}>हिंदी</Button>
+              title={speechAvailable("hi-IN") ? undefined : t("sentence.noHindiVoice")} lang="hi">हिंदी</Button>
           </div>
           {hi && (
             <div className="text-xs text-fg-3">
@@ -123,7 +135,7 @@ function DetailPanel({ lang, conceptId, onClose, readOnly }: { lang: string; con
           )}
           <div>
             {e.in_classifier && <Badge tone="teal">{t("vocab.core")}</Badge>}
-            {e.kind && e.kind !== "word" && <Badge className="ml-1">{e.kind}</Badge>}
+            {e.kind && e.kind !== "word" && <Badge className="ml-1">{kindLabel(e.kind)}</Badge>}
           </div>
           <div>
             <Kv k={t("vocab.category")} v={e.category ?? "—"} />
@@ -162,11 +174,13 @@ function DetailPanel({ lang, conceptId, onClose, readOnly }: { lang: string; con
         </div>
       </div>
     </Card>
+    </div>
   );
 }
 
 export function LanguageVocabulary() {
   const { t } = useT();
+  const kindLabel = useKindLabel();
   const { id, info } = useSignLanguage();
   const [q, setQ] = useState("");
   const dq = useDebounced(q.trim());
@@ -216,6 +230,11 @@ export function LanguageVocabulary() {
   };
 
   const by = lex?.by_review ?? {};
+  const closeDetail = () => {
+    const opener = sel;
+    setSel(null);
+    if (opener) window.requestAnimationFrame(() => document.querySelector<HTMLElement>(`[data-concept="${CSS.escape(opener)}"]`)?.focus());
+  };
   return (
     <div className="fade-in">
       <PageHeader eyebrow={t("vocab.eyebrow", { lang: info?.sign_language ?? "" })} title={t("vocab.title")}
@@ -246,19 +265,19 @@ export function LanguageVocabulary() {
       </div>
 
       {error && <div className="mb-4"><Notice tone="danger">{error}</Notice></div>}
-      {sel && <div className="mb-5"><DetailPanel lang={id} conceptId={sel} onClose={() => setSel(null)} readOnly={readOnly} /></div>}
+      {sel && <div className="mb-5"><DetailPanel lang={id} conceptId={sel} onClose={closeDetail} readOnly={readOnly} /></div>}
       {total === 0 && !loading && <Card><Empty title={t("vocab.noResults")}>{t("vocab.noResultsHelp")}</Empty></Card>}
 
       <ul className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4">
         {items.map((r) => (
           <li key={r.concept_id}>
-            <button onClick={() => setSel(r.concept_id === sel ? null : r.concept_id)} aria-pressed={sel === r.concept_id}
+            <button type="button" data-concept={r.concept_id} onClick={() => (r.concept_id === sel ? closeDetail() : setSel(r.concept_id))} aria-pressed={sel === r.concept_id}
               className={cx("flex w-full flex-col gap-1.5 rounded-xl border bg-ink-850 p-3 text-left transition-colors hover:border-ink-600",
                 sel === r.concept_id ? "border-accent" : "border-ink-700")}>
               <BilingualWord en={r.text.en} hi={r.text.hi} review={r.hi_review} size="md" />
               <div className="flex flex-wrap items-center gap-1">
                 {r.in_classifier && <Badge tone="teal">{t("vocab.coreShort")}</Badge>}
-                {r.kind !== "word" && <Badge>{r.kind}</Badge>}
+                {r.kind !== "word" && <Badge>{kindLabel(r.kind)}</Badge>}
                 {r.regions.map((g) => <Badge key={g} tone="accent">{g}</Badge>)}
               </div>
             </button>

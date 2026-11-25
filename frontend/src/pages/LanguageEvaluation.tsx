@@ -4,7 +4,7 @@
 import { useApi } from "../lib/hooks";
 import { pct } from "../lib/format";
 import { useSignLanguage } from "../state/language";
-import { Badge, Card, Empty, Kv, Notice, PageHeader } from "../components/ui";
+import { Badge, Card, Empty, Kv, Notice, PageHeader, ScrollRegion } from "../components/ui";
 
 type Interval = [number, number];
 type Protocol = {
@@ -67,23 +67,24 @@ export function LanguageEvaluation() {
           </div>
           {e3?.policies && (
             <Card title={<span>Whole system: show / ask / not sure <Badge className="ml-1">E3</Badge></span>} subtitle={e3.label}>
-              <div className="overflow-x-auto">
+              <ScrollRegion label="Show / ask / not sure table" className="overflow-x-auto">
                 <table className="w-full min-w-[640px] text-left text-sm">
+                  <caption className="sr-only">How often the whole system shows a word, asks "did you mean", or says "not sure", per policy</caption>
                   <thead className="text-xs text-fg-3">
                     <tr>
-                      <th className="py-2 pr-3 font-medium">Policy</th>
-                      <th className="py-2 pr-3 font-medium">Shown without asking</th>
-                      <th className="py-2 pr-3 font-medium">Correct when shown</th>
-                      <th className="py-2 pr-3 font-medium">Wrong word shown silently</th>
-                      <th className="py-2 pr-3 font-medium">"Did you mean"</th>
-                      <th className="py-2 pr-3 font-medium">Right word in the 5 choices</th>
-                      <th className="py-2 pr-3 font-medium">"Not sure"</th>
+                      <th scope="col" className="py-2 pr-3 font-medium">Policy</th>
+                      <th scope="col" className="py-2 pr-3 font-medium">Shown without asking</th>
+                      <th scope="col" className="py-2 pr-3 font-medium">Correct when shown</th>
+                      <th scope="col" className="py-2 pr-3 font-medium">Wrong word shown silently</th>
+                      <th scope="col" className="py-2 pr-3 font-medium">"Did you mean"</th>
+                      <th scope="col" className="py-2 pr-3 font-medium">Right word in the 5 choices</th>
+                      <th scope="col" className="py-2 pr-3 font-medium">"Not sure"</th>
                     </tr>
                   </thead>
                   <tbody className="font-mono text-[13px]">
                     {Object.entries(e3.policies).map(([k, v]) => (
                       <tr key={k} className="border-t border-ink-700/60">
-                        <td className="py-2 pr-3 font-sans">{k}</td>
+                        <th scope="row" className="py-2 pr-3 font-sans font-normal">{k}</th>
                         <td className="py-2 pr-3">{pct(v.coverage as number)}{v.n_accepted !== undefined ? ` (${v.n_accepted})` : ""}</td>
                         <td className="py-2 pr-3">{pct(v.accepted_precision as number)}</td>
                         <td className="py-2 pr-3">{pct(v.silent_error_rate as number)}</td>
@@ -94,7 +95,7 @@ export function LanguageEvaluation() {
                     ))}
                   </tbody>
                 </table>
-              </div>
+              </ScrollRegion>
               <p className="mt-2 text-[11px] text-fg-3">n = {e3.n} test clips. Accuracy is only comparable together with how often a word is shown (coverage).</p>
             </Card>
           )}

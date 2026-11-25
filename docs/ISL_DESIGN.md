@@ -1592,3 +1592,77 @@ Dataset pages remain ASL/English only; no "did you mean" keyboard shortcuts beyo
 Chromium's synthetic camera (no person), so accept/suggest/abstain rendering is covered by Vitest component tests and a
 scripted WebSocket check, not by an end-to-end signing test.
 
+
+## 14. Accessibility audit for deaf and low-literacy users (Accessibility Auditor, 25 Nov 2026)
+
+**Scope.** Every screen added or changed for ISL: header switches, Live (recognised / did you mean / not sure, sentence
+strip, speech controls), My signs (recorder, form, list, share, alphabet), ISL Vocabulary (search, word detail, Hindi
+correction), ISL Evaluation, plus the layout, sidebar and footer around them. Checked in the English and Hindi interface,
+with ISL and ASL selected, at 1280 px and 320 px (= 400% zoom). Standard: WCAG 2.2 AA. The users in mind are deaf ISL
+signers in Indore/MP, many reading Hindi better than English, some with low literacy, some deafblind (braille display),
+some using a phone or tablet, all signing with both hands while the app listens.
+
+**Method.** axe-core 4.14 through `@axe-core/playwright` on the preinstalled Playwright Chromium (all 11 pages x 2
+interface languages x 2 sign languages); custom browser checks for what axe cannot see (Hindi marked `lang="hi"`, letter
+spacing and size of Devanagari, English-only pages marked `lang="en"` in the Hindi interface, sideways scrolling at 320 px,
+clipped content); keyboard-only walk-throughs; code review of names, roles, live regions and focus; the three result states
+driven through a mocked recognition WebSocket. Screen readers (NVDA, JAWS, VoiceOver, TalkBack) and a real braille display
+were **not** available on this machine: screen-reader behaviour below is from the accessibility tree and ARIA semantics,
+not from listening to a real reader.
+
+**Automated result.** axe-core already reported 0 violations on every page before this audit (earlier work had fixed the
+basics). All the problems below were found by manual review and the custom checks, which is why "axe is green" was not
+enough.
+
+| # | Problem found | WCAG | Severity | Fix |
+|---|---|---|---|---|
+| 1 | Recognised, "did you mean" and "not sure" were told apart mostly by an 11 px label; "did you mean" and "not sure" used the same amber colour | 1.4.1, 1.3.3 (and plain usability for low literacy) | Serious | Each state is now a framed panel with its own colour, border, round icon and a 16-20 px heading: teal + tick (recognised), amber + "?" (did you mean), orange dashed border + "try again" arrow (not sure). `data-state` marks them for tests |
+| 2 | A recognised word was not announced to screen-reader / braille users (only the generic status pill was) | 4.1.3 | Serious | `ResultAnnouncer`: polite live region announcing "Recognised: water, पानी" (Hindi in a `lang="hi"` span), "Not sure. 3 possible words are shown…", "Not sure…"; quiet while signing; re-announces the same word signed twice |
+| 3 | After "Wrong word? Remove it" the word was still shown large as "recognised" | 3.3.4-style error recovery, clarity | Serious | A rejected word becomes a resolved state "Removed from your sentence. Please sign the word again." (hook tracks `rejected`) |
+| 4 | Focus was lost to the page after choosing a "did you mean" word, rejecting a word, removing a sentence word, Edit/Delete in My signs, alphabet reset | 2.4.3 | Serious (keyboard, switch and screen-reader users) | Focus moves to the confirmation message, the word list, the edit form / confirm button, and back to Edit / Delete; it only moves when the pressed control has gone |
+| 5 | Vocabulary word detail opened above the grid while focus stayed on the card below | 2.4.3 | Moderate | Detail panel is a labelled region that takes focus; closing returns focus to the card |
+| 6 | "Did you mean" buttons used an `aria-label` ("Choose water पानी, 46 percent") that replaced the visible text and its `lang` marks | 2.5.3, 3.1.2 | Moderate | Name now comes from the visible text with explicit spaces: "Choose water पानी 46% sure"; percentage is visible as "46% sure" instead of a bare number |
+| 7 | Hindi letter-spaced apart ("श ब्द") in the Live eyebrow and other `tracking-*` labels | 1.4.8-style readability; rendering defect | Serious in the Hindi interface | Global rule: no letter spacing on Devanagari |
+| 8 | Hindi captions at 10-11 px (sidebar groups, badges, review markers, alphabet counts at 9 px) lose their matras | 1.4.4 / readability | Moderate | Devanagari never below 12 px; alphabet counts and review markers enlarged |
+| 9 | Devanagari outside `lang="hi"` (and in `font-mono`) fell back to whatever system font exists, tofu boxes on some Android/Windows set-ups | robustness of Hindi rendering | Moderate | Bundled Noto Sans Devanagari is in the default sans and mono stacks (its unicode-range keeps Latin in IBM Plex) |
+| 10 | "हिंदी" option and button labels had no `lang="hi"` in the English interface | 3.1.2 | Moderate | `Segmented` options take `lang`; all "हिंदी"/"English" labels marked |
+| 11 | English-only pages (Overview, Evaluation, Analysis, Studio, Dataset, Lab, Experiments, Research, ASL vocabulary), the footer, demo banner, ASL settings and camera metrics were read with Hindi rules in the Hindi interface (`<html lang="hi">`) | 3.1.2 | Moderate | `pageIsTranslated()`; untranslated page content, footer and English-only blocks carry `lang="en"` |
+| 12 | Vocabulary badges showed raw codes ("multiword", "phrase") in the Hindi interface | 3.1.2, understandable | Minor | Translated labels |
+| 13 | Dictionary and take previews loop forever with no pause | 2.2.2 | Moderate (vestibular, attention) | Pause/play button on every `SkeletonPreview`; starts paused (middle frame) with reduced motion |
+| 14 | Sentence chip buttons 22 px and take-remove buttons 18 px | 2.5.8 | Moderate (motor, tablets) | 32 px targets; did-you-mean actions are full-size buttons |
+| 15 | "Check and save" was disabled with no reason given | 3.3.2 | Moderate (low literacy) | "To save: record the sign at least 3 times (2 so far) / type the English word", linked with `aria-describedby` |
+| 16 | Recording time inside a live region would be read ten times a second | 4.1.3 (noise) | Moderate | Time is visual only; the region announces phase changes |
+| 17 | Header health dot on phones was colour only (text `display:none`) | 1.4.1 | Minor | Text kept for assistive technology at all widths |
+| 18 | 320 px: "camera off" panel clipped (Start button cut), My signs scrolled sideways (file input, 16:9 box) | 1.4.10 | Moderate | Minimum height when the camera is off; grid columns `minmax(0,1fr)`, full-width file input |
+| 19 | ISL evaluation table: scrollable area not keyboard focusable, no caption or header scope | 2.1.1, 1.3.1 | Minor | `ScrollRegion`, caption, `scope` on headers |
+
+**No reliance on sound.** Confirmed: nothing in the ISL flows uses audio cues; speaking the sentence aloud is optional, off
+by default, and its absence is explained on screen. The live camera `<video>` is muted and has no audio track, so captions
+(axe "needs review": video-caption) do not apply.
+
+**What was already good and must be kept.** Skip link and focus to `<main>` on navigation; page titles per route; the
+mobile drawer is a proper modal with focus trap and Escape; radio-group switches with arrow keys; `role="switch"` toggles;
+form fields wrapped in labels; landmark structure; visible focus outline; reduced-motion support; "Hindi not available yet"
+instead of invented Hindi; the review markers' long text available to screen readers.
+
+**Tests added.** `frontend/src/components/a11y.test.tsx` (16 Vitest tests: distinct states, axe-core structure rules on
+every state in English and Hindi, focus after choose / reject / remove, announcements, names and `lang`, pause control).
+`frontend/e2e/a11y.spec.ts` (48 Playwright tests: axe WCAG 2.2 A/AA on 11 pages x EN/HI x ISL/ASL with the Devanagari and
+`lang` checks, bundled font and no letter spacing, 320 px reflow, keyboard focus in Vocabulary, the save hint, and the
+three live states via a mocked socket with axe, announcements and keyboard choice). Run with the e2e servers up:
+`cd frontend && npx playwright test e2e/a11y.spec.ts`. The checks were run against the code before the fixes and caught
+the Hindi size/spacing/lang problems, the 320 px overflow and the missing `lang="en"` marks.
+
+**Still open (not fixed here).**
+* Real assistive-technology testing: NVDA + Chrome and TalkBack + Chrome on Android (the likely set-up in Indore), and a
+  braille display for deafblind users; voice control is irrelevant for most signers but switch access is not.
+* Testing with deaf ISL users and teachers in Indore (low literacy, Hindi-first): icon meaning, wording and the order of
+  English/Hindi should be validated with them, ideally with an ISL video or picture guide for the three states.
+* Overview, Evaluation, Analysis, Studio, Dataset, Lab, Experiments and Research are English only (now correctly marked
+  `lang="en"`); the Overview landing page in particular should be translated. Small leftovers in translated pages: "frames"
+  in the result footnote, the camera metrics overlay, ASL-only settings, engine reason codes for ASL.
+* The Hindi interface text and screen-reader announcements need review by a native Hindi speaker.
+* `role="alert"` is used for static warning notices (e.g. the smoke-build notice), which some readers announce on every
+  page load; consider `role="note"` for static warnings.
+* Older ASL pages (Dataset, Experiments) still have non-focusable horizontal-scroll tables; out of this audit's scope.
+* The status pill still blinks (`pulse-dot`) while busy; it stops with reduced motion but has no other pause.
