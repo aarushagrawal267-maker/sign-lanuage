@@ -140,6 +140,9 @@ def e1_closed_set(rec, clips, label: str, split_name: str, kind: str) -> dict:
                              "the app uses the fused decision (E3)",
             "intervals": {"top1": grouped_bootstrap(hit.tolist(), groups),
                           "top5": grouped_bootstrap(top5.tolist(), groups)},
+            "interval_note": None if len(set(groups)) >= 2 else
+            "one signer group in this test part: a signer-level interval needs the cross-validation folds (cv)",
+            "_hits": hit.tolist(), "_groups": groups,
             "per_category_top1": {k: round(float(np.mean(v)), 4) for k, v in sorted(per_cat.items())}}
 
 
@@ -216,8 +219,10 @@ def e2_oneshot_fold(enc, fold: dict, data, linker, fcfg, base_params: FusionPara
         return {"fold": fold["fold"], "run": False, "reason": "empty gallery"}
     G = np.concatenate([enc.embed(np.stack(g_feats[a:a + 128]))[0] for a in range(0, len(g_feats), 128)])
     gal_concepts = set(g_ids)
-    inc_all = [c for c in data.include if c.concept_id]
-    queries = [c for c in inc_all if c.concept_id in set(fold["held_out_concepts"]) and c.concept_id in gal_concepts]
+    # queries: INCLUDE clips of the fold's concepts from the val / test parts only - those are also excluded from
+    # self-supervised pre-training, so a query was never seen in any form (train-part clips were, unlabelled)
+    inc_eval = data.include_part("val") + data.include_part("test")
+    queries = [c for c in inc_eval if c.concept_id in set(fold["held_out_concepts"]) and c.concept_id in gal_concepts]
     queries, dropped = drop_trained_duplicates(queries, train_clips_of_encoder, getattr(data, "dedup", None))
     calib = [c for c in data.include_part("val") if c.concept_id not in held and c.concept_id in gal_concepts]
     seen = [c for c in data.include_part("test") if c.concept_id not in held and c.concept_id in gal_concepts]
@@ -434,6 +439,9 @@ def e8_trim(paths, artifacts_dir: Path) -> dict:
            "trims": len(trims), "method_mix": dict(mix),
            "low_confidence_frac": (sum(1 for r in trims if float(r.get("confidence") or 0) < 0.5) / len(trims))
            if trims else None}
+    if trims:
+        out["metrics"] = {"trims": len(trims), "low_confidence_frac": out["low_confidence_frac"],
+                          "cap_frac": mix.get("cap", 0) / len(trims)}
     if rep.exists():
         try:
             out["trim_eval"] = json.loads(rep.read_text())
@@ -475,6 +483,8 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
         for p in cv:
             pr = Predictor(p)
             sname = pr.meta.get("split")
+            if not sname or sname == split_name:  # the main model is already E1b
+                continue
             try:
                 sp = load_split(paths, sname) if paths is not None else None
             except FileNotFoundError:
@@ -485,11 +495,19 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
             r2 = load_recognizer(work, fcfg, vocab_path, profile=profile)
             r2.classifier = pr
             folds.append(e1_closed_set(r2, fold_test, sname, sname, "cv"))
-        tops = [f["metrics"]["top1"] for f in folds if f.get("run")]
-        if tops:
-            prot["E1b"]["cv"] = {"folds": len(tops), "top1_mean": float(np.mean(tops)), "top1_sd": float(np.std(tops)),
+        runs = [f for f in [prot["E1b"], *folds] if f.get("run")]
+        tops = [f["metrics"]["top1"] for f in runs]
+        if len(runs) > 1:
+            hits = sum((f["_hits"] for f in runs), [])
+            grp = sum(([f"{i}:{g}" for g in f["_groups"]] for i, f in enumerate(runs)), [])
+            prot["E1b"]["cv"] = {"folds": len(runs), "top1_mean": float(np.mean(tops)), "top1_sd": float(np.std(tops)),
+                                 "pooled_n": len(hits), "pooled_top1": float(np.mean(hits)),
+                                 "pooled_top1_interval": grouped_bootstrap(hits, grp),
+                                 "pooled_groups": len(set(grp)),
+                                 "label": "every fold's held-out signers, each fold's model trained without them",
                                  "per_fold": [{"split": f["label"], "n": f.get("n"), "top1": f["metrics"]["top1"]}
-                                              for f in folds if f.get("run")]}
+                                              for f in runs]}
+            prot["E1b"]["intervals"]["top1_cv_pooled"] = prot["E1b"]["cv"]["pooled_top1_interval"]
     off = work / "e1a" / "classifier.pt"
     if off.exists() and paths is not None:
         from app.isl.training.common import load_split
@@ -514,6 +532,9 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
         prot["E1c"] = e1_closed_set(rec, extra_test, "E1c other sources' held-out signers (real signer ids: "
                                     + ", ".join(sorted({c.source for c in extra_test})) + "); signer-independent",
                                     split_name, "extra_signers")
+    else:
+        prot["E1c"] = {"run": False, "reason": "no other labelled source has a signer-held-out test part yet (needs a "
+                       "source with real signer ids and >= 6 signers, e.g. ISL500)"}
     log("E3")
     prot["E3"] = e3_fused(rec, test_inc + extra_test, "E3 fused system (classifier + dictionary retrieval + fusion "
                           "fitted on validation) with accept / suggest / abstain; INCLUDE test part + other sources' "
@@ -541,7 +562,8 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
         pooled = e2_pool(folds)
         full = pooled.get("full", {})
         prot["E2"] = {"label": "E2 open vocabulary, one-shot: concepts held out of ALL supervised training (synonyms "
-                               "too); other signers' INCLUDE clips vs one ISLRTC dictionary clip per word; thresholds "
+                               "too); other signers' INCLUDE clips (val/test parts, never seen even unlabelled) vs one "
+                               "ISLRTC dictionary clip per word; thresholds "
                                "fitted on seen-class validation queries only. Some misses are regional variants, not "
                                "model errors. Unlabelled pre-training may have seen dictionary clips (no labels).",
                       "run": bool(full), "n": full.get("n", 0), "n_groups": full.get("n_groups"),
@@ -564,6 +586,9 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     prot["E7"] = e7_asl_regression(REPO_ROOT)
     if paths is not None:
         prot["E8"] = e8_trim(paths, get_settings().artifacts_dir)
+    for v in prot.values():
+        for k in ("_hits", "_groups"):
+            v.pop(k, None)
     leak = {"split": split_name, "classifier_split_checked": True, "dedup": getattr(data, "multisource", {}).get("dedup"),
             "links": getattr(data, "multisource", {}).get("links"),
             "pretraining_excludes_eval_clips": True}
@@ -597,21 +622,34 @@ def markdown_report(doc: dict) -> str:
              "| Protocol | n | groups | top-1 | 95% CI | top-5 | not sure | wrong accept | label |",
              "|---|---|---|---|---|---|---|---|---|"]
     for pid, p in doc["protocols"].items():
-        if not p.get("run", True) or not p.get("metrics"):
+        if p.get("run") is False or (not p.get("metrics") and p.get("run") is None and not p.get("n")):
             lines.append(f"| {pid} | - | - | - | - | - | - | - | not run: {p.get('reason') or p.get('leakage') or ''} |")
             continue
-        m = p["metrics"]
-        ci = (p.get("intervals") or {}).get("top1")
+        m = p.get("metrics") or {}
+        if "top1" not in m:
+            lines.append(f"| {pid} | {p.get('n', '-')} | {p.get('n_groups', '-')} | - | - | - | - | - | "
+                         f"{p.get('label', '')} (details below) |")
+            continue
+        iv = p.get("intervals") or {}
+        ci, tag = iv.get("top1"), ""
+        if not ci and iv.get("top1_cv_pooled"):
+            ci, tag = iv["top1_cv_pooled"], " (cv pooled)"
         lines.append(f"| {pid} | {p.get('n')} | {p.get('n_groups', '-')} | {_fmt(m.get('top1'))} | "
-                     f"{'-' if not ci else f'{ci[0]:.3f}-{ci[1]:.3f}'} | {_fmt(m.get('top5'))} | "
+                     f"{'-' if not ci else f'{ci[0]:.3f}-{ci[1]:.3f}{tag}'} | {_fmt(m.get('top5'))} | "
                      f"{_fmt(m.get('not_sure_rate'))} | {_fmt(m.get('wrong_accept_rate'))} | {p.get('label', '')} |")
+    cvb = doc["protocols"].get("E1b", {}).get("cv")
+    if cvb:
+        ci = cvb.get("pooled_top1_interval")
+        lines += ["", f"E1b cross-validation: {cvb['folds']} folds, top-1 mean {cvb['top1_mean']:.3f} (sd "
+                  f"{cvb['top1_sd']:.3f}); pooled over {cvb['pooled_groups']} held-out signer groups: "
+                  f"{cvb['pooled_top1']:.3f}" + (f" (95% CI {ci[0]:.3f}-{ci[1]:.3f})" if ci else "")]
     e4 = doc["protocols"].get("E4", {})
     if e4.get("run"):
         lines += ["", "## E4 My signs", "", "| k | n | without | with | gain | user-sign false accepts |", "|---|---|---|---|---|---|"]
         for k, v in e4["by_k"].items():
             lines.append(f"| {k} | {v['n']} | {_fmt(v['top1_without_enrolment'])} | {_fmt(v['top1_with_enrolment'])} | "
                          f"{_fmt(v['gain'])} | {_fmt(v['user_sign_false_accept_rate'])} |")
-    for k in ("E6", "E7", "E8"):
+    for k in ("E5", "E6", "E7", "E8"):
         p = doc["protocols"].get(k)
         if p:
             lines += ["", f"## {k}", "", "```", json.dumps({x: y for x, y in p.items() if x not in ("trim_eval",)},

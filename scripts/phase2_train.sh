@@ -8,7 +8,7 @@
 #
 # Steps (each one writes a stamp file when it succeeds; a re-run skips stamped steps, so the driver can be
 # restarted at any time; training steps also resume inside an epoch from their *.state files):
-#   trim dedup vocab splits link bench pretrain encoder oneshot classifier e1a fingerspell
+#   trim dedup vocab splits link bench pretrain encoder oneshot classifier cv e1a fingerspell
 #   index fusion evaluate index_final pack
 # Options:
 #   --from STEP      ignore stamps from STEP on (re-run it and everything after it)
@@ -19,7 +19,7 @@
 #   --step-minutes M time budget per training call (0 = none); the step is re-run with --resume until done
 #   --list           print the steps and their stamps
 # Environment overrides for the full settings: PRE_EPOCHS PRE_STEPS PRE_BATCH HIDDEN LAYERS EMB ENC_EPOCHS
-# ENC_STEPS CLS_EPOCHS CLS_STEPS ONESHOT_FOLDS ONESHOT_EPOCHS LETTER_EPOCHS.
+# ENC_STEPS CLS_EPOCHS CLS_STEPS E1A_STEPS CV_FOLDS (empty = skip cv) ONESHOT_FOLDS ONESHOT_EPOCHS LETTER_EPOCHS.
 #
 # Outputs: full -> artifacts/isl/<profile>/ (work) and artifacts/packs/<isl|isl-research>/ (pack the app loads);
 # smoke -> artifacts/isl/phase2-smoke/<profile>/ (work, pack/ inside it; never loaded by the app).
@@ -37,7 +37,7 @@ THREADS="${THREADS:-2}"
 MAX_PARTS=1000
 STEP_MIN=0
 LIST=0
-STEPS=(trim dedup vocab splits link bench pretrain encoder oneshot classifier e1a fingerspell index fusion evaluate index_final pack)
+STEPS=(trim dedup vocab splits link bench pretrain encoder oneshot classifier cv e1a fingerspell index fusion evaluate index_final pack)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -104,7 +104,7 @@ else
   PRE="--hidden $H --layers $L --emb-dim $E --epochs ${PRE_EPOCHS:-20} --batches ${PRE_STEPS:-400} --batch-size ${PRE_BATCH:-48}"
   ENC="--hidden $H --layers $L --emb-dim $E --epochs ${ENC_EPOCHS:-40} --batches ${ENC_STEPS:-400} --p 32 --k 2 --patience 10"
   ONE="--hidden $H --layers $L --emb-dim $E --epochs ${ONESHOT_EPOCHS:-20} --batches ${ENC_STEPS:-300} --p 32 --k 2 --patience 6 --folds ${ONESHOT_FOLDS:-0 1}"
-  CLS="--hidden $H --layers $L --epochs ${CLS_EPOCHS:-60} --batches ${CLS_STEPS:-300} --patience 15"
+  CLS="--hidden $H --layers $L --epochs ${CLS_EPOCHS:-40} --batches ${CLS_STEPS:-300} --patience 10"
   LET="--epochs ${LETTER_EPOCHS:-40}"
 fi
 mkdir -p "$WORK"
@@ -134,6 +134,7 @@ state_files() {  # training state of a step (removed by --force)
     oneshot) ls "$WORK"/oneshot/fold*/encoder.pt.state 2>/dev/null ;;
     classifier) echo "$WORK/classifier.pt.state" ;;
     e1a) echo "$WORK/e1a/classifier.pt.state" ;;
+    cv) ls "$WORK"/cv/fold*/classifier.pt.state 2>/dev/null ;;
   esac
 }
 
@@ -152,10 +153,19 @@ run_step() {
     encoder) train train-encoder $COMMON --all-sources $CAP $ENC --init auto ;;
     oneshot) train train-oneshot $COMMON --all-sources $CAP $ONE --init auto ;;
     classifier) train train-classifier $COMMON --all-sources $CAP $CLS ;;
+    cv)  # classifiers for the other folds of the primary split: E1b mean / spread and a signer-grouped interval
+      local base
+      base=$("$PY" -c "import json,sys; print(json.load(open(sys.argv[1])).get('primary_split',''))" \
+             "${SROOT:-$REPO/data/isl}/splits/splits_report.json" 2>/dev/null)
+      if [[ -z "$base" ]]; then log "  no splits_report.json: skipped"; return 0; fi
+      for k in ${CV_FOLDS-$([[ $SMOKE == 1 ]] && echo 1 || echo 1 2 3 4)}; do
+        mkdir -p "$WORK/cv/fold$k"
+        train train-classifier $COMMON --all-sources $CAP $CLS --split "$base-fold$k" --ckpt "$WORK/cv/fold$k/classifier.pt" || return $?
+      done ;;
     e1a)  # E1a needs its own model trained on the official (not signer-independent) INCLUDE split
       if [[ ! -f "${SROOT:-$REPO/data/isl}/splits/include-official.json" ]]; then log "  no official split: skipped"; return 0; fi
       mkdir -p "$WORK/e1a"
-      train train-classifier $COMMON $CAP $CLS --split include-official --ckpt "$WORK/e1a/classifier.pt" ;;
+      train train-classifier $COMMON $CAP $CLS --batches ${E1A_STEPS:-$([[ $SMOKE == 1 ]] && echo 6 || echo 120)} --split include-official --ckpt "$WORK/e1a/classifier.pt" ;;
     fingerspell) cli train-fingerspell --profile "$PROFILE" --threads "$THREADS" --vocab "$VOCAB" $SM $LET ;;
     index) cli build-index $COMMON --all-sources $CAP ;;  # training parts only: evaluation stays clean
     fusion) cli fit-fusion $COMMON --all-sources $CAP ;;

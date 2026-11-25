@@ -237,8 +237,8 @@ def test_evaluate_all_writes_report_with_rates_and_groups(phase2, tmp_path):
         assert m["top1"] is not None and m["not_sure_rate"] is not None and m["wrong_accept_rate"] is not None
     assert p["E1c"]["n_groups"] >= 1 and "signer" in p["E1c"]["label"]
     assert set(p["E3"]["policies"]) == set(POLICIES)
-    # E2: only fold 0 has an encoder; queries = INCLUDE clips of the held-out concept
-    assert p["E2"]["run"] and len(p["E2"]["folds"]) == 1 and p["E2"]["n"] == 6
+    # E2: only fold 0 has an encoder; queries = val/test INCLUDE clips of the held-out concept (never pre-trained on)
+    assert p["E2"]["run"] and len(p["E2"]["folds"]) == 1 and p["E2"]["n"] == 2
     f0 = p["E2"]["folds"][0]
     assert f0["full"]["metrics"]["not_sure_rate"] is not None and "seen_class" in f0
     assert p["E4"]["run"] and p["E4"]["by_k"]["k1"]["n"] > 0
@@ -292,3 +292,35 @@ def test_labelled_part_combines_sources(phase2):
     val = data.labelled_part("val")
     assert {c.source for c in val} == {"include", "isl500"}
     assert replace(val[0]).concept_id
+
+
+def test_e1b_cross_validation_pools_held_out_signers(phase2, tmp_path):
+    from app.isl.evaluation.runners import evaluate_all
+    from app.isl.training.common import ISL_FEATURES, load_isl_data
+    from app.isl.training.train_classifier import train_classifier
+    from app.training.trainer import TrainConfig
+
+    w, data, work = phase2["world"], phase2["data"], phase2["work"]
+    P = w["paths"]
+    base = json.loads((P.splits / "test-split.json").read_text())
+    # a second fold: signer 0 is the test signer, signer 5 trains
+    assign = {}
+    for cid, part in base["assign"].items():
+        s = int(cid.rsplit("_", 1)[1]) % 10
+        assign[cid] = "test" if s == 0 else ("val" if s == 4 else "train")
+    (P.splits / "test-split-b.json").write_text(json.dumps({**base, "name": "test-split-b", "assign": assign}))
+    d2 = load_isl_data(P, phase2["vocab"], "research", "test-split-b")
+    (work / "cv" / "fold1").mkdir(parents=True, exist_ok=True)
+    train_classifier(d2, work / "cv" / "fold1" / "classifier.pt", ISL_FEATURES, TrainConfig(**TINY), smoke=True,
+                     threads=1, use_extra=False)
+    try:
+        doc = evaluate_all(work, data, ISL_FEATURES, profile="research", smoke=True, vocab_path=w["vocab"],
+                           paths=P, out_dirs=[], e4_ks=(1,), latency_n=1)
+    finally:
+        import shutil
+
+        shutil.rmtree(work / "cv")
+    cv = doc["protocols"]["E1b"]["cv"]
+    assert cv["folds"] == 2 and cv["pooled_n"] == 8 and cv["pooled_groups"] >= 2 and cv["pooled_top1_interval"]
+    assert "_hits" not in doc["protocols"]["E1b"]
+    assert "E1b cross-validation" in (work / "eval" / "report.md").read_text()

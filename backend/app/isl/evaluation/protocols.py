@@ -114,6 +114,14 @@ def e6_latency(rec, clips: list[Clip], n: int = 20) -> dict:
         stages.setdefault("feature_ms", []).append(r.feature_ms)
     if not times:
         return {"label": "CPU latency per segment (3 crops)", "n": 0, "metrics": {}}
-    return {"label": "CPU latency per segment (3 crops), measured while the ingestion jobs used ~3.5 CPUs",
+    import os
+
+    try:
+        load = os.getloadavg()[0]
+    except OSError:
+        load = None
+    return {"label": "CPU latency per segment (3 crops)" + (f", measured at load average {load:.1f} on "
+                                                            f"{os.cpu_count()} CPUs" if load is not None else ""),
+            "load_average": load,
             "n": len(times), "metrics": {"p50_ms": float(np.percentile(times, 50)), "p95_ms": float(np.percentile(times, 95))},
             "stages_p50_ms": {k: float(np.percentile(v, 50)) for k, v in stages.items()}}

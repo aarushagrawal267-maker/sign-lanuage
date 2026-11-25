@@ -1754,6 +1754,7 @@ everything under `nice -n 10`, stops before any step if less than 10 GB of disk 
 | encoder | `train-encoder --all-sources --init auto` | fine-tune (SupCon + sub-centre ArcFace) from the pre-trained trunk |
 | oneshot | `train-oneshot --folds 0 1` | E2 encoders, each fold's concepts held out of all supervised training |
 | classifier | `train-classifier --all-sources` | closed-set classifier over every concept with >= 2 signer groups |
+| cv | `train-classifier --split <primary>-fold{1..4} --ckpt <work>/cv/fold<k>/classifier.pt` | E1b mean / spread over folds and a signer-grouped interval pooled over every fold's held-out signers (one fold holds out a single pseudo-signer, so one fold alone cannot give a signer-level interval); `CV_FOLDS=""` skips it |
 | e1a | `train-classifier --split include-official --ckpt <work>/e1a/classifier.pt` | the model E1a needs (official split) |
 | fingerspell | `train-fingerspell` | letter model from every letter source + leave-one-signer-out E5 |
 | index | `build-index --all-sources` | index over training references only (keeps evaluation clean) |
@@ -1766,7 +1767,7 @@ Options: `--from STEP`, `--only STEP`, `--force STEP` (also deletes that step's 
 machine is free, `--step-minutes M` (each training call stops after M minutes with its state saved and is re-run with
 `--resume` until done: exit code 75 means "stopped, continue later"). Full-setting sizes can be overridden with
 environment variables (`HIDDEN LAYERS EMB PRE_EPOCHS PRE_STEPS PRE_BATCH ENC_EPOCHS ENC_STEPS CLS_EPOCHS CLS_STEPS
-ONESHOT_FOLDS ONESHOT_EPOCHS LETTER_EPOCHS`). `--smoke` uses tiny settings, a private ISL root (real manifests and
+E1A_STEPS CV_FOLDS ONESHOT_FOLDS ONESHOT_EPOCHS LETTER_EPOCHS`). `--smoke` uses tiny settings, a private ISL root (real manifests and
 landmarks through read-only symlinks, its own `derived/` and `splits/`) and writes only under
 `artifacts/isl/phase2-smoke/`, so it never changes shared derived files or the packs the app loads.
 
@@ -1825,8 +1826,10 @@ leave-one-signer-out, computed at training time and read from `letters.pt`), E6 
 unchanged in git), E8 (trim report + method mix).
 Leakage guards: **E2** holds a fold's concepts **and every concept sharing a headword or synonym key with them** out of
 all supervised training (INCLUDE, ISLRTC, ISL500, WSLP, ...); the runner refuses an encoder whose
-`excluded_concepts` do not cover that set; the gallery is one ISLRTC clip per dictionary entry; decision thresholds are
-fitted on *seen-class* validation queries only; queries in a duplicate group of any training clip are dropped.
+`excluded_concepts` do not cover that set; the gallery is one ISLRTC clip per dictionary entry; queries are the
+fold concepts' INCLUDE clips from the **val / test parts only** (those are also kept out of pre-training, so a query
+was never seen in any form); decision thresholds are fitted on *seen-class* validation queries only; queries in a
+duplicate group of any training clip are dropped.
 **E1** refuses a classifier trained on another split. Duplicate groups (`DedupIndex`) join clips with the same
 source-video SHA-256, the same landmark file, or a `duplicates.jsonl` cluster; training clips sharing a group with any
 evaluation clip are removed before training (counts in `<work>/multisource.json`).
@@ -1841,3 +1844,60 @@ experimental (< 5 signers) and spelled words are still only suggested, never aut
 **Fusion fix**: `FusionParams` always holds all three policies (missing ones filled from the nearest present one,
 kept ordered strict >= balanced >= lenient), `fit_thresholds` always fits all three, and `fit-fusion` asserts it, so a
 partial `fusion.json` can no longer make `decide()` raise (HTTP 500).
+
+**CPU time budget (honest estimate, not a measurement of a full run).** `cli bench` (2 threads, model size of the
+full run: BiGRU hidden 192, 2 layers, 256-d embedding) measured on 25 Nov **while about 24 processes of the
+ingestion jobs shared the 4 CPUs** (load average ~24): pre-training 10-12 s per step (48 pairs), encoder 5.6-7.5 s
+per step (64 clips, 12k-class ArcFace), classifier 2.5-4.6 s per step (32 clips), augmentation + features 4-8 ms per
+clip. The same classifier step measured 0.24 s on 25 Nov morning with ~3.5 CPUs busy (section 11), so today's numbers
+are 10-20x slower than a free machine. Full-run defaults and the expected wall time **once ingestion has finished**
+(assuming ~0.25-0.3 s per classifier step, ~0.6 s per encoder step and ~1 s per pre-training step for the model, plus
+data loading of ~5 ms per clip; the driver logs `bench` first so the budget can be recomputed as steps x seconds):
+
+| Step | Default size | Steps | Expected wall time |
+|---|---|---|---|
+| dedup, vocab, splits, link | all sources | - | 0.5-1.5 h (dedup fingerprints every clip) |
+| pretrain | 20 epochs x 400 steps x 48 pairs | 8,000 | 3-4 h |
+| encoder | 40 x 400, P=32 K=2 (early stop, patience 10) | <= 16,000 | 3-4 h |
+| oneshot | 2 folds x 20 x 300 | <= 12,000 | 2.5-3 h |
+| classifier | 40 x 300 x 32 (patience 10) | <= 12,000 | 1-1.5 h |
+| cv | 4 more folds of the classifier | <= 48,000 | 4-6 h (skip with `CV_FOLDS=""`) |
+| e1a | 40 x 120 | <= 4,800 | 0.5 h |
+| fingerspell | MLP, 40 epochs + 2-3 leave-one-signer-out refits | - | < 0.5 h (feature extraction dominates) |
+| index, fusion, evaluate, index_final, pack | all references | - | 1.5-2.5 h |
+| **total per profile** | | | **about 17-24 h with cv, 13-18 h without**; research is the longer one (more clips to index / dedup / pre-train on) |
+
+Run it with `--threads 4` after ingestion ends (about 1.5x faster than 2 threads), and `--step-minutes 120` if the run
+has to share the machine (each training call then yields every 2 h and continues). Memory: the lazy dataset keeps at
+most 12,000 body frames (~1.3 GB); validation feature caches ~0.4 GB; peak RSS expected under 4 GB. Disk: work folder
+and packs well under 1 GB per profile.
+
+**Smoke run of the whole driver (25 Nov, 15:15-16:20 UTC, partial data, load average ~24 from the ingestion jobs).**
+`scripts/phase2_train.sh --profile research --smoke` and `--profile commercial-safe --smoke` both completed all 18
+steps (trim, dedup, vocab, splits, link, bench, pretrain, encoder, oneshot, classifier, cv, e1a, fingerspell, index,
+fusion, evaluate, index_final, pack) with tiny models (hidden 32, 1-2 epochs, a few batches), at most 300 clips per
+extra source and 400 ISLRTC clips; about 20-25 min per profile, most of it evaluation and fusion evidence collection.
+Data seen: INCLUDE 2,380 clips in the refreshed pseudo-signer split (795 / 550 / 1,035 in research), ISL500 and WSLP
+300 each (research), Mendeley agriculture 2, letters: OpenHands fingerspelling 172 clips, ISL-Fingerspelling 4
+segments (1 signer), Mendeley static 7 images. What the run proved: every command and hand-over works on real files
+for both profiles; the commercial-safe pack lists only commercial sources (INCLUDE, ISLRTC, ISL-CSLTR, Mendeley) and
+the research pack every source used; E1b gives a cv-pooled signer-grouped interval; E2 ran with 47 held-out concepts
+(after synonym expansion) and 0 duplicate queries dropped; E7 confirmed the ASL model files are unchanged; E1c and E5
+reported "not run" with the reason (fewer than 6 ISL500 signers and 1 fingerspelling signer ingested so far).
+**All accuracy numbers of the smoke reports are near chance (E1b top-1 about 0.01-0.02) because the models are tiny
+and trained for seconds; they are labelled SMOKE RUN and are not the app's accuracy.** Smoke outputs (work folders,
+private ISL roots, `pack/` folders) are under `artifacts/isl/phase2-smoke/` (git-ignored, never loaded by the app);
+logs `data/isl/logs/phase2_<profile>_smoke.log`.
+
+**Open issues found while building this:**
+
+* **My signs inside the fusion**: a user sign is not a classifier class, so in the fused softmax it gets the
+  classifier's non-core penalty (`noncore_logp`); it then wins only through the direct match rule (cosine >= its own
+  threshold and >= best dictionary cosine + 0.05). E4 measures exactly this; if E4's gain is small at full settings,
+  give user signs a neutral classifier term instead of the penalty and re-fit.
+* E1c, E5 and the per-signer interval of E1b depend on data still being ingested (ISL500 users, ISL-Fingerspelling
+  signers); the runners report "not run" until then.
+* New concepts linked only from WSLP / ISL500 / Mendeley glosses have English text only (no Hindi) until the Hindi
+  lexicon is regenerated for them (`hindi --translate` on the pack vocabulary, then review).
+* The refreshed `vocabulary.jsonl` is written to the work folder; copy it to `models/packs/isl/` and commit it after
+  review (the consistency test needs >= 95 % Hindi coverage).
