@@ -435,30 +435,37 @@ items; the measured status at 16:40 UTC is in section 3.5; every count must be r
 **Not done / open**: none of these sources is registered in `profiles.py` yet; no model has been trained on them, so
 nothing here says anything about accuracy.
 
-### 3.5 Measured status of every ingestion job (Reality Checker, 25 Nov 2026 16:37-17:07 UTC)
+### 3.5 Measured status of every ingestion job (Data Engineer, 25 Nov 2026 17:56 UTC)
 
-Measured from the processes (`ps`), manifest line counts taken every 5 minutes from 16:37 to 17:03, the logs and `df`,
-not from the agents' reports. Load average 18-21 on 4 CPUs the whole time; memory group of the jobs at 12-14 of 14.3 GB
-(6.0-6.7 GB resident, the rest page cache). No leaked deleted files in any job. Free disk under `data/isl`: 33.6 GB at 16:37, 32.3 GB
-at 16:48, 31.3 GB at 17:03 (an INCLUDE zip download sits in `data/isl/tmp` while it is converted).
+Counts from the manifests (last record per id) at 17:37, 17:43 and 17:56 UTC, rates over 16:48-17:56 (base: the
+Reality Checker's 16:48 counts) unless noted, `ps`, the logs and `df`. Load average 18-29 on 4 CPUs; memory 7.7 of
+16 GB used, 8.4 GB available (no swap); job RSS: glosl 0.73 GB, openhands-raw 0.48 GB, isl500 0.27 GB, the WSLP
+chunk 0.84 GB (MediaPipe in-process, 1 worker), the recut extraction worker 0.63 GB: all under the new 1.5 GB cap. Free disk under `data/isl`: 36.2 GB. ETAs are
+estimates from these rates, not measurements.
 
-| Job (PID) | Done at 16:48 | Total | Rate (16:37-17:03) | Errors | ETA (UTC, estimate) |
+| Job (PID) | Done at 17:56 | Total | Rate | Errors | ETA (UTC, estimate) |
 |---|---|---|---|---|---|
-| `ingest_isl.py include` (1632) | 2,895 rows, all ok | 4,292 | 6.7 videos/min | none | 20:00-21:30, 25 Nov |
-| `ingest_isl.py islrtc` (6785) | 5,239 rows, all ok | 13,665 | **5.7 videos/min** (17/min this morning on a quieter machine) | none | **04:00-08:00, 26 Nov** (needs 12-17/min after the pose jobs end; the 00:20-01:00 ETA given earlier assumed the morning rate) |
-| `ingest_isl_pose.py glosl` (21834, no lock) | 57,633 ok | 126,846 | 7.9 clips/s | none | about 19:20, 25 Nov |
-| `ingest_isl_pose.py isl500` (21835, no lock) | 36,589 rows (about 4,260 failed by design: no WholeBody file; 1 frame-count mismatch) | 86,756 | 4.6 clips/s | by design only | about 19:50, 25 Nov |
-| `ingest_isl_pose.py openhands-raw` (26183, lock) | 11,812 chunks (Sign Library 9,956 done; NIOS about 1,850 of 1,936) | until `landmarks/openhands_raw` = 12 GB (2.7 GB at 16:49) | 4.5 GB of landmarks per hour on NIOS, 0.7 GB/h on ISH News (from 17:00; 2.9 GB at 17:07) | OOM kill at 15:53 (fixed, see 3.4) | budget reached between about 20:00, 25 Nov and 08:00, 26 Nov (depends on Zenodo speed and chunk sizes) |
-| `isl_queue.sh` (18382) -> `ingest_isl_video.py run wslp` | 619 rows (4 HTTP 429 fetch failures, retried next chunk) | 4,398 | **11.7 s/clip on 1 worker** (7.1 s measured earlier on the first items) | 429 only | WSLP about 03:00-07:00, 26 Nov (1 worker until INCLUDE and ISLRTC both end) |
-| rest of the queue (fingerspelling, Mendeley static / CSLTR / agriculture / emergency, CSLTR words, HF alphabets, WSLP unlabelled) | a few probe rows each | see 3.3 | not started | - | about 6-10 h after WSLP on 3 workers: **about 14:00-18:00, 26 Nov** |
+| `ingest_isl.py include` (1632) | 3,411 rows, all ok | 4,292 | 7.6 videos/min | none | about 19:50, 25 Nov |
+| `ingest_isl.py islrtc` (6785, old card rule) | 5,664 rows, all ok (269 with 0 frames, see 3.1) | 13,665 | 6.3 videos/min (load 18-29) | none | **03:00-06:00, 26 Nov** (needs 12-17/min once INCLUDE and the pose jobs end around 19:30-19:50) |
+| `ingest_isl.py islrtc-recut --follow` (20244, card-v2, started 17:41) | 51 of 342 targets (first 54 records: 39 had 0 frames before, none now; 36 skipped an intro; mean kept length 0.86 s -> 9.5 s) | 342 now, about 6 % of the clips the islrtc job still adds | 3.5 clips/min on 1 worker | none | backlog about 19:20, 25 Nov; then follows the islrtc job and ends after its last scan (03:00-06:30, 26 Nov) |
+| `ingest_isl_pose.py glosl` (21834, no lock, older code) | 87,578 ok | 126,846 | 7.3 clips/s | none | about 19:25, 25 Nov |
+| `ingest_isl_pose.py isl500` (21835, no lock, older code) | 57,089 rows, 50,700 ok (the rest: no WholeBody file, by design) | 86,756 rows | 5.0 clips/s | by design only | about 19:35, 25 Nov |
+| `ingest_isl_pose.py openhands-raw` (**13762**, restarted 17:23 with restore points) | 13,365 chunks; Sign Library and NIOS done, ISH News 1-minute file in progress (restore points up to about 5 GB of its 9.7 GB) | until `landmarks/openhands_raw` = 12 GB (3.1 GB now) | 3-7 MB/s download; landmarks grew 2.9 -> 3.1 GB from 17:07 to 17:56 (one restart in between; ISH News chunks are small) | none since the restart | budget not before about 06:00, 26 Nov at the ISH News rate; MBM Vadodara first needs a full listing pass of its 23 GB zip (about 1 h). Wide range: 06:00-18:00, 26 Nov |
+| `isl_queue.sh` (**17314**, restarted 17:44 with the new script) -> `ingest_isl_video.py run wslp` | 931 of 4,398 rows ok | 4,398 | 4.6 clips/min (13 s/clip; last 45-min chunk: 217 ok, 12.7 s/clip) on 1 worker | 5 fetch failures in the last chunk (retried) | WSLP **03:00-07:00, 26 Nov** (1 worker while islrtc runs) |
+| rest of the queue (fingerspelling, Mendeley static / CSLTR / agriculture / emergency, CSLTR words, HF alphabets, WSLP unlabelled) | a few probe rows each | see 3.3 | not started | - | 6-10 h after WSLP on 3 workers: **about 10:00-17:00, 26 Nov** |
 | `ingest_isl_pose.py openhands-fs` | 172 of 172 ok | 172 | - | none | done 14:58, 25 Nov |
-| CISLR / iSign | gated (403) | - | - | - | the queue polls CISLR every 6 h for 14 days |
+| CISLR / iSign | `pending` (403 on `dataset.csv` / `iSign_v1.1.csv`, probed 17:44) | - | - | - | probed every queue cycle (hourly), then every 6 h for 14 days; ingested automatically when granted |
 
-Projected disk: GloSL about 6.5 GB in total (3.0 GB at 16:50), ISL500 about 2 GB, OpenHands up to the 12 GB budget, ISLRTC
-about 1.3 GB, WSLP about 0.6 GB, the queue's remaining sources about 1 GB: roughly 15 GB free when everything has
-finished, above the 10 GB floor but with less margin than the 39-41 GB seen at 15:08. About 8 GB more can be freed
-outside the repository (an old clean clone in `/tmp/rc_isl`, 2.5 GB, and agents' scratch virtualenvs, about 5.8 GB).
+Process changes made during this check (all with the job's own resumable state; details in 3.1-3.4):
+`openhands-raw` stopped with SIGINT and restarted once (26183 -> 13762); the old queue process 18382 stopped, its
+running WSLP chunk finished normally, the new queue 17314 started 17:44; `islrtc-recut` started (first run 17:36
+stopped after 29 clips and restarted 17:41 with intro skipping, its first output deleted). INCLUDE (1632), ISLRTC
+(6785), glosl (21834) and isl500 (21835) were not touched.
 
+Projected disk: GloSL about 7 GB in total (4.9 GB now), ISL500 about 2 GB (1.3 GB now), OpenHands up to the 12 GB
+budget (3.1 GB now), ISLRTC about 1.3 GB (0.53 GB now), recut about 0.1 GB, WSLP about 0.6 GB, the queue's
+remaining sources about 1 GB: roughly 14 GB more, i.e. about 22 GB free when everything has finished, above the
+10 GB floor (every job checks it).
 
 ---
 

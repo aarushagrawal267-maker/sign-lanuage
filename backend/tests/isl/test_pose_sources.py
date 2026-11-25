@@ -610,3 +610,59 @@ def test_script_run_pool_stops_for_memory(tmp_path):
         assert stats["ok"] == 4 and stats["deferred"] == 1 and mod.stop_code(stats) == 0
     finally:
         mod.MEM = None
+
+
+def test_script_isl500_fallback_size_second_pass(tmp_path, monkeypatch):
+    """Clips without a hand-based size get the signer's most common estimate in a second pass, whatever the
+    thread order; an earlier fallback row with another size is redone."""
+    import argparse
+
+    h5py = pytest.importorskip("h5py")
+    mod = _script()
+    data = tmp_path / "isl"
+    raw = data / "raw" / "isl500"
+    raw.mkdir(parents=True)
+    (raw / "revision.txt").write_text("sha\n")
+    monkeypatch.setattr(mod, "DATA", data)
+    monkeypatch.setattr(mod, "ROOT", tmp_path)
+    monkeypatch.setattr(mod, "fetch_small", lambda url, dest: dest)
+    monkeypatch.setattr(mod, "hf_file", lambda repo, path, sha: path)
+    hands, wb = _isl500_clip()
+    small = wb.copy()
+    small[..., 0] *= 1920 / 2560
+    small[..., 1] *= 1080 / 1440
+    blobs, h5_list, pose = {}, [], {}
+
+    def add(user, key, hh, ww):
+        b = io.BytesIO()
+        with h5py.File(b, "w") as f:
+            f.create_dataset("intermediate", data=hh.astype(np.float32))
+            f.attrs["target_fps"] = 30.0
+        h5p = f"Landmarks/MediaPipe/ISL_DATA_{user.upper()}/{key}.h5"
+        npy = f"Landmarks/Pose/{user.capitalize()}/Round1/{key}.npy"
+        nb = io.BytesIO()
+        np.save(nb, ww)
+        blobs[h5p], blobs[npy] = b.getvalue(), nb.getvalue()
+        h5_list.append({"path": h5p, "size": 1})
+        pose[(user, key)] = [npy]
+
+    add("user001", "A__s1", hands, small)
+    add("user001", "B__s1", hands, small)
+    add("user001", "C__s1", hands, wb)  # 2560x1440: the minority size for this signer
+    add("user001", "Z__s1", np.zeros_like(hands), wb)  # no hand estimate -> fallback
+    add("user001", "E__s1", np.zeros_like(hands), wb)  # earlier fallback row with the wrong size
+    monkeypatch.setattr(mod, "isl500_index", lambda sha, raw_dir: (h5_list, pose))
+    monkeypatch.setattr(mod, "http_get", lambda url: blobs[url])
+    man = data / "manifests" / "isl500.jsonl"
+    man.parent.mkdir(parents=True)
+    man.write_text(json.dumps({"id": "isl500/user001/E__s1", "ok": True, "user": "user001", "size_from": "user",
+                               "width": 2560, "height": 1440}) + "\n")
+    args = argparse.Namespace(limit=0, min_free_gb=0.0, workers=3, target_fps=15.0, dtype="float16")
+    assert mod.run_isl500(args) == 0
+    from app.isl.data.manifest import read_manifest
+
+    rows = {r["id"].split("/")[-1]: r for r in read_manifest(man)}
+    assert rows["A__s1"]["size_from"] == "hands" and (rows["A__s1"]["width"], rows["A__s1"]["height"]) == (1920, 1080)
+    assert (rows["C__s1"]["width"], rows["C__s1"]["height"]) == (2560, 1440)
+    for k in ("Z__s1", "E__s1"):
+        assert rows[k]["size_from"] == "user" and (rows[k]["width"], rows[k]["height"]) == (1920, 1080)
