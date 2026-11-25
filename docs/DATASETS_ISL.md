@@ -20,7 +20,7 @@ running, partial data). Every number below says when and on how much data it was
 | **ISL-CSLTR** (Mendeley `kcmpdxky7p` v1, Elakkiya & Natarajan) | 687 sentence videos of 100 sentences (7 signers) with gloss sequences; 1,036 word-level still frames | CC BY 4.0 | yes, with attribution | commercial-safe + research | public |
 | **ISL emergency words** (Mendeley `2vfdm42337` v1, Adithya & Rajesh) | 8 words x 26 people x 2 takes (412 raw videos), hands only (signer behind a board) | CC BY 4.0 | yes, with attribution | commercial-safe + research | public |
 | **ISL agricultural words** (Mendeley `6v53kfxf46` v1, Adithya & Rajesh) | 13 words, 3 deaf farmers outdoors; 78 original videos (the crop1/2/3 folders are crops of the same recordings, not used) | CC BY 4.0 | yes, with attribution | commercial-safe + research | public |
-| **Static ISL alphabet, Hindi vowels, numerals** (Mendeley `7tsw22y96w` v1, Singh et al.) | 102,470 photos, 46 classes (A-Z with two E signs, 8 Hindi vowels, 0-9 with two 9 signs), kids / teens / adults; we use a balanced sample of 300 per class (13,800) | CC BY 4.0 | yes, with attribution | commercial-safe + research | public |
+| **Static ISL alphabet, Hindi vowels, numerals** (Mendeley `7tsw22y96w` v1, Singh et al.) | 102,470 photos, 46 classes (A-Z with two E signs, 8 Hindi vowels, 0-9 with two 9 signs), kids / teens / adults; **every photo** (no cap since 25 Nov 2026 22:54 UTC; 300 per folder = 13,800 before) | CC BY 4.0 (licence field); **the dataset description says research use only**, see 3.9 | yes by the licence field, **pending a licence review** (3.9) | commercial-safe + research | public |
 | `Hemg/Indian_sign_language_dataset`, `akritRihal/Indian_Sign_Language_dataset` (Hugging Face) | alphabet + digit images (42,745 hand crops / 10,752 photos); **every row** (no per-class cap since 25 Nov 2026 22:21 UTC; 300 per class before) | **none stated**, no provenance (re-checked 25 Nov 2026 20:40 UTC: no `license:` tag in either card, Hemg's card says "More Information needed", akrit's README is only the `dataset_info` block) | **no** (unknown) | research only (`profiles.LETTER_SOURCES["research"]`; in no commercial-safe list) | public |
 | MediaPipe HandLandmarker (`hand_landmarker.task`) | hand landmarks where Holistic finds none (hands-only videos, still images) | Apache-2.0 | yes | both | downloaded to `assets/mediapipe/` (git-ignored) |
 | WLASL (existing ASL model) | ASL, 100 words | C-UDA 1.0 | **no** | research only (warm start) | see `docs/LICENSING.md` |
@@ -276,7 +276,7 @@ free disk under `data/isl` must stay above 10 GB (checked before every item; the
 | `isl_csltr_words` | 1,036 still frames | word (folder) | commercial-safe | one frame of a mostly dynamic sign: hand-shape hints only |
 | `mendeley_emergency` | 412 raw videos (8 zips, 2.58 GB; the cropped copies are not used) | 8 words | commercial-safe | hands only. Some takes are byte-identical (e.g. `call_001_01` = `call_001_02`): kept once (`duplicate_of`) |
 | `mendeley_agri` | 78 videos (the `Original` folders; crop1/2/3 are crops of the same recordings) | 13 words (`Cococnut` -> coconut) | commercial-safe | outdoor, faces often cut off at the top -> `hands` mode. Subject 1's `Original` folder actually holds the `crop1` files (same names and sizes as its `cropped1` folder) |
-| `mendeley_static` | 13,800 of 102,470 photos (300 per folder, round-robin over kids/teens/adults x full/half sleeves, seed 13) | A-Z (`E1`/`E2` -> E, kept as `variant`), 8 Hindi vowels, 0-9 (`9a`/`9b` -> 9) | commercial-safe | `--per-class N` for more; the selected list is in `manifests/mendeley_static_items.json`; Mendeley SHA-256 verified per file |
+| `mendeley_static` | **all 102,470 photos** (no cap since 25 Nov 2026 22:54 UTC; was 13,800 = 300 per folder) | A-Z (`E1`/`E2` -> E, kept as `variant`), 8 Hindi vowels, 0-9 (`9a`/`9b` -> 9) | commercial-safe | item list `manifests/mendeley_static_items.json` (folder by folder, round-robin over kids/teens/adults x full/half sleeves, seed 13; its first 300 per folder are the old sample, so ids are unchanged); `--per-class N` still samples; Mendeley SHA-256 verified per file. **Near-duplicate risk:** no signer ids, ~370 photos per letter per group: never split by photo (3.9). **Licence:** the description says research only despite the CC BY 4.0 field (3.9) |
 | `hf_akrit_alphabet` | **all 10,752 rows** (train 9,139 + test 1,613; 33 classes, no h/j/v, 300-798 per class) | letters, digits | research | licence unknown; no signer ids. Item list rewritten 25 Nov 2026 22:21 UTC by `ingest_isl_video.py list` without the cap (was 10,118 = 300 per class and split). **Near-duplicate risk:** the uploader's train / test split is not by signer or take, and photos of one take (or flips / crops of one photo) can sit on both sides; never use its `test` rows as a held-out test, keep the whole set on one side of any split (or cluster near-duplicates first), see 3.8 |
 | `hf_hemg_alphabet` | **all 42,745 rows** (35 classes, 128x128 hand crops, 1,200-1,447 per class) | letters 1-9 + A-Z | research | licence unknown; probably augmented copies of few originals (byte-identical copies get `duplicate_of` rows; near-identical ones do not). Item list rewritten 25 Nov 2026 22:21 UTC without the cap (was 10,500 = 35 x 300). Same split rule as akrit (3.8) |
 | `islrtc-full` | ISLRTC compilations not yet in `islrtc_full.jsonl`: `A/Ancient_Alphabets`, `G/Greek_Alphabets` (the 7 others were done on 25 Nov) | as ISLRTC | as ISLRTC | runs `scripts/ingest_isl.py`'s own `run_islrtc` (`--only --full --max-s 180 --out-subdir islrtc_full`) in-process, so no second `ingest_isl.py islrtc` process appears |
@@ -644,7 +644,7 @@ samples N per class). The item lists were rewritten at 22:21 UTC with `ingest_is
 label lists (no request to Hugging Face; the queue was still on WSLP, neither source had a manifest): **akrit 10,752**
 (train 9,139 + test 1,613, 33 classes, 300-798 per class; was 10,118) and **Hemg 42,745** (35 classes, 1,200-1,447 per
 class; was 10,500), unique ids. `readiness` now expects 10,752 / 42,745 (`expected_from` = the item lists).
-`mendeley_static` keeps its 300-per-folder sample (13,800 of 102,470 photos); it is outside this change.
+`mendeley_static` kept its 300-per-folder sample (13,800 of 102,470 photos) in this change; since 22:54 UTC it is ingested in full too (3.9).
 
 **Splits (for the split builder).** Neither set has signer, session or take ids. akrit's `train` / `test` (kept as the
 `split` field) is the uploader's split: frames or re-crops of one take can sit on both sides, so its `test` rows are
@@ -691,6 +691,65 @@ the 10 h threshold, so the worker policy is unchanged (no extra workers for imag
 raises `HeaderError("malformed header (...)")`, recorded as a failed row like every other header error;
 `data_nbytes` multiplies the shape with Python integers (`np.prod` wrapped 2^40 x 2^40 to 0, which could have passed
 the size check). Takes effect at the job's next start; the job was not restarted for this.
+
+### 3.9 Mendeley static alphabet in full (Data Engineer, 25 Nov 2026 22:50-23:20 UTC) <!-- static-full -->
+
+**All photos.** `catalog.py` has `per_class: None` for `mendeley_static` (was 300): `listings.static_items` takes every
+photo. Order (deterministic, seed 13): folder by folder (`<category>/<label>`, sorted), inside a folder round-robin
+over the 6 groups (kids / teenagers / adults x full / half sleeves), each group in a seeded hash order. So a folder's
+first N items are exactly the old `--per-class N` sample, and the ids (`isl_static/<Mendeley file id>`) never depend
+on the cap. (The engine fetches `url` items in id order anyway, which interleaves folders.)
+
+**Item list regenerated** at 22:54:18 UTC with `ingest_isl_video.py list mendeley_static` (holds the manifest lock;
+built from the cached Mendeley metadata `raw/mendeley/7tsw22y96w*.json`, no request), after checking that the queue
+had not started the source (queue.log: WSLP chunk since 22:18, no `mendeley_static` line in the run of queue 17314;
+order islrtc-full, wslp, isl_fingerspelling, **mendeley_static**, ...). **102,470 items**, unique ids, 46 folders
+(1,937-2,727 photos each), 44 glosses; groups: teenagers half 33,417 / full 27,304, kids half 13,312 / full 9,744,
+adults half 9,623 / full 9,070; 108 byte-identical copies (same SHA-256: one `duplicate_of` row each). Checks: the
+old list equals `static_items(per_class=300)` of the same metadata and is a subset of the new one; the **8 rows
+already ingested** (14:34 UTC) are all in the new list with unchanged ids and landmark paths, so they stay valid and
+are skipped; readiness now expects 8 / 102,470 (`expected_from` = the item list). Peak memory of the listing 0.36 GB
+(under the run's 1.5 GB guard).
+
+**Measured cost** (scratch data root, not the real manifests; 22:54-22:56 UTC, load 13-15, `--workers auto` = 1
+worker because the islrtc job runs, nice 10): `run mendeley_static --limit 300` -> 300 ok, 0 failed, **0.41 s per
+photo end to end** (123.8 s), extraction alone 0.106 s mean (`secs`), so the Mendeley download (~64 KB, redirect +
+fetch, one fetch thread) is the limit; 269 / 300 with `hands_frac >= 0.2`; landmarks 2.7 KB per photo.
+
+**Extra queue time (estimate).** Remaining 102,462 photos x 0.41 s = **11.7 h** (was 13,792 x 0.41 s = 1.6 h), i.e.
+**+10.1 h**; with 3 workers once islrtc ends the single fetch thread stays the limit, so at best ~0.30 s per photo
+(8.5 h, +7.4 h). About 12-16 of the queue's 45-minute chunks (each re-reads the 79 MB metadata: seconds). Landmarks
++0.28 GB in total (disk not a concern). **Commercial-safe readiness** (it reads mendeley_static, and the queue runs
+mendeley_static, isl_csltr, mendeley_agri, mendeley_emergency in that order) moves from the 15.10 estimate of 26 Nov
+05:30-09:00 UTC to about **26 Nov 13:00-19:00 UTC**; the research profile's queue sources come later in the same
+queue, so its data estimate moves by the same 7-10 h (estimate, not measured end to end; Mendeley's download speed
+decides it). Not changed now, for the engine owner: fetching `url` items with 3-4 concurrent downloads would make
+extraction the limit again (~0.11 s per photo on 1 worker, ~3 h for the source), but `engine.py` is loaded by every
+new queue chunk, so it must be changed between chunks and tested first.
+
+**Near-duplicates (for the split builder and the letter trainer).** The set has no signer or session ids; the 6
+groups are age x clothing, not people, and the same person may appear in both sleeve groups. Each folder holds
+~1,900-2,700 photos, ~370 per letter per group, numbered `A (1).jpg` ... (likely bursts of the same pose, background
+and light). So photos of one signer and take are near-identical. Rules:
+* never split this source by photo (train / validation / test, calibration hold-out, early stopping); put the whole
+  source on one side, or split by age group (kids / teenagers / adults are different people; still check by eye), or
+  first cluster near-duplicates (landmark distance after normalisation, or a perceptual hash) and split by cluster;
+* **today's gap (owner: model code, not changed here):** `train_fingerspell` fits the temperature on the largest
+  ISL-Fingerspelling signer, but the commercial-safe profile has no ISL-Fingerspelling data, so it falls back to a
+  random 10 % of all letter samples: near-copies of training photos, which makes the temperature too confident (worse
+  now: 10x more copies). Hold out one age group of mendeley_static there instead, and give these rows a group
+  (`static-<age>-<sleeves>` is in the manifest's `group` field; for splits use the age only);
+* `max_per_class` (4,000 per letter, random over sources) now drops part of the photos in each fit, and the source
+  dominates the letter data (up to ~4,600 per gloss for E / 9 with both variants): weight per source / group if the
+  other sources' signers should count.
+
+**Licence: needs review before commercial use.** The Mendeley page's licence field is CC BY 4.0 (`data_licence` in the
+cached metadata), but the dataset description itself says: "This dataset can be used only for research purposes
+either as it is or after cropping the static gestures from the image after duly referencing it. Any other use of the
+dataset is strictly prohibited". The images show faces (it also records lip movement), including children, collected
+with consent for research. Until the authors or a lawyer confirm that CC BY 4.0 governs, treat it as research-only for
+anything shipped; the profile (`profiles.py`, commercial-safe) is not changed here because that is the owner's
+decision.
 
 ---
 

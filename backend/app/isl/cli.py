@@ -175,40 +175,55 @@ def _islrtc_records(paths: IslPaths) -> list[dict]:
 
 
 def _trim_model(args):
-    """(model, version suffix, path) of the learned end model (``trim_learned``), or (None, "", None)."""
+    """(model, version suffix, path, SHA-256) of the learned end model (``trim_learned``), or (None, "", None, None).
+    The hash is of the very bytes the model is loaded from (read once), so a file replaced meanwhile cannot be
+    recorded under the hash of another model."""
+    import hashlib
+    import io
+
     from app.isl.data.trim_learned import MODEL_VERSION, default_model_path, load
 
     choice = getattr(args, "learned_model", "auto") or "auto"
     if choice == "none":
-        return None, "", None
+        return None, "", None, None
     path = default_model_path() if choice == "auto" else Path(choice)
     if not path.exists():
         if choice != "auto":
             raise SystemExit(f"learned trim model {path} not found")
-        return None, "", None
-    model, _ = load(path)
-    return model, f"+{MODEL_VERSION}", path
+        return None, "", None, None
+    data = path.read_bytes()
+    model, _ = load(io.BytesIO(data))
+    return model, f"+{MODEL_VERSION}", path, hashlib.sha256(data).hexdigest()
+
+
+_NO_HASH = object()  # a trim record written before the model hash was recorded (re-trimmed once)
 
 
 def cmd_trim(paths: IslPaths, args) -> int:
     """ISLRTC first-sign trims. Uses the learned end model (``artifacts/isl/trim_boundary.pt``, the same call as
     ``trim_bench run --learned``) when it exists, rules otherwise; ``trim_version`` says which (``trim-2`` or
-    ``trim-2+trim-learned-1``), so clips trimmed by rules only are redone once a model exists. Clips whose
-    landmark file changed (re-extraction) are re-trimmed too; the record keeps the file it was computed on."""
+    ``trim-2+trim-learned-1``), so clips trimmed by rules only are redone once a model exists. Every record also
+    keeps ``trim_model_sha256`` (the learned model's SHA-256, null for rules only), and a clip is re-trimmed when
+    that hash differs from the model used now - a retrained ``trim_boundary.pt`` keeps the version but changes the
+    hash - so the sidecar never mixes two models under one version; records written before the hash existed are
+    re-trimmed once. Clips whose landmark file changed (re-extraction) are re-trimmed too; the record keeps the
+    file it was computed on."""
     import time
 
     from app.isl.data.manifest import read_manifest, write_jsonl
     from app.isl.data.trim import TrimConfig, find_first_sign, trim_record_for, words_for
+    from app.isl.data.trim_eval import trim_model_key
     from app.isl.vocab.normalize import parse_islrtc_name
     from app.landmarks.raw import RawSequence
 
     cfg = TrimConfig()
-    model, suffix, model_path = _trim_model(args)
+    model, suffix, model_path, model_sha = _trim_model(args)
     version = cfg.version + suffix
     existing = {r["id"]: r for r in read_manifest(paths.trim_sidecar, only_ok=False)}
     recs = _islrtc_records(paths)
     todo = [r for r in recs if args.redo or r["id"] not in existing
             or existing[r["id"]].get("trim_version") != version
+            or existing[r["id"]].get("trim_model_sha256", _NO_HASH) != model_sha
             or existing[r["id"]].get("landmarks", None if r.get("recut_of") else r["path"]) != r["path"]]
     if args.limit:
         todo = todo[: args.limit]
@@ -232,6 +247,7 @@ def cmd_trim(paths: IslPaths, args) -> int:
             n_err += 1
             rec = {"id": r["id"], "start": 0, "end": int(r.get("n_frames") or 0), "method": "empty", "confidence": 0.0,
                    "alternatives": [], "notes": [f"{type(e).__name__}: {e}"[:200]], "trim_version": version}
+        rec["trim_model_sha256"] = model_sha
         rec["stop"] = r.get("stop")
         rec["kind"] = pn.kind
         rec["landmarks"] = r["path"]
@@ -246,8 +262,9 @@ def cmd_trim(paths: IslPaths, args) -> int:
     methods = Counter(r.get("method") for r in existing.values())
     _print({"trimmed_now": len(todo), "errors": n_err, "total": len(existing), "methods": dict(methods),
             "trim_version": version, "learned_model": str(model_path) if model_path else None,
-            "learned_ends_now": n_learned,
+            "learned_model_sha256": model_sha, "learned_ends_now": n_learned,
             "versions": dict(Counter(r.get("trim_version") for r in existing.values())),
+            "model_hashes": dict(Counter(trim_model_key(r) for r in existing.values())),
             "truncated": methods.get("truncated", 0), "recut": sum(1 for r in existing.values() if r.get("recut")),
             "secs": round(time.time() - t0, 1), "sidecar": str(paths.trim_sidecar)})
     return 0
@@ -354,7 +371,7 @@ def cmd_trim_eval(paths: IslPaths, args) -> int:
     from app.isl.data.trim import TrimConfig
 
     cfg = TrimConfig()
-    legacy = model = model_path = None
+    legacy = model = model_path = model_sha = None
     suffix = ""
     if args.learned:  # the old stage-2 boundary model (artifacts/isl/boundary.pt); no run uses it any more
         from app.isl.data.boundary import load_model
@@ -366,11 +383,11 @@ def cmd_trim_eval(paths: IslPaths, args) -> int:
         legacy, _meta = load_model(model_path)
         suffix = f"+{te.LEGACY_STAGE2}"
     else:
-        model, suffix, model_path = _trim_model(args)
+        model, suffix, model_path, model_sha = _trim_model(args)
     version = cfg.version + suffix
     recs = {r["id"]: r for r in _islrtc_records(paths)}
     out = te.run(paths, n=args.n, seed=args.seed, model=model, model_path=model_path, version=version,
-                 legacy_model=legacy, records=recs)
+                 legacy_model=legacy, records=recs, model_sha256=model_sha)
     rp = Path(args.out) if args.out else get_settings().reports_dir / (
         "trim_eval_learned.json" if legacy is not None else "trim_eval.json")
     rp.parent.mkdir(parents=True, exist_ok=True)

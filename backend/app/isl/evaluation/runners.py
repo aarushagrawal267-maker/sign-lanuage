@@ -503,16 +503,18 @@ def e8_trim(paths, artifacts_dir: Path, work: Path | None = None) -> dict:
     """Trim quality of the trims this run used. The synthetic / INCLUDE numbers come from the trim-eval report the
     driver's ``trim_eval`` step writes into the work folder (``<work>/trim_eval.json``; without ``work`` the old
     ``artifacts/reports/trim_eval.json``) and are shown only when that report evaluated the same ``trim_version``
-    as the run's trim sidecar (and the same learned model file); otherwise ``trim_eval_check`` says ``mismatch`` or
-    ``missing`` with the reason, and the label says so."""
+    as the run's trim sidecar, every trim record carries the SHA-256 of the learned model trim-eval evaluated
+    (``trim_model_sha256``; none recorded, mixed or another hash -> mismatch) and that model file is unchanged;
+    otherwise ``trim_eval_check`` says ``mismatch`` or ``missing`` with the reason, and the label says so."""
     from app.isl.data.manifest import read_manifest
-    from app.isl.data.trim_eval import check_report
+    from app.isl.data.trim_eval import check_report, trim_model_key
 
     rep = (Path(work) / "trim_eval.json") if work is not None else artifacts_dir / "reports" / "trim_eval.json"
     trims = read_manifest(paths.trim_sidecar, only_ok=False) if paths.trim_sidecar.exists() else []
     mix = Counter(r.get("method") for r in trims)
     versions = Counter(r.get("trim_version") for r in trims)
-    chk = check_report(rep, dict(versions))
+    hashes = Counter(trim_model_key(r) for r in trims)
+    chk = check_report(rep, dict(versions), dict(hashes))
     doc = chk.pop("doc", None)
     label = ("ISLRTC first-sign trim quality (synthetic end-error check, INCLUDE active-frame check) from "
              "'cli trim-eval' of the run's trimmer, plus the method mix of the trim sidecar")
@@ -523,6 +525,7 @@ def e8_trim(paths, artifacts_dir: Path, work: Path | None = None) -> dict:
     out = {"label": label, "run": bool(trims) or doc is not None,
            "trims": len(trims), "method_mix": dict(mix),
            "trim_version": next(iter(versions)) if len(versions) == 1 else None, "trim_versions": dict(versions),
+           "trim_model_hashes": dict(hashes),
            "low_confidence_frac": (sum(1 for r in trims if float(r.get("confidence") or 0) < 0.5) / len(trims))
            if trims else None,
            "trim_eval_check": chk}
@@ -819,7 +822,10 @@ def markdown_report(doc: dict) -> str:
                 c = p["trim_eval_check"]
                 lines.append(f"* trim-eval: **{c.get('status')}** - file {c.get('file')} (written "
                              f"{c.get('written_at') or c.get('file_mtime_utc') or '-'}), evaluated "
-                             f"{c.get('trim_version') or '-'}; run's trims {c.get('run_trim_versions')}"
+                             f"{c.get('trim_version') or '-'} (model "
+                             f"{((c.get('learned_model') or {}).get('sha256') or 'none')[:12]}); run's trims "
+                             f"{c.get('run_trim_versions')}, model hashes "
+                             f"{ {k[:12]: v for k, v in (c.get('run_model_hashes') or {}).items()} }"
                              + (f"; {c['reason']}" if c.get("reason") else ""))
                 syn = (p.get("trim_eval") or {}).get("synthetic") or {}
                 if syn:

@@ -2288,6 +2288,24 @@ model `trim_boundary.pt` (16:20:46, SHA-256 `4c0efb82...`), **Learned trim model
 samples, not the full run's numbers). The same sidecar against the old 11:00 `artifacts/reports/trim_eval.json`
 gives `mismatch` ("the report records no trim_version ... learned=False").
 
+**Closed: the trim records carry the model hash (Data Engineer, 25 Nov 2026 23:00-23:20 UTC; the 15.9 open issue
+(1)).** `cli trim` reads the learned model's bytes once, loads the model from them and stores their SHA-256 in every
+trim record (`trim_model_sha256`; `null` for rules only; the run summary prints `learned_model_sha256` and
+`model_hashes`). A clip is re-trimmed when that hash differs from the model used now, not only when `trim_version`
+changes, so a retrained `trim_boundary.pt` (same version) re-trims everything instead of leaving two models under
+one version; records without the field (all sidecars written before this change) are re-trimmed once. The full runs'
+trim step re-trims every clip anyway (the shared sidecar is still `trim-2`, 4,832 records); a smoke work folder's
+sidecar (6,521 records, no hashes) now gives E8 `mismatch` if `evaluate` is re-run on it alone (re-run `--from trim`).
+`trim-eval` records the hash of the bytes it loaded (`learned_model.sha256`; `changed_during_eval` / `gone_after_eval`
+if the file moved meanwhile) and counts the sidecar's hashes (`sidecar.model_hashes`; report schema 3). E8
+(`trim_eval.check_report`, keys from `trim_model_key`: hash, `none`, `unrecorded`) is `ok` only when the run's records
+carry one single hash equal to the model trim-eval evaluated (and the file is unchanged): records without a hash,
+mixed hashes or another model's hash -> `mismatch` with the reason; `report.md`'s "trim-eval:" line prints both
+hashes. Tests (`backend/tests/isl/test_trim_eval_e8.py`): hash statuses; `cli trim` records the hash, does nothing on
+a re-run, re-trims hash-less records once, a retrained model with `--limit 2` gives mixed hashes (E8 mismatch), all
+re-trimmed but not re-evaluated -> mismatch, after `trim-eval` -> ok, rules only -> null hashes; `trim-eval` keeps
+the loaded model's hash if the file changes or goes during the run.
+
 ### 15.9 Adversarial review of `d5b488e`, `0b54985`, `8827aa2` (Code Reviewer, 25 Nov 2026, 22:25-22:45 UTC)
 
 Each change was attacked with targeted offline tests and read-only probes of the real process table, logs and
@@ -2314,7 +2332,7 @@ exit 2 and the queue's 5 tries, not an endless loop of chunks.
 | `parse_v1_header` turned `TypeError` / `OverflowError` into `HeaderError` | a reader bug handing it something that is not bytes would have become one quiet failed row per chunk | only `struct.error` / `IndexError` from malformed bytes are converted; a non-bytes argument raises `TypeError` |
 | E8 mismatch and the guard's warnings were not on the page | a `mismatch` / `missing` E8 showed only in the English subtitle; a partly ingested gated source (`data.readiness.warnings`) was in `report.md` only | the E8 card says "Synthetic trim check not shown (STATUS)" with the reason, or names the evaluated trimmer; a "Some data was used as it is" notice lists the warnings (English + Hindi) |
 
-**Still open.** (1) The trim sidecar records `trim_version`, not the learned model's hash, and `cli trim` re-trims
+**Still open.** (1) (Closed 25 Nov 23:20 UTC, see the note in 15.8.) The trim sidecar records `trim_version`, not the learned model's hash, and `cli trim` re-trims
 only on a version change, so a retrained `trim_boundary.pt` would leave a sidecar trimmed by two models under one
 version, and E8 would check the newer one; record the model's SHA-256 per trim record and re-trim on change before
 retraining that model. (2) HF rows: a page the datasets-server keeps refusing (8 tries, ~20 min) stops the run at that

@@ -294,8 +294,15 @@ def balanced_sample(by_class: dict[str, dict[str, list[str]]], per_class: int, s
     return out
 
 
-def static_items(files: list[dict], folder_paths: dict[str, str], per_class: int = 300, seed: int = 13) -> list[Item]:
-    """Mendeley 7tsw22y96w: ``ISL Images/<age>/<age sleeves>/<English Alphabet|Hindi Vowels|Numerals>/<label>/x.jpg``."""
+def static_items(files: list[dict], folder_paths: dict[str, str], per_class: int | None = None,
+                 seed: int = 13) -> list[Item]:
+    """Mendeley 7tsw22y96w: ``ISL Images/<age>/<age sleeves>/<English Alphabet|Hindi Vowels|Numerals>/<label>/x.jpg``.
+
+    ``per_class`` None (or <= 0, the catalogue default since 25 Nov 2026): **every** photo; N: up to N per folder.
+    Either way the order is deterministic for a seed: folder by folder (sorted), and inside a folder round-robin over
+    the kids / teens / adults x full / half sleeves groups (each group in a seeded hash order). So the first N items
+    of a folder are exactly the old ``per_class=N`` sample, and the ids (``isl_static/<Mendeley file id>``) never
+    depend on the cap: rows ingested from the 300-per-folder list stay valid."""
     by_class: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
     info = {}
     for f in files:
@@ -307,7 +314,9 @@ def static_items(files: list[dict], folder_paths: dict[str, str], per_class: int
         cls = f"{parent}/{label}"
         by_class[cls][group_dir].append(f["id"])
         info[f["id"]] = (f, label, parent, group_dir, age_dir)
-    picked = balanced_sample(by_class, per_class, seed)
+    cap = per_class if per_class is not None and per_class > 0 else max((sum(map(len, g.values()))
+                                                                          for g in by_class.values()), default=0)
+    picked = balanced_sample(by_class, cap, seed)
     out = []
     for cls in sorted(picked):
         for fid in picked[cls]:

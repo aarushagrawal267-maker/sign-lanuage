@@ -215,6 +215,30 @@ def test_mendeley_folder_paths_and_static_balanced_sample():
     assert len(items) == 8
 
 
+def test_mendeley_static_every_photo_by_default_and_old_sample_is_a_prefix():
+    """'All means all' (25 Nov 2026): the catalogue has no cap for mendeley_static, so the item list holds every
+    photo, in a deterministic order whose first N items per folder are exactly the old ``per_class=N`` sample;
+    ids do not depend on the cap, so rows ingested from the 300-per-folder list stay valid."""
+    assert get_source("mendeley_static").extra["per_class"] is None
+    fp = L.mendeley_folder_paths(_folders())
+    files = [_mfile(f"f{i}", "kfa_e1") for i in range(10)] + [_mfile(f"h{i}", "kha_e1") for i in range(3)]
+    files += [_mfile("n1", "kfn_9b"), _mfile("v1", "kfv_a"), _mfile("v2", "kfv_a"), _mfile("bad", "kfv_a", "n.txt")]
+    every = L.static_items(files, fp, per_class=get_source("mendeley_static").extra["per_class"])
+    assert len(every) == 16 and len({i.id for i in every}) == 16  # every image, the .txt skipped
+    assert [i.id for i in every] == [i.id for i in L.static_items(files, fp)]  # default = every photo
+    assert [i.id for i in every] == [i.id for i in L.static_items(files, fp, per_class=0)]
+    assert every == L.static_items(list(reversed(files)), fp)  # deterministic, whatever the API's file order
+    for n in (1, 3, 6):
+        old = L.static_items(files, fp, per_class=n)
+        by_class: dict[str, list[str]] = {}  # class = "<category folder>/<label folder>" over all 6 groups
+        for it in every:
+            by_class.setdefault("/".join(it.meta["folder"].split("/")[-2:]), []).append(it.id)
+        assert [i.id for i in old] == [x for c in sorted(by_class) for x in by_class[c][:n]]
+        assert {i.id for i in old} <= {i.id for i in every}
+    e1 = [i.meta["sleeves"] for i in every if i.meta["variant"] == "E1"]
+    assert e1[:6] == ["full", "half"] * 3 and e1.count("half") == 3  # round-robin over the groups first
+
+
 def test_balanced_sample_caps_and_spreads():
     by = {"A": {"g1": [f"a{i}" for i in range(50)], "g2": ["b1", "b2"]}, "B": {"g1": ["c1"]}}
     out = L.balanced_sample(by, 5)

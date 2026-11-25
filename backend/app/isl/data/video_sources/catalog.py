@@ -125,9 +125,13 @@ SOURCES: dict[str, SourceSpec] = {s.name: s for s in [
         COMMERCIAL_SAFE, "https://data.mendeley.com/datasets/7tsw22y96w/1",
         "A. Singh, S. K. Singh, A. Mittal, B. B. Gupta, Static gestures of Indian Sign Language (ISL) for English "
         "Alphabet, Hindi Vowels and Numerals, Mendeley Data V1, doi:10.17632/7tsw22y96w.1", "image", "image",
-        id_prefix="isl_static", extra={"dataset": "7tsw22y96w", "version": 1, "per_class": 300},
+        id_prefix="isl_static", extra={"dataset": "7tsw22y96w", "version": 1, "per_class": None},
         notes="102,470 photos, 46 folders (A-Z with E1/E2, 8 Hindi vowels, 0-9 with 9a/9b), kids/teens/adults x "
-              "full/half sleeves; a balanced sample (default 300 per folder, spread over the 6 groups)."),
+              "full/half sleeves. Every photo is ingested (per_class None = no cap since 25 Nov 2026; was 300 per "
+              "folder; --per-class N still samples N per folder, round-robin over the 6 groups). No signer ids and "
+              "~370 photos per letter per group: near-duplicates, so splits must group them, never split by photo. "
+              "Licence field CC BY 4.0, but the dataset description says research use only: needs a licence "
+              "review before commercial use (docs/DATASETS_ISL.md 3.9)."),
     SourceSpec(
         "hf_hemg_alphabet", "Hemg/Indian_sign_language_dataset (alphabet + digits images)", "unknown", RESEARCH,
         "https://huggingface.co/datasets/Hemg/Indian_sign_language_dataset", "Hugging Face user Hemg (no card)",

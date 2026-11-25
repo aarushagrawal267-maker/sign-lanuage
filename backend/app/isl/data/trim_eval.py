@@ -8,8 +8,9 @@ that is not a phrase (phrases keep the full clip) - the same calls as ``cmd_trim
 trim sidecar's versions and when it was written.
 
 :func:`check_report` is what E8 uses: the report's ``trim_version`` must equal the single ``trim_version`` of the
-run's trim sidecar (and the model file must be unchanged), otherwise E8 says ``mismatch`` with the reason instead
-of showing numbers that describe another trimmer.
+run's trim sidecar, the learned model's SHA-256 recorded in every trim record (``trim_model_sha256``, written by
+``cli trim`` since 25 Nov 2026) must be the single hash trim-eval evaluated, and the model file must be unchanged;
+otherwise E8 says ``mismatch`` with the reason instead of showing numbers that describe another trimmer.
 """
 
 from __future__ import annotations
@@ -21,8 +22,22 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA = 2
+SCHEMA = 3  # 3: the learned model's hash is the one loaded, the sidecar section counts the records' model hashes
 LEGACY_STAGE2 = "boundary-stage2"  # the old ``--learned`` model (artifacts/isl/boundary.pt): not used by any run
+RULES_ONLY = "none"  # trim_model_key of a record trimmed without a learned model (``trim_model_sha256: null``)
+UNRECORDED = "unrecorded"  # trim_model_key of a record written before cli trim recorded the model hash
+
+
+def trim_model_key(rec: dict) -> str:
+    """The learned model a trim record was computed with: its SHA-256, :data:`RULES_ONLY` (recorded null) or
+    :data:`UNRECORDED` (no ``trim_model_sha256`` field: trimmed before the hash was recorded)."""
+    if "trim_model_sha256" not in rec:
+        return UNRECORDED
+    return rec["trim_model_sha256"] or RULES_ONLY
+
+
+def _short(key: str) -> str:
+    return key if key in (RULES_ONLY, UNRECORDED) else f"{key[:12]}..."
 
 
 def _utc(ts: float) -> str:
@@ -62,9 +77,11 @@ def _learned_end(res) -> bool:
 
 
 def run(paths, *, n: int = 300, seed: int = 0, model=None, model_path: Path | None = None, version: str,
-        legacy_model=None, records: dict | None = None, log=print) -> dict:
+        legacy_model=None, records: dict | None = None, log=print, model_sha256: str | None = None) -> dict:
     """Synthetic end-error check + INCLUDE active-frame check of the trimmer ``version`` (``model`` = the learned
-    end model or None; ``legacy_model`` = the old stage-2 boundary model, only for ``--learned``)."""
+    end model or None; ``legacy_model`` = the old stage-2 boundary model, only for ``--learned``).
+    ``model_sha256`` = the hash of the bytes ``model`` was loaded from: it is the hash recorded (if the file
+    changed while this ran, ``learned_model.changed_during_eval`` is set and E8's file check refuses the report)."""
     import numpy as np
 
     from app.isl.data.manifest import read_manifest
@@ -107,9 +124,15 @@ def run(paths, *, n: int = 300, seed: int = 0, model=None, model_path: Path | No
         methods[res.method] += 1
         within += abs(err) <= 300
     e = np.array(errs, dtype=float)
+    info = file_info(model_path)
+    if model_sha256 and model_path is not None:
+        if info is None:
+            info = {"path": str(model_path), "sha256": model_sha256, "mtime_utc": None, "gone_after_eval": True}
+        elif info["sha256"] != model_sha256:
+            info.update(sha256=model_sha256, changed_during_eval=True)
     out: dict = {
         "schema": SCHEMA, "trim_version": version, "learned": model is not None or legacy_model is not None,
-        "learned_model": file_info(model_path),
+        "learned_model": info,
         "synthetic": {
             "description": "clean ISLRTC clips (bounded source_end trims) + 2-6 s explanation-like tail of another "
                            "clip (after its trimmed end), aligned to the same body frame; the run's trimmer "
@@ -136,18 +159,26 @@ def run(paths, *, n: int = 300, seed: int = 0, model=None, model_path: Path | No
     out["methods_all"] = dict(Counter(t["method"] for t in trims.values()))
     out["sidecar"] = {"path": str(paths.trim_sidecar), "records": len(side),
                       "versions": dict(Counter(t.get("trim_version") for t in side)),
+                      "model_hashes": dict(Counter(trim_model_key(t) for t in side)),
                       "mtime_utc": _utc(paths.trim_sidecar.stat().st_mtime) if paths.trim_sidecar.exists() else None}
     out["written_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return out
 
 
-def check_report(path: Path, run_versions: dict) -> dict:
+def check_report(path: Path, run_versions: dict, run_model_hashes: dict | None = None) -> dict:
     """Does the trim-eval report at ``path`` describe the trimmer of the run whose trim sidecar has
-    ``run_versions`` ({trim_version: clips})? Returns {status: ok|mismatch|missing, reason, file, written_at,
-    file_mtime_utc, trim_version, run_trim_versions, learned_model} plus ``doc`` (the report, only when ok)."""
+    ``run_versions`` ({trim_version: clips}) and ``run_model_hashes`` ({:func:`trim_model_key`: clips}; E8 always
+    passes it, None skips the hash check for older callers)? The hashes must be one single key equal to the model
+    the report evaluated (its ``learned_model.sha256``, :data:`RULES_ONLY` for a rules-only report): records with
+    no hash (trimmed before it was recorded), mixed hashes or another model's hash are a ``mismatch``. Returns
+    {status: ok|mismatch|missing, reason, file, written_at, file_mtime_utc, trim_version, run_trim_versions,
+    run_model_hashes, learned_model} plus ``doc`` (the report, only when ok)."""
     path = Path(path)
     run_versions = {str(k): v for k, v in (run_versions or {}).items()}
     out: dict = {"file": str(path), "run_trim_versions": run_versions, "status": "ok", "reason": None}
+    if run_model_hashes is not None:
+        run_model_hashes = {str(k): v for k, v in run_model_hashes.items()}
+        out["run_model_hashes"] = run_model_hashes
     if not path.exists():
         out.update(status="missing", reason=f"no trim-eval report at {path} (the driver's trim_eval step writes it: "
                                             "python -m app.isl.cli trim-eval --out <work>/trim_eval.json)")
@@ -171,6 +202,8 @@ def check_report(path: Path, run_versions: dict) -> dict:
     elif ver and ver not in run_versions:
         reasons.append(f"trim-eval evaluated {ver} but the run's trims are {next(iter(run_versions))}")
     lm = doc.get("learned_model") or {}
+    if run_model_hashes is not None and run_versions:
+        reasons += _hash_reasons(doc, lm, run_model_hashes)
     if lm.get("path") and lm.get("sha256"):
         now = file_info(Path(lm["path"]))
         if now is None:
@@ -182,3 +215,23 @@ def check_report(path: Path, run_versions: dict) -> dict:
     else:
         out["doc"] = doc
     return out
+
+
+def _hash_reasons(doc: dict, lm: dict, run_hashes: dict) -> list[str]:
+    """Why the run's per-record model hashes do not match the model the report evaluated (empty when they do)."""
+    want = lm.get("sha256") or RULES_ONLY
+    if want == RULES_ONLY and (doc.get("learned") or "trim-learned" in str(doc.get("trim_version") or "")):
+        return ["the report evaluated a learned trimmer but records no model hash, so it cannot be matched to the "
+                "model the run's trims used: re-run trim-eval"]
+    total = sum(run_hashes.values())
+    if run_hashes.get(UNRECORDED):
+        return [f"{run_hashes[UNRECORDED]} of {total} trims record no learned-model hash (trimmed before cli trim "
+                "recorded it), so the model they used is unknown: re-run the trim step (it re-trims them once)"]
+    if len(run_hashes) > 1:
+        mix = {_short(k): v for k, v in sorted(run_hashes.items())}
+        return [f"the run's trim sidecar mixes learned-model hashes {mix} under one trim version: re-run the trim "
+                "step"]
+    have = next(iter(run_hashes), None)
+    if have is not None and have != want:
+        return [f"the run's trims used learned model {_short(have)} but trim-eval evaluated {_short(want)}"]
+    return []

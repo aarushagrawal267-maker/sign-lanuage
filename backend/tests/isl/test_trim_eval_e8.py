@@ -27,9 +27,17 @@ REPO = Path(__file__).resolve().parents[3]
 LEARNED = "trim-2+trim-learned-1"
 
 
-def _sidecar(P, version: str, n: int = 4, methods=("cap", "rest")) -> None:
+_UNSET = object()
+
+
+def _sidecar(P, version: str, n: int = 4, methods=("cap", "rest"), sha=_UNSET) -> None:
+    """``sha``: the ``trim_model_sha256`` of every record (a list: one per record; unset: field left out, as in
+    sidecars written before 25 Nov 2026)."""
     rows = [{"id": f"islrtc/x{i}", "start": 0, "end": 10, "method": methods[i % len(methods)], "confidence": 0.3,
              "trim_version": version} for i in range(n)]
+    if sha is not _UNSET:
+        for i, r in enumerate(rows):
+            r["trim_model_sha256"] = sha[i] if isinstance(sha, list) else sha
     P.trim_sidecar.parent.mkdir(parents=True, exist_ok=True)
     write_manifest(P.trim_sidecar, rows)
 
@@ -96,16 +104,53 @@ def test_e8_reads_work_report_and_refuses_another_trimmer(tmp_path):
     assert "trim_eval" not in e8 and "NOT SHOWN (MISMATCH)" in e8["label"]
     md = markdown_report(_doc(e8))
     assert "trim-eval: **mismatch**" in md and "evaluated trim-2" in md
-    _report(work / "trim_eval.json", LEARNED)
+    m = tmp_path / "trim_boundary.pt"
+    m.write_bytes(b"model-a")
+    _report(work / "trim_eval.json", LEARNED, learned_model=te.file_info(m))
+    e8 = e8_trim(P, art, work)  # the sidecar was written before trim recorded model hashes: refused
+    assert e8["trim_eval_check"]["status"] == "mismatch" and "record no learned-model hash" in e8["label"]
+    assert e8["trim_model_hashes"] == {te.UNRECORDED: 4}
+    _sidecar(P, LEARNED, sha=te.file_info(m)["sha256"])
     e8 = e8_trim(P, art, work)
     assert e8["trim_eval_check"]["status"] == "ok" and e8["trim_eval"]["synthetic"]["within_300ms"] == 0.8
     assert LEARNED in e8["label"] and "2026-11-25T23:00:00Z" in e8["label"] and "NOT SHOWN" not in e8["label"]
     md = markdown_report(_doc(e8))
     assert "trim-eval: **ok**" in md and "within 300 ms 0.800" in md
+    assert te.file_info(m)["sha256"][:12] in md  # the model hash evaluated and the run's hashes are printed
     # without a sidecar and without a report: not run, with the reason
     P2 = isl_paths(tmp_path / "isl2")
     e8 = e8_trim(P2, art, tmp_path / "work2")
     assert e8["run"] is False and "trim-eval" in e8["reason"]
+
+
+def test_check_report_compares_the_records_model_hashes(tmp_path):
+    """E8 hardening (15.9 open issue 1): the single model hash of the run's trim records must be the model trim-eval
+    evaluated; records without a hash, mixed hashes or another model's hash are a mismatch."""
+    rep = tmp_path / "trim_eval.json"
+    a, b = tmp_path / "a.pt", tmp_path / "b.pt"
+    a.write_bytes(b"model-a")
+    b.write_bytes(b"model-b")
+    ha, hb = te.file_info(a)["sha256"], te.file_info(b)["sha256"]
+    _report(rep, LEARNED, learned_model=te.file_info(a))
+    assert te.check_report(rep, {LEARNED: 4}, {ha: 4})["status"] == "ok"
+    c = te.check_report(rep, {LEARNED: 4}, {te.UNRECORDED: 1, ha: 3})
+    assert c["status"] == "mismatch" and "1 of 4 trims record no learned-model hash" in c["reason"]
+    assert c["run_model_hashes"] == {te.UNRECORDED: 1, ha: 3} and "doc" not in c
+    c = te.check_report(rep, {LEARNED: 4}, {ha: 3, hb: 1})  # two models under one trim_version
+    assert c["status"] == "mismatch" and "mixes learned-model hashes" in c["reason"] and hb[:12] in c["reason"]
+    c = te.check_report(rep, {LEARNED: 4}, {hb: 4})  # retrained and re-trimmed, but trim-eval saw the old model
+    assert c["status"] == "mismatch" and f"used learned model {hb[:12]}" in c["reason"] and ha[:12] in c["reason"]
+    c = te.check_report(rep, {LEARNED: 4}, {te.RULES_ONLY: 4})
+    assert c["status"] == "mismatch" and "used learned model none" in c["reason"]
+    _report(rep, LEARNED)  # a learned report without its model hash cannot be matched
+    c = te.check_report(rep, {LEARNED: 4}, {ha: 4})
+    assert c["status"] == "mismatch" and "records no model hash" in c["reason"]
+    _report(rep, "trim-2", learned_model=None)  # rules only: records carry null
+    assert te.check_report(rep, {"trim-2": 4}, {te.RULES_ONLY: 4})["status"] == "ok"
+    c = te.check_report(rep, {"trim-2": 4}, {te.UNRECORDED: 4})
+    assert c["status"] == "mismatch" and "re-run the trim step" in c["reason"]
+    assert te.trim_model_key({}) == te.UNRECORDED and te.trim_model_key({"trim_model_sha256": None}) == te.RULES_ONLY
+    assert te.trim_model_key({"trim_model_sha256": ha}) == ha
 
 
 # --------------------------------------------------------------------------------------------- trim-eval = trim
@@ -189,6 +234,75 @@ def test_trim_eval_evaluates_the_trimmer_trim_used(tmp_path, fake_learned, capsy
     assert doc["trim_version"] == "trim-2" and doc["learned"] is False and doc["learned_model"] is None
     assert not fake_learned
     assert te.check_report(out, {LEARNED: len(rows)})["status"] == "mismatch"
+
+
+def test_trim_records_model_hash_and_retrims_when_it_changes(tmp_path, fake_learned, capsys):
+    """``cli trim`` stores the learned model's SHA-256 in every record and re-trims a clip when it changes (same
+    trim_version); records without a hash are re-trimmed once; E8 follows the hashes."""
+    _, P = _world_with_tails(tmp_path)
+    root = ["--root", str(P.root)]
+    model = get_settings().artifacts_dir / "isl" / "trim_boundary.pt"
+    h1 = te.file_info(model)["sha256"]
+
+    def trim(*extra) -> dict:
+        capsys.readouterr()
+        assert cli.main(root + ["trim", *extra]) == 0
+        return json.loads(capsys.readouterr().out)
+
+    def side() -> dict:
+        return {r["id"]: r for r in read_manifest(P.trim_sidecar, only_ok=False)}
+
+    first = trim()
+    n = first["total"]
+    assert n > 0 and first["trimmed_now"] == n and first["learned_model_sha256"] == h1
+    assert first["model_hashes"] == {h1: n} and {r["trim_model_sha256"] for r in side().values()} == {h1}
+    assert trim()["trimmed_now"] == 0  # same model: nothing to do
+    # a sidecar from before the hash was recorded: those records are re-trimmed once, then never again
+    rows = sorted(side().values(), key=lambda r: r["id"])
+    for r in rows[:2]:
+        del r["trim_model_sha256"]
+    write_manifest(P.trim_sidecar, rows)
+    again = trim()
+    assert again["trimmed_now"] == 2 and again["model_hashes"] == {h1: n}
+    assert trim()["trimmed_now"] == 0
+    # trim-eval of this trimmer: E8 ok
+    work = tmp_path / "work"
+    assert cli.main(root + ["trim-eval", "--n", "10", "--out", str(work / "trim_eval.json")]) == 0
+    doc = json.loads((work / "trim_eval.json").read_text())
+    assert doc["learned_model"]["sha256"] == h1 and doc["sidecar"]["model_hashes"] == {h1: n}
+    assert e8_trim(P, tmp_path / "art", work)["trim_eval_check"]["status"] == "ok"
+    # the model is retrained (same trim_version): a partial re-trim mixes two models -> E8 mismatch
+    model.write_bytes(b"retrained model")
+    h2 = te.file_info(model)["sha256"]
+    part = trim("--limit", "2")
+    assert part["trimmed_now"] == 2 and part["model_hashes"] == {h1: n - 2, h2: 2}
+    assert part["versions"] == {LEARNED: n}  # the version alone cannot tell the two models apart
+    chk = e8_trim(P, tmp_path / "art", work)["trim_eval_check"]
+    assert chk["status"] == "mismatch" and "mixes learned-model hashes" in chk["reason"]
+    # every clip re-trimmed with the new model: still a mismatch until trim-eval evaluates that model
+    rest = trim()
+    assert rest["trimmed_now"] == n - 2 and rest["model_hashes"] == {h2: n}
+    chk = e8_trim(P, tmp_path / "art", work)["trim_eval_check"]
+    assert chk["status"] == "mismatch" and f"used learned model {h2[:12]}" in chk["reason"]
+    assert cli.main(root + ["trim-eval", "--n", "10", "--out", str(work / "trim_eval.json")]) == 0
+    assert e8_trim(P, tmp_path / "art", work)["trim_eval_check"]["status"] == "ok"
+    # rules only (--learned-model none): another version and null hashes; every clip redone once
+    rules = trim("--learned-model", "none")
+    assert rules["trimmed_now"] == n and rules["model_hashes"] == {te.RULES_ONLY: n}
+    assert {r["trim_model_sha256"] for r in side().values()} == {None}
+
+
+def test_trim_eval_records_the_hash_of_the_model_it_loaded(tmp_path):
+    """A model file replaced while trim-eval runs: the report keeps the hash of the bytes it evaluated and says the
+    file changed, so E8's file check refuses it."""
+    P = isl_paths(tmp_path / "isl")
+    m = tmp_path / "trim_boundary.pt"
+    m.write_bytes(b"new bytes on disk")
+    doc = te.run(P, n=0, model=None, model_path=m, version=LEARNED, records={}, model_sha256="ab" * 32)
+    assert doc["learned_model"]["sha256"] == "ab" * 32 and doc["learned_model"]["changed_during_eval"] is True
+    m.unlink()
+    doc = te.run(P, n=0, model=None, model_path=m, version=LEARNED, records={}, model_sha256="ab" * 32)
+    assert doc["learned_model"]["gone_after_eval"] is True and doc["learned_model"]["sha256"] == "ab" * 32
 
 
 # --------------------------------------------------------------------------------------------- driver
