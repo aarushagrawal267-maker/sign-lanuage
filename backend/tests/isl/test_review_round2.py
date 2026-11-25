@@ -77,6 +77,22 @@ def test_readiness_sees_gated_ingestion_but_not_its_probes(tmp_path):
     assert all(p["blocking"] for p in found)
 
 
+def test_include_is_complete_once_every_zip_is_processed(tmp_path):
+    from app.isl.paths import isl_paths
+
+    P = isl_paths(tmp_path / "isl")
+    P.manifests.mkdir(parents=True)
+    write_manifest(P.manifest("include"), [{"id": f"include/x/{i}", "ok": True} for i in range(10)])
+    st = rd.source_status(P, "include")
+    assert st["complete"] is False and st["expected"] == rd.KNOWN_TOTALS["include"]
+    (P.manifests / "include_zips_done.txt").write_text("".join(f"z{i}.zip\n" for i in range(rd.INCLUDE_ZIPS - 1)))
+    assert rd.source_status(P, "include")["complete"] is False
+    with (P.manifests / "include_zips_done.txt").open("a") as fh:
+        fh.write("last.zip\n")
+    st = rd.source_status(P, "include")
+    assert st["complete"] is True and "zips" in st["expected_from"]
+
+
 # --------------------------------------------------------------------------------------------- classifier guard
 
 class _Cls:

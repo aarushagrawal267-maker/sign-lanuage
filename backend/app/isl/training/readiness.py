@@ -37,6 +37,10 @@ PARTIAL_MARKER = "partial_data.json"
 
 # published sizes for sources without an item list on disk
 KNOWN_TOTALS = {"include": 4292, "isl500": 86756, "openhands_fs": 172, "glosl": 126846}
+# INCLUDE: the zenodo record (4010759) has 44 zips; scripts/ingest_isl.py appends a zip to include_zips_done.txt
+# once all its videos have rows. The zips hold 4,284 distinct clip ids, not the published 4,292, so the row count
+# alone would never reach the published size (measured 25 Nov 2026, 19:59 UTC, when the job finished).
+INCLUDE_ZIPS = 44
 GATED = ("cislr", "isign")
 BUDGET_LIMITED = ("openhands_raw",)  # ingested up to a disk budget: complete when its job has ended
 # items file of a source when it differs from "<source>_items.json" (manifest shared with another source)
@@ -158,6 +162,13 @@ def source_status(paths: IslPaths, name: str, running_scripts: set[str] | None =
     exp, how = expected_items(paths, name)
     st = {"source": name, "manifest": man.name, "rows": len(ids), "ok": len(ok), "failed": len(ids) - len(ok),
           "expected_from": how}
+    if name == "include":
+        zf = paths.manifests / "include_zips_done.txt"
+        zdone = len(set(zf.read_text().split())) if zf.exists() else 0
+        if zdone >= INCLUDE_ZIPS:
+            st.update(expected=len(ids), done=len(ids), complete=bool(ids),
+                      expected_from=f"all {INCLUDE_ZIPS} INCLUDE zips processed (include_zips_done.txt)")
+            return st
     if name in BUDGET_LIMITED:
         running = bool(running_scripts and "ingest_isl_pose.py" in running_scripts and (paths.manifests /
                                                                                           f"{name}.lock").exists())

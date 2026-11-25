@@ -2061,7 +2061,7 @@ with `--from trim` for clean numbers.
 Every claimed fix was re-read and, where possible, checked against the real data. Confirmed: intervals below 5 signer
 groups, the readiness guard (exit 4 on real data now), the classifier split guard in E1, the computed pre-training
 exclusion, one source list (`profiles.py`), learned trim versions, the ingestion locks / memory guard / process scan,
-and the running jobs (manifests growing, no deleted-but-open files, 9.5 GB RAM available). Five real gaps, fixed with
+and the running jobs (manifests growing, no deleted-but-open files, 9.5 GB RAM available). Six real gaps, fixed with
 offline tests (`tests/isl/test_review_round2.py`, one more in `test_eval_runners.py`):
 
 | Gap | Effect | Fix |
@@ -2070,10 +2070,10 @@ offline tests (`tests/isl/test_review_round2.py`, one more in `test_eval_runners
 | E3 and E4 used the classifier that E1b refused | a classifier from another split, or with no split, still produced E3 / E4 numbers | E3 / E4 are refused with E1b (`classifier_refusal`); `leakage_guards.classifier_refused` and the report say so |
 | `apply_dedup` kept every Sign Library chunk not named in `drop_ids` | chunks never checked (ingested after the `pretrain_dedup` step, outside a smoke sample, or all of them when the step found none) went into pre-training | the dedupe records `checked_ids`; unchecked chunks are dropped (`unchecked_dropped`) |
 | the readiness guard ignored `ingest_isl_gated.py` | after the queue's list is done (CISLR / iSign polling only), an iSign conversion run would not block a full run | `ingest_isl_gated.py cislr|isign` blocks; its `--check` probe does not |
+| readiness expected 4,292 INCLUDE rows (published size) | the INCLUDE job finished at 19:59 UTC with all 44 zips and 4,284 distinct clip ids, so the guard could never turn ready | INCLUDE is complete once all 44 zips are in `include_zips_done.txt` |
 | `pack_licences` read every row of a reused `sources.json` | a source removed from the profile (e.g. WLASL) could still be named in a research pack | rows outside the profile are not listed; the commercial-safe refusal still reads every row (fails closed) |
 
 Still open (not fixed here): the Sign Library calibration uses synthetic re-cuts of the *same* OpenHands extraction, so
 its recall says nothing about matching our own MediaPipe extractions of evaluation videos against OpenHands poses (a
-different extractor and normalisation); readiness expects exactly 4,292 INCLUDE rows (published size) - if the zips
-hold fewer videos the guard never turns ready and needs a check; `choose_user_mode` picks `neutral` on any top-1 gain
+different extractor and normalisation); `choose_user_mode` picks `neutral` on any top-1 gain
 (no noise margin with as few as 30 validation takes).
