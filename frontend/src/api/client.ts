@@ -123,7 +123,7 @@ export type LanguageInfo = {
   capabilities: string[];
   profile: string;
   version: string | null;
-  licences: { source: string; licence: string; commercial: boolean }[];
+  licences: { source: string; licence: string; commercial: boolean; terms?: string }[];
   status: "ready" | "missing_models" | "error";
   message: string | null;
   components?: Record<string, boolean>;

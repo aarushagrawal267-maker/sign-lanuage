@@ -1,6 +1,7 @@
 # Indian Sign Language (ISL) support: architecture and design
 
-Status: **Proposed** (phase 1 design, 25 Nov 2026). Branch `claude/indian-sign-language`.
+Status: **Phase 1 implemented, models smoke-trained only** (25 Nov 2026): no trained ISL model is committed and no ISL
+accuracy has been measured; phase 2 (full training and evaluation) is listed in section 15. Branch `claude/indian-sign-language`.
 Audience: the agents that build it (Data Engineer, then AI Engineer for models, AI Engineer for Hindi and
 sentences, then Frontend Developer) and the project owner.
 
@@ -1666,3 +1667,62 @@ the Hindi size/spacing/lang problems, the 320 px overflow and the missing `lang=
   page load; consider `role="note"` for static warnings.
 * Older ASL pages (Dataset, Experiments) still have non-focusable horizontal-scroll tables; out of this audit's scope.
 * The status pill still blinks (`pulse-dot`) while busy; it stops with reduced motion but has no other pause.
+
+
+## 15. Phase 1 gate and the phase-2 work list (Reality Checker, 25 Nov 2026)
+
+**Verdict: phase 1 is complete as a code base, NOT as a product.** The ISL pipeline, API, UI, vocabulary and Hindi word list
+exist and are tested; **no ISL model has been trained beyond a smoke run, so the app cannot yet recognise ISL dictionary words.**
+
+Checked from a clean clone of `claude/indian-sign-language` (commit `fc1745a`) in `/tmp`, following the README:
+
+* `./setup.sh --cpu --dev` works (1 min 23 s). Backend: 286 passed, 1 skipped (WordNet data not installed in a fresh
+  clone), with `SLR_TORCH_THREADS=2`. Frontend: typecheck + production build pass, `build:static` passes, Vitest 57 passed, 1 skipped.
+* `./start.sh` serves both languages. ASL (`asl-wlasl100`) is `ready` and the bundled model answers over the WebSocket
+  (git shows no change to `models/wlasl100-gru-signer-holdout/`; `FeatureConfig.to_dict()` is unchanged for ASL).
+  ISL (`isl`) is `missing_models` in a clean clone: real INCLUDE recordings streamed over the ISL WebSocket end as
+  `not_sure`, never a wrong word. The smoke pack exists only locally in `artifacts/packs/isl` (version `2026.11.0-smoke`,
+  `results.json` labelled "SMOKE RUN ... NOT the accuracy of the app").
+* No accuracy number is presented as the app's accuracy: the smoke numbers in 6.7 are labelled, 9.2 holds planning guesses
+  marked as guesses, the frontend has no hard-coded ISL metrics.
+* Licences are recorded in `docs/DATASETS_ISL.md`; this gate added the ISLRTC non-profit terms to the pack licence entries
+  (`pack.json`, `build-pack`) and corrected the CISLR licence string in research packs to CC-BY-NC-4.0.
+* Nothing large or secret is in the branch history since `main` (largest blob `vocabulary.jsonl`, 7.5 MB; no data,
+  landmarks, weights, `.env` or tokens). Gated access today: CISLR and iSign `pending`.
+* Ingestion jobs still running at 14:15 UTC: INCLUDE 1,921 of 4,292 videos, ISLRTC 4,140 of 13,665. At the last hour's
+  rate INCLUDE needs about 4.5 h more and ISLRTC about 10.5 h more (finishing around 01:00 UTC on 26 Nov).
+
+### 15.1 What phase 2 must do (in order)
+
+1. **Confirm ingestion finished**: `pgrep -af ingest_isl` empty; `include.jsonl` has 4,292 rows and `islrtc.jsonl` 13,665
+   (count `ok: false` and 0-frame rows; re-run the script, which resumes, for any failures). Do not delete `data/isl`.
+2. **Refresh the data layer** (from `backend/`, `nice -n 10`, 4 threads once ingestion is done):
+   `python -m app.isl.cli wordnet` (if missing), `trim`, `trim-eval`, `trim-review` (look at the sheet), `splits --fetch`,
+   `splits`, `dedup`, `vocab --no-trims`, `status`. If concept ids changed, re-run `hindi --translate` then `hindi`, and commit
+   the new `vocabulary.jsonl` and `lexicon_hi.jsonl` (the consistency test needs >= 95 % Hindi coverage).
+3. **Decide the primary evaluation split** on the full data: if the pseudo-signer clustering is still very uneven, keep
+   `include-session-cv5` as primary and say "session-independent, not signer-independent" next to every number.
+4. **Trimming**: the synthetic end-error check is 67.7 % within 300 ms against an 80 % target, and compound names are cut
+   early. Either improve stage 1 / stage 2 on the full data or accept and record the measured figure; keep low-confidence
+   trims down-weighted.
+5. **Train the commercial-safe pack at full settings** (section 11, about 13-17 h): `train-classifier` (CV + final),
+   `train-encoder`, `build-index --all-include`, `fit-fusion`, `evaluate`, `build-pack`. `train-letters` only once real
+   alphabet recordings exist (none in the open data).
+6. **Implement the missing evaluation runners** before quoting accuracy: E2 per-fold *held-out concept* one-shot (the
+   smoke E2 is the seen-class variant), E4 My-signs few-shot, E5 fingerspelling, E8 trim quality; plus E1a (official split,
+   labelled not signer-independent), E1b, E3 risk-coverage with the silent-error rate, E6 latency on free CPUs, E7 ASL
+   regression (`models/wlasl100-gru-signer-holdout/results.json` unchanged). Bootstrap intervals over groups; test folds once.
+7. **Re-fit the fusion thresholds** on the full validation folds (Wilson lower bound); the UI must show `fusion.json`
+   `achieved`, never the targets. Revisit the 0.85 top-5 rule that turns many correct top-1 results into "not sure".
+8. **Replace guesses with measurements** in README, `docs/ISL_DESIGN.md` (0, 9.2, this section) and `docs/DATASETS_ISL.md`
+   (all counts dated 25 Nov are from partial data). Remove the README "not yet trained" note only when a full pack exists.
+9. **Ship decision for the pack**: weights must stay under 50 MB to be committed (commercial-safe pack only; never research
+   or iSign-derived weights); otherwise publish it as a release asset and document the download.
+10. **Research profile** only if `scripts/ingest_isl_gated.py --check` reports access: ingest CISLR / an iSign subset,
+    `dedup` against ISLRTC before any evaluation, verify iSign left/right hands (`--swap-hands`), check CISLR CSV column
+    names on the real files, WLASL warm start, build `isl-research` separately.
+11. **People, not code**: a native Hindi-speaking teacher reviews the core ~1,000 Hindi words and the Hindi interface text
+    (then `hindi --merge-local`); hide unchecked machine `hi_alt`; real-webcam tests of Live and My signs with Indore deaf
+    signers; ask an Indore school to record the ISL alphabet and everyday words with 5+ consenting signers.
+12. **Smaller gaps**: look-alike conflict report on sign-pack import; Playwright `e2e/isl.spec.ts` against a backend with
+    the trained pack; ISL in the static demo (IndexedDB) later; licence decision on ISLRTC before any paid release.

@@ -23,6 +23,9 @@ from app.isl.profiles import get_profile
 
 PACK_IDS = {"commercial-safe": "isl", "research": "isl-research"}
 PACK_VERSION = "2026.11.0"
+# ISLRTC dictionary: GODL-India, but the publisher forbids resale and profiteering (docs/DATASETS_ISL.md).
+ISLRTC_TERMS = ("free, non-profit use with acknowledgement only (ISLRTC FAQ Q.23); "
+                "paid or ad-funded use needs ISLRTC permission")
 
 
 def workdir(profile: str) -> Path:
@@ -140,9 +143,10 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
         enc_version = torch.load(work / "encoder.pt", map_location="cpu", weights_only=False)["meta"]["encoder_version"]
     base = json.loads((PACK_DIR / "pack.json").read_text())
     licences = [{"source": "include", "licence": "CC-BY-4.0", "commercial": True},
-                {"source": "islrtc", "licence": "GODL-India", "commercial": True}]
+                {"source": "islrtc", "licence": "GODL-India", "commercial": True,
+                 "terms": ISLRTC_TERMS}]
     if not prof.commercial:
-        licences += [{"source": "cislr", "licence": "AFL-3.0 (pending review)", "commercial": False},
+        licences += [{"source": "cislr", "licence": "CC-BY-NC-4.0 (README; HF tag says AFL-3.0)", "commercial": False},
                      {"source": "isign", "licence": "CC-BY-NC-SA-4.0", "commercial": False}]
     man = {**base, "id": PACK_IDS[prof.name], "version": PACK_VERSION + ("-smoke" if smoke else ""),
            "profile": prof.name, "feature_config": fcfg.to_dict(), "licences": licences,

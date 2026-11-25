@@ -8,6 +8,14 @@
 
 **Current model** (`models/wlasl100-gru-signer-holdout`): bidirectional GRU trained on the 524 WLASL100 clips that could be downloaded (~5 per sign). Signer-independent results — validation top-1 62.0%; held-out test on 7 unseen signers: **top-1 44.3%, top-5 72.2%**. Live webcam accuracy will be lower. This model is **registered automatically the first time the backend starts**, so live recognition works straight after setup — no dataset download or training needed.
 
+> **Indian Sign Language (ISL) on branch `claude/indian-sign-language`: phase 1, not yet trained.** The ISL code, the
+> 12,442-entry ISLRTC vocabulary and the English + Hindi word list are in the repository, but **no trained ISL model is
+> committed and no ISL accuracy has been measured yet**. On a fresh setup the ISL language reports `missing_models` and
+> recognises only the user's own signs (**My signs**); dictionary words answer "Not sure". A quick test build
+> (`python -m app.isl.cli smoke`, a few minutes of CPU on partial data) makes the whole flow run, but its results are mostly
+> wrong and are labelled *smoke run* in the app. Hindi: 890 rows are hand-written, 11,552 are unreviewed machine translations,
+> 0 are teacher-checked. Full training and evaluation happen in phase 2 (`docs/ISL_DESIGN.md` sections 11 and 15).
+
 ![Overview page](docs/screenshots/overview.png)
 
 ---
@@ -133,7 +141,7 @@ cd frontend && npm ci && npm run dev
 
 ## Using the application
 
-**Indian Sign Language (ISL, branch `claude/indian-sign-language`).** The header has a sign-language switch (ISL first, ASL second) and an EN / हिंदी interface switch. With ISL, Live Recognition shows each word in English and Hindi, asks "Did you mean…?" with up to five choices when it is not sure, and says "Not sure – try again or spell it" instead of guessing; the signed words become an approximate English and Hindi sentence that can be read aloud. **My signs** records 3–5 takes of a personal or regional (e.g. Indore) sign and shares signs as `.signpack` files; the Vocabulary page searches the whole ISLRTC dictionary in English or Hindi. Design, data and honest accuracy notes: `docs/ISL_DESIGN.md`, `docs/DATASETS_ISL.md`.
+**Indian Sign Language (ISL, branch `claude/indian-sign-language`).** The header has a sign-language switch (ISL first, ASL second) and an EN / हिंदी interface switch. With ISL, Live Recognition shows each word in English and Hindi, asks "Did you mean…?" with up to five choices when it is not sure, and says "Not sure – try again or spell it" instead of guessing; the signed words become an approximate English and Hindi sentence that can be read aloud. **My signs** records 3–5 takes of a personal or regional (e.g. Indore) sign and shares signs as `.signpack` files; the Vocabulary page searches the whole ISLRTC dictionary in English or Hindi. Phase 1 status: no trained ISL model is committed, so a fresh setup recognises only My signs until the ISL models are built (see the note at the top). Design, data and honest accuracy notes: `docs/ISL_DESIGN.md`, `docs/DATASETS_ISL.md`; dataset licences (ISLRTC data: free, non-profit use only) in `docs/DATASETS_ISL.md`.
 
 **Just want to try it?** After setup, open **Live Recognition → Start camera → Start recognition** — the bundled pretrained WLASL100 model is already active. The steps below are for downloading the dataset and training your own models.
 
@@ -220,6 +228,8 @@ cd frontend; npx playwright install chromium; npx playwright test
 `E2E_FAKE_VIDEO=<file.y4m>` feeds a video file as the fake camera.
 
 GitHub Actions (`.github/workflows/ci.yml`) runs the backend pytest suite, the frontend typecheck, Vitest and production build, and a gitleaks secret scan of the git history on every push and pull request.
+
+On a machine whose CPUs are busy (for example while `scripts/ingest_isl.py` runs), set `SLR_TORCH_THREADS=2` for the backend tests; otherwise PyTorch and MediaPipe threads compete and training tests slow down a lot.
 
 Backend tests run against an isolated temporary data directory with **synthetic landmark sequences** (procedurally generated, clearly flagged). They verify the pipeline's wiring and logic, not ASL accuracy.
 
