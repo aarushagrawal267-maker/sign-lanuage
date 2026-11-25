@@ -246,6 +246,9 @@ def run_test_evaluation(exp_id: int) -> dict:
         exp = db.get(Experiment, exp_id)
         if exp.status != "completed" or not exp.checkpoint_path:
             raise RuntimeError("experiment has no completed checkpoint")
+        if exp.split_id is None:
+            raise RuntimeError("this is an imported pretrained model; its held-out test result was recorded when it was "
+                               "trained and the original split is not available here")
         fcfg = FeatureConfig.from_dict(exp.feature_config)
         cfg = TrainConfig(**exp.config)
         data = load_samples(db, exp.split_id, fcfg, cfg.min_hand_rate)

@@ -6,22 +6,29 @@
 
 **Online demo (runs entirely in your browser):** https://huggingface.co/spaces/agrawalaarush08/sign-language-studio
 
-**Current model** (`models/wlasl100-gru-signer-holdout`): bidirectional GRU trained on the 524 WLASL100 clips that could be downloaded (~5 per sign). Signer-independent results — validation top-1 62.0%; held-out test on 7 unseen signers: **top-1 44.3%, top-5 72.2%**. Live webcam accuracy will be lower.
+**Current model** (`models/wlasl100-gru-signer-holdout`): bidirectional GRU trained on the 524 WLASL100 clips that could be downloaded (~5 per sign). Signer-independent results — validation top-1 62.0%; held-out test on 7 unseen signers: **top-1 44.3%, top-5 72.2%**. Live webcam accuracy will be lower. This model is **registered automatically the first time the backend starts**, so live recognition works straight after setup — no dataset download or training needed.
+
+![Overview page](docs/screenshots/overview.png)
 
 ---
 
 ## Contents
 
 1. [What it does](#what-it-does)
-2. [Quick start (Windows)](#quick-start-windows)
-3. [Using the application](#using-the-application)
-4. [Architecture](#architecture)
-5. [Command line](#command-line)
-6. [Testing](#testing)
-7. [Project structure](#project-structure)
-8. [Documentation](#documentation)
-9. [Licensing, attribution & citation](#licensing-attribution--citation)
-10. [Status](#status)
+2. [Screenshots](#screenshots)
+3. [Tech stack](#tech-stack)
+4. [Quick start (Windows)](#quick-start-windows)
+5. [Quick start (Linux / macOS)](#quick-start-linux--macos)
+6. [Using the application](#using-the-application)
+7. [Architecture](#architecture)
+8. [Command line](#command-line)
+9. [Testing](#testing)
+10. [Project structure](#project-structure)
+11. [Limitations](#limitations)
+12. [Documentation](#documentation)
+13. [Licensing, attribution & citation](#licensing-attribution--citation)
+14. [Deployment (Hugging Face)](#deployment-hugging-face)
+15. [Status](#status)
 
 ## What it does
 
@@ -34,6 +41,25 @@
 | Evaluation | Official split (labelled *not* signer-independent) plus **signer-holdout** and **5-fold signer-grouped CV** splits; automated leakage checks; test set evaluated only on explicit request. |
 | Live | Webcam → MediaPipe in the browser → landmark coordinates over a localhost WebSocket → sign-boundary detection, temporal-crop agreement, confidence/margin thresholds, cooldown and repeat suppression → gloss text. |
 | UI | Ten pages: Overview, Live Recognition, Video Analysis, Vocabulary, Landmark Studio, Dataset Explorer, Model Laboratory, Evaluation, Experiment History, Research & Docs. |
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Live recognition](docs/screenshots/live.png) | ![Evaluation](docs/screenshots/evaluation.png) |
+| **Live Recognition** — webcam → MediaPipe in the browser → gloss. (Captured with Chromium's synthetic fake camera, so no person is visible.) | **Evaluation** — validation and held-out-test results of the bundled pretrained model. |
+| ![Vocabulary](docs/screenshots/vocabulary.png) | ![Model Laboratory](docs/screenshots/model-lab.png) |
+| **Vocabulary** — the 100 WLASL100 glosses the model recognises. | **Model Laboratory** — train GRU / LSTM / TCN models with live training curves. |
+
+## Tech stack
+
+| Layer | Technologies |
+|---|---|
+| Frontend | React 19, TypeScript, Vite, Tailwind CSS 4, React Router, MediaPipe Tasks Vision (WASM), ONNX Runtime Web (static build), Vitest, Playwright |
+| Backend | Python 3.11/3.12, FastAPI, Uvicorn, Pydantic, SQLAlchemy + SQLite, NumPy, pandas, scikit-learn, OpenCV, MediaPipe, PyTorch |
+| ML | Bidirectional GRU (primary), LSTM, temporal CNN with masked attention pooling over hand/body/face landmark features |
+| Data | WLASL v0.3 annotations → WLASL100 subset; signer-grouped splits with automated leakage checks |
+| Deployment | Hugging Face static Space (ONNX in the browser) or Docker Space (full backend) |
 
 ## Quick start (Windows)
 
@@ -75,7 +101,39 @@ powershell -ExecutionPolicy Bypass -File .\stop.ps1
 * `start.ps1` launches both servers in the background (logs in `.run/`), waits until they respond, and opens the browser (`-NoBrowser` to skip).
 * `stop.ps1` stops only the processes `start.ps1` recorded.
 
+## Quick start (Linux / macOS)
+
+Requirements: **Python 3.12 or 3.11** (with `venv`), **Node.js 20+**, Chrome/Edge/Chromium, a webcam. On Debian/Ubuntu MediaPipe also needs `sudo apt install libegl1 libgles2 libgl1`.
+
+```bash
+./setup.sh            # add --cpu to force CPU PyTorch, --dev for test tools
+```
+
+```bash
+./start.sh            # then open http://localhost:5173
+```
+
+```bash
+./stop.sh
+```
+
+If ports 8000/5173 are taken: `BACKEND_PORT=8010 FRONTEND_PORT=5180 ./start.sh`. Logs are in `.run/`.
+
+Manual alternative (any OS, two terminals):
+
+```bash
+python3.12 -m venv .venv && .venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+.venv/bin/pip install -r backend/requirements.txt && .venv/bin/python scripts/fetch_models.py
+cd backend && ../.venv/bin/python -m uvicorn app.main:app --port 8000
+```
+
+```bash
+cd frontend && npm ci && npm run dev
+```
+
 ## Using the application
+
+**Just want to try it?** After setup, open **Live Recognition → Start camera → Start recognition** — the bundled pretrained WLASL100 model is already active. The steps below are for downloading the dataset and training your own models.
 
 1. **Dataset Explorer → Load annotations.** Downloads the two official annotation files, records their SHA-256, builds the WLASL100 inventory and the splits.
 2. **Download & validate.** Start with a limit (e.g. 50) to see how your network fares; the full set is 2,038 instances. Expired links are recorded as *failed*. Videos the WLASL authors send you on request go in `data/videos/provided/<video_id>.mp4`, then **Scan local files**.
@@ -134,25 +192,32 @@ python -m app.cli train --arch gru --split signer-holdout --epochs 80 --seq-len 
 python -m app.cli evaluate-test 1
 ```
 
-Environment variables (prefix `SLR_`): `SLR_DATA_DIR`, `SLR_ARTIFACTS_DIR`, `SLR_DEVICE` (`auto`/`cpu`/`cuda`), `SLR_TORCH_THREADS`, `SLR_DOWNLOAD_WORKERS`, `SLR_DOWNLOAD_TIMEOUT_S`.
+```bash
+python -m app.cli import-model            # (re-)register the pretrained model in models/
+```
+
+Environment variables (prefix `SLR_`): `SLR_DATA_DIR`, `SLR_ARTIFACTS_DIR`, `SLR_DEVICE` (`auto`/`cpu`/`cuda`), `SLR_TORCH_THREADS`, `SLR_DOWNLOAD_WORKERS`, `SLR_DOWNLOAD_TIMEOUT_S`, `SLR_IMPORT_BUNDLED_MODEL` (`true` by default; `false` skips registering the pretrained model on first start).
 
 ## Testing
 
 ```bash
-cd backend; ..\.venv\Scripts\python -m pytest -q
+cd backend; ..\.venv\Scripts\python -m pytest -q        # Windows
+cd backend && ../.venv/bin/python -m pytest -q          # Linux / macOS
 ```
 
 ```bash
 cd frontend; npm test
 ```
 
-With the app running (`start.ps1`), browser end-to-end tests use Chromium's fake camera:
+With the app running (`start.ps1` / `start.sh`), browser end-to-end tests use Chromium's fake camera (set `E2E_BASE_URL` if you changed the frontend port):
 
 ```bash
 cd frontend; npx playwright install chromium; npx playwright test
 ```
 
 `E2E_FAKE_VIDEO=<file.y4m>` feeds a video file as the fake camera.
+
+GitHub Actions (`.github/workflows/ci.yml`) runs the backend pytest suite, the frontend typecheck, Vitest and production build, and a gitleaks secret scan of the git history on every push and pull request.
 
 Backend tests run against an isolated temporary data directory with **synthetic landmark sequences** (procedurally generated, clearly flagged). They verify the pipeline's wiring and logic, not ASL accuracy.
 
@@ -168,7 +233,7 @@ backend/
     landmarks/    MediaPipe Holistic extractor, raw sequence format, batch pipeline
     features/     feature spec + normalisation/resampling/augmentation
     splits/       official / signer-holdout / signer-CV splits, leakage checks
-    models/       GRU / LSTM / TCN networks, checkpoint + predictor
+    models/       GRU / LSTM / TCN networks, checkpoint + predictor, bundled-model import
     training/     dataset loading, training loop, test evaluation
     evaluation/   metrics (top-k, macro F1, per-class, confusion, calibration curve)
     inference/    streaming recognition engine, active-model registry
@@ -181,11 +246,22 @@ frontend/
   src/mediapipe/  browser Holistic loader, overlay drawing
   src/components/ UI kit and SVG/canvas charts
   e2e/            Playwright tests
-scripts/fetch_models.py   MediaPipe model download
-docs/                     dataset, methodology, licensing, limitations, reproducibility, checklist
+models/                   pretrained WLASL100 GRU (checkpoint.pt, model.onnx, results.json)
+scripts/                  MediaPipe model download, static export, Hugging Face deployment, e2e env
+deploy/                   Hugging Face Space files (static + Docker)
+docs/                     dataset, methodology, licensing, limitations, reproducibility, checklist, screenshots
 data/  artifacts/  assets/   local only (git-ignored)
-setup.ps1  start.ps1  stop.ps1
+setup.ps1  start.ps1  stop.ps1   Windows scripts
+setup.sh   start.sh   stop.sh    Linux / macOS scripts
 ```
+
+## Limitations
+
+* Recognises **one isolated sign at a time** from a fixed 100-gloss vocabulary; it does not translate sentences or model ASL grammar.
+* The bundled model was trained on only ~5 clips per sign (524 of 2,038 WLASL100 clips could be downloaded); held-out accuracy on unseen signers is 44.3 % top-1, and live webcam accuracy is lower (lighting, camera angle, signing speed).
+* WLASL is licensed for non-commercial use only, so the model weights cannot be used in a commercial product without new training data.
+* The *Evaluation* page shows summary metrics for the bundled model; per-class tables and confusion matrices appear for models you train locally.
+* Not a substitute for a qualified interpreter. Details: [docs/LIMITATIONS.md](docs/LIMITATIONS.md).
 
 ## Documentation
 
@@ -199,7 +275,7 @@ setup.ps1  start.ps1  stop.ps1
 
 ## Licensing, attribution & citation
 
-The **code** in this repository is provided for education and research. The **WLASL dataset** is © its authors and licensed under the [Computational Use of Data Agreement (C-UDA)](https://github.com/dxli94/WLASL): academic and computational use only, **no commercial use**. This repository contains no WLASL videos; each user downloads them from the original sources. Please cite:
+The **code** in this repository is released under the [MIT licence](LICENSE). The **WLASL dataset** is © its authors and licensed under the [Computational Use of Data Agreement (C-UDA)](https://github.com/dxli94/WLASL): academic and computational use only, **no commercial use**. This repository contains no WLASL videos; each user downloads them from the original sources. Please cite:
 
 ```
 @inproceedings{li2020word,
@@ -217,9 +293,17 @@ MediaPipe © Google (Apache-2.0). Fonts: IBM Plex (SIL OFL 1.1). Icons: Lucide (
 
 The online demo is a free **static** Space: the GRU is exported to ONNX and run with ONNX Runtime Web, and the feature pipeline and recognition engine have TypeScript ports (`frontend/src/static/`) whose output is tested against the Python implementation.
 
+The export and deploy scripts need a few extra packages (ONNX, ONNX Runtime, `huggingface_hub`):
+
+```bash
+.venv/bin/pip install -r backend/requirements-deploy.txt      # Windows: .venv\Scripts\pip install -r backend\requirements-deploy.txt
+```
+
 ```bash
 python scripts/export_static.py
 ```
+
+If you have extracted landmarks for some real WLASL clips, `export_static.py` also writes a parity fixture and `npm test` then runs the TypeScript-vs-Python feature/probability parity test (otherwise that one test is skipped). Deploying needs a Hugging Face write token in `HF_TOKEN`.
 
 ```bash
 cd frontend; npm run build:static

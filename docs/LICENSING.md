@@ -1,5 +1,11 @@
 # Licensing
 
+## Project code
+
+The source code is released under the **MIT licence** (see [`LICENSE`](../LICENSE)). That licence does
+not extend to the WLASL data or to the model weights in `models/`, which are derived from WLASL and
+are therefore for non-commercial use only (C-UDA, below).
+
 ## WLASL dataset
 
 * Licensed under the **Computational Use of Data Agreement (C-UDA)** (`C-UDA-1.0.pdf` in the official repository). Read and accept it before downloading.

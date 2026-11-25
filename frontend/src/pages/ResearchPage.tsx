@@ -1,3 +1,4 @@
+import type { MouseEvent } from "react";
 import { PageHeader } from "../components/ui";
 
 const SECTIONS = [
@@ -16,16 +17,30 @@ const SECTIONS = [
   ["reproducibility", "Reproducibility"],
 ] as const;
 
+/**
+ * In-page section links. Handled in script because the browser-only build uses hash routing, where a plain
+ * "#section" link would be read as a route ("Page not found"). Focus moves to the section so keyboard and
+ * screen-reader users continue reading from there.
+ */
+function jumpTo(e: MouseEvent<HTMLAnchorElement>, id: string) {
+  const target = document.getElementById(id);
+  if (!target) return;
+  e.preventDefault();
+  target.setAttribute("tabindex", "-1");
+  target.scrollIntoView({ block: "start" });
+  target.focus({ preventScroll: true });
+}
+
 export default function ResearchPage() {
   return (
     <div className="fade-in">
       <PageHeader eyebrow="Methodology" title="Research & Documentation"
         description="How the system works, what it can and cannot do, and how to reproduce the results." />
-      <div className="grid gap-8 lg:grid-cols-[220px_minmax(0,1fr)]">
+      <div className="grid grid-cols-[minmax(0,1fr)] gap-8 lg:grid-cols-[220px_minmax(0,1fr)]">
         <nav aria-label="Sections" className="lg:sticky lg:top-20 lg:self-start">
           <ul className="flex flex-wrap gap-1 lg:flex-col">
             {SECTIONS.map(([id, label]) => (
-              <li key={id}><a href={`#${id}`} className="block rounded-md px-2.5 py-1.5 text-[13px] text-fg-2 hover:bg-ink-800 hover:text-fg">{label}</a></li>
+              <li key={id}><a href={`#${id}`} onClick={(e) => jumpTo(e, id)} className="block rounded-md px-2.5 py-1.5 text-[13px] text-fg-2 hover:bg-ink-800 hover:text-fg">{label}</a></li>
             ))}
           </ul>
         </nav>
@@ -144,7 +159,7 @@ export default function ResearchPage() {
             <li>shows reference clips only from your own local copy;</li>
             <li>credits the authors and asks users to cite the paper.</li>
           </ul>
-          <pre>{`@inproceedings{li2020word,
+          <pre tabIndex={0}>{`@inproceedings{li2020word,
   title     = {Word-level Deep Sign Language Recognition from Video:
                A New Large-scale Dataset and Methods Comparison},
   author    = {Li, Dongxu and Rodriguez, Cristian and Yu, Xin and Li, Hongdong},

@@ -1,0 +1,7 @@
+# Extra packages for the static (browser-only) export and the Hugging Face deployment scripts:
+#   scripts/export_static.py  -> onnx, onnxruntime (ONNX export + parity check)
+#   scripts/deploy_hf_static.py, scripts/build_hf_space.py -> huggingface_hub
+-r requirements.txt
+onnx>=1.16
+onnxruntime>=1.18
+huggingface_hub>=0.24

@@ -84,7 +84,7 @@ def export_experiments(db: Session = Depends(get_db)):
         s = _summary(e)
         rows.append({
             "id": e.id, "name": e.name, "status": e.status, "architecture": e.architecture, "split": e.split_name,
-            "signer_independent": None if e.split_id is None else bool(db.get(Split, e.split_id).signer_independent),
+            "signer_independent": ((e.data_summary or {}).get("split_info") or {}).get("signer_independent") if e.split_id is None else bool(db.get(Split, e.split_id).signer_independent),
             "dataset_version": e.dataset_version, "seq_len": s["seq_len"], "n_params": e.n_params, "epochs_run": s["epochs_run"],
             "val_top1": (s["val"] or {}).get("top1"), "val_top5": (s["val"] or {}).get("top5"), "val_macro_f1": (s["val"] or {}).get("macro_f1"),
             "test_top1": (s["test"] or {}).get("top1"), "test_top5": (s["test"] or {}).get("top5"), "test_macro_f1": (s["test"] or {}).get("macro_f1"),
@@ -118,7 +118,7 @@ def get_experiment(exp_id: int, db: Session = Depends(get_db)):
     return {
         **_summary(e), "config": e.config, "feature_config": e.feature_config, "data_summary": e.data_summary,
         "history": e.history, "val_metrics": e.val_metrics, "test_metrics": e.test_metrics,
-        "split": None if split is None else {
+        "split": (e.data_summary or {}).get("split_info") if split is None else {
             "name": split.name, "kind": split.kind, "signer_independent": split.signer_independent,
             "leakage_passed": (split.leakage_report or {}).get("passed"),
             "n_signers": (split.leakage_report or {}).get("n_signers"),

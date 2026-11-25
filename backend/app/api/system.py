@@ -58,8 +58,8 @@ def feature_spec():
 
 @router.get("/models/active", summary="Active recognition model")
 def active_model():
-    p, info = registry.get_predictor()
-    return info or {"experiment_id": None}
+    p, info, problem = registry.load_active()
+    return info or {"experiment_id": None, "message": problem}
 
 
 @router.get("/overview", summary="Data for the overview dashboard (all values from the database)")

@@ -5,7 +5,7 @@ import { DEFAULT_FACE_IDX, loadHolistic, toRawFrame } from "../mediapipe/holisti
 import { COLORS, HAND_CONNECTIONS, drawFrame } from "../mediapipe/draw";
 import { useApi } from "../lib/hooks";
 import { pct } from "../lib/format";
-import { Button, Card, Empty, ErrorText, Field, Notice, PageHeader, Segmented, Toggle, cx, inputCls } from "../components/ui";
+import { Button, Card, Empty, ErrorText, Field, Notice, PageHeader, ScrollRegion, Segmented, Toggle, cx, inputCls } from "../components/ui";
 import { LineChart } from "../components/charts/LineChart";
 import { HBars } from "../components/charts/Bars";
 
@@ -287,7 +287,7 @@ export default function StudioPage() {
             actions={<select className={inputCls + " h-8 w-32 text-xs"} value={comp} onChange={(e) => setComp(e.target.value as Comp)} aria-label="Component">
               <option value="right">right hand</option><option value="left">left hand</option><option value="pose">body pose</option><option value="face">face subset</option></select>}>
             {coords ? (
-              <div className="max-h-72 overflow-y-auto">
+              <ScrollRegion label="Coordinates table" className="max-h-72 overflow-y-auto">
                 <table className="w-full font-mono text-[11px]">
                   <thead className="sticky top-0 bg-ink-850 text-fg-3"><tr><th className="py-1 text-left font-medium">#</th><th className="py-1 text-left font-medium">point</th><th className="py-1 text-right font-medium">x</th><th className="py-1 text-right font-medium">y</th><th className="py-1 text-right font-medium">z</th>{comp === "pose" && <th className="py-1 text-right font-medium">vis</th>}</tr></thead>
                   <tbody>{coords.map((p, i) => (comp === "pose" && !(i in POSE_NAMES)) ? null : (
@@ -297,7 +297,7 @@ export default function StudioPage() {
                       {comp === "pose" && <td className="py-0.5 text-right">{(p[3] ?? 1).toFixed(2)}</td>}</tr>
                   ))}</tbody>
                 </table>
-              </div>
+              </ScrollRegion>
             ) : <p className="text-sm text-fg-3">Not detected in this frame — stored as missing, never filled with invented values.</p>}
           </Card>
 

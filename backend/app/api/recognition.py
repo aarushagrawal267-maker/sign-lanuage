@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
@@ -62,6 +62,17 @@ def vocabulary(db: Session = Depends(get_db)):
             "local_example": next((v.video_id for v in vs if v.status == "valid" and v.file_path and Path(v.file_path).exists()), None),
             "val": per_val.get(g.class_index), "test": per_test.get(g.class_index),
         })
+    if not out and active is not None:
+        # Annotations not loaded yet (fresh install with the pretrained model): list the glosses
+        # the active model recognises so the vocabulary is still browsable.
+        try:
+            p, _ = registry.get_predictor()
+        except Exception:  # noqa: BLE001 - an unreadable checkpoint just means no fallback list
+            p = None
+        for i, name in enumerate(p.class_names if p is not None else []):
+            out.append({"class_index": i, "gloss": name, "annotated": 0, "valid": 0, "with_landmarks": 0,
+                        "train_official": 0, "signers": 0, "variations": 0, "local_example": None,
+                        "val": per_val.get(i), "test": per_test.get(i)})
     return {"model": None if active is None else {"id": active.id, "name": active.name, "split": active.split_name,
                                                    "is_synthetic": active.is_synthetic},
             "glosses": out}
@@ -89,20 +100,26 @@ async def ws_recognize(ws: WebSocket):
     server -> {"type":"hello",...} | {"type":"state",...} | {"type":"pong"} | {"type":"error","message":...}
     """
     await ws.accept()
-    predictor, info = await asyncio.to_thread(registry.get_predictor)
+    predictor, info, problem = await asyncio.to_thread(registry.load_active)
     engine = RecognitionEngine(predictor)
-    await ws.send_json({"type": "hello", "model": info, "engine": engine.describe(),
-                        "message": None if predictor else "No active model. Train and activate a model in the Model Laboratory."})
+    await ws.send_json({"type": "hello", "model": info, "engine": engine.describe(), "message": problem})
     exp_id = info["experiment_id"] if info else None
     try:
         while True:
-            msg = await ws.receive_json()
+            try:
+                msg = await ws.receive_json()
+            except (ValueError, KeyError):  # not JSON (JSONDecodeError is a ValueError) or a binary frame
+                await ws.send_json({"type": "error", "message": "messages must be JSON objects"})
+                continue
+            if not isinstance(msg, dict):
+                await ws.send_json({"type": "error", "message": "messages must be JSON objects"})
+                continue
             kind = msg.get("type")
             if kind == "frame":
                 t0 = time.perf_counter()
                 try:
                     state = await asyncio.to_thread(engine.push, msg)
-                except ValueError as e:
+                except (ValueError, TypeError, OverflowError) as e:
                     await ws.send_json({"type": "error", "message": f"invalid frame: {e}"})
                     continue
                 state["server_ms"] = (time.perf_counter() - t0) * 1000
@@ -118,7 +135,7 @@ async def ws_recognize(ws: WebSocket):
                         engine.cfg = EngineConfig.from_dict({**engine.describe()["config"], **(msg["engine"] or {})})
                         engine.reset()
                     await ws.send_json({"type": "config_ack", "engine": engine.describe()})
-                except (ValueError, TypeError) as e:
+                except (ValueError, TypeError, OverflowError) as e:  # OverflowError: int(Infinity)
                     await ws.send_json({"type": "error", "message": f"invalid config: {e}"})
             elif kind == "reset":
                 engine.reset()
@@ -162,7 +179,7 @@ def _run_engine(predictor, seq: RawSequence, engine_cfg: dict | None) -> dict:
 @router.post("/api/analyze/video", summary="Offline analysis of a local video file (not live recognition)")
 async def analyze_video(file: UploadFile = File(...), mode: str = Form("segment"), threshold: float | None = Form(None),
                         whole_clip: bool = Form(True)):
-    predictor, info = await asyncio.to_thread(registry.get_predictor)
+    predictor, info, problem = await asyncio.to_thread(registry.load_active)
     suffix = Path(file.filename or "video.mp4").suffix or ".mp4"
     fd, tmp = tempfile.mkstemp(suffix=suffix)
     size = 0
@@ -182,6 +199,8 @@ async def analyze_video(file: UploadFile = File(...), mode: str = Form("segment"
         t0 = time.perf_counter()
         try:
             seq, fps = await asyncio.to_thread(ex.extract_video, Path(tmp))
+        except ExtractorUnavailable as e:
+            raise HTTPException(503, str(e)) from e
         except ValueError as e:
             raise HTTPException(400, f"could not read video: {e}") from e
         extract_s = time.perf_counter() - t0
@@ -200,7 +219,7 @@ async def analyze_video(file: UploadFile = File(...), mode: str = Form("segment"
         "model": info, "whole_clip": None, "stream": None,
     }
     if predictor is None:
-        result["message"] = "Landmarks extracted, but no active model is available for classification."
+        result["message"] = f"Landmarks extracted, but no model is available for classification. {problem}"
         return result
     if whole_clip:
         result["whole_clip"] = await asyncio.to_thread(_classify_whole, predictor, seq)
@@ -217,19 +236,19 @@ async def analyze_video(file: UploadFile = File(...), mode: str = Form("segment"
 
 
 class LandmarkClip(BaseModel):
-    width: int
-    height: int
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
     frames: list[dict]
 
 
 @router.post("/api/analyze/landmarks", summary="Classify a landmark clip recorded in the browser")
 def analyze_landmarks(clip: LandmarkClip):
-    predictor, info = registry.get_predictor()
+    predictor, info, problem = registry.load_active()
     if predictor is None:
-        raise HTTPException(409, "no active model")
+        raise HTTPException(409, problem)
     try:
         seq = RawSequence.from_frames(clip.frames, clip.width, clip.height)
-    except ValueError as e:
+    except (ValueError, TypeError) as e:  # TypeError: e.g. a landmark list sent as an object
         raise HTTPException(422, str(e)) from e
     res = _classify_whole(predictor, seq)
     res["quality"] = sequence_quality(seq)

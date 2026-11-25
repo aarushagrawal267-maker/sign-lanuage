@@ -19,6 +19,7 @@ _TMP = Path(tempfile.mkdtemp(prefix="slr-test-"))
 os.environ["SLR_DATA_DIR"] = str(_TMP / "data")
 os.environ["SLR_ARTIFACTS_DIR"] = str(_TMP / "artifacts")
 os.environ["SLR_DEVICE"] = "cpu"
+os.environ["SLR_IMPORT_BUNDLED_MODEL"] = "false"  # tests opt in explicitly (test_bundled_model.py)
 REPO_MODEL = ROOT.parent / "assets" / "mediapipe" / "holistic_landmarker.task"
 if REPO_MODEL.exists():
     (_TMP / "assets" / "mediapipe").mkdir(parents=True, exist_ok=True)

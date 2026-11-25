@@ -24,6 +24,7 @@ Two modes
 
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from dataclasses import asdict, dataclass
@@ -105,7 +106,10 @@ class RecognitionEngine:
         return self.predictor.recommended_threshold if self.predictor else 0.6
 
     def set_size(self, width: int, height: int) -> None:
-        self.width, self.height = int(width), int(height)
+        w, h = int(width), int(height)
+        if w <= 0 or h <= 0:  # the aspect correction in the features needs a real frame size
+            raise ValueError(f"width and height must be positive, got {w}x{h}")
+        self.width, self.height = w, h
 
     # --------------------------------------------------------------- helpers
     def _raw(self, frames: list[_Frame]) -> RawSequence:
@@ -154,6 +158,8 @@ class RecognitionEngine:
         hands = bool(not np.isnan(tmp.left[0, 0, 0]) or not np.isnan(tmp.right[0, 0, 0]))
         pose = bool(not np.isnan(tmp.pose[0, 0, 0]))
         t = float(frame.get("t", 0.0))
+        if not math.isfinite(t):  # a NaN/Infinity timestamp would stop old frames from ever leaving the buffer
+            raise ValueError(f"t must be a finite number of milliseconds, got {t}")
         f = _Frame(t, frame, hands, pose)
         self.buf.append(f)
         horizon = max(self.cfg.max_segment_ms, self.cfg.window_ms) + self.cfg.pre_roll_ms + 500

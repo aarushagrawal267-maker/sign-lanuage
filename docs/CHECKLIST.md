@@ -9,7 +9,7 @@ Verification environment for this build: Linux container (4 CPU cores, no GPU), 
 | # | Deliverable | Status | Evidence |
 |---|---|---|---|
 | 1 | Frontend | ✅ | 10 pages, typecheck + production build pass, Playwright renders every page without console errors |
-| 2 | Backend | ✅ | FastAPI, docs at `/docs`, 36 pytest tests |
+| 2 | Backend | ✅ | FastAPI, docs at `/docs`, 45 pytest tests |
 | 3 | WLASL100 acquisition pipeline | ✅/🟡 | YouTube/HTTP/ASLPro paths; failures recorded (verified with real URLs: 1 valid, 5 blocked-host failures recorded). Full download not run here (network) |
 | 4 | Dataset inventory | ✅ | per-gloss inventory API/page/CSV; verified on the real annotation file |
 | 5 | Video validation | ✅ | decode check, measured fps/resolution/duration/hash; tests with valid + corrupt files |
@@ -32,9 +32,14 @@ Verification environment for this build: Linux container (4 CPU cores, no GPU), 
 | 24 | Experiment history | ✅ | full configs, CSV export |
 | 25 | SQLite database | ✅ | |
 | 26 | API documentation | ✅ | `/docs` (HTTP 200 verified) |
-| 27 | Automated tests | ✅ | pytest 36, Vitest 8, Playwright 2 |
+| 27 | Automated tests | ✅ | pytest 45 (incl. MediaPipe extractor tests when the model and libEGL are present), Vitest 12 (11 + the TS-vs-Python parity test, which runs only when `export_static.py` has written the real-clip fixture), Playwright 3 (incl. a keyboard-only test); GitHub Actions CI in `.github/workflows/ci.yml` |
 | 28–30 | setup / start / stop scripts | ✅/🟡 | all three run successfully under PowerShell 7 (Linux); Windows-only branches (`taskkill`, `Scripts\python.exe`, `npm.cmd`, CUDA wheel) need a run on Windows |
 | 31–36 | README, dataset docs, references, licensing, limitations, reproducibility | ✅ | `README.md`, `docs/` |
+| 37 | Works from a fresh clone without training | ✅ | bundled pretrained model auto-registered + activated on first backend start (`app/models/bundled.py`, `tests/test_bundled_model.py`); `python -m app.cli import-model` |
+| 38 | Linux / macOS scripts | ✅ | `setup.sh`, `start.sh`, `stop.sh` (verified on Linux, 2026-11-24; macOS not run) |
+| 39 | LICENSE | ✅ | MIT for code; WLASL data and derived weights remain C-UDA (non-commercial) |
+| 40 | Static export dependencies | ✅ | `backend/requirements-deploy.txt` (onnx, onnxruntime, huggingface_hub); `export_static.py` + `npm run build:static` verified 2026-11-24, ONNX parity max diff < 1e-4 |
+| 41 | Continuous integration | ✅ | `.github/workflows/ci.yml`: backend pytest (CPU torch) + frontend typecheck, Vitest and build + gitleaks secret scan of the full history on every push / PR |
 
 ## Final acceptance criteria
 
@@ -54,13 +59,28 @@ Verification environment for this build: Linux container (4 CPU cores, no GPU), 
 | Model can be trained locally | ✅ (CPU, synthetic) · ⏳ WLASL100 |
 | Signer-independent evaluation where metadata permits | ✅ |
 | Model can classify actual signs | ✅ 44.3% top-1 on unseen signers (modest: ~5 training clips per sign) |
-| Live predictions from webcam input | ✅ (pipeline, synthetic model) · ⏳ meaningful predictions need a WLASL model |
+| Live predictions from webcam input | ✅ pipeline with the bundled WLASL100 model (active by default) · 🟡 accuracy with a physical webcam not measured |
 | Smoothing prevents repeated unstable text | ✅ (tests; real-clip loop produced ≈1 word per repetition) |
 | Unknown / uncertain signs handled | ✅ threshold, margin, agreement, explicit "uncertain" state |
-| Real evaluation results displayed | ✅ from stored experiment records (currently synthetic-flagged) |
+| Real evaluation results displayed | ✅ from stored experiment records (bundled model: summary metrics; locally trained models: full breakdown) |
 | Experiment history saved | ✅ |
 | Important workflows pass automated tests | ✅ |
 | Documentation explains the methodology | ✅ |
+
+## Independent re-verification (2026-11-24, Linux container, no GPU)
+
+* `./setup.sh --dev --cpu` then `./start.sh` on a fresh database: the bundled model was registered as experiment 1 and activated.
+* pytest 41 passed; Vitest 9 passed (incl. parity on 3 real clips); typecheck, `build`, `build:static` pass; Playwright 2 passed.
+* Three real WLASL BOOK clips (07068, 07069, 07070) downloaded through the app (12 of 15 attempted links failed: dead or blocked hosts). Offline *Video Analysis* classified all three as BOOK (whole-clip probability 0.92-0.96). These clips are in the model's **training** split, so this shows the pipeline works end to end, not generalisation.
+* The same clip fed as the fake camera on *Live Recognition* (backend mode and static browser-only build): statuses went waiting → collecting → inference with BOOK/FAMILY in the top-2; at the ~7 fps MediaPipe rate of a software-rendered headless browser the sign was rejected as below threshold. A real browser with GPU MediaPipe runs at much higher frame rates.
+* The videos were stored only in the git-ignored `data/` folder and were not committed.
+
+## Accessibility audit (2026-11-25, WCAG 2.1 AA)
+
+* axe-core 4.10.2 (tags wcag2a, wcag2aa, wcag21a, wcag21aa, best-practice) on all 10 pages at 1400 px and 390 px, plus states: live camera on with settings open, an expanded experiment row, the mobile menu open. Before: white text on the primary blue button (3.2:1), a horizontally scrolling table that keyboard users could not reach, an empty table header. After: 0 violations.
+* Keyboard-only walk of every page. Fixed: experiment rows opened only on mouse click (now a button with `aria-expanded`); the mobile menu did not take focus, trap Tab or close on Escape; no skip link; one page title for every view; focus stayed on the clicked link after navigation; the Video Analysis file picker had no visible focus; buttons nested inside links; the `<label>` around radio groups renamed their first option (e.g. "Architecture Architecture" instead of "GRU"); radio groups ignored arrow keys; progress bars had no name; `aria-sort` sat on the button instead of the column header.
+* Research page: section links broke the browser-only (hash-routed) build ("Page not found") and the page scrolled sideways at 320 px; both fixed.
+* Not tested: real screen readers (NVDA, JAWS, VoiceOver) and Windows high-contrast mode. Automated checks and keyboard tests do not replace them.
 
 ## Data acquired (2026-11-15)
 
@@ -74,7 +94,7 @@ Online demo (static, browser-only): https://huggingface.co/spaces/agrawalaarush0
 
 1. **Where data acquisition and training run** — allow the video hosts in this environment, or run `acquire`/`extract`/`train` on your Windows machine.
 2. **Missing videos** — submit the WLASL authors' request form, or proceed with what downloads.
-3. **Committing derived data** — whether a trained checkpoint should be committed (landmarks stay local).
+3. **Committing derived data** — decided: the trained checkpoint is committed in `models/` (landmarks stay local).
 
 ## Notes
 

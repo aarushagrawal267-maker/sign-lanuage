@@ -10,6 +10,7 @@ Run from the backend folder:  python -m app.cli <command> [options]
   train [--arch gru] [--split signer-holdout] [--epochs 80] [--seq-len 48] [--hidden 192] [--layers 2] [--activate]
   evaluate-test ID       held-out test evaluation of experiment ID (run once, after model selection)
   activate ID            make experiment ID the live recognition model
+  import-model [DIR]     register a pretrained model folder (default: models/wlasl100-gru-signer-holdout)
   seed-synthetic         TESTS ONLY: create a synthetic landmark dataset in an EMPTY data dir
 """
 
@@ -59,6 +60,9 @@ def main(argv: list[str] | None = None) -> int:
     ev.add_argument("id", type=int)
     ac = sub.add_parser("activate")
     ac.add_argument("id", type=int)
+    im = sub.add_parser("import-model")
+    im.add_argument("dir", nargs="?", help="folder with checkpoint.pt and results.json")
+    im.add_argument("--activate", action="store_true", help="make it the live model even if another one is active")
     sy = sub.add_parser("seed-synthetic")
     sy.add_argument("--classes", type=int, default=6)
     sy.add_argument("--signers", type=int, default=8)
@@ -145,6 +149,21 @@ def main(argv: list[str] | None = None) -> int:
 
         activate(args.id)
         print(f"activated experiment {args.id}")
+    elif args.cmd == "import-model":
+        from pathlib import Path
+
+        from app.inference.registry import activate
+        from app.models.bundled import DEFAULT_BUNDLED, import_bundled_model
+
+        try:
+            res = import_bundled_model(Path(args.dir) if args.dir else DEFAULT_BUNDLED)
+        except FileNotFoundError as ex:
+            print(str(ex), file=sys.stderr)
+            return 2
+        if args.activate and not res["activated"]:
+            activate(res["experiment_id"])
+            res["activated"] = True
+        print(json.dumps(res))
     elif args.cmd == "seed-synthetic":
         from sqlalchemy import func, select
 

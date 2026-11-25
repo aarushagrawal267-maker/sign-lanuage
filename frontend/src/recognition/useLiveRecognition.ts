@@ -21,6 +21,7 @@ export function useLiveRecognition(settings: LiveSettings) {
   const [socket, setSocket] = useState<"closed" | "connecting" | "open" | "error">("closed");
   const [model, setModel] = useState<ModelInfo | null>(null);
   const [modelAvailable, setModelAvailable] = useState<boolean | null>(null);
+  const [modelMessage, setModelMessage] = useState<string | null>(null);
   const [server, setServer] = useState<ServerState | null>(null);
   const [provisional, setProvisional] = useState<TopK[] | null>(null);
   const [lastResult, setLastResult] = useState<ServerState["segment_result"] | null>(null);
@@ -75,6 +76,7 @@ export function useLiveRecognition(settings: LiveSettings) {
     closeSocket();
     setSocket("connecting");
     setModelAvailable(null);
+    setModelMessage(null);
     const ws = (IS_STATIC ? new LocalRecognitionSocket() : new WebSocket(wsUrl("/api/ws/recognize"))) as WebSocket;
     wsRef.current = ws;
     ws.onopen = () => {
@@ -94,6 +96,7 @@ export function useLiveRecognition(settings: LiveSettings) {
       if (msg.type === "hello") {
         setModel(msg.model);
         setModelAvailable(!!msg.model);
+        setModelMessage(typeof msg.message === "string" ? msg.message : null);
         sendingRef.current = !!msg.model;
       } else if (msg.type === "state") {
         const st = msg as ServerState;
@@ -308,7 +311,7 @@ export function useLiveRecognition(settings: LiveSettings) {
   const status = deriveStatus({ camera, mediapipe, recognizing, paused, socket, modelAvailable, serverStatus: server?.status ?? null });
 
   return {
-    videoRef, canvasRef, status, camera, cameraError, mediapipe, delegate, recognizing, paused, socket, model, modelAvailable,
+    videoRef, canvasRef, status, camera, cameraError, mediapipe, delegate, recognizing, paused, socket, model, modelAvailable, modelMessage,
     server, provisional, lastResult, transcript, detection, metrics, videoSize,
     actions: { startCamera, stopCamera, startRecognition, stopRecognition, pause, resume, resetSequence, clearText },
   };

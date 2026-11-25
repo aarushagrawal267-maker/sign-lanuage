@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import { useId, type ButtonHTMLAttributes, type KeyboardEvent, type ReactNode } from "react";
 import { AlertTriangle, Info, Loader2 } from "lucide-react";
 
 export function cx(...c: (string | false | null | undefined)[]) {
@@ -49,22 +49,29 @@ export function Stat({ label, value, sub, tone }: { label: string; value: ReactN
 }
 
 type BtnVariant = "primary" | "secondary" | "ghost" | "danger" | "teal";
-export function Button({ variant = "secondary", size = "md", icon, loading, children, className, ...rest }: ButtonHTMLAttributes<HTMLButtonElement> & {
-  variant?: BtnVariant; size?: "sm" | "md" | "lg"; icon?: ReactNode; loading?: boolean;
-}) {
+type BtnSize = "sm" | "md" | "lg";
+/** Button styles, also used for links that look like buttons (never nest a <button> inside a link). */
+export function buttonClass(variant: BtnVariant = "secondary", size: BtnSize = "md", className?: string) {
   const v = {
-    primary: "bg-accent text-white hover:bg-[#5d99ff] border-transparent",
+    // white on #2f6bd8 = 4.98:1 (WCAG 1.4.3); the lighter accent #4c8dff only reached 3.2:1
+    primary: "bg-[#2f6bd8] text-white hover:bg-[#2563eb] border-transparent",
     teal: "bg-teal text-ink-950 hover:bg-[#46dcc9] border-transparent",
     secondary: "bg-ink-800 text-fg hover:bg-ink-700 border-ink-700",
     ghost: "bg-transparent text-fg-2 hover:bg-ink-800 hover:text-fg border-transparent",
     danger: "bg-transparent text-danger hover:bg-danger/10 border-danger/40",
   }[variant];
   const s = { sm: "h-8 px-3 text-xs gap-1.5", md: "h-9 px-3.5 text-sm gap-2", lg: "h-11 px-5 text-sm gap-2" }[size];
+  return cx("inline-flex select-none items-center justify-center rounded-lg border font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-45", v, s, className);
+}
+
+export function Button({ variant = "secondary", size = "md", icon, loading, children, className, ...rest }: ButtonHTMLAttributes<HTMLButtonElement> & {
+  variant?: BtnVariant; size?: BtnSize; icon?: ReactNode; loading?: boolean;
+}) {
   return (
     <button
       {...rest}
       disabled={rest.disabled || loading}
-      className={cx("inline-flex select-none items-center justify-center rounded-lg border font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-45", v, s, className)}
+      className={buttonClass(variant, size, className)}
     >
       {loading ? <Loader2 className="size-4 animate-spin" aria-hidden /> : icon}
       {children}
@@ -110,15 +117,29 @@ export function Empty({ icon, title, children, action }: { icon?: ReactNode; tit
   );
 }
 
-export function Progress({ value, tone = "accent" }: { value: number; tone?: "accent" | "teal" }) {
+export function Progress({ value, tone = "accent", label }: { value: number; tone?: "accent" | "teal"; label: string }) {
   return (
-    <div className="h-1.5 w-full overflow-hidden rounded-full bg-ink-700" role="progressbar" aria-valuenow={Math.round(value * 100)} aria-valuemin={0} aria-valuemax={100}>
+    <div className="h-1.5 w-full overflow-hidden rounded-full bg-ink-700" role="progressbar" aria-label={label} aria-valuenow={Math.round(value * 100)} aria-valuemin={0} aria-valuemax={100}>
       <div className={cx("h-full rounded-full transition-[width] duration-300", tone === "teal" ? "bg-teal" : "bg-accent")} style={{ width: `${Math.max(0, Math.min(1, value)) * 100}%` }} />
     </div>
   );
 }
 
-export function Field({ label, hint, children }: { label: string; hint?: ReactNode; children: ReactNode }) {
+/**
+ * Labelled form field. Wraps a single input/select in a <label>. For composite controls (radio groups, switches)
+ * pass `group`: a <label> around buttons would rename the first button and click it when the label is clicked.
+ */
+export function Field({ label, hint, children, group }: { label: string; hint?: ReactNode; children: ReactNode; group?: boolean }) {
+  const id = useId();
+  if (group) {
+    return (
+      <div role="group" aria-labelledby={`${id}-l`} aria-describedby={hint ? `${id}-h` : undefined} className="flex flex-col gap-1.5">
+        <span id={`${id}-l`} className="text-xs font-medium text-fg-2">{label}</span>
+        {children}
+        {hint && <span id={`${id}-h`} className="text-[11px] leading-snug text-fg-3">{hint}</span>}
+      </div>
+    );
+  }
   return (
     <label className="flex flex-col gap-1.5">
       <span className="text-xs font-medium text-fg-2">{label}</span>
@@ -143,19 +164,44 @@ export function Toggle({ checked, onChange, label }: { checked: boolean; onChang
 }
 
 export function Segmented<T extends string>({ value, options, onChange, ariaLabel }: { value: T; options: { value: T; label: string }[]; onChange: (v: T) => void; ariaLabel: string }) {
+  // WAI-ARIA radio group: one tab stop (the checked option); arrow keys, Home and End move and select.
+  const onKeyDown = (e: KeyboardEvent<HTMLButtonElement>, i: number) => {
+    const n = options.length;
+    const next = e.key === "ArrowRight" || e.key === "ArrowDown" ? (i + 1) % n
+      : e.key === "ArrowLeft" || e.key === "ArrowUp" ? (i - 1 + n) % n
+      : e.key === "Home" ? 0 : e.key === "End" ? n - 1 : -1;
+    if (next < 0) return;
+    e.preventDefault();
+    onChange(options[next].value);
+    const buttons = e.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>("[role=radio]");
+    buttons?.[next]?.focus();
+  };
+  const hasChecked = options.some((o) => o.value === value);
   return (
     <div role="radiogroup" aria-label={ariaLabel} className="inline-flex rounded-lg border border-ink-700 bg-ink-900 p-0.5">
-      {options.map((o) => (
+      {options.map((o, i) => (
         <button
           key={o.value}
+          type="button"
           role="radio"
           aria-checked={value === o.value}
+          tabIndex={value === o.value || (!hasChecked && i === 0) ? 0 : -1}
           onClick={() => onChange(o.value)}
+          onKeyDown={(e) => onKeyDown(e, i)}
           className={cx("rounded-md px-3 py-1 text-xs font-medium transition-colors", value === o.value ? "bg-ink-700 text-fg" : "text-fg-3 hover:text-fg")}
         >
           {o.label}
         </button>
       ))}
+    </div>
+  );
+}
+
+/** Scrollable container that keyboard users can focus and scroll (WCAG 2.1.1); announced as a named region. */
+export function ScrollRegion({ label, className, children }: { label: string; className?: string; children: ReactNode }) {
+  return (
+    <div role="region" aria-label={label} tabIndex={0} className={className}>
+      {children}
     </div>
   );
 }

@@ -56,7 +56,13 @@ class HolisticExtractor:
             min_hand_landmarks_confidence=0.5,
             min_face_detection_confidence=0.5,
         )
-        return vision.HolisticLandmarker.create_from_options(opts)
+        try:
+            return vision.HolisticLandmarker.create_from_options(opts)
+        except OSError as e:  # native library missing a system dependency (e.g. libEGL on Linux)
+            raise ExtractorUnavailable(
+                f"MediaPipe could not load its native library ({e}). On Debian/Ubuntu install the system "
+                "packages with:  sudo apt install libegl1 libgles2 libgl1"
+            ) from e
 
     def extract_frames(
         self,

@@ -8,7 +8,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="$ROOT/.venv/bin/python"
 TMP="$(mktemp -d -t slr-e2e-XXXX)"
-export SLR_DATA_DIR="$TMP/data" SLR_ARTIFACTS_DIR="$TMP/artifacts"
+export SLR_DATA_DIR="$TMP/data" SLR_ARTIFACTS_DIR="$TMP/artifacts" SLR_IMPORT_BUNDLED_MODEL=false
 cd "$ROOT/backend"
 "$PY" -m app.cli seed-synthetic >/dev/null
 "$PY" -m app.cli train --split signer-holdout --epochs 15 --hidden 64 --layers 1 --seq-len 32 --activate >/dev/null

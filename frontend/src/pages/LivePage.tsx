@@ -3,22 +3,23 @@ import { Link } from "react-router-dom";
 import {
   Camera, CameraOff, Copy, Eraser, Hand, Pause, Play, RotateCcw, Settings2, ShieldCheck, Square, User, Smile,
 } from "lucide-react";
+import { IS_STATIC } from "../api/client";
 import { useLocalStorage } from "../lib/hooks";
 import { ms, pct } from "../lib/format";
 import { DEFAULT_SETTINGS, type LiveSettings } from "../recognition/live";
 import { REJECT_REASON, STATUS, TONE_CLASS } from "../recognition/status";
 import { useLiveRecognition } from "../recognition/useLiveRecognition";
-import { Badge, Button, Card, Field, Notice, Segmented, Toggle, cx, inputCls } from "../components/ui";
+import { Badge, Button, Card, Field, Notice, ScrollRegion, Segmented, Toggle, cx, inputCls } from "../components/ui";
 import { ConfidenceRing } from "../components/charts/ConfidenceRing";
 import { HBars } from "../components/charts/Bars";
 
 function DetectionChip({ on, icon, label }: { on: boolean; icon: React.ReactNode; label: string }) {
   return (
     <span className={cx("inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-medium",
-      on ? "border-teal/40 bg-teal-soft/70 text-teal" : "border-ink-600 bg-ink-900/80 text-fg-3")}
-      aria-label={`${label} ${on ? "detected" : "not detected"}`}>
+      on ? "border-teal/40 bg-teal-soft/70 text-teal" : "border-ink-600 bg-ink-900/80 text-fg-3")}>
       {icon}
       {label}
+      <span className="sr-only">{on ? " detected" : " not detected"}</span>
     </span>
   );
 }
@@ -55,7 +56,7 @@ export default function LivePage() {
         </div>
         <div className="flex items-center gap-2 text-xs text-fg-3">
           <ShieldCheck className="size-4 text-teal" aria-hidden />
-          Video stays in your browser · only landmark coordinates are sent to the local server
+          {IS_STATIC ? "Video, landmarks and the model all stay in your browser" : "Video stays in your browser · only landmark coordinates are sent to the local server"}
         </div>
       </div>
 
@@ -154,7 +155,7 @@ export default function LivePage() {
           {showSettings && (
             <Card title="Recognition settings" subtitle="Saved in this browser. Engine changes apply immediately.">
               <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
-                <Field label="Recognition mode" hint={settings.engine.mode === "segment" ? "Classifies each complete sign between hand raise and hand drop (matches training clips)." : "Classifies a sliding window continuously with smoothing."}>
+                <Field label="Recognition mode" group hint={settings.engine.mode === "segment" ? "Classifies each complete sign between hand raise and hand drop (matches training clips)." : "Classifies a sliding window continuously with smoothing."}>
                   <Segmented ariaLabel="Recognition mode" value={settings.engine.mode} onChange={(v) => setEngine({ mode: v })}
                     options={[{ value: "segment", label: "Sign boundaries" }, { value: "sliding", label: "Sliding window" }]} />
                 </Field>
@@ -261,23 +262,29 @@ export default function LivePage() {
             {transcript.length === 0 ? (
               <p className="text-sm text-fg-3">No recognitions in this session yet.</p>
             ) : (
-              <ul className="flex max-h-56 flex-col gap-1 overflow-y-auto">
-                {[...transcript].reverse().slice(0, 20).map((t) => (
-                  <li key={t.id} className="flex items-center justify-between rounded-md px-2 py-1.5 text-sm hover:bg-ink-800">
-                    <span className="font-mono text-fg">{t.gloss.toUpperCase()}</span>
-                    <span className="flex items-center gap-3 font-mono text-xs text-fg-3">
-                      {pct(t.score, 0)}
-                      <span>{new Date(t.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
-                    </span>
-                  </li>
-                ))}
-              </ul>
+              <ScrollRegion label="Recent signs" className="max-h-56 overflow-y-auto">
+                <ul className="flex flex-col gap-1">
+                  {[...transcript].reverse().slice(0, 20).map((t) => (
+                    <li key={t.id} className="flex items-center justify-between rounded-md px-2 py-1.5 text-sm hover:bg-ink-800">
+                      <span className="font-mono text-fg">{t.gloss.toUpperCase()}</span>
+                      <span className="flex items-center gap-3 font-mono text-xs text-fg-3">
+                        {pct(t.score, 0)}
+                        <span>{new Date(t.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </ScrollRegion>
             )}
           </Card>
 
           <Card title="Model">
             {live.modelAvailable === false ? (
-              <p className="text-sm text-fg-2">No active model. <Link className="text-accent underline underline-offset-2" to="/lab">Train one in the Model Laboratory</Link> and activate it.</p>
+              live.modelMessage && !live.modelMessage.startsWith("No active model") ? (
+                <p className="text-sm text-fg-2">{live.modelMessage}</p>
+              ) : (
+                <p className="text-sm text-fg-2">No active model. <Link className="text-accent underline underline-offset-2" to="/lab">Train one in the Model Laboratory</Link> and activate it.</p>
+              )
             ) : model ? (
               <div className="flex flex-col gap-1.5 text-sm">
                 <div className="flex items-center justify-between gap-2"><span className="truncate text-fg">{model.name}</span>{model.is_synthetic && <Badge tone="warn">synthetic</Badge>}</div>
