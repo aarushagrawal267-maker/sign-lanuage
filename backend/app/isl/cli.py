@@ -635,8 +635,16 @@ def _init_path(args, work: Path) -> Path | None:
 
 
 def _eval_clip_ids(data) -> set[str]:
-    return {c.clip_id for c in data.include if data.assign.get(c.clip_id) in ("val", "test")} | {
-        c.clip_id for c in data.extra if data.extra_assign.get(c.clip_id) in ("val", "test")}
+    """Ids of every evaluation clip plus every clip in the same duplicate group (same video / landmark file /
+    near-duplicate cluster): copies that ``attach_all_sources`` dropped from training or from the evaluation side
+    are re-read by ``pretrain_clips``, so excluding by id alone let a test video reach pre-training."""
+    ids = {c.clip_id for c in data.include if data.assign.get(c.clip_id) in ("val", "test")} | {
+        c.clip_id for c in getattr(data, "extra", []) if data.extra_assign.get(c.clip_id) in ("val", "test")}
+    dedup = getattr(data, "dedup", None)
+    if dedup is not None and getattr(dedup, "parent", None):
+        groups = {dedup.group(i) for i in ids}
+        ids |= {x for x in list(dedup.parent) if dedup.group(x) in groups}
+    return ids
 
 
 def cmd_pretrain(paths: IslPaths, args) -> int:
