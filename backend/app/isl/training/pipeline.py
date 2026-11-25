@@ -116,11 +116,18 @@ CORE_LICENCES = {"include": {"licence": "CC-BY-4.0", "commercial": True},
                  "islrtc": {"licence": "GODL-India", "commercial": True, "terms": ISLRTC_TERMS}}
 
 
-def pack_licences(work: Path) -> list[dict]:
+def pack_licences(work: Path, profile: str | None = None) -> list[dict]:
     """Licence entries of a pack: only the sources that really contributed clips to this build (``sources.json``
     ``used`` counts > 0, written by the phase-2 commands), with their roles and clip counts. INCLUDE and ISLRTC are
     always named because the pack's vocabulary is built from their word lists (role ``vocabulary`` when no clip of
-    theirs was used). Without ``sources.json`` (phase-1 commands) the build used exactly INCLUDE + ISLRTC."""
+    theirs was used). Without ``sources.json`` (phase-1 commands) the build used exactly INCLUDE + ISLRTC.
+    With ``profile``, rows of sources outside that profile (left in a reused work folder by an older build, e.g.
+    WLASL before it was removed) are ignored: no current command of the profile can have read them."""
+    allowed = None
+    if profile is not None:
+        from app.isl.profiles import get_profile
+
+        allowed = set(get_profile(profile).all_sources()) | set(CORE_LICENCES)
     used = work / "sources.json"
     rows: dict[str, dict] = {}
     if used.exists():
@@ -129,7 +136,7 @@ def pack_licences(work: Path) -> list[dict]:
         except ValueError:
             doc = {}
         for name, d in sorted(doc.items()):
-            if not isinstance(d, dict):
+            if not isinstance(d, dict) or (allowed is not None and name not in allowed):
                 continue
             per_role = d.get("used")
             if per_role is None:  # sources.json of an older build: no per-role counts (unknown count = assume used)
@@ -199,11 +206,12 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
     from app.isl.training.readiness import partial_data_flag
 
     base = json.loads((PACK_DIR / "pack.json").read_text())
-    licences = pack_licences(work)
+    licences = pack_licences(work, prof.name)
     partial = partial_data_flag(work)
-    if prof.commercial and any(not x.get("commercial", False) for x in licences):
-        raise ValueError(f"refusing to build a commercial-safe pack with non-commercial sources: "
-                         f"{[x['source'] for x in licences if not x.get('commercial', False)]}")
+    # the commercial check reads every contributing row, also those outside the profile (fail closed)
+    nc = [x["source"] for x in pack_licences(work) if not x.get("commercial", False)]
+    if prof.commercial and nc:
+        raise ValueError(f"refusing to build a commercial-safe pack with non-commercial sources: {nc}")
     man = {**base, "id": PACK_IDS[prof.name], "version": PACK_VERSION + ("-smoke" if smoke else ""),
            "profile": prof.name, "feature_config": fcfg.to_dict(), "licences": licences,
            "display_name": base["display_name"] if prof.commercial else

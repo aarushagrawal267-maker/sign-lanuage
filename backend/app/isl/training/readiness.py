@@ -4,7 +4,8 @@ Two checks, both required before ``scripts/phase2_train.sh`` starts a full run:
 
 * **no ingestion job is running**: a process whose command line runs ``scripts/ingest_isl.py``,
   ``ingest_isl_pose.py``, ``ingest_isl_video.py`` (except the read-only ``status`` / ``sources`` / ``probe``
-  sub-commands) or ``isl_queue.sh``. The queue counts only until its log says "all listed sources processed":
+  sub-commands), ``ingest_isl_gated.py cislr|isign`` (not its ``--check`` access probe) or ``isl_queue.sh``.
+  The queue counts only until its log says "all listed sources processed":
   after that it only polls the gated CISLR dataset every 6 h for 14 days, which must not block training.
 * **every manifest the profile reads is complete**: rows (ok or failed) for every expected item. Expected counts
   come from the ingestion item lists (``manifests/<source>_items.json``, ``islrtc_index.json``), the GloSL id list,
@@ -25,7 +26,10 @@ from pathlib import Path
 
 from app.isl.paths import IslPaths
 
-INGEST_SCRIPTS = ("ingest_isl.py", "ingest_isl_pose.py", "ingest_isl_video.py", "isl_queue.sh")
+INGEST_SCRIPTS = ("ingest_isl.py", "ingest_isl_pose.py", "ingest_isl_video.py", "ingest_isl_gated.py",
+                  "isl_queue.sh")
+# ingest_isl_gated.py without a source, or with --check anywhere, only probes access (the queue runs that every cycle)
+GATED_SCRIPT = "ingest_isl_gated.py"
 READ_ONLY_SUBCOMMANDS = {"status", "sources", "probe", "-h", "--help"}
 QUEUE_DONE_MARK = "all listed sources processed"
 QUEUE_START_MARK = "queue start"
@@ -86,6 +90,11 @@ def ingestion_processes(proc_root: Path | None = None, queue_log: Path | None = 
             sub = argv[i + 1] if i + 1 < len(argv) else ""
             if script != "isl_queue.sh" and sub in READ_ONLY_SUBCOMMANDS:
                 break
+            if script == GATED_SCRIPT:  # iSign / CISLR conversion; "--check" (anywhere) or no source = probe only
+                rest = argv[i + 1:]
+                if "--check" in rest or not any(a in ("cislr", "isign") for a in rest):
+                    break
+                sub = next(a for a in rest if a in ("cislr", "isign"))
             blocking = not (script == "isl_queue.sh" and queue_polling_only(queue_log))
             out.append({"pid": int(d.name), "script": script, "subcommand": sub, "cmd": " ".join(argv)[:200],
                         "blocking": blocking})

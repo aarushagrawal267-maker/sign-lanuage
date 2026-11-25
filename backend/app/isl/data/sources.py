@@ -188,10 +188,20 @@ class IslrtcAdapter(_Base):
     SIGNER_GROUP = "islrtc-signer-1"
 
     def __init__(self, paths: IslPaths | None = None, vocab=None, use_trims: bool = True,
-                 include_non_index: bool = False):
+                 include_non_index: bool = False, overrides: dict[str, dict] | None = None):
         super().__init__(paths, vocab)
         self.use_trims = use_trims
         self.include_non_index = include_non_index
+        # id -> re-extracted row (``training.common.islrtc_overrides``): replaces the islrtc.jsonl row BEFORE the
+        # frame / quality filters, so a clip whose first extraction had 0 frames (opening intro, false title card)
+        # or too few hand frames is used from its re-extracted file
+        self.overrides = overrides or {}
+
+    def records(self, only_ok: bool = True) -> list[dict]:
+        rows = super().records(only_ok=only_ok)
+        if not self.overrides:
+            return rows
+        return [self.overrides.get(r.get("id"), r) for r in rows]
 
     def trims(self) -> dict[str, dict]:
         if not self.use_trims:

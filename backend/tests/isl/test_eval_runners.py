@@ -352,3 +352,29 @@ def test_e4_runs_with_both_user_sign_classifier_modes(phase2):
     assert out["penalty"]["by_k"]["k1"]["n"] == out["neutral"]["by_k"]["k1"]["n"]  # same tests, shared evidence
     p, rep = choose_user_mode(rec, clips, rec.fusion, ks=(1,))
     assert rep["chosen"] in ("penalty", "neutral") and p.user_cls_mode == rep["chosen"]
+
+
+def test_e3_and_e4_are_refused_with_a_classifier_from_another_split(phase2, tmp_path):
+    """Review fix: E1b refused a classifier trained on another split, but E3 / E4 used the same classifier and
+    still reported numbers."""
+    import shutil
+
+    import torch
+
+    from app.isl.evaluation.runners import evaluate_all
+    from app.isl.training.common import ISL_FEATURES
+
+    w, data = phase2["world"], phase2["data"]
+    work = tmp_path / "work"
+    shutil.copytree(phase2["work"], work, ignore=shutil.ignore_patterns("eval", "oneshot"))
+    ck = torch.load(work / "classifier.pt", map_location="cpu", weights_only=False)
+    ck["meta"]["split"] = "some-other-split"
+    torch.save(ck, work / "classifier.pt")
+    doc = evaluate_all(work, data, ISL_FEATURES, profile="research", smoke=True, vocab_path=w["vocab"],
+                       paths=w["paths"], out_dirs=[], e4_ks=(1,), latency_n=1)
+    p = doc["protocols"]
+    for k in ("E1b", "E3", "E4"):
+        assert p[k]["run"] is False and p[k]["reason"].startswith("refused:"), (k, p[k])
+        assert "some-other-split" in p[k]["leakage"]
+    assert doc["leakage_guards"]["classifier_refused"]
+    assert "REFUSED" in (work / "eval" / "report.md").read_text()

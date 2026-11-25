@@ -2055,3 +2055,25 @@ pack 4 / 4. What the reports show (all numbers near chance, labelled SMOKE RUN, 
 Engineer; the content is now the "What phase-2 training actually uses" table there, minus WLASL). The data guard is a
 start-of-run check: a run started with `--allow-partial` keeps its PARTIAL DATA mark even after ingestion ends; rebuild
 with `--from trim` for clean numbers.
+
+### 15.5 Adversarial review of the 15.4 fixes (Code Reviewer, 25 Nov 2026, 19:50-20:40 UTC)
+
+Every claimed fix was re-read and, where possible, checked against the real data. Confirmed: intervals below 5 signer
+groups, the readiness guard (exit 4 on real data now), the classifier split guard in E1, the computed pre-training
+exclusion, one source list (`profiles.py`), learned trim versions, the ingestion locks / memory guard / process scan,
+and the running jobs (manifests growing, no deleted-but-open files, 9.5 GB RAM available). Five real gaps, fixed with
+offline tests (`tests/isl/test_review_round2.py`, one more in `test_eval_runners.py`):
+
+| Gap | Effect | Fix |
+|---|---|---|
+| `IslrtcAdapter` dropped rows with 0 frames / failing quality **before** the `islrtc_recut` row could replace them | the 260 opening-intro / false-card clips that the recut job re-extracted never reached training (real data: 6,014 ISLRTC clips; 6,277 with the fix) | the adapter applies the recut rows first (`overrides`), `load_isl_data` passes them |
+| E3 and E4 used the classifier that E1b refused | a classifier from another split, or with no split, still produced E3 / E4 numbers | E3 / E4 are refused with E1b (`classifier_refusal`); `leakage_guards.classifier_refused` and the report say so |
+| `apply_dedup` kept every Sign Library chunk not named in `drop_ids` | chunks never checked (ingested after the `pretrain_dedup` step, outside a smoke sample, or all of them when the step found none) went into pre-training | the dedupe records `checked_ids`; unchecked chunks are dropped (`unchecked_dropped`) |
+| the readiness guard ignored `ingest_isl_gated.py` | after the queue's list is done (CISLR / iSign polling only), an iSign conversion run would not block a full run | `ingest_isl_gated.py cislr|isign` blocks; its `--check` probe does not |
+| `pack_licences` read every row of a reused `sources.json` | a source removed from the profile (e.g. WLASL) could still be named in a research pack | rows outside the profile are not listed; the commercial-safe refusal still reads every row (fails closed) |
+
+Still open (not fixed here): the Sign Library calibration uses synthetic re-cuts of the *same* OpenHands extraction, so
+its recall says nothing about matching our own MediaPipe extractions of evaluation videos against OpenHands poses (a
+different extractor and normalisation); readiness expects exactly 4,292 INCLUDE rows (published size) - if the zips
+hold fewer videos the guard never turns ready and needs a check; `choose_user_mode` picks `neutral` on any top-1 gain
+(no noise margin with as few as 30 validation takes).

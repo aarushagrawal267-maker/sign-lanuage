@@ -775,7 +775,7 @@ def cmd_pretrain_dedup(paths: IslPaths, args) -> int:
     sl = [c for c in ad.clips() if c.category == SIGN_LIBRARY] if ad is not None else []
     if not sl:
         doc = {"skipped": True, "reason": "no OpenHands Sign Library chunks in this profile's pre-training data",
-               "reliable": True, "drop_ids": [], "drop_channels": []}
+               "reliable": True, "drop_ids": [], "drop_channels": [], "checked_ids": []}
         out.write_text(json.dumps(doc, indent=1))
         _print(doc)
         return 0
@@ -786,8 +786,8 @@ def cmd_pretrain_dedup(paths: IslPaths, args) -> int:
     res = dedupe_sign_library(sl, eval_clips(data), seed=args.seed, n_calib=args.calib, progress=_log)
     doc = {**res.to_json(), "profile": profile, "split": data.split.get("name"), "sign_library_chunks_checked": len(sl)}
     out.write_text(json.dumps(doc, indent=1, default=str))
-    _print({k: v for k, v in doc.items() if k not in ("drop_ids", "within_examples", "eval_matches")}
-           | {"drop_ids": len(doc["drop_ids"])})
+    _print({k: v for k, v in doc.items() if k not in ("drop_ids", "checked_ids", "within_examples", "eval_matches")}
+           | {"drop_ids": len(doc["drop_ids"]), "checked_ids": len(doc["checked_ids"])})
     return 0
 
 

@@ -301,7 +301,7 @@ def test_apply_dedup_drops_sign_library_without_a_reliable_check():
                                                                                       None, Path("/y"))]
     keep, rep = pd.apply_dedup(clips, None)
     assert [c.clip_id for c in keep] == ["c", "g"] and rep["dropped"] == 2
-    keep, _ = pd.apply_dedup(clips, {"reliable": True, "drop_ids": ["b"], "drop_channels": []})
+    keep, _ = pd.apply_dedup(clips, {"reliable": True, "drop_ids": ["b"], "drop_channels": [], "checked_ids": ["a", "b"]})
     assert [c.clip_id for c in keep] == ["a", "c", "g"]
     keep, _ = pd.apply_dedup(clips, {"reliable": False, "drop_ids": [], "drop_channels": ["Sign_Library"]})
     assert [c.clip_id for c in keep] == ["c", "g"]

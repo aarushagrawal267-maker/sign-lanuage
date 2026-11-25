@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -165,10 +165,11 @@ class DedupResult:
     drop_ids: list[str]
     drop_channels: list[str]
     report: dict
+    checked_ids: list[str] = field(default_factory=list)  # every Sign Library chunk this check looked at
 
     def to_json(self) -> dict:
         return {"reliable": self.reliable, "drop_ids": sorted(self.drop_ids), "drop_channels": self.drop_channels,
-                **self.report}
+                "checked_ids": sorted(self.checked_ids), **self.report}
 
 
 def dedupe_sign_library(sl_clips: list, eval_clips: Iterable, *, eps: float = EPS, n_calib: int = 300, seed: int = 0,
@@ -196,7 +197,7 @@ def dedupe_sign_library(sl_clips: list, eval_clips: Iterable, *, eps: float = EP
     if not cal.get("reliable"):
         rep["decision"] = ("matcher not shown reliable on this data: the whole Sign Library channel is excluded from "
                            "pre-training")
-        return DedupResult(False, [], [SIGN_LIBRARY], rep)
+        return DedupResult(False, [], [SIGN_LIBRARY], rep, [c.clip_id for c in sl_clips])
     drop: set[str] = set()
     within = []
     idx1 = FrameIndex([(c.clip_id, vec[c.clip_id]) for c in one_min])
@@ -223,7 +224,7 @@ def dedupe_sign_library(sl_clips: list, eval_clips: Iterable, *, eps: float = EP
                 "eval_matches": ev_hits[:200], "n_eval_matches": len(ev_hits),
                 "decision": "reliable: drop the matched chunks only",
                 "seconds": round((datetime.now(UTC) - t0).total_seconds(), 1)})
-    return DedupResult(True, sorted(drop), [], rep)
+    return DedupResult(True, sorted(drop), [], rep, [c.clip_id for c in sl_clips])
 
 
 def load_dedup(path: Path) -> dict | None:
@@ -235,16 +236,24 @@ def load_dedup(path: Path) -> dict | None:
 
 def apply_dedup(clips: list, dedup: dict | None) -> tuple[list, dict]:
     """Pre-training clips minus the dropped Sign Library chunks. Without a dedupe result the whole Sign Library
-    channel is dropped (conservative default: overlap unknown)."""
-    sl = [c for c in clips if c.source == "openhands_raw" and c.category == SIGN_LIBRARY]
+    channel is dropped (conservative default: overlap unknown). A chunk the dedupe never looked at (ingested after
+    the pretrain-dedup step, left out of a smoke sample, or a result file without ``checked_ids``) is dropped too:
+    nothing says it is not a copy of an evaluation clip."""
+    def is_sl(c) -> bool:
+        return c.source == "openhands_raw" and c.category == SIGN_LIBRARY
+
+    sl = [c for c in clips if is_sl(c)]
     if not sl:
         return clips, {"sign_library_chunks": 0}
     if dedup is None:
-        keep = [c for c in clips if not (c.source == "openhands_raw" and c.category == SIGN_LIBRARY)]
+        keep = [c for c in clips if not is_sl(c)]
         return keep, {"sign_library_chunks": len(sl), "dropped": len(sl),
                       "why": "no pretrain_dedup.json: Sign Library excluded (overlap not checked)"}
     channels = set(dedup.get("drop_channels") or [])
     ids = set(dedup.get("drop_ids") or [])
-    keep = [c for c in clips if not (c.source == "openhands_raw" and (c.category in channels or c.clip_id in ids))]
+    checked = set(dedup.get("checked_ids") or [])
+    unchecked = sum(1 for c in sl if c.clip_id not in checked)
+    keep = [c for c in clips if not (c.source == "openhands_raw" and (c.category in channels or c.clip_id in ids))
+            and not (is_sl(c) and c.clip_id not in checked)]
     return keep, {"sign_library_chunks": len(sl), "dropped": len(clips) - len(keep), "reliable": dedup.get("reliable"),
-                  "why": dedup.get("decision")}
+                  "unchecked_dropped": unchecked, "why": dedup.get("decision") or dedup.get("reason")}

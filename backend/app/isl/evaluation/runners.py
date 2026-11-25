@@ -103,16 +103,32 @@ def check_classifier_split(meta: dict | None, split_name: str) -> None:
                            f"{split_name!r}: its test clips may be training clips of that model")
 
 
+def classifier_refusal(classifier, split_name: str) -> str | None:
+    """Why a recogniser's classifier may not be evaluated on ``split_name`` (None = allowed, or no classifier)."""
+    if classifier is None:
+        return None
+    try:
+        check_classifier_split(getattr(classifier, "meta", None), split_name)
+    except LeakageError as e:
+        return str(e)
+    return None
+
+
+def refused_entry(label: str, why: str, kind: str | None = None) -> dict:
+    """Protocol entry of a run refused by a leakage guard (reported instead of a number)."""
+    return {"label": label, **({"kind": kind} if kind else {}), "run": False, "n": 0, "leakage": why,
+            "reason": f"refused: {why}"}
+
+
 def e1_closed_set(rec, clips, label: str, split_name: str, kind: str) -> dict:
     """Classifier alone on ``clips``; decision = classifier probability vs the fused balanced threshold."""
     from sklearn.metrics import f1_score
 
     if rec.classifier is None:
         return {"label": label, "run": False, "reason": "no classifier"}
-    try:
-        check_classifier_split(getattr(rec.classifier, "meta", None), split_name)
-    except LeakageError as e:
-        return {"label": label, "kind": kind, "run": False, "n": 0, "leakage": str(e), "reason": f"refused: {e}"}
+    why = classifier_refusal(rec.classifier, split_name)
+    if why:
+        return refused_entry(label, why, kind)
     ids = list(rec.classifier.class_names)
     pos = {c: i for i, c in enumerate(ids)}
     sel = [c for c in clips if c.concept_id in pos]
@@ -600,9 +616,12 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
         prot["E1c"] = {"run": False, "reason": "no other labelled source has a signer-held-out test part yet (needs a "
                        "source with real signer ids and >= 6 signers, e.g. ISL500)"}
     log("E3")
-    prot["E3"] = e3_fused(rec, test_inc + extra_test, "E3 fused system (classifier + dictionary retrieval + fusion "
-                          "fitted on validation) with accept / suggest / abstain; INCLUDE test part + other sources' "
-                          "held-out signers")
+    # E3 / E4 use the same classifier as E1b: refused with it (a classifier trained on another split, or one whose
+    # split is unknown, may have seen these test clips)
+    cls_why = classifier_refusal(rec.classifier, split_name)
+    e3_label = ("E3 fused system (classifier + dictionary retrieval + fusion fitted on validation) with accept / "
+                "suggest / abstain; INCLUDE test part + other sources' held-out signers")
+    prot["E3"] = refused_entry(e3_label, cls_why) if cls_why else e3_fused(rec, test_inc + extra_test, e3_label)
     # E2 held-out-concept one-shot
     one = (paths.splits / "oneshot_concepts.json") if paths is not None else None
     fold_models = sorted((work / "oneshot").glob("fold*/encoder.pt")) if (work / "oneshot").exists() else []
@@ -655,7 +674,8 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     if e2s:
         prot["E2_seen"] = e2s
     log("E4")
-    prot["E4"] = e4_my_signs(rec, test_inc + extra_test, ks=e4_ks)
+    prot["E4"] = (refused_entry("My signs few-shot (uses the word classifier)", cls_why) if cls_why else
+                  e4_my_signs(rec, test_inc + extra_test, ks=e4_ks))
     prot["E5"] = e5_from_letters(work / "letters.pt")
     log("E6")
     prot["E6"] = e6_latency(rec, test_inc + extra_test, n=latency_n)
@@ -665,7 +685,8 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     for v in prot.values():
         for k in ("_hits", "_groups"):
             v.pop(k, None)
-    leak = {"split": split_name, "classifier_split_checked": True, "dedup": getattr(data, "multisource", {}).get("dedup"),
+    leak = {"split": split_name, "classifier_split_checked": True,
+            "classifier_refused": cls_why, "dedup": getattr(data, "multisource", {}).get("dedup"),
             "links": getattr(data, "multisource", {}).get("links"),
             "pretraining_excludes_eval_clips": pre_guard.get("excludes_eval_clips"), "pretraining_check": pre_guard}
     if smoke:
@@ -752,7 +773,8 @@ def markdown_report(doc: dict) -> str:
     pc = lg.get("pretraining_check") or {}
     lines += ["", "## Leakage guards", "",
               f"* classifier split checked: {lg.get('classifier_split_checked')} (a classifier without a recorded split "
-              "is refused)",
+              "is refused, and with it E3 and E4, which use the same classifier)"
+              + (f"; REFUSED: {lg['classifier_refused']}" if lg.get("classifier_refused") else ""),
               f"* pre-training excludes evaluation clips: {_fmt(lg.get('pretraining_excludes_eval_clips'))} "
               + (f"(computed: {pc.get('overlap')} of {pc.get('pretrain_clips')} pre-training clips are evaluation "
                  f"clips or their duplicates)" if pc.get("pretrain_clips") is not None else f"({pc.get('reason', '')})")]

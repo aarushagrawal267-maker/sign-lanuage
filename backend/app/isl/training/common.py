@@ -263,8 +263,8 @@ def load_isl_data(paths: IslPaths, vocab, profile: str = "commercial-safe", spli
     if "include" in prof.sources:
         include = list(IncludeAdapter(paths, vocab=vocab).clips())
     if "islrtc" in prof.sources:
-        islrtc, islrtc_stats = resolve_islrtc([c for c in IslrtcAdapter(paths, vocab=vocab).clips() if c.concept_id],
-                                              paths)
+        ad = IslrtcAdapter(paths, vocab=vocab, overrides=islrtc_overrides(paths))
+        islrtc, islrtc_stats = resolve_islrtc([c for c in ad.clips() if c.concept_id], paths)
     if max_islrtc and len(islrtc) > max_islrtc:
         # smoke runs: keep the dictionary clips of INCLUDE concepts first (the ones E1 / E2 / E3 evaluate), then fill
         rng = random.Random(seed)
