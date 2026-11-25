@@ -16,9 +16,11 @@
 > wrong and are labelled *smoke run* in the app. Hindi: 890 rows are hand-written, 11,552 are unreviewed machine translations,
 > 0 are teacher-checked. Full training and evaluation happen in phase 2 (`docs/ISL_DESIGN.md` sections 11 and 15).
 > Phase 2 status (25 Nov 2026): landmarks from every openly downloadable ISL source are still being ingested
-> (`docs/DATASETS_ISL.md` section 3.5; expected to finish on 26 Nov); one resumable command,
-> `scripts/phase2_train.sh --profile both`, then trains and evaluates both data profiles (estimated 1.5-2 days on 4 CPUs, not yet measured).
-> Only its smoke mode has been run so far.
+> (`docs/DATASETS_ISL.md` section 3.6: the commercial-safe sources are expected to finish on 26 Nov; the OpenHands raw
+> poses used by the research profile take days longer at the measured rate). One resumable command per profile,
+> `scripts/phase2_train.sh --profile commercial-safe|research`, refuses to start until its data is complete, then trains
+> and evaluates that profile (estimated 13-24 h each on 4 CPUs, not yet measured). Only its smoke mode has been run so far
+> (`docs/ISL_DESIGN.md` 15.6 lists the exact commands).
 
 ![Overview page](docs/screenshots/overview.png)
 

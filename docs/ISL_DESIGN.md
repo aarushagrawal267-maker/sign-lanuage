@@ -2078,4 +2078,76 @@ offline tests (`tests/isl/test_review_round2.py`, one more in `test_eval_runners
 Still open (not fixed here): the Sign Library calibration uses synthetic re-cuts of the *same* OpenHands extraction, so
 its recall says nothing about matching our own MediaPipe extractions of evaluation videos against OpenHands poses (a
 different extractor and normalisation); `choose_user_mode` picks `neutral` on any top-1 gain
-(no noise margin with as few as 30 validation takes).
+(no noise margin with as few as 30 validation takes) - fixed in 15.6.
+
+### 15.6 Final reality check before the full run (Reality Checker, 25 Nov 2026, 20:00-20:45 UTC)
+
+**Verdict: READY for the commercial-safe full run as soon as its data guard passes (estimate 26 Nov, 12:00-17:00
+UTC). The research run is ready in code but its data will not be complete for days unless the OpenHands raw job is
+stopped or fixed (one decision, below).** Nothing was trained at full settings; no ingestion job was touched.
+
+**Evidence.**
+* Backend suite: 425 passed at `5bb2c19` (20:02), **431 passed** after the fixes below (`SLR_TORCH_THREADS=2`, nice 10).
+* Fresh smoke run of both profiles (`scripts/phase2_train.sh --profile both --smoke`; the 19:03 outputs moved to
+  `artifacts/isl/phase2-smoke.run2_2002/`, stamps / logs `*.run2_2002*`): **all 19 steps, 0 failures** in both:
+  commercial-safe 20:02:16-20:15:42 UTC (13.4 min), research 20:15:46-20:29:03 (13.3 min); load average 15-20.
+  Seconds per step (commercial-safe / research): trim 231 / 162, dedup 42 / 40, vocab 15 / 14, splits 20 / 17, link
+  16 / 19, bench 20 / 11, pretrain_dedup 15 / 45, pretrain 21 / 27, encoder 39 / 27, oneshot 34 / 26, classifier
+  26 / 26, cv 28 / 28, e1a 22 / 21, fingerspell 4 / 5, index 23 / 26, fusion 98 / 118, evaluate 122 / 147,
+  index_final 27 / 35, pack 3 / 3. Trim: 6,380 clips `trim-2+trim-learned-1`, 517 learned ends, 344 clips read from
+  `islrtc_recut`, 8 truncated clips without a recut left out. Reports: every interval is `lo-hi (k groups)` with
+  k >= 5 (E1b cv pool 8 groups, research E3 6 groups) or `none: too few signer groups (k)`; `partial_data: true`
+  and the SMOKE label everywhere; pre-training excludes evaluation clips: true (computed); research Sign Library
+  dedupe not reliable with 100 controls -> whole channel excluded (the designed fallback). **fit-fusion chose
+  `user_cls_mode = neutral` from data for the first time** (4 validation groups, 87 enrolled takes: top-1 with
+  enrolment 0.126 -> 0.632, user-sign false accepts +0.008); with a near-chance smoke classifier this mostly says
+  the penalty mode buries user signs - the full run decides again. All numbers near chance, never the app's accuracy.
+* Data guard on real data: `scripts/phase2_train.sh --profile commercial-safe|research --check-only` -> exit 4 for
+  both (running jobs plus incomplete manifests: ISLRTC 6,650 / 13,665, WSLP, the queue's later sources, HF alphabet
+  listings, OpenHands raw). Ingestion rates and ETAs measured at 20:03-20:26 are in DATASETS_ISL.md 3.6.
+
+**Found and fixed (commits `a844f63`, `a0f954f`, `e744583`, `b00fe99`; tests in
+`backend/tests/isl/test_readiness_retry.py`):**
+
+| Gap | Effect | Fix |
+|---|---|---|
+| readiness counted every failed row as attempted | a download that failed in the job's last pass (curl / HF 429, written as `ok: false`), or the 3 `superseded` Mendeley rows, would pass as "complete" while the next run would redo them | rows whose last record is `fetch: ...`, `download failed ...` or `superseded ...` count as missing (`retry_pending`); permanent failures (ISL500 without WholeBody) still count |
+| a public source with no rows and no item list was "not available" | the two HF alphabet sets, whose listings failed with 429 / 503 in the probe runs: if the queue gives up on them (5 tries) the guard would have passed silently | incomplete ("listing failed or never run"); only CISLR / iSign are "unavailable" |
+| any ingestion process blocked every profile | the OpenHands raw job (research only, days from its end, DATASETS 3.6) would have held back the commercial-safe run too | a job of one known source blocks only the profiles that read it; `ingest_isl.py`, the queue and unknown jobs still block all |
+| `build-pack` copied `<work>/results.json` | phase-2 work folders have no such file (the report is `eval/report.json`), so a phase-2 pack served no results to the app; and the full run reuses `artifacts/isl/commercial-safe/`, which still holds the **phase-1 smoke** `results.json` of 11:57 - the full pack would have shipped and served it | the pack's `results.json` is the phase-2 report when one exists (verified on both smoke packs: identical to `eval/report.json`) |
+| `choose_user_mode` picked `neutral` on any top-1 gain | one lucky take of 30 decided the mode | needs a gain >= 0.02 **and** >= 2 more correct enrolled takes |
+
+**Still open (not blocking the commercial-safe run):**
+* **OpenHands raw reads about 30 MB per 130-frame chunk** (10.7 chunks/min, 5-8 MB/s fetched; 84,129 ISH News
+  `sub_based` chunks left, then MBM), so its job, and with it research readiness, would end around 1-2 Dec or later.
+  Ingestion owner: make it read in data-address order / keep the inflated window; or the main session stops it
+  (SIGINT, resumable) and accepts the 16.7k chunks already ingested (all four channels are represented).
+* Frontend (`LanguageEvaluation.tsx`) renders the phase-1 protocol names: with a phase-2 report it shows E2, E3
+  and E6 but not E1a/b/c, E4, E5, E7, E8, the interval reasons or a `partial_data` warning (only `smoke` gets a
+  notice). A `--allow-partial` pack would therefore not be flagged in the UI; do not ship one.
+* Carried over: the Sign Library eval-clip matching is uncalibrated across extractors (15.5); GloSL / NIOS / ISH
+  News not content-checked against evaluation clips; a recut that lands after the trim step is used untrimmed until
+  the next trim; the learned trim end (`artifacts/isl/trim_boundary.pt`) was trained at 16:20 on 4,832 clips.
+
+**Commands for the main session, in order** (from the repository root; never start a second copy of a running job):
+
+1. Ingestion is complete for a profile when
+   `scripts/phase2_train.sh --profile commercial-safe --check-only; echo $?` prints 0 (same for `research`).
+   The signs behind it: `data/isl/logs/islrtc.log` ends with `islrtc done: total ok ...`; `islrtc_recut.log` with
+   `islrtc-recut: finished`; `queue.log` contains `all listed sources processed`; `pgrep -af 'scripts/ingest_isl'`
+   shows no job for a source of the profile; `artifacts/isl/<profile>/data_readiness.json` lists no reasons.
+   If the queue gave up on a source (`queue.log`: `giving up`), re-run that one source, e.g.
+   `nice -n 10 .venv/bin/python scripts/ingest_isl_video.py run hf_akrit_alphabet --workers auto --min-free-gb 10`,
+   then check again.
+2. Move the phase-1 smoke work folder aside (classifier / encoder / index / results of 25 Nov 11:57):
+   `mv artifacts/isl/commercial-safe artifacts/isl/commercial-safe.phase1_1157`
+3. Commercial-safe full run (about 13-24 h, 15.2; resumable - re-run the same command after any stop):
+   `nohup scripts/phase2_train.sh --profile commercial-safe --threads 4 >> data/isl/logs/phase2_driver.out 2>&1 &`
+   Progress: `scripts/phase2_train.sh --profile commercial-safe --list`, `data/isl/logs/phase2_commercial-safe.log`.
+4. Research: decide on OpenHands raw (above). If stopping it: `kill -INT $(pgrep -f 'ingest_isl_pose.py openhands-raw')`,
+   wait until it has exited, then `scripts/phase2_train.sh --profile research --check-only` must print 0, and, after
+   the commercial-safe run has finished (one profile at a time; both write the shared ISLRTC trims):
+   `nohup scripts/phase2_train.sh --profile research --threads 4 >> data/isl/logs/phase2_driver.out 2>&1 &`
+5. After each run: read `artifacts/isl/<profile>/eval/report.md` (it must not say PARTIAL DATA or SMOKE), then the
+   15.1 follow-ups (commit the reviewed vocabulary, Hindi for new concepts, pack size decision). Never use
+   `--allow-partial` for a pack that is shipped.
