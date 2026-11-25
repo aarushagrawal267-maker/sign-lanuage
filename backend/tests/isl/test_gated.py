@@ -191,7 +191,7 @@ def test_pose_to_raw_mapping(version):
     face_src = data[2, 0, 33:33 + 468][FACE_IDX]
     np.testing.assert_allclose(raw.face[2, :, 0], face_src[:, 0] / 1280, rtol=1e-5)
     assert np.isnan(raw.left[3]).all() and np.isnan(raw.left[4]).all() and not np.isnan(raw.left[5]).any()
-    np.testing.assert_allclose(raw.right[0, :, 2], data[0, 0, 33 + 468 + 21:, 2] / 1280, rtol=1e-5)
+    np.testing.assert_allclose(raw.right[0, :, 2], data[0, 0, 33 + 468 + 21:, 2], rtol=1e-5)  # raw z
     np.testing.assert_allclose(np.diff(raw.t_ms), 40.0)
     swapped = isign_mod.pose_to_raw(buf, swap_hands=True)
     np.testing.assert_allclose(swapped.left[0], raw.right[0])

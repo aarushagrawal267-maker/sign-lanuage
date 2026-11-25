@@ -21,10 +21,10 @@ Pose-format -> ``RawSequence`` mapping (``pose_to_raw``):
 =====================  ==========================  ============================================
 pose-format component   points                      RawSequence field
 =====================  ==========================  ============================================
-POSE_LANDMARKS          33, XYZC (pixels)           ``pose`` (x/W, y/H, z/W, confidence as visibility)
-LEFT_HAND_LANDMARKS     21, XYZC                    ``left`` (x/W, y/H, z/W); confidence 0 -> NaN frame
+POSE_LANDMARKS          33, XYZC (pixels)           ``pose`` (x/W, y/H, z, confidence as visibility)
+LEFT_HAND_LANDMARKS     21, XYZC                    ``left`` (x/W, y/H, z); confidence 0 -> NaN frame
 RIGHT_HAND_LANDMARKS    21, XYZC                    ``right``
-FACE_LANDMARKS          468 (or 478), XYZC          ``face`` = points ``FACE_IDX`` (x/W, y/H, z/W)
+FACE_LANDMARKS          468 (or 478), XYZC          ``face`` = points ``FACE_IDX`` (x/W, y/H, z)
 POSE_WORLD_LANDMARKS    33 (optional)               ignored
 =====================  ==========================  ============================================
 
@@ -196,7 +196,8 @@ def pose_to_raw(buf: bytes, person: int = 0, swap_hands: bool = False) -> RawSeq
         out = np.full(block.shape[:2] + (3,), np.nan)
         out[..., 0] = block[..., 0] / W
         out[..., 1] = block[..., 1] / H
-        out[..., 2] = block[..., 2] / W if dims >= 3 else 0.0
+        # pose-format's Holistic writer stores raw MediaPipe z (x * W, y * H, z), as our extractor does
+        out[..., 2] = block[..., 2] if dims >= 3 else 0.0
         return out
 
     def comp(names, n_expected):

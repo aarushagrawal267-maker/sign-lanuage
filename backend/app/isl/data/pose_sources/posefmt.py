@@ -1,7 +1,7 @@
 """pose-format (MediaPipe Holistic) -> ``RawSequence``, matching ``HolisticExtractor`` (app/landmarks/extractor.py).
 
-Reuses the dependency-free reader ``app.isl.data.isign.read_pose`` (pose-format v0.1 / v0.2). Differences from
-``isign.pose_to_raw`` (kept unchanged for the iSign job):
+Reuses the dependency-free reader ``app.isl.data.isign.read_pose`` (pose-format v0.1 / v0.2). Same mapping as
+``isign.pose_to_raw`` (whose z/W scaling was fixed to raw z in the phase-2 review), plus:
 
 * **z is not divided by the width.** pose-format's own Holistic writer (``pose_format.utils.holistic``)
   stores ``x * width, y * height, z`` (raw MediaPipe z), and the GloSL card says "z raw". Our extractor stores
