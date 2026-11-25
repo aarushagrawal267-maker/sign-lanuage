@@ -292,8 +292,10 @@ needed hundreds of restarts, which is why the first run was restarted at 14:57 U
 the datasets and their object-header addresses with h5py (one streaming pass; the list is cached in
 `raw/openhands_raw/<member>.index.json`), pass 2 parses each small version-1 object header itself and reads the data
 in address order. Network cost about twice the compressed size; no temp files; peak memory about 0.5 GB. Chunks of a
-video already ingested from another file of the same channel (Sign Library ships `1_min_splits` and `sub_based`) are
-skipped. Zips are processed smallest first until `landmarks/openhands_raw/` reaches `--budget-gb` (12 GB): at about
+video already ingested from another file of the same channel are skipped. Sign Library ships two files: `1_min_splits`
+(374 chunks of 76 named YouTube videos, 6.8 h at 25 fps, ingested first) and `sub_based` (9,582 chunks named by
+hashes, about 28 h): the names cannot be matched, so up to 6.8 h may be ingested twice; deduplicate by pose content
+before pre-training (open issue). Zips are processed smallest first until `landmarks/openhands_raw/` reaches `--budget-gb` (12 GB): at about
 360 B per stored frame that is roughly Sign Library + NIOS + ISH News and part of MBM Vadodara (estimate).
 
 **GloSL and iSign overlap.** The GloSL `id` is the iSign / ISLTranslate `uid`: 30,648 of the 31,221 public
@@ -431,7 +433,8 @@ python -m app.isl.cli hindi --merge-local            # fold reviewed local Hindi
   OpenHands raw corpus (CC BY label on third-party YouTube content) and fingerspelling set before any commercial use;
   ISL500 signs were recorded in Goa and 14 of its 500 words link only through a synonym / domain rule or not at all
   (`derived/isl500_links.jsonl`), so check sign forms against ISLRTC before mixing them into one class; frame aspect
-  of GloSL / OpenHands is a hand-bone estimate (about +-10 %).
+  of GloSL / OpenHands is a hand-bone estimate (about +-10 %); Sign Library's two OpenHands files may overlap by up
+  to 6.8 h (hash-named chunks in `sub_based`), deduplicate by content before pre-training.
 * `isign.pose_to_raw` divides z by the frame width, but pose-format's Holistic writer stores raw MediaPipe z (and our
   extractor stores raw z): fix it (or use `pose_sources.posefmt.holistic_pose_to_raw`) before the iSign job runs.
 
