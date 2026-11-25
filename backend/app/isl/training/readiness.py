@@ -10,7 +10,10 @@ Two checks, both required before ``scripts/phase2_train.sh`` starts a full run:
 * **every manifest the profile reads is complete**: rows (ok or failed) for every expected item. Expected counts
   come from the ingestion item lists (``manifests/<source>_items.json``, ``islrtc_index.json``), the GloSL id list,
   or the published dataset sizes. Gated sources without access (CISLR, iSign) are "unavailable", not incomplete;
-  OpenHands raw is budget-limited, so it is complete once its job has ended.
+  OpenHands raw is budget-limited, so it is complete once its job has ended. A failed row counts as attempted only
+  when its failure is permanent: rows whose last record is a download / fetch failure or a ``superseded`` marker are
+  retried by the next ingestion run, so they count as missing. A public source with no rows and no item list (its
+  listing failed, e.g. Hugging Face 429 / 503, and the queue gave up) is incomplete, not "not available".
 
 ``--allow-partial`` overrides the check; the run is then marked with ``<work>/partial_data.json`` (sticky: every
 later step, report and pack of that work folder says PARTIAL DATA until the work folder is rebuilt from the first
@@ -46,6 +49,9 @@ BUDGET_LIMITED = ("openhands_raw",)  # ingested up to a disk budget: complete wh
 # items file of a source when it differs from "<source>_items.json" (manifest shared with another source)
 ITEMS_FILE = {"wslp_unlabelled": "wslp_unlabelled_items.json"}
 MANIFEST_OF = {"wslp_unlabelled": "wslp"}
+# failures the next ingestion run retries (video engine "fetch: ...", ingest_isl.py "download failed: ...", rows
+# marked "superseded: ... re-extract"): such an item has not really been attempted yet
+RETRY_ERROR_PREFIXES = ("fetch:", "download failed", "superseded")
 
 
 # --------------------------------------------------------------------------------------------- processes
@@ -120,8 +126,9 @@ def _ids_of_items(path: Path) -> set[str] | int | None:
 
 
 def _manifest_ids(path: Path) -> tuple[set[str], set[str]]:
-    """(all ids, ok ids) of a manifest (last row per id wins, like ``read_manifest``)."""
-    last: dict[str, bool] = {}
+    """(attempted ids, ok ids) of a manifest (last row per id wins, like ``read_manifest``). An id whose last row
+    is a retryable failure (:data:`RETRY_ERROR_PREFIXES`) is not attempted yet: the next ingestion run redoes it."""
+    last: dict[str, bool | None] = {}  # True ok, False permanent failure, None retryable failure
     if not path.exists():
         return set(), set()
     with path.open(encoding="utf-8", errors="replace") as fh:
@@ -131,8 +138,29 @@ def _manifest_ids(path: Path) -> tuple[set[str], set[str]]:
             except ValueError:
                 continue  # a line being written right now
             if isinstance(r, dict) and r.get("id"):
-                last[r["id"]] = bool(r.get("ok"))
-    return set(last), {k for k, v in last.items() if v}
+                if r.get("ok"):
+                    last[r["id"]] = True
+                else:
+                    err = str(r.get("error") or "").lstrip().lower()
+                    last[r["id"]] = None if err.startswith(RETRY_ERROR_PREFIXES) else False
+    return {k for k, v in last.items() if v is not None}, {k for k, v in last.items() if v}
+
+
+def _retry_count(path: Path) -> int:
+    """Ids whose last row is a retryable failure (reported so a stuck download is visible)."""
+    if not path.exists():
+        return 0
+    last: dict[str, bool] = {}
+    with path.open(encoding="utf-8", errors="replace") as fh:
+        for ln in fh:
+            try:
+                r = json.loads(ln)
+            except ValueError:
+                continue
+            if isinstance(r, dict) and r.get("id"):
+                last[r["id"]] = (not r.get("ok")) and str(r.get("error") or "").lstrip().lower().startswith(
+                    RETRY_ERROR_PREFIXES)
+    return sum(last.values())
 
 
 def expected_items(paths: IslPaths, name: str) -> tuple[set[str] | int | None, str]:
@@ -161,7 +189,7 @@ def source_status(paths: IslPaths, name: str, running_scripts: set[str] | None =
     ids, ok = _manifest_ids(man)
     exp, how = expected_items(paths, name)
     st = {"source": name, "manifest": man.name, "rows": len(ids), "ok": len(ok), "failed": len(ids) - len(ok),
-          "expected_from": how}
+          "retry_pending": _retry_count(man), "expected_from": how}
     if name == "include":
         zf = paths.manifests / "include_zips_done.txt"
         zdone = len(set(zf.read_text().split())) if zf.exists() else 0
@@ -185,7 +213,14 @@ def source_status(paths: IslPaths, name: str, running_scripts: set[str] | None =
     if not ids and name in GATED:
         st.update(complete=None, note="gated: no access yet (unavailable, not incomplete)")
     elif not ids and st.get("expected") is None:
-        st.update(complete=None, note="no manifest and no item list (source not available)")
+        # a public source: its listing failed (e.g. HF 429 / 503) or it was never run; training without it must be
+        # a decision (--allow-partial), not a silent default
+        st.update(complete=False, note="nothing ingested and no item list (listing failed or never run)")
+    if st["retry_pending"] and st.get("complete"):
+        st["complete"] = False
+    if st["retry_pending"]:
+        st["note"] = (st.get("note", "") + "; " if st.get("note") else "") + \
+            f"{st['retry_pending']} download / superseded rows to retry (re-run the source)"
     return st
 
 
