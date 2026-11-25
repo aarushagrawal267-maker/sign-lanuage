@@ -24,8 +24,9 @@ Conversion (:func:`isl500_to_raw`, ``extractor_version = "isl500-mphands+mmpose-
 * face: the app's 20 ``FACE_IDX`` mesh points from their iBUG-68 equivalents (z = 0), present when the mean
   face score >= 0.3;
 * pixel -> normalised with the frame size estimated per clip from the two hand estimates of the same hand
-  (WholeBody pixels / MediaPipe normalised), snapped to a standard size within 6 %, else the user's last good
-  size, else 2560x1440 (the released videos' size).
+  (WholeBody pixels / MediaPipe normalised), snapped to a standard size within 6 %, else the signer's usual
+  size, else 2560x1440 (the released videos' size). The fallback is deterministic (:func:`signer_size`: the
+  signer's most common estimate over all their clips, applied in a second pass after every estimate is known).
 
 Parity check on ``USER001/Absent__session106__clip014`` (our ``HolisticExtractor`` on the released MP4, same
 166 frames, error in shoulder widths): hands 0.012-0.019; nose / shoulders / elbows 0.02-0.05; wrists
@@ -127,6 +128,36 @@ def estimate_size(hands: np.ndarray, wb: np.ndarray, min_frames: int = 3) -> tup
         if abs(w / sw - 1) < 0.06 and abs(h / sh - 1) < 0.06:
             return sw, sh
     return None
+
+
+def signer_size(counts: dict[tuple[int, int], int]) -> tuple[int, int]:
+    """Deterministic per-signer fallback frame size: the most common hand-based estimate; ties go to the size
+    listed first in ``STANDARD_SIZES`` (then the smaller size); :data:`DEFAULT_SIZE` without estimates."""
+    if not counts:
+        return DEFAULT_SIZE
+    rank = {sz: i for i, sz in enumerate(STANDARD_SIZES)}
+    return min(counts, key=lambda sz: (-counts[sz], rank.get(tuple(sz), len(rank)), tuple(sz)))
+
+
+class SignerSizes:
+    """Thread-safe counts of hand-based size estimates per signer; :meth:`fallback` -> (size, ``size_from``)."""
+
+    def __init__(self):
+        import threading
+        from collections import Counter
+
+        self._c: dict[str, Counter] = {}
+        self._lock = threading.Lock()
+        self._Counter = Counter
+
+    def add(self, user: str, size: tuple[int, int]) -> None:
+        with self._lock:
+            self._c.setdefault(user, self._Counter())[(int(size[0]), int(size[1]))] += 1
+
+    def fallback(self, user: str) -> tuple[tuple[int, int], str]:
+        with self._lock:
+            counts = dict(self._c.get(user) or {})
+        return (signer_size(counts), "user") if counts else (DEFAULT_SIZE, "default")
 
 
 def isl500_to_raw(hands: np.ndarray, wb: np.ndarray, size: tuple[int, int], fps: float = 30.0) -> RawSequence:

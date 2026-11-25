@@ -140,9 +140,19 @@ def fetch_small(url: str, dest: Path) -> Path:
     return dest
 
 
+MEM: common.MemoryGuard | None = None  # set in main() (--max-rss-gb)
+
+
+def mem_check(force: bool = False) -> None:
+    if MEM is not None:
+        MEM.check(force=force)
+
+
 def run_pool(items, worker, workers: int, guard: common.DiskGuard, label: str, log_every: int = 500) -> dict:
-    """Run ``worker(item) -> record`` over ``items`` with a bounded in-flight window; stops on DiskFull."""
-    stats = {"processed": 0, "ok": 0, "failed": 0, "stopped": None}
+    """Run ``worker(item) -> record`` over ``items`` with a bounded in-flight window; stops on DiskFull or when
+    the memory guard (``--max-rss-gb``) trips (``stats["stopped"]`` starts with ``memory:`` then). A record
+    with ``deferred: true`` was not written and is counted separately."""
+    stats = {"processed": 0, "ok": 0, "failed": 0, "deferred": 0, "stopped": None}
     t0 = time.time()
     it = iter(items)
     with ThreadPoolExecutor(workers) as pool:
@@ -152,9 +162,15 @@ def run_pool(items, worker, workers: int, guard: common.DiskGuard, label: str, l
             while not exhausted and len(running) < workers * 3:
                 try:
                     guard.check()
+                    mem_check()
                 except common.DiskFull as e:
                     stats["stopped"] = str(e)
                     log.error("%s: stopping: %s", label, e)
+                    exhausted = True
+                    break
+                except common.MemoryCap as e:
+                    stats["stopped"] = f"memory: {e}"
+                    log.error("%s: stopping for memory (resumable, exit %d): %s", label, common.EXIT_MEMORY, e)
                     exhausted = True
                     break
                 try:
@@ -167,13 +183,18 @@ def run_pool(items, worker, workers: int, guard: common.DiskGuard, label: str, l
             for f in done:
                 rec = f.result()
                 stats["processed"] += 1
-                stats["ok" if rec.get("ok") else "failed"] += 1
+                stats["deferred" if rec.get("deferred") else "ok" if rec.get("ok") else "failed"] += 1
                 if stats["processed"] % log_every == 0:
                     rate = stats["processed"] / max(1e-6, time.time() - t0)
                     log.info("%s: %d processed (%d ok, %d failed) %.1f/s, free %.1f GB", label, stats["processed"],
                              stats["ok"], stats["failed"], rate, common.free_gb(DATA))
     log.info("%s: finished this run: %s", label, stats)
     return stats
+
+
+def stop_code(stats: dict) -> int:
+    s = str(stats.get("stopped") or "")
+    return common.EXIT_MEMORY if s.startswith("memory") else 3 if s else 0
 
 
 def stride_info(fps: float, target: float) -> int:
@@ -243,7 +264,7 @@ def run_glosl(args) -> int:
         return rec
 
     stats = run_pool(todo, work, args.workers, guard, "glosl")
-    return 3 if stats["stopped"] else 0
+    return stop_code(stats)
 
 
 # --------------------------------------------------------------------------------------------- ISL500
@@ -308,11 +329,15 @@ def run_isl500(args) -> int:
         fetch_small(hf_file(isl500.REPO, f, sha), raw_dir / Path(f).name)
     h5_files, pose_idx = isl500_index(sha, raw_dir)
     pd = read_pd_splits(raw_dir)
-    sizes: dict[str, tuple[int, int]] = {}
-    for r in read_manifest(man.path, only_ok=True):  # per-user fallback frame size from earlier runs
+    # Per-signer fallback frame size = the most common size estimated from the hands over ALL of that signer's
+    # clips (isl500.signer_size), applied only after every clip of the run has been estimated: clips without an
+    # estimate are deferred to a second pass, so the result no longer depends on which thread finished first.
+    sizes = isl500.SignerSizes()
+    prior_ok = read_manifest(man.path, only_ok=True)
+    for r in prior_ok:
         if r.get("size_from") == "hands":
-            sizes[r["user"]] = (r["width"], r["height"])
-    items = []
+            sizes.add(r["user"], (r["width"], r["height"]))
+    items, all_items = [], []
     seen = set()
     for x in sorted(h5_files, key=lambda x: x["path"]):
         parts = x["path"].split("/")
@@ -322,18 +347,17 @@ def run_isl500(args) -> int:
         if cid in seen:
             continue
         seen.add(cid)
+        all_items.append((cid, user, key, x["path"], pose_idx.get((user, key), [])))
         if cid in man.done:
             continue
-        items.append((cid, user, key, x["path"], pose_idx.get((user, key), [])))
+        items.append(all_items[-1])
     if args.limit:
         items = items[: args.limit]
     log.info("isl500: %d h5 clips, %d with MMPose, %d to process (revision %s)", len(seen),
              sum(1 for k in {(isl500.user_of(x['path'].split('/')[2]), isl500.clip_key(Path(x['path']).stem)) for x in h5_files} if k in pose_idx),
              len(items), sha[:12])
     guard = common.DiskGuard(DATA, min_free_gb=args.min_free_gb, every=100)
-    size_lock = threading.Lock()
-
-    def work(item) -> dict:
+    def work(item, fallback: bool = False) -> dict:
         cid, user, key, h5_path, npys = item
         t0 = time.time()
         out = out_dir / user / (common.safe_name(key) + ".npz")
@@ -365,13 +389,11 @@ def run_isl500(args) -> int:
             size = isl500.estimate_size(hands, wb)
             if size is not None:
                 rec["size_from"] = "hands"
-                with size_lock:
-                    sizes[user] = size
+                sizes.add(user, size)
+            elif not fallback:
+                return {"id": cid, "deferred": True}  # second pass, once the signer's sizes are all known
             else:
-                with size_lock:
-                    size = sizes.get(user)
-                rec["size_from"] = "user" if size else "default"
-                size = size or isl500.DEFAULT_SIZE
+                size, rec["size_from"] = sizes.fallback(user)
             seq = isl500.isl500_to_raw(hands, wb, size, fps)
             stride = common.stride_for(fps, args.target_fps)
             saved = common.save_compact(seq, out, dtype=args.dtype, stride=stride)
@@ -386,8 +408,32 @@ def run_isl500(args) -> int:
         man.add(rec)
         return rec
 
-    stats = run_pool(items, work, args.workers, guard, "isl500")
-    return 3 if stats["stopped"] else 0
+    deferred_ids: set[str] = set()
+    base_work = work
+
+    def first_pass(item) -> dict:
+        rec = base_work(item)
+        if rec.get("deferred"):
+            deferred_ids.add(rec["id"])
+        return rec
+
+    stats = run_pool(items, first_pass, args.workers, guard, "isl500")
+    if stats["stopped"]:
+        return stop_code(stats)  # deferred clips have no manifest row: the next run retries them
+    # fallback pass: deferred clips + earlier fallback rows whose size differs from the deterministic one
+    by_id = {it[0]: it for it in all_items}
+    redo = [by_id[c] for c in sorted(deferred_ids) if c in by_id]
+    for r in prior_ok:
+        if r.get("size_from") in ("user", "default") and r["id"] in by_id:
+            want, _ = sizes.fallback(r["user"])
+            if (r.get("width"), r.get("height")) != tuple(want) and r["id"] not in deferred_ids:
+                redo.append(by_id[r["id"]])
+    if redo:
+        log.info("isl500: %d clips without a hand-based size estimate: second pass with the per-signer size %s",
+                 len(redo), {u: sizes.fallback(u)[0] for u in sorted({it[1] for it in redo})})
+        stats2 = run_pool(redo, lambda it: base_work(it, fallback=True), args.workers, guard, "isl500-fallback")
+        return stop_code(stats2)
+    return 0
 
 
 def run_isl500_links(args) -> int:
@@ -422,6 +468,7 @@ def run_openhands_raw(args) -> int:
 
     import h5py
 
+    from app.isl.data.pose_sources import zran
     from app.isl.data.remote import RangeFile
 
     out_dir = DATA / "landmarks" / "openhands_raw"
@@ -455,16 +502,28 @@ def run_openhands_raw(args) -> int:
                 continue
             try:
                 guard.check(force=True)
+                mem_check(force=True)
             except common.DiskFull as e:
                 log.error("openhands-raw: stopping: %s", e)
                 return 3
+            except common.MemoryCap as e:
+                log.error("openhands-raw: stopping for memory (resumable, exit %d): %s", common.EXIT_MEMORY, e)
+                return common.EXIT_MEMORY
             reader = openhands.PrefetchReader(lambda s, e, u=url: openhands.range_fetch(u, s, e), z["size"],
                                               block=8 << 20, ahead=args.workers)
             try:
                 start, csize, usize, method = openhands.zip_member_span(reader, info)
                 if method != 8:
                     raise OSError(f"unsupported zip method {method}")
-                stream = openhands.SeekableInflate(reader, start, csize, usize)
+                # access points persisted next to the dataset index: a restart seeks to the point before its
+                # next chunk instead of re-inflating the member from byte 0 (NIOS: 11 GB of downloads)
+                pts = zran.PointFile(raw_dir / (common.safe_name(mkey) + ".points"), mkey, csize, usize)
+                stream = openhands.SeekableInflate(reader, start, csize, usize, points_file=pts)
+                if stream.points_loaded:
+                    log.info("openhands-raw: %s: %d restore points loaded (up to %.2f GB of %.2f GB inflated)", mkey,
+                             stream.points_loaded, stream.persisted_out / 1e9, usize / 1e9)
+                elif not stream.native:
+                    log.warning("openhands-raw: libz not available: restore points are not persisted")
                 idx_file = raw_dir / (common.safe_name(mkey) + ".index.json")
                 if idx_file.exists():
                     entries = [tuple(e) for e in json.loads(idx_file.read_text())]
@@ -488,6 +547,9 @@ def run_openhands_raw(args) -> int:
             except common.DiskFull as e:
                 log.error("openhands-raw: stopping: %s", e)
                 return 3
+            except common.MemoryCap as e:
+                log.error("openhands-raw: stopping for memory (resumable, exit %d): %s", common.EXIT_MEMORY, e)
+                return common.EXIT_MEMORY
             finally:
                 reader.close()
             if args.limit and n_new >= args.limit:
@@ -507,6 +569,17 @@ def _openhands_member(args, stream, entries, channel, mkey, member, man, out_dir
     n = 0
     t0 = time.time()
     stride = common.stride_for(openhands.ASSUMED_FPS, args.target_fps)
+
+    def relief() -> None:  # memory guard: page cache, metadata pages (pass 2 reads headers directly), read-ahead
+        stream.pages.clear()
+        stream.meta.clear()
+        stream.meta_bytes = 0
+        stream.meta_cap = 0
+        stream.r.ahead = max(2, stream.r.ahead // 2)
+        hdr_cache.clear()
+
+    if MEM is not None:
+        MEM.relief = [relief]
     for name, kp_e, vis_e in openhands.iter_pairs(entries):
         cid = f"openhands_raw/{channel}/{name}"
         video = openhands.video_key(name)
@@ -516,6 +589,7 @@ def _openhands_member(args, stream, entries, channel, mkey, member, man, out_dir
         if prev is not None and prev != member:  # same video already ingested from another file of this channel
             continue
         guard.check()
+        mem_check()
         out = out_dir / channel / (common.safe_name(name) + ".npz")
         rec = {"id": cid, "source": "openhands_raw", "gloss": "", "channel": channel, "video": video, "member": member,
                "path": rel(out), "licence": openhands.LICENCE}
@@ -541,6 +615,9 @@ def _openhands_member(args, stream, entries, channel, mkey, member, man, out_dir
         rec["secs"] = round(time.time() - t1, 2)
         man.add(rec)
         n += 1
+        if n == 1:  # how far the restart had to inflate / download to reach its first new chunk
+            log.info("openhands-raw: %s: first new chunk at %.2f GB (inflated): %.2f GB downloaded, %d restores, "
+                     "%.0f s", mkey, kp_e[0] / 1e9, stream.r.fetched_bytes / 1e9, stream.restores, time.time() - t0)
         if n % 50 == 0:
             log.info("openhands-raw: %s: %d chunks this run, %.1f MB/s fetched, free %.1f GB", mkey, n,
                      stream.r.fetched_bytes / 1e6 / max(1.0, time.time() - t0), common.free_gb(DATA))
@@ -627,11 +704,22 @@ def main() -> None:
     ap.add_argument("--min-free-gb", type=float, default=common.MIN_FREE_GB)
     ap.add_argument("--budget-gb", type=float, default=12.0, help="openhands-raw: max size of its landmark folder")
     ap.add_argument("--only", nargs="+", help="openhands-raw: zip names to process (e.g. Sign_Library.zip)")
+    ap.add_argument("--max-rss-gb", type=float, default=common.DEFAULT_MAX_RSS_GB,
+                    help="soft memory cap of this process: drop caches, then stop cleanly (exit 5); 0 = off")
+    ap.add_argument("--respawn-on-memory", type=int, default=3,
+                    help="after a memory stop, restart this job in a fresh process up to N times")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     if args.source not in ("status", "isl500-links"):
         import fcntl
+
+        # a process scan as well as the lock: the first glosl / isl500 jobs were started before locks existed
+        others = common.find_running(Path(__file__).name, args.source)
+        if others:
+            log.error("another %s job is running (pid %s, found by process scan); exiting", args.source,
+                      ", ".join(map(str, others)))
+            sys.exit(4)
 
         lock_path = DATA / "manifests" / f"{args.source.replace('-', '_')}.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -643,9 +731,23 @@ def main() -> None:
             sys.exit(4)
         lock.write(str(os.getpid()))
         lock.flush()
+    global MEM
+    if args.source not in ("status", "isl500-links") and args.max_rss_gb > 0:
+        MEM = common.MemoryGuard(max_gb=args.max_rss_gb, every=20, log=log)
     fn = {"glosl": run_glosl, "isl500": run_isl500, "isl500-links": run_isl500_links,
           "openhands-raw": run_openhands_raw, "openhands-fs": run_openhands_fs, "status": run_status}[args.source]
-    sys.exit(fn(args))
+    rc = fn(args)
+    if rc == common.EXIT_MEMORY:
+        n = int(os.environ.get("ISL_MEM_RESPAWNS", "0"))
+        if n < args.respawn_on_memory:
+            log.warning("%s: stopped for memory (RSS %.2f GB); restarting in a fresh process (%d of %d)",
+                        args.source, common.rss_gb(), n + 1, args.respawn_on_memory)
+            logging.shutdown()
+            time.sleep(30)
+            os.environ["ISL_MEM_RESPAWNS"] = str(n + 1)
+            os.execv(sys.executable, [sys.executable, *sys.argv])  # the lock fd is close-on-exec
+        log.error("%s: stopped for memory %d times; giving up (resumable: start it again)", args.source, n)
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

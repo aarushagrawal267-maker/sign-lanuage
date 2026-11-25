@@ -150,6 +150,43 @@ python scripts/ingest_isl.py islrtc --only A/Alphabet.mp4 F/Fingerspell.mp4 "Num
     --full --max-s 120 --out-subdir islrtc_full        # long reference videos, full length
 ```
 
+**Title-card detector `card-v2` and re-extraction (25 Nov 2026, evening).** The old rule (left 60 of 160 columns
+near-uniform, grey std < 6) also holds for the plain grey background most ISLRTC signers stand in front of, so 53 of
+the 71 `card` stops in the trim run were mid-sign (section 7.3). `CardDetector` in `scripts/ingest_isl.py` now
+needs a real change of picture: either nobody in the centre (under 10 % of the centre pixels differ from the
+background colour; a signer gives 25-80 %, measured on 10 videos) with a plain left strip (fade to black, blank
+or plain card), or a left-strip colour more than 40 levels away from the opening background (the blue
+"Explanation" card, coloured wipes); 3 such frames in a row after 800 ms. Checked by re-reading the videos
+(frames only, no MediaPipe): the 6 labelled misfires (Driver (Sign 2), Dominance, Emission, Break a Leg, Bribe,
+Energy Infrastructure) and 16 random `truncated` clips no longer stop (old stops at 0.8-6.2 s); the two
+labelled true ends still stop (Cardiovascular Medicine: fade to black at 5.76 s, same as before; Definition: the
+"Explanation" card at 3.36 s, where the old rule only fired on the final fade at 9.6 s). Not caught by either
+rule: a cut to a second signer without a card (`Bermuda Shorts`), which the trimmer's rest/dip rules handle.
+**Opening intros**: 10 of 12 sampled `card` clips that were not `truncated` (`Arc`, `Carbon Dioxide`,
+`Beaker (Academic)`, ...; the "Academic Terms in Indian Sign Language" series) open with a ~6.5 s animated title
+and were stopped at 0.88 s by both rules, keeping no sign at all (269 of the 5,575 ISLRTC records at 17:40 UTC have
+0 frames). When a video starts on a card-like frame, frames are now skipped until the signer appears (at most
+15 s), the kept frames' `t_ms` start at 0, `max_s` counts from there and the record has `intro_ms` (6,480 ms on
+`Arc`, which now keeps 10 s of signing).
+Synthetic-frame tests: `backend/tests/isl/test_ingest_fixes.py`. Records written with it carry
+`card_detector: "card-v2"`; the running `islrtc` job (PID 6785) keeps the old rule until it ends.
+
+```
+nice -n 10 python scripts/ingest_isl.py islrtc-recut --workers 1 --follow     # running since 17:41 UTC, PID 20244
+```
+
+re-extracts every clip of `manifests/islrtc.jsonl` with an old-rule `card` stop plus every `truncated` clip of
+`derived/islrtc_trim.jsonl` into **`landmarks/islrtc_recut/` + `manifests/islrtc_recut.jsonl`** (same record
+format plus `recut_of`, `recut_reason`, `card_detector`; same 12 fps / 10 s opening extraction as the main job).
+The running job's manifest and files are only read. **A record in `islrtc_recut.jsonl` supersedes the
+`islrtc.jsonl` record with the same id** (to be honoured by the ISLRTC adapter / trimmer, which are not part of
+the ingestion code). With `--follow` it re-scans every 30 min while `ingest_isl.py islrtc` runs (that job still
+adds old-rule `card` stops) and exits after one last scan once it has ended. Lock: `manifests/islrtc_recut.lock`
+plus a process scan (a second copy exits with status 4). The 10 s-capped compilations (alphabets,
+fingerspelling, number ranges) were already re-extracted full length into `islrtc_full` (9 entries, the queue's
+`islrtc-full` step); the other names containing "Number" (`Complex_Number`, `Fir_Fir_Number`, ...) are single
+dictionary signs, not compilations.
+
 INCLUDE quirk: 27 videos sit one level deeper in an `Extra/` folder; the running job gave them the gloss "Extra".
 The adapters rebuild canonical ids from the zip member path, and the script now writes the right gloss/category.
 
@@ -160,16 +197,28 @@ quality filter `n_frames >= 8, hands_frac >= 0.2`). Stop reasons: max_s 619, eof
 ### 3.2 Gated datasets (`scripts/ingest_isl_gated.py`)
 
 ```
-python scripts/ingest_isl_gated.py --check           # exit 0 = granted, 3 = pending (cron-friendly)
-python scripts/ingest_isl_gated.py cislr --workers 2
-python scripts/ingest_isl_gated.py isign --subset 10000          # random access into the split zip
-python scripts/ingest_isl_gated.py isign --mode stream           # fallback: parts piped one after another
+python scripts/ingest_isl_gated.py --check [cislr|isign]   # exit 0 = granted, 3 = pending (cron-friendly)
+python scripts/ingest_isl_gated.py cislr --workers 2       # delegates to: ingest_isl_video.py run cislr
+python scripts/ingest_isl_gated.py isign                   # every iSign uid GloSL lacks; random access into the zip
+python scripts/ingest_isl_gated.py isign --subset 10000    # only the sentences with the most vocabulary words
+python scripts/ingest_isl_gated.py isign --mode stream     # fallback: parts piped one after another
 ```
+
+* **One path per gated dataset, and the queue runs it** (25 Nov 2026). CISLR used to have two ingesters writing
+  `manifests/cislr.jsonl` (`ingest_isl_gated.py cislr` and the queue's `ingest_isl_video.py run cislr`). Only the
+  queue path remains: `ingest_isl_gated.py cislr` now runs it in-process, and both hold `manifests/cislr.lock`
+  (plus a process scan for an older copy), so they can never run together (a second run exits with status 6).
+  `scripts/isl_queue.sh` probes `dataset.csv` (CISLR) and `iSign_v1.1.csv` (iSign) once per queue cycle (before a
+  chunk, at most hourly; every 6 h for 14 days after its list) and ingests as soon as the probe answers 200/206.
+  iSign runs as `ingest_isl_gated.py isign` (lock `manifests/isign.lock`), research only, read from the remote
+  archive and never stored, and **skips every uid in `derived/glosl_isign_uids.txt`** (126,846 GloSL ids: the same
+  poses, already ingested), so only the clips GloSL lacks are converted. Status 25 Nov 17:30 UTC: both `pending`
+  (403 on the data files).
 
 * **Access check**: a 1-byte range request for a data file (`dataset.csv`, `iSign_v1.1.csv`). The dataset cards
   (`README.md`) answer 206 even without access, so they cannot be used. 25 Nov 2026: both repos `pending` (data 403).
   Credentials come from the egress proxy (or `HF_TOKEN` elsewhere); never printed or stored.
-* **CISLR**: the three CSVs are downloaded (about 500 KB). The 1.17 GB video zip is opened through `RangeFile`
+* **CISLR** (the reader below is `app/isl/data/cislr.py`; the queue path reuses its CSV parsing, ids and paths): the three CSVs are downloaded (about 500 KB). The 1.17 GB video zip is opened through `RangeFile`
   (seekable HTTP range reads, 8 MB blocks, LRU cache); members are streamed one by one to a temp file, extracted with
   `extract_full` (15 fps, same as INCLUDE), deleted. Resumable per member; peak disk = one video per worker; at most
   2 workers and 2 GB of temp data. Manifest `manifests/cislr.jsonl` adds `uid`, `member`, `split` (prototype / test).
@@ -252,6 +301,14 @@ mendeley_static, isl_csltr, mendeley_agri, mendeley_emergency, isl_csltr_words, 
 wslp_unlabelled`, then CISLR polling every 6 h for 14 days. Each source runs in 45-minute chunks with `--workers auto`
 (1 worker while `ingest_isl.py include` or `islrtc` runs, 3 once both have finished), so the long INCLUDE/ISLRTC jobs
 keep their CPUs. Only one queue runs at a time (`flock` on `data/isl/logs/queue.lock`; PID in `queue.pid`).
+Since 25 Nov 2026 17:35 UTC (queue restarted with the new script once the running WSLP chunk ended; the old queue
+process was stopped, its chunk finished normally): every `run` holds `manifests/<manifest>.lock` (`wslp` and
+`wslp_unlabelled` share one) plus a process scan, so a chunk left over from a stopped queue makes the next one
+wait (exit 6) instead of running twice; children no longer inherit the queue lock; each run has a soft memory
+cap (`--max-rss-gb`, default 1.5 GB per process, this one and every extraction worker): above it the caches are
+dropped, and if a process stays above, the chunk stops cleanly (exit 5, fetched items deleted and retried) and the
+queue restarts the source in fresh processes after 1 min (at most 20 times per source); CISLR / iSign are probed
+every cycle (section 3.2).
 
 **Adapters** (`video_sources/adapters.py`, `VIDEO_ADAPTERS`): one `Clip` reader per manifest (quality filter
 `n_frames >= 8` for videos, `>= 1` for images, `hands_frac >= 0.2`; unlabelled and `duplicate_of` rows skipped by
@@ -282,11 +339,26 @@ nice -n 10 .venv/bin/python scripts/ingest_isl_pose.py openhands-fs
 
 Conventions shared with `scripts/ingest_isl.py`: manifest `manifests/<source>.jsonl` (id, source, gloss, path relative
 to the repo, n_frames, fps, hands_frac, ok, error, secs, plus per-source fields), resumable (ok ids are skipped),
-failures retried on the next run. Every job started from the committed code holds a lock (`manifests/<source>.lock`) so a
-second copy exits (the `glosl` and `isl500` processes started at 14:45 UTC on 25 Nov ran pre-commit code and hold none:
-never start a second copy while they run), and
+failures retried on the next run. Every job started from the committed code holds a lock (`manifests/<source>.lock`)
+**and scans the process table** for another `ingest_isl_pose.py <source>` (exact source token), so a second copy
+exits with status 4 even next to the `glosl` / `isl500` processes started at 14:45 UTC on 25 Nov, which hold no lock
+(checked 17:37 UTC: both refused with "found by process scan"), and
 stops cleanly (exit code 3) before free disk drops under 12 GB (`--min-free-gb`). Nothing is downloaded to disk except
 small CSV/JSON files and the 28 MB fingerspelling zip; pose files are converted in memory.
+
+**Memory guard** (`--max-rss-gb`, default 1.5 GB; all jobs share one ~14 GB memory group and the OOM killer
+already hit `openhands-raw` once): every 20 items the job reads its own RSS; above the cap it drops its caches
+(OpenHands: the 64 KB page cache, the metadata pages, the header cache, half the read-ahead), runs `gc` and
+`malloc_trim`, and if it is still above, stops cleanly with exit status 5 and a `stopping for memory` log line
+(resumable from the manifest and, for OpenHands, the restore points). It then restarts itself in a fresh process
+after 30 s (`--respawn-on-memory`, 3 times). The `glosl` / `isl500` processes started at 14:45 run older code
+without the guard; they were not restarted (they finish this evening).
+
+**ISL500 frame size** is now order-independent: the per-signer fallback (for clips whose hands give no size
+estimate) is the signer's most common hand-based estimate over all their clips (ties: `STANDARD_SIZES` order),
+applied in a second pass after every clip of the run has been estimated; earlier fallback rows whose size differs
+from it are redone. It used to be whichever estimate a download thread had stored last. All 38,811 estimated clips
+measured so far are 2560x1440, as are the 813 fallback rows, so no existing data changes.
 
 **Storage.** Landmark arrays are saved as **float16** (`--dtype float32` keeps full precision) and strided to about
 **15 fps** (`--target-fps`, same rule as INCLUDE: step = round(fps / 15); 25/29/30 fps -> step 2). `t_ms` stays
@@ -316,7 +388,20 @@ in address order. Network cost about twice the compressed size; no temp files; p
 video already ingested from another file of the same channel are skipped. Sign Library ships two files: `1_min_splits`
 (374 chunks of 76 named YouTube videos, 6.8 h at 25 fps, ingested first) and `sub_based` (9,582 chunks named by
 hashes, about 28 h): the names cannot be matched, so up to 6.8 h may be ingested twice; deduplicate by pose content
-before pre-training (open issue). Zips are processed smallest first until `landmarks/openhands_raw/` reaches `--budget-gb` (12 GB): at about
+before pre-training (open issue).
+
+**Restore points across restarts** (25 Nov 2026): a restart used to re-inflate the current member from byte 0
+(NIOS: about 11 GB of downloads before the first new chunk), because `zlib` snapshots cannot be saved. The
+snapshots are now `zran`-style access points (`pose_sources/zran.py`: `libz` through `ctypes`, decoding with
+`Z_BLOCK`; a point = deflate block boundary, its bit offset and the last 32 KB of output), and one is appended
+every 64 MB of output to `raw/openhands_raw/<member>.points` (CRC per record, a cut record is ignored; about 13 KB
+per point). A restart loads them and jumps to the point before its next chunk. Restarted once with this code at
+17:23 UTC (SIGINT to PID 26183, now **PID 13762**, same arguments); since the old process had saved no points,
+that one restart still re-read ISH News up to its next chunk (1.84 GB downloaded, 162 s). Verified afterwards
+with a read-only probe on the real ISH News member: from the persisted points, the chunk whose data starts at
+4.71 GB (inflated) was read and matched its manifest frame count with **27 MB** downloaded. Decoding cost: about
+10 % more CPU than `zlib` (64 MB in 1.83 s vs 1.64 s under load 20); without `libz` the reader falls back to
+in-memory `zlib` snapshots. Zips are processed smallest first until `landmarks/openhands_raw/` reaches `--budget-gb` (12 GB): at about
 360 B per stored frame that is roughly Sign Library + NIOS + ISH News and part of MBM Vadodara (estimate).
 
 **GloSL and iSign overlap.** The GloSL `id` is the iSign / ISLTranslate `uid`: 30,648 of the 31,221 public

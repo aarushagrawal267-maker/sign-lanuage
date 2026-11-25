@@ -9,6 +9,10 @@ delete the temp file, append a manifest row.
   stops cleanly (exit status ``stopped: "disk"``) and the queue script waits.
 * ``max_minutes``: stop taking new items after that long (pending items finish), so a queue can re-plan worker
   counts between chunks.
+* ``max_rss_gb``: soft memory cap per process (this one and every extraction worker). Above it the caches are
+  dropped (``gc``, ``malloc_trim``, the HF row-URL cache); if a process stays above, the run stops taking items
+  (``stopped: "memory"``, fetched but unstarted items are deleted and retried next run) and
+  ``scripts/isl_queue.sh`` restarts the source in fresh processes. All ingestion jobs share one ~14 GB memory group.
 """
 
 from __future__ import annotations
@@ -135,7 +139,8 @@ def rel_path(p: Path, paths: IslPaths) -> str:
 
 def run(spec: SourceSpec, items: list[Item], paths: IslPaths, fetcher: Fetcher, *, workers: int = 1,
         limit: int = 0, max_minutes: float = 0.0, min_free_gb: float = 10.0, extract: Callable | None = None,
-        progress: Callable[[str], None] | None = None, clock=time.time) -> dict:
+        progress: Callable[[str], None] | None = None, clock=time.time, max_rss_gb: float = 0.0,
+        rss: Callable | None = None) -> dict:
     """Process every not-yet-done item. ``extract(mode, src, out, step_fps, max_s) -> dict`` defaults to
     ``extract.work``; with ``workers <= 1`` it runs in this process (tests)."""
     if extract is None:
@@ -199,6 +204,30 @@ def run(spec: SourceSpec, items: list[Item], paths: IslPaths, fetcher: Fetcher, 
     th.start()
     pool = ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn")) if workers > 1 else None
     pending: list[tuple[dict, Path, Future | dict]] = []
+    from app.isl.data.pose_sources.common import malloc_trim, rss_gb
+
+    rss = rss or rss_gb
+
+    def worst_rss() -> tuple[float, int | None]:
+        pids = [None] + (list(getattr(pool, "_processes", None) or {}) if pool is not None else [])
+        vals = [(float(rss(pid)), pid) for pid in pids]
+        return max(vals, key=lambda v: v[0])
+
+    def memory_exceeded() -> bool:
+        if not max_rss_gb or max_rss_gb <= 0:
+            return False
+        gb, _ = worst_rss()
+        if gb <= max_rss_gb:
+            return False
+        import gc
+
+        fetcher._rows.clear()
+        gc.collect()
+        malloc_trim()
+        gb2, pid = worst_rss()
+        log.warning("%s: memory guard: RSS %.2f GB > cap %.2f GB; after dropping caches %.2f GB (%s)", spec.name, gb,
+                    max_rss_gb, gb2, "this process" if pid is None else f"worker {pid}")
+        return gb2 > max_rss_gb
 
     def write_duplicate(dup: dict, orig: dict) -> None:
         for k, v in orig.items():
@@ -236,6 +265,10 @@ def run(spec: SourceSpec, items: list[Item], paths: IslPaths, fetcher: Fetcher, 
             if entry is None:
                 break
             status, it, payload, dest = entry
+            if stats["stopped"] == "memory":  # fetched after the memory stop: retried on the next run
+                if dest is not None:
+                    dest.unlink(missing_ok=True)
+                continue
             if status == "failed":
                 append_jsonl(man, payload)
                 stats["fetch_failed"] += 1
@@ -261,6 +294,10 @@ def run(spec: SourceSpec, items: list[Item], paths: IslPaths, fetcher: Fetcher, 
                 pending.append((meta, dest, pool.submit(extract, *args)))
                 while pending and (len(pending) >= 2 * workers or pending[0][2].done()):
                     finish(pending.pop(0))
+            if stats["stopped"] != "memory" and memory_exceeded():
+                stats["stopped"] = "memory"
+                stop.set()
+                log.error("%s: stopping for memory (resumable; the queue restarts this source)", spec.name)
         for entry in pending:
             finish(entry)
         pending.clear()

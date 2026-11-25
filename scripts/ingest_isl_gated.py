@@ -6,9 +6,16 @@ landmark files and the source bytes are discarded. Both jobs are resumable per m
 manifests (data/isl/manifests/{cislr,isign}.jsonl).
 
 Usage (from the repository root; runs with nice 10):
-  python scripts/ingest_isl_gated.py --check                 # granted/pending per repo; exit 0 all granted, 3 otherwise
-  python scripts/ingest_isl_gated.py cislr [--workers 2] [--limit N]
-  python scripts/ingest_isl_gated.py isign [--subset 10000] [--mode zip|stream] [--limit N] [--swap-hands]
+  python scripts/ingest_isl_gated.py --check [cislr|isign]   # granted/pending; exit 0 all granted, 3 otherwise
+  python scripts/ingest_isl_gated.py cislr [--workers 2] [--limit N]   # delegates to ingest_isl_video.py run cislr
+  python scripts/ingest_isl_gated.py isign [--subset 0] [--mode zip|stream] [--limit N] [--swap-hands]
+
+CISLR has ONE ingestion path, ``scripts/ingest_isl_video.py run cislr`` (what scripts/isl_queue.sh runs as soon
+as access is granted): ``cislr`` here only delegates to it in-process, sharing its lock
+(``manifests/cislr.lock``), so the two can never write ``manifests/cislr.jsonl`` at the same time.
+iSign: ``manifests/isign.lock`` (plus a process scan) keeps one copy; uids already ingested from GloSL
+(``data/isl/derived/glosl_isign_uids.txt``, the same poses re-packaged) are skipped, so with ``--subset 0`` only
+the iSign clips GloSL lacks are converted. The queue starts it when the iSign probe answers.
 
 Access check: a 1-byte range request for a data file (the dataset card README.md is public even without
 access, so it cannot be used). Hugging Face credentials come from the egress proxy or the HF_TOKEN
@@ -51,22 +58,29 @@ def check(repos: list[str]) -> int:
 
 
 def run_cislr(args, paths) -> int:
-    from app.isl.data.cislr import CISLR_REPO, ZIP_PATH, download_small_files, ingest_cislr
-    from app.isl.data.remote import RangeFile, hf_access, hf_url, remote_size
+    """Delegate to the single CISLR path (``ingest_isl_video.py run cislr``, same ids/paths/manifest plus
+    sha256/crc32) in this process; its manifest lock refuses a concurrent queue run (exit 6)."""
+    import ingest_isl_video  # scripts/ is on sys.path (this file's folder)
 
-    state = hf_access(CISLR_REPO)
-    if state != "granted":
-        log.info("CISLR access: %s (request access on the dataset page, then re-run)", state)
-        return 3
-    download_small_files(paths)
-    url = hf_url(CISLR_REPO, ZIP_PATH)
-    size = remote_size(url)
-    log.info("CISLR zip: %.2f GB, reading members with range requests", size / 1e9)
-    rf = RangeFile([url], [size], block=args.block_mb << 20, cache_blocks=8)
-    stats = ingest_cislr(paths, rf, limit=args.limit, workers=max(1, min(2, args.workers)),
-                         progress=lambda m: log.info(m))
-    log.info("CISLR done: %s; transferred %.1f MB in %d requests", stats, rf.bytes_fetched / 1e6, rf.requests)
-    return 0
+    log.info("cislr: delegating to scripts/ingest_isl_video.py run cislr (the one CISLR ingestion path)")
+    argv = ["run", "cislr", "--workers", str(max(1, min(2, args.workers)))]
+    if args.limit:
+        argv += ["--limit", str(args.limit)]
+    if args.root:
+        argv = ["--root", str(args.root), *argv]
+    return ingest_isl_video.main(argv)
+
+
+def isign_wanted(sentences: dict[str, str], skip: set[str], subset: list[str] | None) -> set[str]:
+    """iSign uids to convert: the subset (or every sentence) minus the uids GloSL already provides."""
+    base = set(subset) if subset is not None else set(sentences)
+    return base - skip
+
+
+def read_uid_file(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    return {ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()}
 
 
 def run_isign(args, paths) -> int:
@@ -88,6 +102,9 @@ def run_isign(args, paths) -> int:
     if state != "granted":
         log.info("iSign access: %s (request access on the dataset page, then re-run)", state)
         return 3
+    lock = _isign_lock(paths)
+    if lock is None:
+        return 6
     raw_dir = paths.raw / "isign"
     raw_dir.mkdir(parents=True, exist_ok=True)
     for f in CSV_FILES:  # ~10 MB in total
@@ -97,15 +114,22 @@ def run_isign(args, paths) -> int:
             r.raise_for_status()
             dest.write_bytes(r.content)
     sentences = read_sentences(paths)
-    wanted = None
+    subset = None
     if args.subset:
         vocab = PACK_DIR / "vocabulary.jsonl"
         words = []
         if vocab.exists():
             for e in read_vocabulary(vocab):
                 words += [e.headword] + list(e.synonyms)
-        wanted = set(select_subset(sentences, words, n=args.subset))
-        log.info("iSign subset: %d of %d sentences contain a vocabulary word", len(wanted), len(sentences))
+        subset = select_subset(sentences, words, n=args.subset)
+        log.info("iSign subset: %d of %d sentences contain a vocabulary word", len(subset), len(sentences))
+    skip_path = Path(args.skip_uids) if args.skip_uids else paths.root / "derived" / "glosl_isign_uids.txt"
+    skip = read_uid_file(skip_path)
+    wanted = isign_wanted(sentences, skip, subset)
+    log.info("iSign: %d uids to convert (%d already ingested from GloSL, %s, are skipped)", len(wanted),
+             len((set(subset) if subset is not None else set(sentences)) & skip), skip_path.name)
+    if not wanted:
+        return 0
     sizes = {t["path"]: int(t.get("size") or 0) for t in hf_tree(ISIGN_REPO)}
     urls = [hf_url(ISIGN_REPO, p) for p in POSE_PARTS]
     part_sizes = [sizes[p] for p in POSE_PARTS]
@@ -132,13 +156,36 @@ def run_isign(args, paths) -> int:
     return 0
 
 
+def _isign_lock(paths):
+    import fcntl
+
+    from app.isl.data.pose_sources.common import find_running
+
+    if find_running(Path(__file__).name, "isign"):
+        log.error("isign: another ingest_isl_gated.py isign is running; exiting")
+        return None
+    lp = paths.manifests / "isign.lock"
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    fh = lp.open("w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        log.error("isign: %s is locked by another run; exiting", lp)
+        return None
+    return fh
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("source", nargs="?", choices=["cislr", "isign"])
     ap.add_argument("--check", action="store_true", help="only report access (exit 0 granted, 3 pending)")
     ap.add_argument("--workers", type=int, default=1, help="extraction processes (max 2 while other jobs run)")
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--subset", type=int, default=10_000, help="iSign: sentences to convert (0 = all)")
+    ap.add_argument("--subset", type=int, default=0,
+                    help="iSign: only the N sentences with the most vocabulary words (0 = all not in GloSL)")
+    ap.add_argument("--skip-uids", default=None,
+                    help="iSign: file of uids to skip (default data/isl/derived/glosl_isign_uids.txt)")
     ap.add_argument("--mode", choices=["zip", "stream"], default="zip", help="iSign archive access mode")
     ap.add_argument("--block-mb", type=int, default=8, help="range-request block size")
     ap.add_argument("--swap-hands", action="store_true", help="iSign: swap left/right hands (see docs)")

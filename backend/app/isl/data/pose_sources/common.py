@@ -184,7 +184,7 @@ class DiskGuard:
 
     def check(self, force: bool = False) -> None:
         self._n += 1
-        if not force and self._n % max(1, self.every) != 1:
+        if not force and (self._n - 1) % max(1, self.every) != 0:
             return
         free = free_gb(self.path)
         if free < self.min_free_gb:
@@ -217,3 +217,129 @@ def active_window(seq: RawSequence, pad: int = 2) -> dict:
         return {"active_start": 0, "active_end": n, "hands_frac_active": 0.0}
     s, e = max(0, int(idx[0]) - pad), min(n, int(idx[-1]) + 1 + pad)
     return {"active_start": s, "active_end": e, "hands_frac_active": round(float(hands[s:e].mean()), 4)}
+
+
+# --------------------------------------------------------------------------------------------- memory
+
+DEFAULT_MAX_RSS_GB = 1.5  # per ingestion process; all jobs share one ~14 GB memory group (an OOM kill happened)
+EXIT_MEMORY = 5  # exit status of a job that stopped itself for memory (resumable; isl_queue.sh restarts it)
+
+
+def rss_gb(pid: int | None = None) -> float:
+    """Resident set size of ``pid`` (default: this process) in GB, from ``/proc/<pid>/status`` (0.0 if
+    unavailable, e.g. not Linux or the process is gone)."""
+    try:
+        with open(f"/proc/{pid or 'self'}/status", encoding="ascii", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024 / 1e9
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0.0
+
+
+def malloc_trim() -> None:
+    """Return freed heap pages to the OS (glibc); a no-op elsewhere."""
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+class MemoryCap(RuntimeError):
+    """Raised by :class:`MemoryGuard` when the process stays above its RSS cap after relief."""
+
+
+@dataclass
+class MemoryGuard:
+    """Soft RSS cap for a long ingestion job. ``check()`` measures the RSS (every ``every`` calls); above
+    ``max_gb`` it runs the ``relief`` callbacks (drop caches, shrink read-ahead), ``gc.collect()`` and
+    ``malloc_trim``, measures again and raises :class:`MemoryCap` if the process is still above the cap, so
+    the job can stop cleanly (its manifest makes it resumable). ``max_gb <= 0`` disables the guard;
+    ``rss`` is injectable for tests."""
+
+    max_gb: float = DEFAULT_MAX_RSS_GB
+    every: int = 20
+    relief: list = field(default_factory=list)
+    rss: object = None
+    log: object = None
+    _n: int = 0
+    reliefs: int = 0
+    last_gb: float = 0.0
+
+    def measure(self) -> float:
+        self.last_gb = float((self.rss or rss_gb)())
+        return self.last_gb
+
+    def check(self, force: bool = False) -> None:
+        if not self.max_gb or self.max_gb <= 0:
+            return
+        self._n += 1
+        if not force and (self._n - 1) % max(1, self.every) != 0:
+            return
+        if self.measure() <= self.max_gb:
+            return
+        before = self.last_gb
+        import gc
+
+        for fn in self.relief:
+            try:
+                fn()
+            except Exception:  # noqa: BLE001
+                pass
+        gc.collect()
+        malloc_trim()
+        self.reliefs += 1
+        after = self.measure()
+        if self.log is not None:
+            self.log.warning("memory guard: RSS %.2f GB > cap %.2f GB; dropped caches -> %.2f GB", before,
+                             self.max_gb, after)
+        if after > self.max_gb:
+            raise MemoryCap(f"RSS {after:.2f} GB stays above the {self.max_gb:.2f} GB cap after dropping caches")
+
+
+# --------------------------------------------------------------------------------------------- process scan
+
+def process_table() -> list[tuple[int, list[str]]]:
+    """(pid, argv) of every process readable in ``/proc`` (Linux; empty elsewhere)."""
+    out = []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for n in names:
+        if not n.isdigit():
+            continue
+        try:
+            with open(f"/proc/{n}/cmdline", "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+        if argv:
+            out.append((int(n), argv))
+    return out
+
+
+def find_running(script: str, source: str | tuple[str, ...], exclude: set[int] | None = None,
+                 table: list[tuple[int, list[str]]] | None = None) -> list[int]:
+    """PIDs of other processes running ``script`` (file name, e.g. ``ingest_isl_pose.py``) with the positional
+    ``source`` argument right after it (exact token, so ``isl500`` does not match ``isl500-links``; a tuple
+    matches several tokens, e.g. ``("run", "wslp")``). Catches
+    copies started without a lock file (the first glosl / isl500 jobs). Shell wrappers whose command line merely
+    contains the text (``bash -c "... ingest_isl_pose.py glosl ..."``) are ignored: the script must be an
+    argument of its own, run by an interpreter."""
+    exclude = set(exclude or ()) | {os.getpid()}
+    seq = [source] if isinstance(source, str) else list(source)
+    hits = []
+    for pid, argv in (process_table() if table is None else table):
+        if pid in exclude:
+            continue
+        for i, a in enumerate(argv[:-1]):
+            if os.path.basename(a) == script and argv[i + 1:i + 1 + len(seq)] == seq:
+                if i >= 1 and "python" in os.path.basename(argv[0]):
+                    hits.append(pid)
+                break
+    return sorted(hits)

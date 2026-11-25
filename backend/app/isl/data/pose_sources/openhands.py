@@ -22,6 +22,12 @@ through it once; 4 KB pages that look like HDF5 metadata are kept in memory whil
 reads rarely need a restart, see :func:`looks_like_metadata`); pass 2 visits the headers in address order, parses each small version-1 object header
 itself (:func:`parse_v1_header`: shape, dtype, contiguous data address) and reads the data sequentially.
 Network cost: about twice the compressed size, no temp files.
+
+Restore points (25 Nov 2026): the snapshots are now ``zran`` access points on deflate block boundaries (bit
+offset + last 32 KB of output, :mod:`~app.isl.data.pose_sources.zran`), and every 64 MB of output one is
+appended to ``raw/openhands_raw/<member>.points``. A restarted job loads them and seeks straight to the point
+before its next chunk (measured on ISH News: a chunk at 4.7 GB read with 27 MB of downloads instead of
+re-streaming the member from byte 0).
 """
 
 from __future__ import annotations
@@ -190,18 +196,42 @@ class PrefetchReader:
 
 class SeekableInflate(io.RawIOBase):
     """Read-only seekable file over a raw-deflate stream (zip method 8) of ``usize`` bytes, compressed bytes
-    ``[cstart, cstart + csize)`` of ``reader``. Backward seeks restart from ``zlib`` snapshots taken every
-    ``every`` output bytes; requested 64 KB pages stay in a small LRU cache (h5py re-reads metadata)."""
+    ``[cstart, cstart + csize)`` of ``reader``. Backward seeks restart from the nearest access point, taken about
+    every ``every`` output bytes; requested 64 KB pages stay in a small LRU cache (h5py re-reads metadata).
+
+    Access points (:mod:`~app.isl.data.pose_sources.zran`, ``libz`` through ``ctypes``) sit on deflate block
+    boundaries and hold the last 32 KB of output, so they can be **persisted**: with ``points_file`` (a
+    :class:`~app.isl.data.pose_sources.zran.PointFile`) the points saved by an earlier run are loaded and new
+    ones are appended every ``persist_every`` output bytes, so a restarted job seeks straight to the point
+    before its next chunk instead of re-inflating the member from its first byte. Without ``libz`` it falls
+    back to in-memory ``zlib`` snapshots (no persistence)."""
 
     PAGE = 64 << 10
 
     def __init__(self, reader, cstart: int, csize: int, usize: int, every: int | None = None, chunk: int = 1 << 20,
-                 cache_pages: int = 256, meta_cap: int = 256 << 20):
+                 cache_pages: int = 256, meta_cap: int = 256 << 20, points_file=None,
+                 persist_every: int | None = None, native: bool | None = None):
+        from app.isl.data.pose_sources import zran
+
         self.r, self.cstart, self.csize, self.usize = reader, int(cstart), int(csize), int(usize)
         self.every = int(every or max(4 << 20, self.usize // 3000))
         self.chunk = chunk
+        self.native = zran.available() if native is None else bool(native)
+        # access points: ck_out[i] = output offset; ck[i] = (input offset, state) where state is
+        # ("w", bits, window) (native, restorable from disk) or ("z", zlib snapshot) (fallback, memory only)
         self.ck_out: list[int] = [0]
-        self.ck: list[tuple[int, object]] = [(0, zlib.decompressobj(-15))]
+        self.ck: list[tuple[int, tuple]] = [(0, ("w", 0, b"") if self.native else ("z", zlib.decompressobj(-15)))]
+        self.points_file = points_file if self.native else None
+        self.persist_every = int(persist_every or max(64 << 20, self.every))
+        self.persisted_out = 0
+        self.points_loaded = 0
+        if self.points_file is not None:
+            for o, i, b, w in self.points_file.load():
+                if 0 < o <= self.usize and i <= self.csize:
+                    self._insert_point(o, i, ("w", b, w))
+                    self.persisted_out = max(self.persisted_out, o)
+                    self.points_loaded += 1
+        self.win = b""  # last 32 KB of output (native mode: the window of the next access point)
         self.pages: OrderedDict[int, bytes] = OrderedDict()
         self.cache_pages = cache_pages
         self.pos = 0
@@ -218,24 +248,58 @@ class SeekableInflate(io.RawIOBase):
         self._restore(0)
 
     # -- inflate state
+    def _insert_point(self, out: int, inp: int, state: tuple) -> None:
+        i = bisect.bisect_left(self.ck_out, out)
+        if i < len(self.ck_out) and self.ck_out[i] == out:
+            return
+        self.ck_out.insert(i, out)
+        self.ck.insert(i, (inp, state))
+
     def _restore(self, i: int) -> None:
-        inp, d = self.ck[i]
-        self.d = d.copy()
+        from app.isl.data.pose_sources import zran
+
+        inp, state = self.ck[i]
+        if state[0] == "z":
+            self.d = state[1].copy()
+        else:
+            _, bits, window = state
+            prev = self.r.read_at(self.cstart + inp - 1, 1)[0] if bits else 0
+            self.d = zran.Inflater.at_point(bits, prev, window)
+            self.win = window
         self.out = self.ck_out[i]
         self.inp = inp  # compressed offset (relative to cstart) of the next byte to feed
         self.buf, self.bpos = b"", 0  # fetched compressed bytes starting at self.inp - self.bpos
         self.restores += 1
 
     def _limit(self) -> int:
+        if self.native:
+            return 1 << 30  # native points sit on block boundaries, not on exact multiples
         if self.out >= self.ck_out[-1]:
             nxt = (self.out // self.every + 1) * self.every
             return max(1, nxt - self.out)
         return 1 << 30
 
     def _maybe_checkpoint(self) -> None:
-        if self.out > self.ck_out[-1] and self.out % self.every == 0:
-            self.ck_out.append(self.out)
-            self.ck.append((self.inp, self.d.copy()))
+        if not self.native:
+            if self.out > self.ck_out[-1] and self.out % self.every == 0:
+                self.ck_out.append(self.out)
+                self.ck.append((self.inp, ("z", self.d.copy())))
+            return
+        if not self.d.at_block_end or self.out <= 0:
+            return
+        i = bisect.bisect_right(self.ck_out, self.out)
+        prev = self.ck_out[i - 1]
+        nxt = self.ck_out[i] if i < len(self.ck_out) else None
+        if self.out - prev < self.every or (nxt is not None and nxt - self.out < self.every):
+            return
+        window = self.win[-zran_window():]
+        self._insert_point(self.out, self.inp, ("w", self.d.bits, window))
+        if self.points_file is not None and self.out >= self.persisted_out + self.persist_every:
+            try:
+                self.points_file.add(self.out, self.inp, self.d.bits, window)
+                self.persisted_out = self.out
+            except OSError as e:  # a full disk must not stop the stream
+                log.warning("could not persist an access point: %s", e)
 
     FEED = 16 << 10  # small input pieces: a snapshot keeps a reference to the unconsumed input tail
 
@@ -253,9 +317,14 @@ class SeekableInflate(io.RawIOBase):
         if out and self.out + len(out) > self.scan_pos and self.meta_cap > 0:
             self._scan(out[max(0, self.scan_pos - self.out):])
         self.out += len(out)
+        if self.native and out:
+            w = zran_window()
+            self.win = out[-w:] if len(out) >= w else (self.win + out)[-w:]
         self._maybe_checkpoint()
         if not out and self.d.eof:
             raise EOFError("deflate stream ended early")
+        if not out and not used and not getattr(self.d, "at_block_end", False):
+            raise EOFError(f"deflate stream made no progress at {self.out} of {self.usize}")
         return out
 
     MPAGE = 4096
@@ -376,6 +445,12 @@ class SeekableInflate(io.RawIOBase):
         b[:len(data)] = data
         self.pos += len(data)
         return len(data)
+
+
+def zran_window() -> int:
+    from app.isl.data.pose_sources.zran import WINDOW
+
+    return WINDOW
 
 
 _SIGNATURES = re.compile(rb"TREE|HEAP|SNOD|GCOL|OHDR|OCHK|FRHP|FSHD|BTHD|BTIN|BTLF|FHDB|FHIB")

@@ -468,3 +468,145 @@ def test_inflate_metadata_pages_serve_reads_without_restart():
     st.seek(10 * page)
     assert st.read(64) == plain[10 * page:10 * page + 64]  # a dropped float page needs a restart
     assert st.restores == restores + 1
+
+
+# --------------------------------------------------------------------------------------------- persisted access points
+
+def _float_blob(n_floats: int, seed: int = 3) -> bytes:
+    """HDF5-like payload: smooth float64 tracks with zero runs (dynamic and stored deflate blocks, odd bit offsets)."""
+    rng = np.random.default_rng(seed)
+    a = np.cumsum(rng.normal(0, 1e-3, n_floats)).astype("<f8")
+    a[rng.integers(0, n_floats, n_floats // 50)] = 0.0
+    a[n_floats // 3: n_floats // 3 + 20_000] = 0.0
+    return a.tobytes()
+
+
+@pytest.mark.skipif(not __import__("app.isl.data.pose_sources.zran", fromlist=["x"]).available(), reason="no libz")
+def test_zran_points_restore_after_restart(tmp_path):
+    from app.isl.data.pose_sources import zran
+
+    plain = _float_blob(600_000)  # 4.8 MB
+    comp = _deflate(plain)
+    fetched = {"n": 0}
+
+    def fetch(s, e):
+        fetched["n"] += e - s + 1
+        return comp[s:e + 1]
+
+    pf = zran.PointFile(tmp_path / "m.points", "Chan.zip:x.h5", len(comp), len(plain))
+    reader = openhands.PrefetchReader(fetch, len(comp), block=16 << 10, ahead=0)
+    st = openhands.SeekableInflate(reader, 0, len(comp), len(plain), every=128 << 10, chunk=16 << 10,
+                                   points_file=pf, persist_every=512 << 10)
+    assert st.native and st.points_loaded == 0
+    assert st.read_range(0, len(plain)) == plain
+    saved = pf.load()
+    assert len(saved) >= 6 and any(b for _, _, b, _ in saved)  # some points sit mid-byte (inflatePrime path)
+    # random access within this run restores from in-memory points
+    for off in (4_000_000, 100, 2_500_000):
+        st.seek(off)
+        assert st.read(5000) == plain[off:off + 5000]
+    reader.close()
+
+    # "restart": a new stream with the same point file reads a late chunk without re-inflating from byte 0
+    fetched["n"] = 0
+    reader = openhands.PrefetchReader(fetch, len(comp), block=16 << 10, ahead=0)
+    st2 = openhands.SeekableInflate(reader, 0, len(comp), len(plain), every=128 << 10, chunk=16 << 10,
+                                    points_file=zran.PointFile(tmp_path / "m.points", "Chan.zip:x.h5", len(comp),
+                                                               len(plain)), persist_every=512 << 10)
+    assert st2.points_loaded == len(saved)
+    off = len(plain) - 300_000
+    assert st2.read_range(off, 200_000) == plain[off:off + 200_000]
+    assert fetched["n"] < len(comp) * 0.35, fetched["n"]
+    reader.close()
+
+
+@pytest.mark.skipif(not __import__("app.isl.data.pose_sources.zran", fromlist=["x"]).available(), reason="no libz")
+def test_zran_point_file_ignores_other_members_and_damaged_tails(tmp_path):
+    from app.isl.data.pose_sources import zran
+
+    p = tmp_path / "pts"
+    pf = zran.PointFile(p, "a", 100, 1000)
+    pf.add(10, 5, 3, b"w" * 10)
+    pf.add(20, 9, 0, b"v" * 20)
+    with p.open("ab") as fh:
+        fh.write(b"\x01\x02\x03")  # record cut by a kill
+    assert [x[:3] for x in zran.PointFile(p, "a", 100, 1000).load()] == [(10, 5, 3), (20, 9, 0)]
+    assert zran.PointFile(p, "a", 100, 1000).load()[1][3] == b"v" * 20  # tail truncated, still readable
+    other = zran.PointFile(p, "b", 100, 1000)
+    assert other.load() == []
+    other.add(30, 7, 1, b"x")
+    assert [x[:3] for x in zran.PointFile(p, "b", 100, 1000).load()] == [(30, 7, 1)]
+    assert zran.PointFile(p, "a", 100, 1000).load() == []
+
+
+def test_seekable_inflate_zlib_fallback_still_works():
+    plain = _float_blob(200_000, seed=9)
+    comp = _deflate(plain)
+    reader = openhands.PrefetchReader(lambda s, e: comp[s:e + 1], len(comp), block=16 << 10, ahead=1)
+    st = openhands.SeekableInflate(reader, 0, len(comp), len(plain), every=64 << 10, native=False)
+    assert not st.native
+    for off, n in ((1_000_000, 4096), (10, 10), (1_500_000, 100_000)):
+        st.seek(off)
+        assert st.read(n) == plain[off:off + n]
+    assert len(st.ck_out) > 5
+    reader.close()
+
+
+# --------------------------------------------------------------------------------------------- guards and locks
+
+def test_memory_guard_relief_then_cap():
+    vals = iter([2.0, 1.2, 0.5, 2.0, 1.9])
+    dropped = []
+    g = common.MemoryGuard(max_gb=1.5, every=1, relief=[lambda: dropped.append(1)], rss=lambda: next(vals))
+    g.check()  # 2.0 -> relief -> 1.2: keeps going
+    assert dropped == [1] and g.reliefs == 1
+    g.check()  # 0.5: nothing to do
+    with pytest.raises(common.MemoryCap):
+        g.check()  # 2.0 -> relief -> 1.9: still above
+    common.MemoryGuard(max_gb=0, rss=lambda: 99.0).check()  # disabled
+    assert common.rss_gb() > 0  # this process (Linux /proc)
+
+
+def test_find_running_matches_exact_source_and_interpreter():
+    table = [
+        (101, ["/repo/.venv/bin/python", "scripts/ingest_isl_pose.py", "glosl", "--workers", "8"]),
+        (102, ["python3", "/x/scripts/ingest_isl_pose.py", "isl500-links"]),
+        (103, ["/bin/bash", "-c", "nice python scripts/ingest_isl_pose.py isl500 --workers 6"]),
+        (104, [".venv/bin/python", "scripts/ingest_isl_pose.py", "isl500", "--workers", "6"]),
+        (105, ["/usr/bin/vim", "scripts/ingest_isl_pose.py", "glosl"]),
+    ]
+    assert common.find_running("ingest_isl_pose.py", "glosl", table=table) == [101]
+    assert common.find_running("ingest_isl_pose.py", "isl500", table=table) == [104]
+    assert common.find_running("ingest_isl_pose.py", "isl500", exclude={104}, table=table) == []
+    assert common.find_running("ingest_isl_pose.py", "openhands-raw", table=table) == []
+
+
+def test_isl500_signer_fallback_is_order_independent():
+    a, b = (2560, 1440), (1920, 1080)
+    assert isl500.signer_size({}) == isl500.DEFAULT_SIZE
+    assert isl500.signer_size({a: 3, b: 5}) == b
+    assert isl500.signer_size({b: 2, a: 2}) == isl500.signer_size({a: 2, b: 2}) == a  # tie: STANDARD_SIZES order
+    orders = ([a, a, b], [b, a, a], [a, b, a])
+    results = set()
+    for order in orders:
+        s = isl500.SignerSizes()
+        for sz in order:
+            s.add("user001", sz)
+        results.add(s.fallback("user001"))
+    assert results == {(a, "user")}
+    assert isl500.SignerSizes().fallback("user009") == (isl500.DEFAULT_SIZE, "default")
+
+
+def test_script_run_pool_stops_for_memory(tmp_path):
+    mod = _script()
+    mod.MEM = common.MemoryGuard(max_gb=1.0, every=1, rss=lambda: 5.0)
+    try:
+        guard = common.DiskGuard(tmp_path, min_free_gb=0.0)
+        stats = mod.run_pool(range(10), lambda i: {"ok": True}, 2, guard, "t")
+        assert stats["stopped"].startswith("memory") and stats["processed"] == 0
+        assert mod.stop_code(stats) == common.EXIT_MEMORY == 5
+        mod.MEM = None
+        stats = mod.run_pool(range(5), lambda i: {"deferred": True} if i == 2 else {"ok": True}, 2, guard, "t")
+        assert stats["ok"] == 4 and stats["deferred"] == 1 and mod.stop_code(stats) == 0
+    finally:
+        mod.MEM = None

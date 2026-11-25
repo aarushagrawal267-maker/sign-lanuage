@@ -13,7 +13,10 @@ Usage (repository root; CPU work runs with nice 10):
   python scripts/ingest_isl_video.py status
 
 Exit codes of `run`: 0 finished, 10 stopped after --max-minutes (more to do), 4 stopped for low disk,
-3 gated dataset not accessible yet, 2 error.
+3 gated dataset not accessible yet, 5 stopped for memory (--max-rss-gb; resumable, the queue restarts it),
+6 another run of the same manifest is active (lock manifests/<manifest>.lock or a process scan), 2 error.
+CISLR has exactly one ingestion path: this `run cislr` (the queue runs it as soon as the 1-byte probe of
+dataset.csv answers); scripts/ingest_isl_gated.py cislr delegates here and shares the lock.
 --workers auto: 1 while INCLUDE (1 worker) and ISLRTC (3 workers) ingestion run, otherwise the CPUs they leave free
 (3 of 4 when neither runs).
 """
@@ -34,7 +37,7 @@ sys.path.insert(0, str(ROOT / "backend"))
 os.environ.setdefault("GLOG_minloglevel", "2")
 
 log = logging.getLogger("ingest_isl_video")
-EXIT_MORE, EXIT_DISK, EXIT_GATED, EXIT_ERR = 10, 4, 3, 2
+EXIT_MORE, EXIT_DISK, EXIT_GATED, EXIT_ERR, EXIT_MEMORY, EXIT_BUSY = 10, 4, 3, 2, 5, 6
 
 
 # --------------------------------------------------------------------------------------------- helpers
@@ -139,15 +142,13 @@ def ensure_hand_model() -> None:
     log.info("downloaded %s (%d bytes)", p, p.stat().st_size)
 
 
-def running_video_jobs() -> dict[str, bool]:
-    """Are the long INCLUDE / ISLRTC ingestion jobs (scripts/ingest_isl.py) running?"""
-    try:
-        out = subprocess.run(["pgrep", "-af", "ingest_isl.py"], capture_output=True, text=True, timeout=10).stdout
-    except Exception:  # noqa: BLE001
-        out = ""
-    lines = [ln for ln in out.splitlines() if "ingest_isl.py" in ln and "pgrep" not in ln]
-    return {"include": any(" include" in ln for ln in lines),
-            "islrtc": any(" islrtc" in ln and "islrtc_full" not in ln for ln in lines)}
+def running_video_jobs(table=None) -> dict[str, bool]:
+    """Are the long INCLUDE / ISLRTC ingestion jobs (scripts/ingest_isl.py) running? Matches the source argument
+    exactly, so ``ingest_isl.py islrtc-recut`` (1 small worker) does not count as the 3-worker ISLRTC job."""
+    from app.isl.data.pose_sources.common import find_running
+
+    return {"include": bool(find_running("ingest_isl.py", "include", table=table)),
+            "islrtc": bool(find_running("ingest_isl.py", "islrtc", table=table))}
 
 
 def auto_workers(ncpu: int | None = None, jobs: dict[str, bool] | None = None) -> int:
@@ -311,7 +312,7 @@ def cmd_probe(args) -> int:
         ex = s.extra
         try:
             if s.gated:
-                state = hf_access(ex["repo"], probe=ex["zip"])
+                state = hf_access(ex["repo"], probe=ex.get("probe"))  # a data file (dataset.csv), not the card
                 print(f"{n}: {state}")
                 worst = max(worst, 0 if state == "granted" else EXIT_GATED)
                 continue
@@ -344,6 +345,32 @@ def _setup_logging(paths, name: str) -> None:
     )
 
 
+def source_lock(paths, spec, name: str, table=None):
+    """Exclusive lock for one manifest (wslp and wslp_unlabelled share ``wslp.jsonl``; ``cislr`` is shared with
+    scripts/ingest_isl_gated.py) plus a process scan for an older run without a lock. Returns the open lock file
+    (keep it until the run ends) or None when another run is active."""
+    import fcntl
+
+    from app.isl.data.pose_sources.common import find_running
+
+    others = find_running(Path(__file__).name, ("run", name), table=table)
+    if others:
+        log.error("%s: another run is active (pid %s); exiting", name, others)
+        return None
+    lock_path = paths.manifests / f"{spec.manifest_name}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = lock_path.open("w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        log.error("%s: %s is locked by another run; exiting", name, lock_path)
+        return None
+    fh.write(f"{os.getpid()} {name}\n")
+    fh.flush()
+    return fh
+
+
 def cmd_run(args) -> int:
     from app.isl.data.video_sources import engine
     from app.isl.data.video_sources.catalog import get_source
@@ -351,6 +378,16 @@ def cmd_run(args) -> int:
     paths = _paths(args.root)
     _setup_logging(paths, args.source)
     spec = get_source(args.source)
+    lock = source_lock(paths, spec, args.source)
+    if lock is None:
+        return EXIT_BUSY
+    try:
+        return _run_locked(args, paths, spec, engine)
+    finally:
+        lock.close()
+
+
+def _run_locked(args, paths, spec, engine) -> int:
     if spec.mode in ("hands", "image"):
         ensure_hand_model()
     workers = auto_workers() if args.workers == "auto" else max(1, int(args.workers))
@@ -363,8 +400,11 @@ def cmd_run(args) -> int:
     log.info("%s: %d items listed, %d workers, profile %s, licence %s", spec.name, len(items), workers, spec.profile,
              spec.licence)
     stats = engine.run(spec, items, paths, fetcher, workers=workers, limit=args.limit, max_minutes=args.max_minutes,
-                       min_free_gb=args.min_free_gb, progress=log.info)
+                       min_free_gb=args.min_free_gb, progress=log.info,
+                       max_rss_gb=getattr(args, "max_rss_gb", 0.0) or 0.0)
     log.info("%s run finished: %s", spec.name, stats)
+    if stats["stopped"] == "memory":
+        return EXIT_MEMORY
     if stats["stopped"] == "disk":
         return EXIT_DISK
     if stats["stopped"] == "time":
@@ -450,6 +490,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-minutes", type=float, default=0.0, help="stop taking new items after this long (exit 10)")
     p.add_argument("--min-free-gb", type=float, default=10.0)
     p.add_argument("--per-class", type=int, default=None, help="image sets: sample size per class")
+    p.add_argument("--max-rss-gb", type=float, default=1.5,
+                   help="soft memory cap per process (this one and each worker); stop with exit 5 above it; 0 = off")
     p = sub.add_parser("islrtc-full")
     p.add_argument("--paths", nargs="*", help="ISLRTC paths (default: alphabet / fingerspell / number compilations)")
     p.add_argument("--max-s", type=float, default=180.0)
