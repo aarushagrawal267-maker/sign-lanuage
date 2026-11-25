@@ -168,7 +168,9 @@ describe("names and languages", () => {
     expect(pageIsTranslated("/my-signs", false)).toBe(true);
     expect(pageIsTranslated("/vocabulary", false)).toBe(true);
     expect(pageIsTranslated("/vocabulary", true)).toBe(false);
-    for (const p of ["/", "/evaluation", "/analyze", "/studio", "/dataset", "/lab", "/experiments", "/research"]) expect(pageIsTranslated(p, false), p).toBe(false);
+    expect(pageIsTranslated("/evaluation", false)).toBe(true); // ISL report page
+    expect(pageIsTranslated("/evaluation", true)).toBe(false); // ASL evaluation is English only
+    for (const p of ["/", "/analyze", "/studio", "/dataset", "/lab", "/experiments", "/research"]) expect(pageIsTranslated(p, false), p).toBe(false);
   });
 });
 

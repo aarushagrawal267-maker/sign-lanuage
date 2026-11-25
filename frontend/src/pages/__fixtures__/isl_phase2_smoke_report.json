@@ -1,0 +1,598 @@
+{
+ "schema": 2,
+ "language": "isl",
+ "profile": "research",
+ "smoke": true,
+ "partial_data": true,
+ "created": "2026-11-25T20:28:23Z",
+ "git_commit": "b00fe99",
+ "label": "SMOKE RUN on partial data with tiny settings: proves the pipeline runs end to end. These numbers are NOT the accuracy of the app.",
+ "data": {
+  "extra_sources": {
+   "isl500": {
+    "train": 215,
+    "test": 34,
+    "val": 51
+   },
+   "wslp": {
+    "train": 300
+   },
+   "mendeley_agri": {
+    "train": 2
+   }
+  },
+  "profile": "research",
+  "split": "include-session-cv5-fold0",
+  "split_label": "session-independent",
+  "signer_independent": "session",
+  "include": {
+   "train": 2566,
+   "val": 856,
+   "test": 856
+  },
+  "include_unassigned": 0,
+  "islrtc": 400,
+  "islrtc_untrimmed": 1,
+  "islrtc_reextraction": {
+   "recut_used": 378,
+   "truncated_excluded": 4
+  },
+  "islrtc_trim_versions": {
+   "trim-2+trim-learned-1": 396
+  },
+  "include_concepts": 262
+ },
+ "leakage_guards": {
+  "split": "include-session-cv5-fold0",
+  "classifier_split_checked": true,
+  "classifier_refused": null,
+  "dedup": {
+   "unions": {},
+   "dropped_train_extra": 0,
+   "dropped_train_islrtc": 0,
+   "dropped_eval_duplicates": 0
+  },
+  "links": {
+   "adapter": 298,
+   "exact": 298,
+   "new": 6,
+   "new_concepts": 6
+  },
+  "pretraining_excludes_eval_clips": true,
+  "pretraining_check": {
+   "excludes_eval_clips": true,
+   "pretrain_clips": 200,
+   "eval_clips_and_duplicates": 1797,
+   "overlap": 0,
+   "overlap_examples": [],
+   "sign_library": {
+    "reliable": false,
+    "drop_channels": [
+     "Sign_Library"
+    ],
+    "eval_content_matches": 0,
+    "matched_chunks_in_pretraining": 0
+   },
+   "islrtc_clips_seen_unlabelled": 1,
+   "islrtc_clips": 400
+  }
+ },
+ "protocols": {
+  "E1b": {
+   "label": "E1b core words, closed set, INCLUDE test part of include-session-cv5-fold0 (session-independent; signer-independent: session)",
+   "kind": "primary",
+   "run": true,
+   "n": 814,
+   "n_classes": 163,
+   "n_groups": 4,
+   "metrics": {
+    "top1": 0.0098,
+    "top5": 0.0283,
+    "macro_f1": 0.0006,
+    "coverage": 0.0,
+    "not_sure_rate": 1.0,
+    "wrong_accept_rate": 0.0
+   },
+   "decision_note": "classifier alone: accept when its probability >= the fused balanced threshold 0.24; the app uses the fused decision (E3)",
+   "intervals": {
+    "top1": null,
+    "top5": null,
+    "top1_cv_pooled": [
+     0.0033,
+     0.0111
+    ]
+   },
+   "interval_reasons": {
+    "top1": "too few signer groups (4)",
+    "top5": "too few signer groups (4)"
+   },
+   "interval_groups": {
+    "top1": 4,
+    "top5": 4,
+    "top1_cv_pooled": 8
+   },
+   "interval_note": "too few signer groups (4) in this test part: a signer-level interval needs more held-out signers (the cross-validation folds pool them)",
+   "per_category_top1": {
+    "Adjectives": 0.0,
+    "Animals": 0.0,
+    "Clothes": 0.0,
+    "Colours": 0.0
+   },
+   "cv": {
+    "folds": 2,
+    "top1_mean": 0.0073,
+    "top1_sd": 0.0025,
+    "pooled_n": 1652,
+    "pooled_top1": 0.0073,
+    "pooled_top1_interval": [
+     0.0033,
+     0.0111
+    ],
+    "pooled_top1_interval_reason": null,
+    "pooled_groups": 8,
+    "label": "every fold's held-out signers, each fold's model trained without them",
+    "per_fold": [
+     {
+      "split": "E1b core words, closed set, INCLUDE test part of include-session-cv5-fold0 (session-independent; signer-independent: session)",
+      "n": 814,
+      "top1": 0.0098
+     },
+     {
+      "split": "include-session-cv5-fold1",
+      "n": 838,
+      "top1": 0.0048
+     }
+    ]
+   }
+  },
+  "E1a": {
+   "label": "E1a INCLUDE official split: NOT signer-independent (same recording sessions in train and test); shown only next to E1b",
+   "kind": "official",
+   "run": true,
+   "n": 816,
+   "n_classes": 262,
+   "n_groups": 4,
+   "metrics": {
+    "top1": 0.0098,
+    "top5": 0.0306,
+    "macro_f1": 0.0008,
+    "coverage": 0.0,
+    "not_sure_rate": 1.0,
+    "wrong_accept_rate": 0.0
+   },
+   "decision_note": "classifier alone: accept when its probability >= the fused balanced threshold 0.24; the app uses the fused decision (E3)",
+   "intervals": {
+    "top1": null,
+    "top5": null
+   },
+   "interval_reasons": {
+    "top1": "too few signer groups (4)",
+    "top5": "too few signer groups (4)"
+   },
+   "interval_groups": {
+    "top1": 4,
+    "top5": 4
+   },
+   "interval_note": "too few signer groups (4) in this test part: a signer-level interval needs more held-out signers (the cross-validation folds pool them)",
+   "per_category_top1": {
+    "Adjectives": 0.0,
+    "Animals": 0.125,
+    "Clothes": 0.0
+   }
+  },
+  "E1c": {
+   "label": "E1c other sources' held-out signers (real signer ids: isl500); signer-independent",
+   "kind": "extra_signers",
+   "run": true,
+   "n": 16,
+   "n_classes": 16,
+   "n_groups": 2,
+   "metrics": {
+    "top1": 0.0,
+    "top5": 0.0,
+    "macro_f1": 0.0,
+    "coverage": 0.0,
+    "not_sure_rate": 1.0,
+    "wrong_accept_rate": 0.0
+   },
+   "decision_note": "classifier alone: accept when its probability >= the fused balanced threshold 0.24; the app uses the fused decision (E3)",
+   "intervals": {
+    "top1": null,
+    "top5": null
+   },
+   "interval_reasons": {
+    "top1": "too few signer groups (2)",
+    "top5": "too few signer groups (2)"
+   },
+   "interval_groups": {
+    "top1": 2,
+    "top5": 2
+   },
+   "interval_note": "too few signer groups (2) in this test part: a signer-level interval needs more held-out signers (the cross-validation folds pool them)",
+   "per_category_top1": {
+    "other": 0.0
+   }
+  },
+  "E3": {
+   "label": "E3 fused system (classifier + dictionary retrieval + fusion fitted on validation) with accept / suggest / abstain; INCLUDE test part + other sources' held-out signers",
+   "run": true,
+   "n": 890,
+   "n_groups": 6,
+   "n_classes": 197,
+   "fusion_fitted": true,
+   "metrics": {
+    "top1": 0.082,
+    "top5": 0.2315,
+    "coverage": 0.0067,
+    "accepted_precision": 0.5,
+    "not_sure_rate": 0.7753,
+    "wrong_accept_rate": 0.0034,
+    "suggest_rate": 0.218,
+    "suggest_top5_hit": 0.3247
+   },
+   "policies": {
+    "strict": {
+     "policy": "strict",
+     "n": 890,
+     "top1": 0.082,
+     "top5": 0.2315,
+     "coverage": 0.0067,
+     "accepted_precision": 0.5,
+     "silent_error_rate": 0.0034,
+     "suggest_rate": 0.218,
+     "suggest_top5_hit": 0.3247,
+     "abstain_rate": 0.7753,
+     "n_accepted": 6,
+     "not_sure_rate": 0.7753,
+     "wrong_accept_rate": 0.0034,
+     "intervals": {
+      "wrong_accept_rate": [
+       0.0,
+       0.0202
+      ],
+      "not_sure_rate": [
+       0.6977,
+       0.8004
+      ]
+     },
+     "interval_reasons": {},
+     "interval_groups": {
+      "wrong_accept_rate": 6,
+      "not_sure_rate": 6
+     }
+    },
+    "balanced": {
+     "policy": "balanced",
+     "n": 890,
+     "top1": 0.082,
+     "top5": 0.2315,
+     "coverage": 0.0067,
+     "accepted_precision": 0.5,
+     "silent_error_rate": 0.0034,
+     "suggest_rate": 0.218,
+     "suggest_top5_hit": 0.3247,
+     "abstain_rate": 0.7753,
+     "n_accepted": 6,
+     "not_sure_rate": 0.7753,
+     "wrong_accept_rate": 0.0034,
+     "intervals": {
+      "wrong_accept_rate": [
+       0.0,
+       0.0202
+      ],
+      "not_sure_rate": [
+       0.6977,
+       0.8004
+      ]
+     },
+     "interval_reasons": {},
+     "interval_groups": {
+      "wrong_accept_rate": 6,
+      "not_sure_rate": 6
+     }
+    }
+   },
+   "intervals": {
+    "top1": [
+     0.0608,
+     0.0989
+    ],
+    "top5": [
+     0.2023,
+     0.2424
+    ]
+   },
+   "interval_reasons": {},
+   "interval_groups": {
+    "top1": 6,
+    "top5": 6
+   },
+   "risk_coverage": [
+    {
+     "coverage": 0.1,
+     "risk": 0.8989
+    },
+    {
+     "coverage": 0.2,
+     "risk": 0.882
+    }
+   ],
+   "aurc": 0.8988,
+   "top1_by_source": {
+    "include": {
+     "n": 856,
+     "top1": 0.0829
+    },
+    "isl500": {
+     "n": 34,
+     "top1": 0.0588
+    }
+   }
+  },
+  "E2": {
+   "label": "E2 open vocabulary, one-shot: concepts held out of ALL supervised training (synonyms too); other signers' INCLUDE clips (val/test parts, never seen even unlabelled) vs one ISLRTC dictionary clip per word; thresholds fitted on seen-class validation queries only. Some misses are regional variants, not model errors. NOTE: self-supervised pre-training saw ISLRTC clips WITHOUT labels, including the dictionary reference clips E2 retrieves against (1 of 400 ISLRTC clips were in the pre-training list).",
+   "pretraining_saw_gallery_unlabelled": true,
+   "run": true,
+   "n": 120,
+   "n_groups": 4,
+   "metrics": {
+    "top1": 0.0333,
+    "top5": 0.05,
+    "top10": 0.1083,
+    "coverage": 0.425,
+    "not_sure_rate": 0.2167,
+    "wrong_accept_rate": 0.4083,
+    "suggest_rate": 0.3583
+   },
+   "intervals": {
+    "top1": null,
+    "top5": null,
+    "top10": null
+   },
+   "interval_reasons": {
+    "top1": "too few signer groups (4)",
+    "top5": "too few signer groups (4)",
+    "top10": "too few signer groups (4)"
+   },
+   "interval_groups": {
+    "top1": 4,
+    "top5": 4,
+    "top10": 4
+   },
+   "restricted_gallery": {
+    "n": 120,
+    "n_groups": 4,
+    "metrics": {
+     "top1": 0.0333,
+     "top5": 0.1417,
+     "top10": 0.1583,
+     "coverage": 0.5333,
+     "not_sure_rate": 0.175,
+     "wrong_accept_rate": 0.5,
+     "suggest_rate": 0.2917
+    },
+    "intervals": {
+     "top1": null,
+     "top5": null,
+     "top10": null
+    },
+    "interval_reasons": {
+     "top1": "too few signer groups (4)",
+     "top5": "too few signer groups (4)",
+     "top10": "too few signer groups (4)"
+    },
+    "interval_groups": {
+     "top1": 4,
+     "top5": 4,
+     "top10": 4
+    }
+   },
+   "folds": [
+    {
+     "fold": 0,
+     "run": true,
+     "held_out_concepts": 41,
+     "held_out_expanded": 47,
+     "gallery_rows": 400,
+     "gallery_concepts": 370,
+     "dropped_duplicate_queries": 0,
+     "calibration_queries": 220,
+     "full": {
+      "n": 120,
+      "n_groups": 4,
+      "n_classes": 19,
+      "gallery_concepts": 370,
+      "metrics": {
+       "top1": 0.0333,
+       "top5": 0.05,
+       "coverage": 0.425,
+       "accepted_precision": 0.0392,
+       "not_sure_rate": 0.2167,
+       "wrong_accept_rate": 0.4083,
+       "suggest_rate": 0.3583,
+       "suggest_top5_hit": 0.093,
+       "top10": 0.1083
+      },
+      "intervals": {
+       "top1": null,
+       "top5": null,
+       "top10": null
+      },
+      "interval_reasons": {
+       "top1": "too few signer groups (4)",
+       "top5": "too few signer groups (4)",
+       "top10": "too few signer groups (4)"
+      },
+      "interval_groups": {
+       "top1": 4,
+       "top5": 4,
+       "top10": 4
+      }
+     },
+     "seen_class": {
+      "n": 245,
+      "top1": 0.0163,
+      "top5": 0.0327,
+      "label": "INCLUDE test clips of concepts the fold encoder DID train on (same gallery)"
+     }
+    }
+   ]
+  },
+  "E2_seen": {
+   "label": "E2_seen: INCLUDE test clips vs ISLRTC rows only; SEEN classes (the encoder trained on these concepts' other clips) - not the open-vocabulary number",
+   "n": 306,
+   "n_groups": 4,
+   "gallery_concepts": 370,
+   "metrics": {
+    "top1": 0.0098,
+    "top5": 0.0294,
+    "top10": 0.0556
+   },
+   "intervals": {
+    "top1": null
+   },
+   "interval_reasons": {
+    "top1": "too few signer groups (4)"
+   },
+   "interval_groups": {
+    "top1": 4
+   }
+  },
+  "E4": {
+   "label": "My signs few-shot: a held-out signer enrols k takes of half of their words; tested on their other takes (gain over no enrolment) and on the words they did not enrol (false accepts of user signs). Groups are INCLUDE sessions / estimated signers, not verified identities.",
+   "run": true,
+   "n": 84,
+   "n_groups": 4,
+   "user_cls_mode": "neutral",
+   "metrics": {
+    "top1_with_enrolment_k3": 0.7619,
+    "gain_k3": 0.7024,
+    "user_sign_false_accept_rate_k3": 0.0
+   },
+   "by_k": {
+    "k1": {
+     "n": 307,
+     "n_groups": 4,
+     "top1_without_enrolment": 0.0717,
+     "top1_with_enrolment": 0.6059,
+     "gain": 0.5342,
+     "interval_with": null,
+     "interval_with_reason": "too few signer groups (4)",
+     "n_other_words": 429,
+     "user_sign_false_accept_rate": 0.0047,
+     "interval_false_accept": null,
+     "interval_false_accept_reason": "too few signer groups (4)"
+    },
+    "k3": {
+     "n": 84,
+     "n_groups": 4,
+     "top1_without_enrolment": 0.0595,
+     "top1_with_enrolment": 0.7619,
+     "gain": 0.7024,
+     "interval_with": null,
+     "interval_with_reason": "too few signer groups (4)",
+     "n_other_words": 239,
+     "user_sign_false_accept_rate": 0.0,
+     "interval_false_accept": null,
+     "interval_false_accept_reason": "too few signer groups (4)"
+    },
+    "k5": {
+     "n": 23,
+     "n_groups": 3,
+     "top1_without_enrolment": 0.0435,
+     "top1_with_enrolment": 0.9565,
+     "gain": 0.913,
+     "interval_with": null,
+     "interval_with_reason": "too few signer groups (3)",
+     "n_other_words": 95,
+     "user_sign_false_accept_rate": 0.0211,
+     "interval_false_accept": null,
+     "interval_false_accept_reason": "too few signer groups (3)"
+    }
+   }
+  },
+  "E5": {
+   "label": "Fingerspelling, leave-one-signer-out over the letter-annotated continuous fingerspelling signers (0); letter accuracy on letter frames, words via hold detection + dictionary decoding. Experimental while fewer than 5 signers exist.",
+   "run": false,
+   "reason": "1 signer(s) with letter-annotated continuous fingerspelling; leave-one-signer-out needs at least 2",
+   "data": {
+    "examples": 2535,
+    "letters": 36,
+    "noise": 20,
+    "signers": 176,
+    "per_source": {
+     "isl_fingerspelling": 238,
+     "openhands_fs": 2291,
+     "mendeley_static": 6
+    },
+    "words": 8,
+    "skipped": {
+     "image_unknown_label": 1
+    }
+   }
+  },
+  "E6": {
+   "label": "CPU latency per segment (3 crops), measured at load average 15.3 on 4 CPUs",
+   "load_average": 15.2637,
+   "n": 20,
+   "metrics": {
+    "p50_ms": 13.601,
+    "p95_ms": 63.2417
+   },
+   "stages_p50_ms": {
+    "classifier_ms": 3.613,
+    "encoder_ms": 2.5545,
+    "search_ms": 0.2355,
+    "feature_ms": 2.61
+   }
+  },
+  "E7": {
+   "label": "ASL regression: bundled WLASL100 model files unchanged (the full backend test suite checks behaviour)",
+   "run": true,
+   "sha256": "ad44f99417b06081ceca3665e747640376e62f17c4fd455b11c7183f2958032d",
+   "unchanged_in_git": true,
+   "metrics": {
+    "passed": 1.0
+   }
+  },
+  "E8": {
+   "label": "ISLRTC first-sign trim quality (synthetic end-error check, INCLUDE active-frame check) from 'cli trim-eval', plus the method mix of the trim sidecar",
+   "run": true,
+   "trims": 6521,
+   "method_mix": {
+    "dip": 923,
+    "rest": 896,
+    "cap": 1900,
+    "source_end": 2573,
+    "pause": 52,
+    "full": 158,
+    "empty": 4,
+    "clip_end": 11,
+    "truncated": 4
+   },
+   "low_confidence_frac": 0.2926,
+   "metrics": {
+    "trims": 6521,
+    "low_confidence_frac": 0.2926,
+    "cap_frac": 0.2914
+   },
+   "trim_eval": {
+    "synthetic": {
+     "description": "clean ISLRTC clips (bounded source_end trims) + 2-6 s explanation-like tail of another clip (after its stage-1 end), aligned to the same body frame; trimmer run as if stop=max_s",
+     "n": 331,
+     "within_300ms": 0.677,
+     "median_abs_err_ms": 80.0,
+     "late_frac": 0.187,
+     "early_frac": 0.136
+    },
+    "include_active_kept": {
+     "n": 400,
+     "mean": 1.0,
+     "frac_ge_90pct": 1.0
+    },
+    "learned": false
+   }
+  }
+ },
+ "seconds": 128.8
+}

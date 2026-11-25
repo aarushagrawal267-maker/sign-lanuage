@@ -1,0 +1,145 @@
+{
+ "schema": 1,
+ "language": "isl",
+ "profile": "commercial-safe",
+ "created": "2026-11-25T11:57:54Z",
+ "git_commit": "a3b7f8a",
+ "smoke": true,
+ "label": "SMOKE RUN on partial data (few minutes of CPU training): proves the pipeline works end to end. These numbers are NOT the accuracy of the app.",
+ "data": {
+  "profile": "commercial-safe",
+  "split": "include-session-cv5-fold0",
+  "split_label": "session-independent",
+  "signer_independent": "session",
+  "include": {
+   "train": 373,
+   "val": 125,
+   "test": 125
+  },
+  "include_unassigned": 168,
+  "islrtc": 2023,
+  "islrtc_untrimmed": 5,
+  "include_concepts": 59
+ },
+ "protocols": {
+  "E1": {
+   "label": "E1 core words, closed set, INCLUDE test fold of include-session-cv5-fold0 (session-independent; signer-independent: session)",
+   "n": 84,
+   "n_classes": 16,
+   "n_groups": 4,
+   "metrics": {
+    "top1": 0.5,
+    "top5": 0.7857,
+    "macro_f1": 0.4317
+   },
+   "intervals": {
+    "top1": [
+     0.3968,
+     0.8095
+    ],
+    "top5": [
+     0.6316,
+     1.0
+    ]
+   }
+  },
+  "E2": {
+   "label": "E2 INCLUDE clips vs ISLRTC dictionary rows only (another signer). Seen-class: the encoder trained on these concepts' INCLUDE train clips; the held-out-concept one-shot protocol is phase 2",
+   "n": 15,
+   "gallery_concepts": 1808,
+   "metrics": {
+    "top1": 0.0,
+    "top5": 0.0,
+    "top10": 0.0
+   },
+   "intervals": {
+    "top1": [
+     0.0,
+     0.0
+    ]
+   }
+  },
+  "E3": {
+   "label": "E3 fused system with accept / suggest / abstain (fusion fitted on the validation fold)",
+   "n": 125,
+   "fusion_fitted": true,
+   "policies": {
+    "strict": {
+     "policy": "strict",
+     "n": 125,
+     "top1": 0.304,
+     "top5": 0.528,
+     "coverage": 0.064,
+     "accepted_precision": 0.625,
+     "silent_error_rate": 0.024,
+     "suggest_rate": 0.568,
+     "suggest_top5_hit": 0.6901,
+     "abstain_rate": 0.368,
+     "n_accepted": 8
+    },
+    "balanced": {
+     "policy": "balanced",
+     "n": 125,
+     "top1": 0.304,
+     "top5": 0.528,
+     "coverage": 0.064,
+     "accepted_precision": 0.625,
+     "silent_error_rate": 0.024,
+     "suggest_rate": 0.568,
+     "suggest_top5_hit": 0.6901,
+     "abstain_rate": 0.368,
+     "n_accepted": 8
+    },
+    "lenient": {
+     "policy": "lenient",
+     "n": 125,
+     "top1": 0.304,
+     "top5": 0.528,
+     "coverage": 0.064,
+     "accepted_precision": 0.625,
+     "silent_error_rate": 0.024,
+     "suggest_rate": 0.568,
+     "suggest_top5_hit": 0.6901,
+     "abstain_rate": 0.368,
+     "n_accepted": 8
+    }
+   },
+   "metrics": {
+    "top1": 0.304,
+    "top5": 0.528,
+    "coverage": 0.064,
+    "accepted_precision": 0.625,
+    "silent_error_rate": 0.024,
+    "suggest_rate": 0.568,
+    "suggest_top5_hit": 0.6901,
+    "abstain_rate": 0.368
+   },
+   "risk_coverage": [
+    {
+     "coverage": 0.1,
+     "risk": 0.4167
+    },
+    {
+     "coverage": 0.2,
+     "risk": 0.4
+    }
+   ],
+   "aurc": 0.5399
+  },
+  "E6": {
+   "label": "CPU latency per segment (3 crops), measured while the ingestion jobs used ~3.5 CPUs",
+   "n": 20,
+   "metrics": {
+    "p50_ms": 114.0549,
+    "p95_ms": 207.4483
+   },
+   "stages_p50_ms": {
+    "classifier_ms": 24.3725,
+    "encoder_ms": 13.7895,
+    "search_ms": 10.411,
+    "feature_ms": 7.5942
+   }
+  }
+ },
+ "partition": "test"
+}

@@ -51,7 +51,7 @@ const TITLE_KEYS: Record<string, StringKey> = Object.fromEntries(NAV.flatMap((g)
  * reading English words with Hindi pronunciation rules (WCAG 3.1.2 Language of Parts).
  */
 export function pageIsTranslated(path: string, isAsl: boolean): boolean {
-  return path === "/live" || path === "/my-signs" || (path === "/vocabulary" && !isAsl);
+  return path === "/live" || path === "/my-signs" || ((path === "/vocabulary" || path === "/evaluation") && !isAsl);
 }
 
 /** Mobile navigation drawer: modal dialog that takes focus, traps Tab, closes on Escape and returns focus to the menu button. */

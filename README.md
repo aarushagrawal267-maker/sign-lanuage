@@ -279,6 +279,7 @@ setup.sh   start.sh   stop.sh    Linux / macOS scripts
 * The bundled model was trained on only ~5 clips per sign (524 of 2,038 WLASL100 clips could be downloaded); held-out accuracy on unseen signers is 44.3 % top-1, and live webcam accuracy is lower (lighting, camera angle, signing speed).
 * WLASL is licensed for non-commercial use only, so the model weights cannot be used in a commercial product without new training data.
 * The *Evaluation* page shows summary metrics for the bundled model; per-class tables and confusion matrices appear for models you train locally.
+* For an ISL pack the *Evaluation* page reads the pack's `results.json` (the phase-2 report): every protocol E1a/E1b/E1c, E2, E3, E4, E5, E6, E7, E8 with its 95 % interval or the reason there is none ("none: too few signer groups (4)"), refused / not-run protocols with their reason, the leakage guards, and a warning banner for smoke and partial-data reports (English and Hindi interface). Phase-1 files still render.
 * Not a substitute for a qualified interpreter. Details: [docs/LIMITATIONS.md](docs/LIMITATIONS.md).
 
 ## Documentation
