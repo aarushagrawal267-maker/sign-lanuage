@@ -119,7 +119,7 @@ async def ws_recognize(ws: WebSocket):
                 t0 = time.perf_counter()
                 try:
                     state = await asyncio.to_thread(engine.push, msg)
-                except (ValueError, TypeError) as e:
+                except (ValueError, TypeError, OverflowError) as e:
                     await ws.send_json({"type": "error", "message": f"invalid frame: {e}"})
                     continue
                 state["server_ms"] = (time.perf_counter() - t0) * 1000
@@ -135,7 +135,7 @@ async def ws_recognize(ws: WebSocket):
                         engine.cfg = EngineConfig.from_dict({**engine.describe()["config"], **(msg["engine"] or {})})
                         engine.reset()
                     await ws.send_json({"type": "config_ack", "engine": engine.describe()})
-                except (ValueError, TypeError) as e:
+                except (ValueError, TypeError, OverflowError) as e:  # OverflowError: int(Infinity)
                     await ws.send_json({"type": "error", "message": f"invalid config: {e}"})
             elif kind == "reset":
                 engine.reset()
@@ -248,7 +248,7 @@ def analyze_landmarks(clip: LandmarkClip):
         raise HTTPException(409, problem)
     try:
         seq = RawSequence.from_frames(clip.frames, clip.width, clip.height)
-    except ValueError as e:
+    except (ValueError, TypeError) as e:  # TypeError: e.g. a landmark list sent as an object
         raise HTTPException(422, str(e)) from e
     res = _classify_whole(predictor, seq)
     res["quality"] = sequence_quality(seq)

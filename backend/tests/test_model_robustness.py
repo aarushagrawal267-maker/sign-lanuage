@@ -75,10 +75,19 @@ def test_malformed_live_messages_keep_the_connection(client):
         assert ws.receive_json()["type"] == "error"
         ws.send_json({"type": "frame", "t": 0, "pose": "abc", "left": None, "right": None, "face": None})
         assert ws.receive_json()["type"] == "error"
+        # json.loads accepts Infinity/NaN: int(Infinity) raised OverflowError and a NaN timestamp was accepted
+        ws.send_text('{"type": "config", "width": Infinity, "height": 480}')
+        assert ws.receive_json()["type"] == "error"
+        ws.send_text('{"type": "config", "engine": {"top_k": Infinity}}')
+        assert ws.receive_json()["type"] == "error"
+        ws.send_text('{"type": "frame", "t": NaN, "pose": null, "left": null, "right": null, "face": null}')
+        assert ws.receive_json()["type"] == "error"
         ws.send_json({"type": "ping", "t": 7})
         assert ws.receive_json() == {"type": "pong", "t": 7}
 
 
 def test_landmark_clip_needs_a_frame_size(client):
     r = client.post("/api/analyze/landmarks", json={"width": 0, "height": 480, "frames": []})
+    assert r.status_code == 422
+    r = client.post("/api/analyze/landmarks", json={"width": 640, "height": 480, "frames": [{"t": 0, "pose": {"a": 1}}]})
     assert r.status_code == 422
