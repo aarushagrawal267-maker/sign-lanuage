@@ -1694,8 +1694,10 @@ Checked from a clean clone of `claude/indian-sign-language` (commit `fc1745a`) i
 
 ### 15.1 What phase 2 must do (in order)
 
-1. **Confirm ingestion finished**: `pgrep -af 'ingest_isl.py '` empty (the bare `ingest_isl` pattern also matches the pose / video ingesters); `include.jsonl` has 4,292 rows and `islrtc.jsonl` 13,665
-   (count `ok: false` and 0-frame rows; re-run the script, which resumes, for any failures). Do not delete `data/isl`.
+1. **Confirm ingestion finished** (updated 25 Nov 20:10 UTC, see 15.6): `scripts/phase2_train.sh --profile both
+   --check-only` exits 0 (the readiness guard: no ingestion process, every manifest complete, retryable download
+   rows retried). INCLUDE is complete when all 44 zips are in `manifests/include_zips_done.txt` (4,284 distinct clips,
+   not the published 4,292); `islrtc.jsonl` needs a row for each of the 13,665 index entries. Do not delete `data/isl`.
 2. **Refresh the data layer** (from `backend/`, `nice -n 10`, 4 threads once ingestion is done):
    `python -m app.isl.cli wordnet` (if missing), `trim`, `trim-eval`, `trim-review` (look at the sheet), `splits --fetch`,
    `splits`, `dedup`, `vocab --no-trims`, `status`. If concept ids changed, re-run `hindi --translate` then `hindi`, and commit
@@ -1772,7 +1774,7 @@ E1A_STEPS CV_FOLDS ONESHOT_FOLDS ONESHOT_EPOCHS LETTER_EPOCHS`). `--smoke` uses 
 landmarks through read-only symlinks, its own `derived/` and `splits/`) and writes only under
 `artifacts/isl/phase2-smoke/`, so it never changes shared derived files or the packs the app loads.
 
-**Sources per profile** (`backend/app/isl/training/multisource.py`; enforced twice: an allow-list per profile **and**
+**Sources per profile** (`backend/app/isl/profiles.py`, re-exported by `training/multisource.py`; WLASL and `isl_csltr_words` are in no profile, 15.4; enforced twice: an allow-list per profile **and**
 the adapter's own `commercial` flag, `LicenceError` otherwise; `build-pack` also refuses a commercial-safe pack whose
 `sources.json` lists a non-commercial source):
 
@@ -2056,7 +2058,7 @@ Engineer; the content is now the "What phase-2 training actually uses" table the
 start-of-run check: a run started with `--allow-partial` keeps its PARTIAL DATA mark even after ingestion ends; rebuild
 with `--from trim` for clean numbers.
 
-### 15.5 Adversarial review of the 15.4 fixes (Code Reviewer, 25 Nov 2026, 19:50-20:40 UTC)
+### 15.5 Adversarial review of the 15.4 fixes (Code Reviewer, 25 Nov 2026, 19:50-20:01 UTC, commits `2c649f9`, `5bb2c19`)
 
 Every claimed fix was re-read and, where possible, checked against the real data. Confirmed: intervals below 5 signer
 groups, the readiness guard (exit 4 on real data now), the classifier split guard in E1, the computed pre-training

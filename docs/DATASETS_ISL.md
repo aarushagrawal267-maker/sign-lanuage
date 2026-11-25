@@ -79,34 +79,30 @@ claim and does not change this.
 
 ### Data profiles (`backend/app/isl/profiles.py`)
 
-| Profile | Training / index / calibration sources | Pre-training only | Commercial |
-|---|---|---|---|
-| `commercial-safe` (default) | INCLUDE, ISLRTC | none | yes |
-| `research` | INCLUDE, ISLRTC, CISLR, iSign | WLASL, iSign | no |
+`profiles.py` is the single source of the lists (`WORD_SOURCES`, `PRETRAIN_SOURCES`, `LETTER_SOURCES`); the phase-1
+commands and the phase-2 training (`multisource.py` re-exports them, `scripts/phase2_train.sh`) read the same tuples
+(updated 25 Nov 2026 20:10 UTC by the Reality Checker from the code at commit `a0f954f`):
 
-User data never enters a global model in either profile. The profile name is written into every derived artifact.
-
-**What phase-2 training actually uses** (checked 25 Nov 2026 16:40 UTC by the Reality Checker): the table above is
-still the content of `profiles.py`, which only the phase-1 commands read. The phase-2 commands (`--all-sources`,
-`scripts/phase2_train.sh`) take their source lists from `backend/app/isl/training/multisource.py`
-(`WORD_SOURCES`, `PRETRAIN_SOURCES`, `LETTER_SOURCES`) and check each adapter's own `commercial` flag as well:
-
-| Role | `commercial-safe` | `research` |
+| Role | `commercial-safe` (default) | `research` (adds) |
 |---|---|---|
-| labelled words | include, islrtc, mendeley_emergency, mendeley_agri | + isl500, wslp, cislr |
-| pre-training only | isl_csltr | + glosl, openhands_raw, isign, wslp_unlabelled |
-| letters | mendeley_static | + isl_fingerspelling, openhands_fs, hf_hemg_alphabet, hf_akrit_alphabet |
+| labelled words (classifier, encoder, index, calibration) | include, islrtc, mendeley_emergency, mendeley_agri | isl500, wslp, cislr |
+| pre-training only (labels never read; the word sources are added without labels) | isl_csltr | glosl, openhands_raw, isign, wslp_unlabelled |
+| letters (fingerspelling model) | mendeley_static | isl_fingerspelling, openhands_fs, hf_hemg_alphabet, hf_akrit_alphabet |
+| commercial | yes | no |
 
-Every adapter's flag was read on the real manifests: `commercial = True` only for include, islrtc, isl_csltr,
-isl_csltr_words, mendeley_emergency, mendeley_agri and mendeley_static; every NC / ND / research-only / no-licence /
-pending source is `False`, and asking for one in `commercial-safe` raises `LicenceError`. `isl_csltr_words` (1,036
-CC BY still frames) is ingested but is in neither profile's lists, so no model uses it yet. WLASL is listed in
-`profiles.py` but not in `multisource.py`. `profiles.py` should be brought in line with `multisource.py` (model owner).
+Not used by any profile (`profiles.NOT_USED`): **WLASL** (American Sign Language, not ISL; no ASL warm start in
+phase 2) and **isl_csltr_words** (CC BY word labels, but each item is one still frame of a moving sign). User data
+("My signs") never enters a global model in either profile. The profile name is written into every derived
+artifact.
 
-Pose-native sources (section 3.4) are not yet registered in `profiles.py` / `sources.ADAPTERS` (that is the model
-owner's call); `app.isl.data.pose_sources.PROFILE_SOURCES` says where they belong <!-- pose-sources -->: `research`
-gains `isl500` and `openhands_fs` (labelled) and `glosl`, `openhands_raw` (pre-training only); `commercial-safe` gains
-nothing. `pose_sources.register(ADAPTERS)` adds the adapters to a registry.
+The licence rule is enforced twice: these allow-lists **and** each adapter's own `commercial` flag (`LicenceError`
+otherwise); `build-pack` also refuses a commercial-safe pack whose `sources.json` names a non-commercial source.
+Every adapter's flag was read on the real manifests (25 Nov 16:40 UTC): `commercial = True` only for include,
+islrtc, isl_csltr, isl_csltr_words, mendeley_emergency, mendeley_agri and mendeley_static. The video and pose
+adapters are registered in `sources.ADAPTERS` (`register_optional_adapters`); a test checks that every listed source
+has an adapter and that the commercial-safe lists agree with `catalog.profile_sources` / `pose_sources.PROFILE_SOURCES`.
+A pack lists only the sources whose clips really reached the build (`sources.json`, per role); INCLUDE and ISLRTC are
+always named because the vocabulary is built from their word lists.
 
 ---
 
@@ -599,17 +595,20 @@ Kept (each improved the tune half / dev labels and did not hurt the others):
 * **`truncated` card clips**: the ingestion title-card detector (`_cut_at_card`, near-uniform left part of the
   frame) also fires on plain grey backgrounds. Of 10 `card` clips viewed, 6 stopped mid-sign (0.8-3.8 s into
   the video), 1 was a real card after a second signer, 3 were right. A `card` clip whose last frames still
-  have a hand up is now `truncated` (confidence 0.1; 53 of the 71 card clips in the final run). **These should
-  be re-extracted with
-  `scripts/ingest_isl.py islrtc --only ... --full --max-s 14 --out-subdir islrtc_full`** (not done here: the
-  ingestion jobs belong to the main session).
+  have a hand up is now `truncated` (confidence 0.1; 53 of the 71 card clips in the final run). **Update 25 Nov
+  evening:** these are re-extracted by `scripts/ingest_isl.py islrtc-recut --follow` (card-v2 detector plus
+  opening-intro skipping, section 3.1) into `landmarks/islrtc_recut/` / `manifests/islrtc_recut.jsonl` (349 records
+  at 20:05 UTC); a recut row replaces the original in `cli trim` and in training (also when the original had 0
+  frames), and a `truncated` clip without a recut is left out of training, the index and the galleries.
 * **learned end for `cap` clips** (`trim_learned.py`, optional): the stage-2 BiGRU of `boundary.py` trained on
   same-signer spliced clips (not cross-signer joins). Spliced report half: 43.8% -> 51.7% main cut, 65.4% best
   of 2. It changes only `cap` ends; applied to every method it reached 70% on spliced data but lost on the
   labels (91.7% -> 90.6%), because real first rests/dips are mostly right. Train with
   `python -m app.isl.data.trim_learned train` (about 15 min on the shared 4 CPUs,
   `artifacts/isl/trim_boundary.pt`), apply with `trim_bench run --learned artifacts/isl/trim_boundary.pt`.
-  The default `cli trim` does not use it.
+  Since 25 Nov evening `cli trim` (and the phase-2 driver's `trim` step) uses it whenever that file exists
+  (`trim_version` `trim-2+trim-learned-1`; `--learned-model none` for rules only) and redoes clips trimmed with
+  another version or from another landmark file.
 
 Tried and dropped (measured, did not help):
 
@@ -633,8 +632,8 @@ sidecar `derived/islrtc_trim.jsonl`, `trim_version` `trim-2`; `.npz` files only 
 taken from the learned model (trained on all ingested `max_s` clips, 3,984 spliced examples, 15 min CPU);
 4,429 records have a `second` cut. `cap` clips keep 2.8 s (median; p10 1.8 s, p90 4.3 s) instead of 3.9 s.
 `cap` is still 28% of clips: they are the continuous-signing videos, not a failure of the boundary rules.
-Clips ingested later and trimmed by `python -m app.isl.cli trim` get stage 1 only (same `trim_version`);
-re-run `trim_bench run --learned ...` after ingestion to refine them.
+Clips ingested later are trimmed by `python -m app.isl.cli trim` with the same learned end (see 7.3), so no
+separate `trim_bench run --learned` pass is needed after ingestion.
 Confidence by method (unchanged): rest 0.9, source_end 0.8, dip 0.75, pause 0.7, cap 0.3, truncated 0.1.
 Measured: rest 14/16 and source_end 68/72 on labels (all dip labels right, n=6); `cap` 66% on spliced data,
 so 0.3 is conservative (kept: an existing data-layer test pins `cap <= 0.3`).
@@ -672,22 +671,24 @@ python -m app.isl.cli hindi --merge-local            # fold reviewed local Hindi
 
 ## 9. Open issues
 
-* INCLUDE and ISLRTC ingestion are partial (25 Nov 16:40 UTC: 2,839 of 4,292 and 5,191 of 13,665; section 3.5);
-  every count above must be refreshed after ingestion.
+* ISLRTC ingestion is partial (25 Nov 20:05 UTC: 6,446 of 13,665; INCLUDE finished at 19:59 UTC with all 44 zips
+  and 4,284 distinct clips, not the published 4,292; section 3.6); every count above must be refreshed after
+  ingestion.
 * Pseudo-signers are estimates; INCLUDE signer identities are not published in the manifest or the split lists.
 * Trimming (trim-2): 91.7% within 300 ms on 96 by-eye labelled clips with a visible end, but 65% of plain `max_s`
   videos run straight from the sign into the explanation and cannot be labelled by eye; on synthetic versions of
-  that case 44-52% (62-65% with the second cut). 53 `card` clips stopped mid-sign need a `--full` re-extraction.
+  that case 44-52% (62-65% with the second cut). Card / intro stops are re-extracted by `islrtc-recut` (7.3).
 * 41 vocabulary concepts need a human review (`review.status == "needs_review"`), plus the synonym-list detection.
 * CISLR licence review (videos collected from third-party online sources) before any commercial use.
 * iSign hand labelling (left/right) to be verified on real data.
 * Hindi lexicon: curated rows await a native-speaker teacher; machine rows are unreviewed drafts (section 10).
-* Pose-native sources (3.4) <!-- pose-sources -->: register them in `profiles.py` / `sources.ADAPTERS`; decide the
+* Pose-native sources (3.4) <!-- pose-sources -->: registered in `profiles.py` / `sources.ADAPTERS` (section 1); decide the
   OpenHands raw corpus (CC BY label on third-party YouTube content) and fingerspelling set before any commercial use;
   ISL500 signs were recorded in Goa and 14 of its 500 words link only through a synonym / domain rule or not at all
   (`derived/isl500_links.jsonl`), so check sign forms against ISLRTC before mixing them into one class; frame aspect
-  of GloSL / OpenHands is a hand-bone estimate (about +-10 %); Sign Library's two OpenHands files may overlap by up
-  to 6.8 h (hash-named chunks in `sub_based`), deduplicate by content before pre-training.
+  of GloSL / OpenHands is a hand-bone estimate (about +-10 %); Sign Library's two OpenHands files: measured by pose
+  content, only 19 chunks copy a one-minute chunk (a few minutes, not 6.8 h); the driver's `pretrain_dedup` step
+  drops them (ISL_DESIGN 15.4).
 * Fixed in commit 514be97: `isign.pose_to_raw` used to divide z by the frame width; it now keeps raw MediaPipe z like
   pose-format's Holistic writer and our extractor. No iSign data exists yet (still gated), so nothing needs re-running.
 
