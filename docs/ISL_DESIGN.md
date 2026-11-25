@@ -2118,11 +2118,12 @@ stopped or fixed (one decision, below).** Nothing was trained at full settings; 
 | `choose_user_mode` picked `neutral` on any top-1 gain | one lucky take of 30 decided the mode | needs a gain >= 0.02 **and** >= 2 more correct enrolled takes |
 
 **Still open (not blocking the commercial-safe run):**
-* **OpenHands raw reads about 30 MB per 130-frame chunk** (10.7 chunks/min, 5-8 MB/s fetched; 84,129 ISH News
+* *(Closed 21:13 UTC, see 15.7 and DATASETS_ISL.md 3.7: the job now reads each member in one forward pass; the
+  "30 MB per chunk" was a logging artifact, the real cost was about 16 MB.)* **OpenHands raw reads about 30 MB per 130-frame chunk** (10.7 chunks/min, 5-8 MB/s fetched; 84,129 ISH News
   `sub_based` chunks left, then MBM), so its job, and with it research readiness, would end around 1-2 Dec or later.
   Ingestion owner: make it read in data-address order / keep the inflated window; or the main session stops it
   (SIGINT, resumable) and accepts the 16.7k chunks already ingested (all four channels are represented).
-* Frontend (`LanguageEvaluation.tsx`) renders the phase-1 protocol names: with a phase-2 report it shows E2, E3
+* *(Closed by `7508274` / `45aee49`, see 15.7.)* Frontend (`LanguageEvaluation.tsx`) renders the phase-1 protocol names: with a phase-2 report it shows E2, E3
   and E6 but not E1a/b/c, E4, E5, E7, E8, the interval reasons or a `partial_data` warning (only `smoke` gets a
   notice). A `--allow-partial` pack would therefore not be flagged in the UI; do not ship one.
 * Carried over: the Sign Library eval-clip matching is uncalibrated across extractors (15.5); GloSL / NIOS / ISH
@@ -2151,3 +2152,84 @@ stopped or fixed (one decision, below).** Nothing was trained at full settings; 
 5. After each run: read `artifacts/isl/<profile>/eval/report.md` (it must not say PARTIAL DATA or SMOKE), then the
    15.1 follow-ups (commit the reviewed vocabulary, Hindi for new concepts, pack size decision). Never use
    `--allow-partial` for a pack that is shipped.
+
+### 15.7 OpenHands speed-up and eval page (Reality Checker, 25 Nov 2026, 21:33-22:10 UTC, at `45aee49`)
+
+Read-only re-check of `0d6e7e8` (HF alphabet listings), `0bccbcf` + `0efd7b7` (OpenHands forward pass), `7508274` +
+`45aee49` (Evaluation page) and `f1d92f7`, with live evidence. No job was touched; nothing was trained.
+
+**Verdicts.** Commercial-safe full run: **NEEDS WORK only on data** (code ready; data guard exit 4; estimate **26 Nov
+09:00-15:00 UTC**). Research full run: **NEEDS WORK only on data** (same queue, plus the OpenHands job, which now ends
+tonight; estimate also **26 Nov 09:00-15:00 UTC**). Both are bounded by the video queue (`isl_queue.sh`), which blocks
+every profile until its whole list is done, including the research-only sources at its end.
+
+**OpenHands raw (PID 25287, pre-review code in memory).** Sampled every 60 s from `/proc/25287/{status,io}`, the
+manifest, the log and `df`, 21:33-22:00 UTC:
+
+| | before (20:33, old pass 2) | MBM data pass 21:39:50-21:57:11 (17.4 min, measured) |
+|---|---|---|
+| chunks | 10.7 / min (~130-frame ISH News chunks) | 6,069 chunks of a median 3,729 native frames (~2.5 min; modes 7,500-7,552 = 5 min, so "chunked_1_min" is a name, not the length) = 350 / min |
+| download | 2.9 MB/s, ~16 MB per chunk for 0.64 MB of payload | 22.5 MB/s (`rchar` +22.98 GB over 17.0 min); 23.33 GB in total = the member's compressed size, i.e. **every byte fetched once**; 0 jumps, 0 fallbacks, 0 stream errors |
+| inflated | - | 59.07 GB in 1,043 s = 56.6 MB/s; 1.19 cores of CPU |
+| RSS | 0.69-0.87 GB | **1.11-1.20 GB** (ISH News: 0.40-0.66 GB; MBM chunks are 15-30x larger); 0.96-1.11 GB in the listing passes; guard at 1.5 GB |
+
+The ISH News `sub_based` pass (log): 16,462 chunks in 591 s = 1,670 / min, 0.28 MB downloaded per chunk (old path:
+~16 MB). So the claimed ~170x holds for small chunks; per inflated byte the job is now network-and-one-core bound.
+Listing passes are the slow part: MBM listed 12,138 datasets in 1,596 s (23.32 GB fetched = the whole member a first
+time). Manifest at 21:58: **63,745 rows, all ok, 0 duplicate ids, one key order**; rows 0-18,023 have `.npz` mtimes
+before the 20:47:38 restart and rows 18,024-57,675 after it, contiguously, so nothing was redone. Spot checks: 3 new
+ISH News rows, 3 MBM rows and 1 old row load with pose (T,33,4), hands (T,21,3), face (T,20,3) all-NaN (by design),
+increasing `t_ms`; 500 sampled rows (400 new) all match `n_frames` and `hands_frac` to 0.002. No deleted-but-open
+files in any job; `du -xsh /` = `df` used (41 GB at 21:34). Landmarks `openhands_raw` **10.99 GB** allocated at 21:57
+(MBM 4.76 GB), 24 GB free disk. Hours ingested at 25 fps: Sign Library 35, NIOS 140, ISH News 174, MBM 273 = 622 h of
+the published ~1,129 h.
+
+ETA (estimate): NewzHook (61.24 GB compressed, **159.48 GB raw**) started listing at 21:57:14 at 17-20 MB/s, so its
+listing ends about 22:45-23:05; the 12 GB budget then leaves about 1.0 GB of landmarks, i.e. roughly the first 12 GB
+(about 8 %) of NewzHook **in file order (not a random sample)**, and the job ends about **22:50-23:30 UTC, 25 Nov**
+(DATASETS 3.7 said 00:00-01:00). Risks: (1) the NewzHook listing starts at RSS 1.11 GB with up to 256 MB of metadata
+cache, and the memory guard's `relief` still points at the previous member's stream during a listing; a stop there
+restarts the 61 GB listing from byte 0 (up to 3 respawns, then the job exits and readiness treats OpenHands as
+complete); (2) the running process still has the pre-review `PrefetchReader` (a failed block is never re-fetched),
+so a Zenodo outage longer than `range_fetch`'s retries ends the job; restart it with the same command, it resumes.
+
+**HF alphabets.** `manifests/hf_{akrit,hemg}_alphabet_items.json` exist: 10,118 items (33 classes, 300-418 per class,
+train + test) and 10,500 (35 x 300), unique ids, `listing_status.json` "complete" for every split. Readiness now says
+`hf_hemg_alphabet 0/10500`, `hf_akrit_alphabet 0/10118` (not "listing failed"). Remaining research reasons at 21:34:
+five running jobs (islrtc, recut, queue, its WSLP chunk, openhands-raw), islrtc 7,597/13,665, wslp 2,213/4,398,
+wslp_unlabelled 3/635, mendeley_static 8/13,800, isl_fingerspelling 4/1,308, isl_csltr 2/687, mendeley_agri 2/78,
+mendeley_emergency 0/412 (3 retries), both HF sets 0, openhands_raw (job running). Commercial-safe: islrtc, recut and
+the queue running, plus islrtc, mendeley_static, isl_csltr, mendeley_agri, mendeley_emergency. Note: the per-class
+cap of 300 means Hemg contributes 10,500 of its 42,745 rows (25 %); "all means all" is not literally met there (most
+Hemg rows are probably augmented copies, DATASETS 3.3).
+
+**Rates for the ETA** (manifests, 21:39:59-21:58:16, plus 20:26-21:34): islrtc 12.6-13.9 / min (5,759 left -> about
+**05:00-06:00 UTC**, recut final scan 30-60 min later); WSLP 6-8.5 / min on 1 worker (1,979 left -> about 02:00-03:30).
+After WSLP the queue runs fingerspelling (1 worker until islrtc ends), then Mendeley static, CSLTR, agriculture,
+emergency, CSLTR words, the two HF sets (20,618 images through the rows API, the least certain step) and WSLP
+unlabelled on 3 workers: roughly 3.5-7.5 h of work, so the list ends about **09:00-15:00 UTC, 26 Nov**. Commercial-safe
+could start 2-4 h earlier if the queue processed its four commercial-safe sources first, or if readiness let a
+queue whose remaining sources are all research-only block only the research profile (not changed here).
+
+**Eval page.** `npm run typecheck` pass, `npx vitest run` 76 passed / 1 skipped, `npm run build` pass. Re-took the
+screenshots at `45aee49` (the 21:18 one predates the review fix) from the real smoke `report.json` files with
+Playwright (`/api` mocked): research and commercial-safe at 1360 px, commercial-safe in Hindi at 390 px; no console
+errors, `scrollWidth` = 390 at phone width. Every overview number matches the report (research: E1a 1.0 %, E1b 1.0 %,
+E1c 0.0 %, E2 3.3 %, E2_seen 1.0 %, E3 8.2 % 6.1-9.9 % (6 groups), E4 76.2 % at k = 3, E5 not measured with the report's
+reason, E6 14 ms, E7 yes, E8 29.3 %; commercial-safe: 0.7 / 0.8 / not measured / 3.3 / 1.0 / 6.4 / 74.1 % / not
+measured / 22 ms / yes / 29.2 %); E1b cross-validation pooled 0.7 % (0.3-1.1 %, 8 groups); SMOKE + PARTIAL DATA banner
+and badges shown. One misleading row, from the backend: E8's "Learned trim model used: no" is true of
+`artifacts/reports/trim_eval.json` (written 11:00 by the rules-only `cli trim-eval`), but the trims the run used are
+`trim-2+trim-learned-1` (530 learned ends in the research smoke sidecar). `e8_trim` reads that stale file and the
+driver never re-runs `trim-eval`, so the full run's E8 synthetic check would describe an older trimmer.
+
+**Backend suite:** 461 passed (`SLR_TORCH_THREADS=2`, nice 10, 50 s).
+
+**For the main session.**
+1. Nothing to do for OpenHands tonight unless its log shows `stopped for memory` 3 times or a traceback: then start
+   it again with the same command (resumable). To get more NewzHook, raise `--budget-gb` (owner decision; about
+   +1 GB of landmarks per 12 GB of NewzHook inflated, and a restart also loads the review fixes).
+2. Before the full runs, make E8 honest: run `cli trim-eval` with the learned model in the driver (or have `e8_trim`
+   read `trim_eval_learned.json` when the sidecar's `trim_version` contains `trim-learned`, and record the file's
+   time). Until then, read E8's synthetic numbers as the rules-only trimmer's.
+3. Then follow the 15.6 commands unchanged; check-only must print 0 for each profile first.

@@ -499,7 +499,7 @@ measurements.
 | `ingest_isl.py islrtc` (6785) | 6,650 rows, all ok (312 with 0 frames: opening intros / false card stops, re-extracted by the recut job) | 13,665 | 9.8 videos/min over 20:03-20:26; 11-12/min over 19:46-20:04 (log) | none | **06:30-10:00, 26 Nov** (7,015 left) - the critical path for commercial-safe |
 | `ingest_isl.py islrtc-recut --follow` (20244) | 383 records (all ok); 14 card stops and 20 zero-frame clips waiting for its next 30-min scan | follows islrtc | 36 records in 23 min | none | about 30-60 min after the islrtc job ends (one final scan, then it exits) |
 | queue (17314) -> `ingest_isl_video.py run wslp` (chunk PID 1696) | 1,649 of 4,398 ok | 4,398 | 6.3 clips/min (20:03-20:26); 5.4/min over the last 45-min chunk; 1 worker | 0 standing failures (fetch failures are retried) | WSLP about **03:45-05:00, 26 Nov** |
-| rest of the queue (fingerspelling 1,308, Mendeley static 13,800 images, CSLTR 687, agriculture 78, emergency 412, CSLTR words 1,036, two HF alphabet sets, WSLP unlabelled 635) | probe rows only (Mendeley emergency: 3 `superseded` rows to redo) | see 3.3 | not started; per-item times from the probe runs: 0.5 s per image, 4-13 s per video | HF alphabet listings failed with 429 / 503 in the probe runs (no item lists yet) | about **12:00-17:00, 26 Nov** (roughly 11 h on 1 worker, 4-6 h once islrtc has ended and the queue gets 3) |
+| rest of the queue (fingerspelling 1,308, Mendeley static 13,800 images, CSLTR 687, agriculture 78, emergency 412, CSLTR words 1,036, two HF alphabet sets, WSLP unlabelled 635) | probe rows only (Mendeley emergency: 3 `superseded` rows to redo) | see 3.3 | not started; per-item times from the probe runs: 0.5 s per image, 4-13 s per video | HF alphabet listings failed with 429 / 503 in the probe runs (no item lists yet; **since 20:43 / 21:08 UTC both item lists exist**, 3.3) | about **12:00-17:00, 26 Nov** (roughly 11 h on 1 worker, 4-6 h once islrtc has ended and the queue gets 3) |
 | `ingest_isl_pose.py openhands-raw` (13762) | 16,670 chunks; Sign Library, NIOS and the ISH News one-minute file done; ISH News `sub_based` 2,117 of 86,246 | until `landmarks/openhands_raw` = 12 GB (3.62 GB now) | **10.7 chunks/min** (450 in 42 min); landmarks +12 MB in 20 min; 5-8 MB/s downloaded, i.e. ~30 MB fetched per ~130-frame chunk | none | **not before about 1-2 Dec** for ISH News `sub_based` alone (84,129 chunks left), then MBM; the 12 GB budget is not reached for weeks at this rate. The 17:56 estimate (budget at 06:00-18:00, 26 Nov) was wrong. **Superseded by 3.7**: ISH News `sub_based` finished 21:13 UTC (it had 43,123 chunks, not 86,246: that is the dataset count, two per chunk) |
 | CISLR / iSign | gated, no access (probed by the queue) | - | - | - | ingested automatically if access is granted |
 
@@ -591,6 +591,17 @@ line; the last line of a file without a final newline is now treated as cut. (4)
 headers (0.9 KB each in memory, measured: 70 MB for ISH News; for a NewzHook-sized member of ~460k datasets about
 0.4 GB, reloaded on every restart, near the 1.5 GB guard if the budget is raised); they are released once queued.
 Tests: `test_openhands_forward.py` (4 new).
+
+**Reality check (21:33-22:00 UTC, read-only, ISL_DESIGN 15.7).** MBM Vadodara: listing 12,138 datasets in 1,596 s
+(ended 21:39:47), then the forward pass **6,069 chunks in 1,043 s** (21:39:50-21:57:11), 59.07 GB inflated, 23.33 GB
+downloaded (= the member's compressed size: nothing fetched twice in the data pass), 0 jumps / fallbacks / stream
+errors; 22.5 MB/s by `/proc/<pid>/io`; RSS 1.11-1.20 GB (not 0.40-0.66 GB: MBM chunks are a median 3,729 native frames,
+modes 7,500-7,552 = 5 min at 25 fps, despite the `chunked_1_min` name); MBM landmarks 4.76 GB. Manifest at 21:58:
+63,745 rows, all ok, 0 duplicate ids, pre-restart rows untouched (their `.npz` mtimes are all before 20:47:38).
+`landmarks/openhands_raw` 10.99 GB allocated. NewzHook is **159.48 GB raw** (61.24 GB compressed); its listing started
+21:57:14 at about 17-20 MB/s (ends about 22:45-23:05), after which the 12 GB budget leaves about 1 GB of landmarks:
+about the first 8 % of NewzHook in file order. **Job end: about 22:50-23:30 UTC, 25 Nov** (estimate; the 00:00-01:00
+above assumed a slower MBM pass).
 
 ---
 
