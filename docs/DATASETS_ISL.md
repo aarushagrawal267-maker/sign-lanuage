@@ -255,7 +255,7 @@ fingerspelling set) and little CPU; the jobs are network-bound.
 ```
 nice -n 10 .venv/bin/python scripts/ingest_isl_pose.py glosl --workers 8
 nice -n 10 .venv/bin/python scripts/ingest_isl_pose.py isl500 --workers 6
-nice -n 10 .venv/bin/python scripts/ingest_isl_pose.py openhands-raw --workers 8 --budget-gb 12
+nice -n 10 .venv/bin/python scripts/ingest_isl_pose.py openhands-raw --workers 12 --budget-gb 12
 nice -n 10 .venv/bin/python scripts/ingest_isl_pose.py openhands-fs
 .venv/bin/python scripts/ingest_isl_pose.py isl500-links   # ISL500 glosses -> vocabulary (derived/isl500_links.jsonl)
 .venv/bin/python scripts/ingest_isl_pose.py status        # counts, frames, disk per source
@@ -282,7 +282,8 @@ stored frame (GloSL), about 360 bytes (OpenHands, no face).
 | `openhands_fs` | `Indian.zip`: MP4 + pickled poses | the pickles are never loaded (untrusted pickle = code execution); our own extractor runs on the 172 MP4s (`ingest_isl.extract_full`, 15 fps, float32) | exact (same extractor) | `holistic-v1` |
 
 **Streaming the OpenHands archives** (`openhands.SeekableInflate`): the zip member is inflated from HTTP range
-requests with parallel read-ahead (Zenodo gives about 1 MB/s per connection; 8 parallel 8 MB blocks gave 6 MB/s).
+requests with parallel read-ahead (Zenodo gives about 0.8 MB/s per connection and sometimes stalls a connection
+without closing it; 8 parallel 8 MB blocks gave 4-8 MB/s; a block slower than 250 KB/s after 15 s is retried).
 While inflating, a `zlib` snapshot is kept every max(4 MB, size / 3000) of output so backward seeks restart nearby,
 and 4 KB pages that look like HDF5 metadata (a block signature, or under 99 % plausible float64 words) are kept in
 memory with their neighbours, plus the indexes of all-zero pages (Sign Library 1-minute file: 446 of 357,076 pages,
@@ -316,7 +317,7 @@ with our extractor once the CPU is free (estimate 8-10 CPU hours).
 
 **Jobs started 25 Nov 2026** (detached, `nice -n 10`, logs `data/isl/logs/ingest_pose_<source>.log`): `glosl`
 (14:45 UTC, 8 download threads, 8.5-12.6 clips/s depending on machine load, ETA about 19:00 UTC), `isl500` (14:45,
-6 threads, 4.5-5.8 clips/s, ETA about 20:10 UTC), `openhands-raw` (restarted 14:57, 8 read-ahead, 6-8 MB/s, budget
+6 threads, 4.5-5.8 clips/s, ETA about 20:10 UTC), `openhands-raw` (last restarted 15:02 with 12 read-ahead after stream fixes, 4-8 MB/s, budget
 12 GB, ETA about 21:30 UTC or earlier when the budget is reached; Zenodo allows 133 requests per minute and answers
 429 above that, which the reader waits out), `openhands-fs` (done 14:58: 172 of 172 clips ok). Rates measured on the
 first 3-7k items; every count in this section must be refreshed when the jobs finish.
