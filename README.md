@@ -133,6 +133,8 @@ cd frontend && npm ci && npm run dev
 
 ## Using the application
 
+**Indian Sign Language (ISL, branch `claude/indian-sign-language`).** The header has a sign-language switch (ISL first, ASL second) and an EN / हिंदी interface switch. With ISL, Live Recognition shows each word in English and Hindi, asks "Did you mean…?" with up to five choices when it is not sure, and says "Not sure – try again or spell it" instead of guessing; the signed words become an approximate English and Hindi sentence that can be read aloud. **My signs** records 3–5 takes of a personal or regional (e.g. Indore) sign and shares signs as `.signpack` files; the Vocabulary page searches the whole ISLRTC dictionary in English or Hindi. Design, data and honest accuracy notes: `docs/ISL_DESIGN.md`, `docs/DATASETS_ISL.md`.
+
 **Just want to try it?** After setup, open **Live Recognition → Start camera → Start recognition** — the bundled pretrained WLASL100 model is already active. The steps below are for downloading the dataset and training your own models.
 
 1. **Dataset Explorer → Load annotations.** Downloads the two official annotation files, records their SHA-256, builds the WLASL100 inventory and the splits.
@@ -287,7 +289,7 @@ The **code** in this repository is released under the [MIT licence](LICENSE). Th
 }
 ```
 
-MediaPipe © Google (Apache-2.0). Fonts: IBM Plex (SIL OFL 1.1). Icons: Lucide (ISC).
+MediaPipe © Google (Apache-2.0). Fonts: IBM Plex and Noto Sans Devanagari (SIL OFL 1.1). Icons: Lucide (ISC).
 
 ## Deployment (Hugging Face)
 

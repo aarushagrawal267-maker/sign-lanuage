@@ -5,6 +5,8 @@ import { api, type ExperimentDetail, type ExperimentSummary, type Metrics } from
 import { useApi } from "../lib/hooks";
 import { dateTime, downloadCsv, ms, pct } from "../lib/format";
 import { Badge, Button, Card, Empty, ErrorText, Notice, PageHeader, Segmented, Stat, inputCls } from "../components/ui";
+import { useSignLanguage } from "../state/language";
+import { LanguageEvaluation } from "./LanguageEvaluation";
 import { ConfusionMatrix } from "../components/charts/ConfusionMatrix";
 import { LineChart } from "../components/charts/LineChart";
 import { ColumnChart } from "../components/charts/Bars";
@@ -128,7 +130,7 @@ function MetricsView({ m, exp }: { m: Metrics; exp: ExperimentDetail }) {
   );
 }
 
-export default function EvaluationPage() {
+function AslEvaluation() {
   const [params, setParams] = useSearchParams();
   const exps = useApi<ExperimentSummary[]>("/api/experiments");
   const completed = (exps.data ?? []).filter((e) => e.status === "completed");
@@ -198,4 +200,10 @@ export default function EvaluationPage() {
       )}
     </div>
   );
+}
+
+export default function EvaluationPage() {
+  const { isAsl, loading, id } = useSignLanguage();
+  if (loading) return <p className="text-sm text-fg-3">Loading…</p>;
+  return isAsl ? <AslEvaluation /> : <LanguageEvaluation key={id} />;
 }

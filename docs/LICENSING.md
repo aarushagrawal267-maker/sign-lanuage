@@ -54,5 +54,6 @@ required) and INCLUDE word folders (CC BY 4.0); no ISL video or landmark data is
 | React, React Router, Vite, Tailwind CSS | MIT |
 | Lucide icons | ISC |
 | IBM Plex fonts | SIL Open Font License 1.1 |
+| Noto Sans Devanagari (Hindi text, `@fontsource/noto-sans-devanagari`) | SIL Open Font License 1.1 |
 
 Downloading YouTube videos may be subject to YouTube's Terms of Service in your jurisdiction; the official WLASL tooling uses the same approach for research purposes.

@@ -4,6 +4,8 @@ import type { VocabEntry } from "../api/client";
 import { useApi } from "../lib/hooks";
 import { pct } from "../lib/format";
 import { Badge, Card, Empty, Kv, Notice, PageHeader, Segmented, SyntheticBadge, cx, inputCls } from "../components/ui";
+import { useSignLanguage } from "../state/language";
+import { LanguageVocabulary } from "./LanguageVocabulary";
 
 type Sort = "class" | "alpha" | "f1" | "data";
 
@@ -56,7 +58,7 @@ function DetailPanel({ e, onClose, modelName }: { e: VocabEntry; onClose: () => 
   );
 }
 
-export default function VocabularyPage() {
+function AslVocabulary() {
   const { data, error } = useApi<{ model: { id: number; name: string; is_synthetic: boolean } | null; glosses: VocabEntry[] }>("/api/vocabulary");
   const [q, setQ] = useState("");
   const [sort, setSort] = useState<Sort>("class");
@@ -116,4 +118,10 @@ export default function VocabularyPage() {
       </ul>
     </div>
   );
+}
+
+export default function VocabularyPage() {
+  const { isAsl, loading, id } = useSignLanguage();
+  if (loading) return <p className="text-sm text-fg-3">Loading…</p>;
+  return isAsl ? <AslVocabulary /> : <LanguageVocabulary key={id} />;
 }

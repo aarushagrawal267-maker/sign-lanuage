@@ -4,6 +4,10 @@
 @import "@fontsource/ibm-plex-sans/600.css";
 @import "@fontsource/ibm-plex-mono/400.css";
 @import "@fontsource/ibm-plex-mono/500.css";
+/* Hindi: Noto Sans Devanagari (SIL OFL 1.1), Devanagari subset only; the browser fetches it only when Hindi text is shown. */
+@import "@fontsource/noto-sans-devanagari/devanagari-400.css";
+@import "@fontsource/noto-sans-devanagari/devanagari-500.css";
+@import "@fontsource/noto-sans-devanagari/devanagari-600.css";
 
 /* Design tokens - Sign Intelligence Studio (dark, charcoal) */
 @theme {
@@ -170,4 +174,16 @@ body {
 .prose-doc strong {
   color: var(--color-fg);
   font-weight: 600;
+}
+
+/* Hindi (Devanagari). IBM Plex Sans has no Devanagari glyphs: use the bundled Noto Sans Devanagari, then system fonts
+   (Nirmala UI on Windows, Kohinoor Devanagari on macOS/iOS, Mangal on older Windows).
+   The :lang rule is in the base layer so utilities such as font-mono still win over it. */
+@layer base {
+  :lang(hi) {
+    font-family: "IBM Plex Sans", "Noto Sans Devanagari", "Nirmala UI", "Kohinoor Devanagari", "Mangal", ui-sans-serif, system-ui, sans-serif;
+  }
+}
+.font-hi {
+  font-family: "Noto Sans Devanagari", "Nirmala UI", "Kohinoor Devanagari", "Mangal", "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
 }

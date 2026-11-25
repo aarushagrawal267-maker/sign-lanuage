@@ -59,7 +59,9 @@ const staticDenied = <T>(): Promise<T> => Promise.reject(new ApiError(403, STATI
 export const api = IS_STATIC ? {
   get: staticGet,
   post: <T>(_path: string, _body?: unknown) => staticDenied<T>(),
+  patch: <T>(_path: string, _body?: unknown) => staticDenied<T>(),
   del: <T>(_path: string) => staticDenied<T>(),
+  blob: (_path: string) => staticDenied<{ blob: Blob; filename: string | null }>(),
   upload: <T>(_path: string, _form: FormData) => staticDenied<T>(),
 } : {
   get: <T>(path: string) => fetch(API_BASE + path).then((r) => parse<T>(r)),
@@ -69,7 +71,21 @@ export const api = IS_STATIC ? {
       headers: body === undefined ? undefined : { "Content-Type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
     }).then((r) => parse<T>(r)),
+  patch: <T>(path: string, body?: unknown) =>
+    fetch(API_BASE + path, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body ?? {}),
+    }).then((r) => parse<T>(r)),
   del: <T>(path: string) => fetch(API_BASE + path, { method: "DELETE" }).then((r) => parse<T>(r)),
+  /** Download a file response (e.g. a .signpack export). */
+  blob: async (path: string) => {
+    const r = await fetch(API_BASE + path);
+    if (!r.ok) await parse<never>(r);
+    const cd = r.headers.get("Content-Disposition") ?? "";
+    const m = /filename="?([^";]+)"?/i.exec(cd);
+    return { blob: await r.blob(), filename: m ? m[1] : null };
+  },
   upload: <T>(path: string, form: FormData) =>
     fetch(API_BASE + path, { method: "POST", body: form }).then((r) => parse<T>(r)),
 };
@@ -83,6 +99,114 @@ export function wsUrl(path: string): string {
 // ---------------------------------------------------------------- types
 export type TopK = { class_index: number; gloss: string; prob: number };
 
+/** Review state of a Hindi word (docs/ISL_DESIGN.md 8.1 / 8.4). "user" = typed by the person who recorded a My sign. */
+export type HiReview = "reviewed" | "curated" | "machine" | "disputed" | "missing" | "user" | null;
+
+/** A recognition candidate from a language pack: a superset of TopK (ISL and ASL with a Hindi lexicon). */
+export type Candidate = TopK & {
+  concept_id?: string;
+  text?: { en?: string | null; hi?: string | null };
+  hi_review?: HiReview;
+  source?: string; // classifier | retrieval | classifier+retrieval | my_signs | spelling
+  variant_id?: string | null;
+  region?: string | null;
+  origin?: string | null;
+};
+
+export type LanguageInfo = {
+  id: string;
+  kind: string;
+  sign_language: string;
+  standard: string;
+  display_name: { en: string; hi?: string };
+  output_languages: string[];
+  capabilities: string[];
+  profile: string;
+  version: string | null;
+  licences: { source: string; licence: string; commercial: boolean }[];
+  status: "ready" | "missing_models" | "error";
+  message: string | null;
+  components?: Record<string, boolean>;
+};
+
+export type LanguageVocabRow = {
+  class_index: number;
+  concept_id: string;
+  headword: string;
+  text: { en: string; hi: string | null };
+  hi_review: HiReview;
+  hi_alt: string[];
+  hi_source: string | null;
+  hi_reviewed: boolean;
+  kind: string;
+  category: string | null;
+  in_classifier: boolean;
+  indexable: boolean;
+  n_variants: number;
+  sources: string[];
+  regions: string[];
+  review: string;
+};
+
+export type LanguageVocabEntry = {
+  concept_id: string;
+  headword: string;
+  display?: { en?: string };
+  synonyms?: string[];
+  category?: string | null;
+  pos?: string | null;
+  kind?: string;
+  in_classifier?: boolean;
+  fingerspell?: string | null;
+  variants?: { variant_id: string; source: string; region?: string | null; clips?: string[] }[];
+  sources?: { dataset: string; id: string; licence: string; url?: string }[];
+  class_index: number;
+  hindi: { hi?: string; hindi?: string; hi_alt?: string[]; review?: HiReview; source?: string; reviewed?: boolean; model?: string | null } | null;
+  metrics?: Record<string, number> | null;
+  preview?: { clip: string; variant_id: string | null; width: number; height: number; frames: RawFrame[] } | null;
+};
+
+export type SentenceOut = { text: string; approximate: boolean; rules: string[]; missing_hi: string[] };
+export type SentenceResponse = { en: SentenceOut; hi: SentenceOut; language: string; note?: string } & Record<string, unknown>;
+
+export type MySign = {
+  sign_id: string;
+  pack: string;
+  concept_id: string | null;
+  text_en: string;
+  text_hi: string | null;
+  region: string | null;
+  note: string | null;
+  n_takes: number;
+  origin: string;
+  author: string | null;
+  created: string;
+  enabled: boolean;
+  deleted: boolean;
+  theta?: number | null;
+  licence?: string | null;
+};
+
+export type TakeQuality = {
+  usable?: boolean;
+  frames?: number;
+  duration_ms?: number;
+  any_hand_rate?: number;
+  problems?: string[];
+} & Record<string, unknown>;
+
+export type AddSignResult = {
+  sign: MySign | null;
+  take_quality: TakeQuality[];
+  consistency: number | null;
+  conflicts: { concept_id: string; score: number; name: string }[];
+  self_test: { hits?: number; n?: number } & Record<string, unknown>;
+  accepted: boolean;
+  message: string;
+};
+
+export type AlphabetStatus = { letters: Record<string, number>; ready: boolean; min_letters: number; trained_model: boolean };
+
 export type ModelInfo = {
   experiment_id: number;
   name: string;
@@ -93,6 +217,10 @@ export type ModelInfo = {
   threshold: number;
   seq_len: number;
   num_classes: number;
+  // language packs (ISL)
+  version?: string | null;
+  profile?: string;
+  components?: Record<string, ({ smoke?: boolean; experimental?: boolean } & Record<string, unknown>) | null>;
 };
 
 export type ExpBrief = {

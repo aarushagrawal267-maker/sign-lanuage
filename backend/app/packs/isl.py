@@ -12,7 +12,7 @@ import logging
 import threading
 from pathlib import Path
 
-from app.core.config import get_settings
+from app.core.config import REPO_ROOT, get_settings
 from app.features.spec import FeatureConfig
 from app.packs.registry import PackInfo
 from app.packs.schema import PackManifest
@@ -56,9 +56,23 @@ class IslPack:
             "spelling_lexicon": self._path(fs.get("lexicon")),
             "fusion": self._path(c.get("fusion") if isinstance(c.get("fusion"), str) else None),
             "vocabulary": self._path(self.manifest.vocabulary),
-            "lexicon_hi": self._path(self.manifest.lexicons.get("hi")),
+            "lexicon_hi": self._lexicon_path(),
             "results": self._path(self.manifest.results),
         }
+
+    def _lexicon_path(self) -> Path | None:
+        """The pack's Hindi lexicon. A local build (artifacts/packs/<id>) made before the lexicon existed falls back
+        to the tracked copy in models/packs/<id>, which is keyed by the same concept ids; rows of concepts that
+        are not in this pack's vocabulary are simply never looked up."""
+        rel = self.manifest.lexicons.get("hi")
+        p = self._path(rel)
+        if p is None or p.exists():
+            return p
+        tracked = REPO_ROOT / "models" / "packs" / self.manifest.id
+        if tracked.resolve() == self.folder.resolve():
+            return p
+        alt = (tracked / rel).resolve()
+        return alt if tracked.resolve() in alt.parents and alt.exists() else p
 
     def present(self) -> dict[str, bool]:
         out = {}

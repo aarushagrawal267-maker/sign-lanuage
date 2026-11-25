@@ -3,6 +3,7 @@ import { expect, test } from "@playwright/test";
 const PAGES: [string, RegExp][] = [
   ["/", /Overview/],
   ["/live", /Live Sign Recognition/],
+  ["/my-signs", /My signs/],
   ["/analyze", /Video Analysis/],
   ["/vocabulary", /Sign Vocabulary Explorer/],
   ["/studio", /Landmark Visualisation Studio/],

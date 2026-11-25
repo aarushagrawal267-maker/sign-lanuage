@@ -19,6 +19,10 @@ def _fold(s: str) -> str:
     return "".join(ch for ch in s if not unicodedata.combining(ch)).lower().strip()
 
 
+def _is_devanagari(s: str) -> bool:
+    return any("ऀ" <= ch <= "ॿ" for ch in s)
+
+
 class Vocabulary:
     def __init__(self, rows: list[dict]):
         self.rows = rows
@@ -77,6 +81,8 @@ class Vocabulary:
                kind: str | None = None, in_classifier: bool | None = None, has_hi=None, review: str | None = None,
                offset: int = 0, limit: int = 50, hi_lookup=None) -> tuple[int, list[tuple[int, dict]]]:
         qf = _fold(q or "")
+        # A query in Devanagari searches the Hindi lexicon (main word and alternatives) instead of the English fields.
+        hindi_q = bool(qf) and _is_devanagari(qf) and hi_lookup is not None
         exact, prefix, other = [], [], []
         for i, r in enumerate(self.rows):
             if category and r.get("category") != category:
@@ -91,7 +97,19 @@ class Vocabulary:
                 continue
             if has_hi is not None and hi_lookup is not None and (hi_lookup(r["concept_id"]) is not None) != has_hi:
                 continue
-            if qf:
+            if hindi_q:
+                hi = hi_lookup(r["concept_id"])
+                if not hi:
+                    continue
+                main = _fold(hi.get("hi") or "")
+                alts = [_fold(a) for a in hi.get("hi_alt") or []]
+                if main == qf or qf in alts:
+                    exact.append(i)
+                elif main.startswith(qf) or any(a.startswith(qf) for a in alts):
+                    prefix.append(i)
+                elif qf in main or any(qf in a for a in alts):
+                    other.append(i)
+            elif qf:
                 hw = _fold(r.get("headword", ""))
                 if hw == qf:
                     exact.append(i)

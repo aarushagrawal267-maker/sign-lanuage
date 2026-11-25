@@ -41,7 +41,9 @@ sentences, then Frontend Developer) and the project owner.
 ### 1.2 Non-goals (this phase)
 
 * Continuous ISL sentence translation (ISL grammar, classifiers, role shift). The sentence builder only joins recognised words and is labelled approximate.
-* Hindi user interface (menus in Hindi). Output text is bilingual; UI translation can follow later.
+* ~~Hindi user interface (menus in Hindi).~~ Moved into scope by the owner's frontend task (25 Nov 2026): a simple English/Hindi
+  interface toggle covers the navigation, Live, Vocabulary, My signs and status texts (section 13). The research pages
+  (Model Laboratory, Dataset, Evaluation, Studio, Analysis) stay English.
 * GPU training, full-scale training before ingestion finishes (phase 2).
 
 ### 1.3 Constraints
@@ -1522,3 +1524,71 @@ Order of work and acceptance per agent:
 
 Open questions for the owner (do not block phase 2): who reviews the core Hindi list (a teacher at an Indore school would be ideal);
 whether an Indore school can record the ISL alphabet and 100 everyday words with 5+ signers (the single most valuable dataset for this launch).
+
+---
+
+## 13. Frontend implementation notes and deviations (Frontend Developer, 25 Nov 2026)
+
+Implemented (section 11, task 4): `state/language.tsx`, `i18n/` (English/Hindi interface strings), `lib/speech.ts`,
+`components/{LanguageSwitcher,BilingualWord,CandidateList,SignResult,SentenceBar,SkeletonPreview,ErrorBoundary}.tsx`,
+`recognition/useLandmarkRecorder.ts`, `pages/{MySignsPage,LanguageVocabulary,LanguageEvaluation}.tsx`, and the language-aware
+`LivePage`, `VocabularyPage`, `EvaluationPage` and `Layout`. What the user sees:
+
+* **Sign language switch** in the header: ISL first and selected by default, ASL second; the choice is kept in `localStorage`
+  (`sis.language`). The backend default stays `asl-wlasl100` (so old clients and the legacy routes are unchanged); the
+  *frontend* picks ISL whenever an ISL pack is listed (`pickLanguage`). The static in-browser demo has only ASL and shows no switch.
+* **Live page, ISL**: the result is shown in large type as "WATER / पानी" with the Hindi review marker (checked / word list /
+  machine / doubtful / your text) or "Hindi not available yet / हिंदी उपलब्ध नहीं"; `suggest` shows up to five tappable
+  English+Hindi chips ("Did you mean…?") that send `choose`; nothing enters the sentence until the user taps; `abstain` shows
+  "Not sure – try again or spell it". An accepted word has a "Wrong word? Remove it" button that sends `reject`. The
+  ASL threshold sliders are replaced by the pack policy (Careful / Balanced / More words = strict / balanced / lenient) and a
+  "Recognise my own signs" switch; the ASL engine still receives exactly the config fields it always did
+  (`engineConfigPayload`, unit-tested). Switching language on an open socket sends `config` with `language`, clears the
+  sentence and waits for the new `hello`.
+* **ASL keeps working** with the same messages. Small visible changes: a rejected ASL sign that still has ranked guesses now
+  shows the same "did you mean" chips (the choice is added locally, because the classic engine has no `segment_id`), and
+  ASL words also show Hindi when `models/packs/asl-wlasl100/lexicon_hi.jsonl` provides it.
+* **Spelling**: the Words / Spell switch appears only when the socket's `hello` lists the `spelling` capability (a trained
+  letter model, or a calibrated alphabet). Otherwise the page links to the alphabet calibration on My signs. Live letters
+  (`state.spell`) show in a letter strip; the finished word arrives as "did you mean" chips (never auto-accepted), labelled
+  experimental.
+* **Sentence strip**: the committed words as English+Hindi chips; `POST /api/languages/{lang}/sentence` (`words` form, so My
+  signs and spelled words work too) gives an approximate English and Hindi sentence, always labelled approximate, with the
+  applied rules on hover. If the endpoint is unreachable the words are shown in signing order. **Speak** uses the browser's
+  `speechSynthesis` (`hi-IN` or `en-IN`; off by default; "speak each new word" toggle); with no Hindi voice the page says so
+  and English is spoken. Nothing is sent to a server.
+* **My signs** (`/my-signs`): camera + MediaPipe in the browser; "Record take N" starts when the hands appear and stops after
+  450 ms with hands down (capped at 3.8 s, under the 4 s server limit); 3–5 takes, each previewed as a stick figure; English
+  word with dictionary suggestions to link the sign to an existing concept (then Hindi is filled in); Hindi, region
+  (default "Indore, Madhya Pradesh") and note. "Check and save" runs `dry_run` first: if it is accepted with no
+  look-alikes it saves; with a look-alike it asks "This looks like X. Save anyway as your own version?" (or save as a version
+  of X); otherwise it shows the server's message and marks the problem takes. The list allows on/off, edit and delete
+  (two-step). Export needs the consent checkbox (text from 7.4 in English and Hindi), face points off by default, licence
+  choice; import supports merge/replace. **Alphabet calibration**: A–Z buttons record a 1.2 s hold per letter
+  (`POST .../my-signs/alphabet`); "spelling ready" once the server says so (at least 5 letters).
+* **Vocabulary, ISL**: server-side paged search over all concepts; a query in Devanagari searches the Hindi lexicon (main
+  word and alternatives, nukta-insensitive; small backend addition in `packs/vocabulary.py`); filters for entry type and
+  core words; the Hindi coverage line states how much is machine translation and that 0 rows are teacher-checked; detail
+  panel with Hindi review state, alternatives (machine alternatives labelled "not checked"), variants and regions, a
+  stick-figure preview of the dictionary sign when the landmarks are on this computer, speak buttons and a local Hindi
+  correction form (`PATCH .../lexicon/{concept_id}`: "Hindi is correct", "Save correction", "Hindi is wrong" = disputed;
+  disabled in the public demo).
+* **Evaluation, ISL**: `results.json` per protocol with n, classes, groups and 95% intervals; E2 ("any dictionary word") is
+  placed first; E3 shows coverage next to accepted precision, the silent error rate, "did you mean" and "not sure" rates per
+  policy; a smoke run is labelled as such. Only measured numbers are shown, never targets.
+* **Hindi interface**: an EN / हिंदी toggle in the header (remembered; defaults to Hindi when the browser language is Hindi);
+  `<html lang>` follows it. Every English string has a Hindi string with the same placeholders (unit-tested). The Hindi
+  interface text was written by the AI developer, **not reviewed by a native speaker**; a teacher should read it.
+* **Fonts**: Noto Sans Devanagari (OFL, `@fontsource/noto-sans-devanagari`, Devanagari subset only, loaded only when Hindi is
+  on screen); Hindi text carries `lang="hi"` for screen readers.
+
+Backend changes made for the UI (small, tested in `tests/isl/test_vocab_hindi_search.py`): Devanagari queries in
+`Vocabulary.search`; `IslPack` falls back to the tracked `models/packs/<id>/lexicon_hi.jsonl` when a local build in
+`artifacts/packs/<id>` has none (the smoke pack was built before the lexicon existed, so live results had no Hindi).
+
+Deviations and gaps: the localStorage key for the language is `sis.language` as specified, but the interface language uses
+`ui-lang-v1`; the static demo does not offer ISL or My signs (no IndexedDB store yet, 7.4); the Analysis, Studio, Lab and
+Dataset pages remain ASL/English only; no "did you mean" keyboard shortcuts beyond normal Tab/Enter; the Playwright tests use
+Chromium's synthetic camera (no person), so accept/suggest/abstain rendering is covered by Vitest component tests and a
+scripted WebSocket check, not by an end-to-end signing test.
+

@@ -13,7 +13,9 @@ export type LiveStatus =
   | "collecting"
   | "analyzing"
   | "recognized"
-  | "uncertain";
+  | "uncertain"
+  | "not_sure"
+  | "spelling";
 
 type Meta = { label: string; tone: "idle" | "active" | "busy" | "good" | "warn" | "error"; help: string };
 
@@ -33,6 +35,8 @@ export const STATUS: Record<LiveStatus, Meta> = {
   analyzing: { label: "Model inference", tone: "busy", help: "Classifying the sign so far. Lower your hands to finish." },
   recognized: { label: "Recognised sign", tone: "good", help: "The sign passed confidence, margin and agreement checks." },
   uncertain: { label: "Uncertain sign", tone: "warn", help: "Not confident enough to output text. Try again, or the sign may be outside the vocabulary." },
+  not_sure: { label: "Not sure", tone: "warn", help: "No good guess for that sign. Please sign it again, or spell it." },
+  spelling: { label: "Spelling", tone: "busy", help: "Hold each letter still for a moment; lower your hands to finish the word." },
 };
 
 export const TONE_CLASS: Record<Meta["tone"], string> = {
@@ -51,5 +55,9 @@ export const REJECT_REASON: Record<string, string> = {
   cooldown: "inside cooldown window",
   repeat_suppressed: "same sign repeated",
   too_short: "too few frames with hands",
+  out_of_vocabulary: "looks like no word in the dictionary",
+  low_coverage: "too little of the sign was seen",
+  my_signs: "matched one of your signs",
+  no_features: "body or hands not detected well enough",
   ok: "accepted",
 };

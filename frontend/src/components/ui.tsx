@@ -9,7 +9,7 @@ export function PageHeader({ eyebrow, title, description, actions }: { eyebrow?:
   return (
     <header className="mb-6 flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
       <div className="max-w-3xl">
-        {eyebrow && <div className="mb-1 font-mono text-[11px] uppercase tracking-[0.14em] text-accent">{eyebrow}</div>}
+        {eyebrow && <div className="mb-1 font-mono text-[11px] uppercase tracking-[0.14em] text-accent [&:lang(hi)]:font-sans [&:lang(hi)]:tracking-normal">{eyebrow}</div>}
         <h1 className="text-2xl font-semibold tracking-tight text-fg">{title}</h1>
         {description && <p className="mt-1.5 text-sm leading-relaxed text-fg-2">{description}</p>}
       </div>

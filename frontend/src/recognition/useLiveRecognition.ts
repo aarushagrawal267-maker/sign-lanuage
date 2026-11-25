@@ -1,14 +1,25 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { HolisticLandmarker } from "@mediapipe/tasks-vision";
 import { LocalRecognitionSocket } from "../static/engine";
-import { IS_STATIC, api, wsUrl, type FeatureSpec, type ModelInfo, type RawFrame, type TopK } from "../api/client";
+import { IS_STATIC, api, wsUrl, type Candidate, type FeatureSpec, type LanguageInfo, type ModelInfo, type RawFrame } from "../api/client";
 import { DEFAULT_FACE_IDX, loadHolistic, toRawFrame } from "../mediapipe/holistic";
 import { drawFrame } from "../mediapipe/draw";
-import { RollingStat, deriveStatus, engineConfigPayload, type LiveSettings, type ServerState, type TranscriptItem } from "./live";
+import {
+  RollingStat, deriveStatus, engineConfigPayload, transcriptFromCandidate, transcriptItem,
+  type Commit, type LiveSettings, type SegmentResult, type ServerState, type SpellState, type TranscriptItem,
+} from "./live";
 
 type Metrics = { fps: number | null; mpMs: number | null; serverMs: number | null; inferenceMs: number | null; e2eMs: number | null; sendFps: number | null };
 
-export function useLiveRecognition(settings: LiveSettings) {
+/** Language pack details the server reports in its hello message (authoritative for what this socket can do). */
+export type HelloLanguage = Pick<LanguageInfo, "id" | "display_name" | "output_languages" | "capabilities" | "profile" | "status" | "sign_language">;
+
+/**
+ * Live recognition over the WebSocket. `language` is a language-pack id (docs/ISL_DESIGN.md 4.5); `pack` says it is a
+ * language pack with a recogniser (ISL: accept / suggest / abstain, choose / reject, spelling) rather than the classic
+ * ASL engine, whose messages are unchanged. `spell` switches a pack to spelling mode.
+ */
+export function useLiveRecognition(settings: LiveSettings, language: string, opts: { pack: boolean; spell: boolean } = { pack: false, spell: false }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -23,8 +34,12 @@ export function useLiveRecognition(settings: LiveSettings) {
   const [modelAvailable, setModelAvailable] = useState<boolean | null>(null);
   const [modelMessage, setModelMessage] = useState<string | null>(null);
   const [server, setServer] = useState<ServerState | null>(null);
-  const [provisional, setProvisional] = useState<TopK[] | null>(null);
-  const [lastResult, setLastResult] = useState<ServerState["segment_result"] | null>(null);
+  const [provisional, setProvisional] = useState<Candidate[] | null>(null);
+  const [lastResult, setLastResult] = useState<SegmentResult | null>(null);
+  const [resolved, setResolved] = useState<{ segment: SegmentResult; how: "chosen" | "dismissed" } | null>(null);
+  const [spell, setSpell] = useState<SpellState | null>(null);
+  const [helloLanguage, setHelloLanguage] = useState<HelloLanguage | null>(null);
+  const [serverError, setServerError] = useState<string | null>(null);
   const [transcript, setTranscript] = useState<TranscriptItem[]>([]);
   const [detection, setDetection] = useState({ pose: false, left: false, right: false, face: false });
   const [metrics, setMetrics] = useState<Metrics>({ fps: null, mpMs: null, serverMs: null, inferenceMs: null, e2eMs: null, sendFps: null });
@@ -44,6 +59,11 @@ export function useLiveRecognition(settings: LiveSettings) {
   const trail = useRef<{ x: number; y: number; side: "left" | "right" }[]>([]);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  const langRef = useRef(language);
+  langRef.current = language;
+  const optsRef = useRef(opts);
+  optsRef.current = opts;
+  const payload = () => engineConfigPayload(settingsRef.current.engine, optsRef.current);
   const stats = useRef({ fps: new RollingStat(), mp: new RollingStat(), srv: new RollingStat(), inf: new RollingStat(4000), e2e: new RollingStat(), send: new RollingStat() });
   const idRef = useRef(1);
   const pausedRef = useRef(false);
@@ -77,12 +97,13 @@ export function useLiveRecognition(settings: LiveSettings) {
     setSocket("connecting");
     setModelAvailable(null);
     setModelMessage(null);
-    const ws = (IS_STATIC ? new LocalRecognitionSocket() : new WebSocket(wsUrl("/api/ws/recognize"))) as WebSocket;
+    const lang = langRef.current;
+    const ws = (IS_STATIC ? new LocalRecognitionSocket() : new WebSocket(wsUrl(`/api/ws/recognize?language=${encodeURIComponent(lang)}`))) as WebSocket;
     wsRef.current = ws;
     ws.onopen = () => {
       setSocket("open");
       const v = videoRef.current;
-      ws.send(JSON.stringify({ type: "config", width: v?.videoWidth || 640, height: v?.videoHeight || 480, engine: engineConfigPayload(settingsRef.current.engine) }));
+      ws.send(JSON.stringify({ type: "config", width: v?.videoWidth || 640, height: v?.videoHeight || 480, engine: payload() }));
     };
     ws.onerror = () => setSocket("error");
     ws.onclose = () => {
@@ -97,7 +118,16 @@ export function useLiveRecognition(settings: LiveSettings) {
         setModel(msg.model);
         setModelAvailable(!!msg.model);
         setModelMessage(typeof msg.message === "string" ? msg.message : null);
+        setHelloLanguage(msg.language ?? null);
+        setServerError(null);
         sendingRef.current = !!msg.model;
+      } else if (msg.type === "error") {
+        setServerError(typeof msg.message === "string" ? msg.message : "error");
+      } else if (msg.type === "config_ack") {
+        setServerError(null);
+      } else if (msg.type === "choice_ack") {
+        const c = msg.commit as Commit;
+        setTranscript((tr) => [...tr, transcriptItem(idRef.current++, c)]);
       } else if (msg.type === "state") {
         const st = msg as ServerState;
         if (inflight.current.has(st.t)) {
@@ -110,24 +140,53 @@ export function useLiveRecognition(settings: LiveSettings) {
           setProvisional(st.provisional.top);
           stats.current.inf.push(st.provisional.inference_ms + st.provisional.feature_ms);
         }
+        if (st.spell) setSpell(st.spell);
         if (st.segment_result) {
           setLastResult(st.segment_result);
+          setResolved(null);
+          setSpell(null);
           if (st.segment_result.inference_ms !== undefined) stats.current.inf.push(st.segment_result.inference_ms + (st.segment_result.feature_ms ?? 0));
           if (settingsRef.current.engine.mode === "segment") setProvisional(st.segment_result.top ?? null);
         }
         if (st.commit) {
           const c = st.commit;
-          setTranscript((tr) => [...tr, { id: idRef.current++, gloss: c.gloss, score: c.score, at: Date.now() }]);
+          setTranscript((tr) => [...tr, transcriptItem(idRef.current++, c)]);
         }
       }
     };
   }, [closeSocket]);
 
-  // Push engine setting changes to an open socket.
+  // Push engine setting changes (and spelling mode) to an open socket.
   useEffect(() => {
     const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "config", engine: engineConfigPayload(settings.engine) }));
-  }, [settings.engine]);
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "config", engine: engineConfigPayload(settings.engine, opts) }));
+    setSpell(null);
+  }, [settings.engine, opts.pack, opts.spell]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Switching the sign language: the open socket changes pack (the server answers with a new hello) and the
+  // sentence starts again, because words of two sign languages do not form one sentence.
+  const firstLang = useRef(true);
+  useEffect(() => {
+    if (firstLang.current) {
+      firstLang.current = false;
+      return;
+    }
+    const ws = wsRef.current;
+    setProvisional(null);
+    setLastResult(null);
+    setResolved(null);
+    setSpell(null);
+    setTranscript([]);
+    setHelloLanguage(null);
+    setModel(null);
+    setModelMessage(null);
+    if (ws && ws.readyState === WebSocket.OPEN && !IS_STATIC) {
+      setModelAvailable(null);
+      sendingRef.current = false;
+      const v = videoRef.current;
+      ws.send(JSON.stringify({ type: "config", language, width: v?.videoWidth || 640, height: v?.videoHeight || 480, engine: payload() }));
+    }
+  }, [language]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // --------------------------------------------------------------- loop
   const processFrame = useCallback(() => {
@@ -292,14 +351,40 @@ export function useLiveRecognition(settings: LiveSettings) {
     setPaused(false);
     setServer(null);
     setProvisional(null);
+    setSpell(null);
   }, [closeSocket]);
   const resetSequence = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.send(JSON.stringify({ type: "reset" }));
     setProvisional(null);
     setLastResult(null);
+    setResolved(null);
+    setSpell(null);
     trail.current = [];
   }, []);
   const clearText = useCallback(() => setTranscript([]), []);
+
+  /** The user picked a word from "did you mean". Packs confirm it on the server (logged as chosen_by_user); the
+   *  classic ASL engine has no segment ids, so the word is added here. */
+  const choose = useCallback((segment: SegmentResult, cand: Candidate) => {
+    const ws = wsRef.current;
+    if (segment.segment_id !== undefined && cand.concept_id && ws && ws.readyState === WebSocket.OPEN && !IS_STATIC) {
+      ws.send(JSON.stringify({ type: "choose", segment_id: segment.segment_id, concept_id: cand.concept_id }));
+    } else {
+      setTranscript((tr) => [...tr, transcriptFromCandidate(idRef.current++, cand)]);
+    }
+    setResolved({ segment, how: "chosen" });
+  }, []);
+  /** "None of these": hide the suggestions until the next sign. */
+  const dismiss = useCallback((segment: SegmentResult) => setResolved({ segment, how: "dismissed" }), []);
+  /** "That was wrong": remove a word from the text; packs log the feedback (never used for training). */
+  const rejectWord = useCallback((item: TranscriptItem) => {
+    const ws = wsRef.current;
+    if (item.segment_id !== null && item.segment_id !== undefined && ws && ws.readyState === WebSocket.OPEN && !IS_STATIC) {
+      ws.send(JSON.stringify({ type: "reject", segment_id: item.segment_id }));
+    }
+    setTranscript((tr) => tr.filter((t) => t.id !== item.id));
+  }, []);
+  const removeWord = useCallback((id: number) => setTranscript((tr) => tr.filter((t) => t.id !== id)), []);
 
   // Stop everything when the page unmounts (camera light must go off).
   useEffect(() => () => {
@@ -312,7 +397,7 @@ export function useLiveRecognition(settings: LiveSettings) {
 
   return {
     videoRef, canvasRef, status, camera, cameraError, mediapipe, delegate, recognizing, paused, socket, model, modelAvailable, modelMessage,
-    server, provisional, lastResult, transcript, detection, metrics, videoSize,
-    actions: { startCamera, stopCamera, startRecognition, stopRecognition, pause, resume, resetSequence, clearText },
+    server, provisional, lastResult, resolved, spell, transcript, detection, metrics, videoSize, helloLanguage, serverError,
+    actions: { startCamera, stopCamera, startRecognition, stopRecognition, pause, resume, resetSequence, clearText, choose, dismiss, rejectWord, removeWord },
   };
 }
