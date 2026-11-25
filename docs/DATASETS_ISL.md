@@ -315,9 +315,11 @@ different: re-extract the 7,500 released MP4s (one per word and signer, about 21
 with our extractor once the CPU is free (estimate 8-10 CPU hours).
 
 **Jobs started 25 Nov 2026** (detached, `nice -n 10`, logs `data/isl/logs/ingest_pose_<source>.log`): `glosl`
-(8 download threads, 12.6 clips/s, ETA about 17:40 UTC), `isl500` (6 threads, 5.8 clips/s, ETA about 19:00 UTC),
-`openhands-raw` (8 read-ahead, 6 MB/s, budget 12 GB, ETA about 20:30 UTC), `openhands-fs` (minutes). Measured on the
-first 1-3k items; every count in this section must be refreshed when the jobs finish.
+(14:45 UTC, 8 download threads, 8.5-12.6 clips/s depending on machine load, ETA about 19:00 UTC), `isl500` (14:45,
+6 threads, 4.5-5.8 clips/s, ETA about 20:10 UTC), `openhands-raw` (restarted 14:57, 8 read-ahead, 6-8 MB/s, budget
+12 GB, ETA about 21:30 UTC or earlier when the budget is reached; Zenodo allows 133 requests per minute and answers
+429 above that, which the reader waits out), `openhands-fs` (done 14:58: 172 of 172 clips ok). Rates measured on the
+first 3-7k items; every count in this section must be refreshed when the jobs finish.
 
 **Not done / open**: none of these sources is registered in `profiles.py` yet; no model has been trained on them, so
 nothing here says anything about accuracy.
