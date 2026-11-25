@@ -1744,12 +1744,13 @@ everything under `nice -n 10`, stops before any step if less than 10 GB of disk 
 
 | Step | Command | What it does |
 |---|---|---|
-| trim | `trim` | ISLRTC first-sign trims for clips without one (incremental) |
+| trim | `trim` | ISLRTC first-sign trims (incremental); learned end model `artifacts/isl/trim_boundary.pt` when present, `trim_version` says which (15.4) |
 | dedup | `dedup --sources include islrtc cislr wslp isl500 mendeley_*` | landmark near-duplicates across sources |
 | vocab | `vocab --no-trims --out <work>/vocabulary.jsonl` | refreshed vocabulary in the work folder (review, then commit it to `models/packs/isl/`) |
 | splits | `splits --vocab <work>/vocabulary.jsonl` | INCLUDE official / session / pseudo-signer splits, one-shot concept folds |
 | link | `link-sources --all-sources` | every labelled word source linked to concepts, signer-held-out splits, duplicates dropped |
 | bench | `bench` | CPU seconds per step for the chosen model size (logged, for the time budget) |
+| pretrain_dedup | `pretrain-dedup` | OpenHands Sign Library chunks that repeat another chunk or contain an evaluation clip (pose-content matcher, 15.4) |
 | pretrain | `pretrain` | self-supervised encoder pre-training on every unlabelled / sentence source |
 | encoder | `train-encoder --all-sources --init auto` | fine-tune (SupCon + sub-centre ArcFace) from the pre-trained trunk |
 | oneshot | `train-oneshot --folds 0 1` | E2 encoders, each fold's concepts held out of all supervised training |
@@ -1891,10 +1892,9 @@ logs `data/isl/logs/phase2_<profile>_smoke.log`.
 
 **Open issues found while building this:**
 
-* **My signs inside the fusion**: a user sign is not a classifier class, so in the fused softmax it gets the
-  classifier's non-core penalty (`noncore_logp`); it then wins only through the direct match rule (cosine >= its own
-  threshold and >= best dictionary cosine + 0.05). E4 measures exactly this; if E4's gain is small at full settings,
-  give user signs a neutral classifier term instead of the penalty and re-fit.
+* **My signs inside the fusion** (done in 15.4): a user sign is not a classifier class, so in the fused softmax it
+  gets the classifier's non-core penalty (`noncore_logp`) by default; `fit-fusion` now compares that with a neutral
+  classifier term (`user_cls_mode`) on validation few-shot data and keeps the penalty when that data is too small.
 * E1c, E5 and the per-signer interval of E1b depend on data still being ingested (ISL500 users, ISL-Fingerspelling
   signers); the runners report "not run" until then.
 * New concepts linked only from WSLP / ISL500 / Mendeley glosses have English text only (no Hindi) until the Hindi
@@ -1968,3 +1968,90 @@ and the 15.2 budget assumes 10-20x faster once the CPUs are free):
 
 So the first full-settings, honestly evaluated packs can exist around **28-29 Nov**, if nothing fails and nothing else
 loads the CPUs. Setting `CV_FOLDS=""` saves 4-6 h per profile but leaves E1b without a signer-level interval.
+
+### 15.4 Fixes after the reality check (AI Engineer, 25 Nov 2026, 17:40-19:55 UTC)
+
+**Status: every item of the 15.3 "must fix" list and of the code review is fixed and tested offline; nothing was
+trained at full settings.** Code commits `f1c188a` and `b27df44` (smoke-run follow-ups). Backend suite: **417 passed**
+(`SLR_TORCH_THREADS=2`, nice 10, 101 s while the ingestion jobs loaded the CPUs). New tests:
+`backend/tests/isl/test_phase2_guards.py` (19 tests, synthetic data, no network; the driver's guard is tested through
+`scripts/phase2_train.sh --check-only` with a fake process table) and extra tests / assertions in `test_eval_runners.py`.
+
+| # | Problem (15.3 / review) | Fix | Where |
+|---|---|---|---|
+| 1 | "95 % CI" from 2 signer groups | `grouped_bootstrap` returns no interval below **5** groups; JSON keeps `null` plus `interval_reasons` (`"too few signer groups (2)"`) and `interval_groups`; `report.md` prints `0.612-0.701 (7 groups)` or `none: too few signer groups (2)` in every interval cell (E1a/b/c, E2, E3 per policy, E4, E5, cv pooled, phase-1 `results.md`) | `evaluation/report.py` (`MIN_INTERVAL_GROUPS`, `interval_fields`), `runners.py`, `protocols.py`, `train_fingerspell.py` |
+| 2 | a full run could start on partial data and say "Measured on held-out data" | `python -m app.isl.cli readiness --profile P`: (a) no process runs `ingest_isl.py`, `ingest_isl_pose.py`, `ingest_isl_video.py` (read-only `status` / `sources` / `probe` ignored) or `isl_queue.sh` - the queue counts only until its log says "all listed sources processed" (afterwards it only polls CISLR, which must not block training: the 15.3 concern); (b) every manifest the profile reads has a row for every expected item (item lists `manifests/<source>_items.json`, `islrtc_index.json`, the GloSL id list, published sizes; gated CISLR / iSign without access = unavailable, not incomplete; OpenHands raw = complete once its budget-limited job ended). The driver runs it before every full run and **refuses (exit 4)** unless `--allow-partial`, which writes `<work>/partial_data.json` (sticky until `--from trim`); `report.json` / `results.json` / `pack.json` then carry `partial_data: true`, the label is "PARTIAL DATA ... NOT the accuracy of the app" and the markdown title ends "- PARTIAL DATA". `--check-only` runs only the guard. Measured at 18:00 UTC: not ready (8 ingestion processes; include 3,401/4,292, islrtc 5,642/13,665, isl500 56,200/86,756, glosl 86,222/126,846, wslp 912/4,398, the rest of the queue barely started) | `training/readiness.py`, `cli.py readiness`, `scripts/phase2_train.sh` |
+| 3a | `check_classifier_split` passed a classifier without `split` | refused (`LeakageError`); E1 then reports `run: false, reason: "refused: ..."` instead of a number | `runners.py` |
+| 3b | `pretraining_excludes_eval_clips` was a constant `True` | `pretrain` writes the exact clip list `<work>/pretrain_clips.txt` (union over resumed parts; count + SHA-256 in the checkpoint meta); `evaluate` intersects it with every evaluation clip **and its duplicate group** (and with the Sign Library content matches): `true` / `false` (with examples, and a LEAKAGE line in `report.md`) / `null` with the reason (no pre-training, or a checkpoint from before this change) | `multisource.py` (`eval_clip_ids`, `write_pretrain_list`), `runners.pretraining_guard` |
+| 4 | two drifting profile definitions; adapters not registered; licence lists naming sources with 0 clips | the source lists live once in `profiles.py` (`WORD_SOURCES`, `PRETRAIN_SOURCES`, `LETTER_SOURCES`; `DataProfile` is built from them, `multisource` re-exports them). **WLASL removed** (it is American Sign Language; no ASL warm start in phase 2). **`isl_csltr_words` not used** (word labels are valid, but each item is one still frame of a moving sign: the word models read sequences, the letter model reads letters; `profiles.NOT_USED` says why). Video and pose adapters registered in `sources.ADAPTERS` (lazily, `register_optional_adapters`: `VIDEO_ADAPTERS` + `pose_sources.register`); a test checks every listed source has an adapter and that commercial-safe agrees with `catalog.profile_sources` / `pose_sources.PROFILE_SOURCES`. `sources.json` now records per role the clips that **really reached** the build (after caps, sampling, dedupe); `build-pack` lists only sources with > 0 (no `cislr` / `isign` while they contribute nothing); INCLUDE / ISLRTC are always named because the vocabulary is built from their word lists (role `vocabulary` when no clip of theirs was used) | `profiles.py`, `data/sources.py`, `cli._record_sources`, `pipeline.pack_licences`, `models/packs/isl/pack.json` |
+| 5 | OpenHands Sign Library overlap "up to 6.8 h" | pose-content matcher (`training/pose_dedup.py`, new driver step `pretrain_dedup`), measured first: see below | `pose_dedup.py`, `cli pretrain-dedup`, `cli pretrain` |
+| 6 | the driver's trim was rules-only; truncated clips used | `trim` loads `artifacts/isl/trim_boundary.pt` when present (the same `trim_learned.refine_cap` call as `trim_bench run --learned`), records `trim_version = trim-2+trim-learned-1` (rules only: `trim-2`) and redoes every clip whose version or landmark file differs, so new clips are never silently rules-only; `--learned-model none|PATH` overrides. Re-extracted ISLRTC rows (`manifests/islrtc_recut.jsonl`, card-v2 detector, written by the ingestion agent) replace the original file in `trim` and in training (`training.common.resolve_islrtc`; the trim is used only if it was computed on the new file, recorded as `landmarks`); a clip whose trim is `truncated` and that has no re-extracted file is **excluded** (training, index, galleries). `data.summary()` reports `islrtc_reextraction` and `islrtc_trim_versions` | `cli.py trim`, `training/common.py` |
+| 7 | E2 did not say what pre-training saw | E2 label: "self-supervised pre-training saw ISLRTC clips WITHOUT labels, including the dictionary reference clips E2 retrieves against (n of N ISLRTC clips were in the pre-training list)"; `pretraining_saw_gallery_unlabelled` in the JSON | `runners.py` |
+| 8 | My signs got the classifier's non-core penalty | `FusionParams.user_cls_mode`: `penalty` (default, as before) or `neutral` (a user key's classifier term = the crop's best classifier log-probability: the classifier can neither vote for nor against it). `fit-fusion` runs the E4 protocol on the **validation** signers for both modes (k = 3, else k = 1) and picks `neutral` only if enrolled-word top-1 rises and the user-sign false-accept rate rises by <= 0.01; with < 30 enrolled test takes or < 2 groups it keeps `penalty` and says why (`fit-fusion` report `my_signs`). E4 in the report names the mode | `models/fusion.py`, `training/fit_fusion.py`, `runners.e4_my_signs` |
+
+**Sign Library: measured, then decided (item 5).** The two files of the channel cannot be matched by name, so chunks
+are matched by pose content: 7 upper-body points (x, y) per frame; a query chunk copies a reference chunk when, for a
+large enough fraction of its consecutive frame pairs, both frames have one of their 4 nearest reference frames within
+0.04 (normalised units) *in that same chunk* and the reference index moves forward 0-2 frames (time order separates a
+re-cut copy from another video of the same presenter in the same studio).
+* Real data (25 Nov, 9,510 `sub_based` chunks against the 341 usable one-minute chunks, nearest frame only, eps 0.05):
+  **16 chunks** match with time-order scores 0.5-1.0 at median frame distances of 0.014-0.023 (true copies); every
+  other chunk scores <= 0.33 with median distances >= 0.035. So the real overlap is a few minutes, not 6.8 h.
+* Calibration (run again inside every `pretrain_dedup` step): 300 synthetic re-cuts of one-minute chunks (a random
+  2-5 s window re-sampled half a frame off the stored frames, plus 0.003-0.005 landmark jitter, as a second
+  extraction / another stride offset gives) and 300 windows of other videos queried against an index without their
+  own video. At eps 0.04: recall 0.977 (jitter 0.003) / 0.967 (0.005) at a score threshold of 0.2 with a
+  false-positive rate of 0.010; above 0.4 the false-positive rate is 0.003 (one "negative" window scores 1.0 at every
+  threshold: most likely the same video published under two names). The step picks the threshold with the best recall
+  among those with a false-positive rate <= 1 % (never below 0.2) and calls the dedupe **reliable only with recall >= 0.95**.
+* Decision: reliable -> **drop only the matched chunks** (copies of a one-minute chunk, and any chunk that contains an
+  evaluation clip: INCLUDE val/test and the other sources' held-out signers are queried against every Sign Library
+  chunk). If the calibration is not reliable on the data of a run, or the step has not run, **the whole Sign Library
+  channel is left out of pre-training** (`apply_dedup`).
+* Full run on today's data (25 Nov 18:00-18:27 UTC, research profile, split `include-session-cv5-fold0`, every
+  ingested Sign Library chunk: 341 one-minute + 9,510 other, 1.52 M frames; 1,474 s at load ~24): calibration
+  **reliable** (recall 0.997 at threshold 0.15 -> used 0.2, false-positive rate 0.010); **19** chunks copy a one-minute
+  chunk (scores 0.2-0.94, 16 of them >= 0.5, the same 16 as the first search); of **16,474** evaluation clips
+  (INCLUDE val/test, ISL500 held-out signers, ...) **1** matched a Sign Library chunk (ISL500 `user007` "Town",
+  score 0.25: most likely a false positive near the threshold, dropped anyway). So 20 chunks are dropped. This was a
+  one-off run into a scratch work folder; the driver's `pretrain_dedup` step repeats it for every full run.
+  In the smoke runs (600 chunks, 100 controls) the calibration had too few controls to show recall >= 0.95 at a
+  false-positive rate <= 1 %, so the fallback was exercised: the whole channel was excluded.
+* Not checked by content: GloSL, NIOS, ISH News against the evaluation sources (sentence-level news / education
+  videos; the evaluation clips are studio recordings that are not published on these channels) and GloSL against
+  OpenHands NIOS / ISH News (possible double weight in pre-training, not a leakage into evaluation).
+
+**Smoke re-run of both profiles after the fixes.** The outputs of 16:38 were moved to
+`artifacts/isl/phase2-smoke.prev_1758/` (stamps / logs `*.prev_1758`). A first re-run (17:58-19:02 UTC, kept in
+`phase2-smoke.run1_1903/`, logs `*.run1_1903`) passed all 19 steps but showed three things to fix (commit `b27df44`):
+`sources.json` gave a read-but-unsampled source its read count, the research E2 had no queries (the smoke cap of 400
+ISLRTC clips had dropped the held-out concepts' dictionary clips) and fit-fusion spent minutes on E4 evidence with one
+validation signer group. The final run, `scripts/phase2_train.sh --profile both --smoke` from fresh work folders and
+private ISL roots (manifests of 19:03 UTC, load average 22-26 from the ingestion jobs), **completed all 19 steps of
+both profiles with 0 failures**: commercial-safe 19:03:22-19:29:05 UTC (25.7 min), research 19:29:10-19:49:21 UTC
+(20.2 min). Seconds per step (commercial-safe / research): trim 323 / 268 (every clip re-trimmed once with the learned
+end: 5,896 / 6,078 clips, 474 / 492 learned ends, 22 / 9 still `truncated`), dedup 61 / 48, vocab 19 / 18, splits 19 / 20, link 18 / 23,
+bench 29 / 18, pretrain_dedup 25 / 58, pretrain 37 / 38, encoder 50 / 35, oneshot 51 / 35, classifier 55 / 29, cv
+38 / 32, e1a 28 / 26, fingerspell 7 / 10, index 37 / 33, fusion 252 / 162, evaluate 443 / 321, index_final 46 / 33,
+pack 4 / 4. What the reports show (all numbers near chance, labelled SMOKE RUN, never the app's accuracy):
+
+* every interval cell is either `lo-hi (k groups)` (only E1a, 5 groups) or `none: too few signer groups (k)` (E1b and
+  its cv pool: 2, E1c: 1, E2: 2, E3: 1-3, E4: 1); both packs and reports carry `partial_data: true`;
+* `pretraining_excludes_eval_clips: true`, computed: 0 of 200 pre-training clips are among the 2,500 / 2,714
+  evaluation clips and their duplicates; E2 ran with 173 queries per profile and its label says 14 / 1 of the 400 ISLRTC
+  clips were in the pre-training list;
+* ISLRTC: 66 / 75 clips read from their re-extracted (`islrtc_recut`) files, 13 / 9 truncated clips without one left
+  out, every trimmed clip `trim-2+trim-learned-1`;
+* research `pretrain_dedup` with 100 controls was not reliable (recall 0.87 at a false-positive rate of 0.008), so
+  the whole Sign Library channel was left out of that smoke pre-training (the fallback); commercial-safe has no
+  OpenHands data;
+* fit-fusion kept `user_cls_mode = penalty` in both: "insufficient validation few-shot data (1 signer groups with
+  repeated takes; need 2)";
+* pack licences: commercial-safe `include, islrtc, mendeley_agri, mendeley_static`; research adds `glosl, isl500,
+  isl_fingerspelling, openhands_fs, openhands_raw, wslp` with per-role clip counts - no `cislr` / `isign` /
+  `mendeley_emergency` (0 clips used).
+
+**Still open:** `docs/DATASETS_ISL.md` section 1 "Data profiles" still shows the old `profiles.py` table (owner: Data
+Engineer; the content is now the "What phase-2 training actually uses" table there, minus WLASL). The data guard is a
+start-of-run check: a run started with `--allow-partial` keeps its PARTIAL DATA mark even after ingestion ends; rebuild
+with `--from trim` for clean numbers.
