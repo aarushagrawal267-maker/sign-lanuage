@@ -24,7 +24,8 @@ Two checks, both required before ``scripts/phase2_train.sh`` starts a full run:
   gated source whose manifest is partly filled while no job writes it is "partial (gated; job not running)": it does
   not block (both are research-only and access may never be granted again), but it is listed in ``warnings`` of the
   report (``data_readiness.json``) and in the evaluation report's data section (:func:`readiness_summary`);
-  OpenHands raw is budget-limited, so it is complete once its job has ended. A failed row counts as attempted only
+  OpenHands raw is budget-limited, so it is complete once its job has ended normally (its log ends with "all members
+  done", a disk-guard stop or a deliberate SIGINT; a crash keeps it incomplete). A failed row counts as attempted only
   when its failure is permanent: rows whose last record is a download / fetch failure or a ``superseded`` marker are
   retried by the next ingestion run, so they count as missing. A public source with no rows and no item list (its
   listing failed, e.g. Hugging Face 429 / 503, and the queue gave up) is incomplete, not "not available".
@@ -62,7 +63,14 @@ INCLUDE_ZIPS = 44
 GATED = ("cislr", "isign")
 GATED_PARTIAL = "partial (gated; job not running)"
 GATED_RUNNING = "partial (gated; job running)"
-BUDGET_LIMITED = ("openhands_raw",)  # ingested up to a disk budget: complete when its job has ended
+BUDGET_LIMITED = ("openhands_raw",)  # ingested up to a disk budget: complete when its job has ended normally
+# the job's log (``nohup ... >> data/isl/logs/<file>``) and the last lines that mean it ended on purpose: every member
+# done, the disk guard (budget / min free) stopped it, or a deliberate SIGINT (ISL_DESIGN 15.6, command 4). Anything
+# else (a traceback such as h5py's "bad symbol table node signature", a kill, a memory give-up) is a crash: the source
+# stays incomplete until the job is restarted (it resumes) or the run is started with --allow-partial.
+BUDGET_LOGS = {"openhands_raw": "ingest_pose_openhands_raw.log"}
+BUDGET_CLEAN_END = ("openhands-raw: all members done", "openhands-raw: stopping: ", "KeyboardInterrupt")
+BUDGET_LOG_TAIL = 200_000
 # items file of a source when it differs from "<source>_items.json" (manifest shared with another source)
 ITEMS_FILE = {"wslp_unlabelled": "wslp_unlabelled_items.json"}
 MANIFEST_OF = {"wslp_unlabelled": "wslp"}
@@ -80,8 +88,15 @@ QUEUE_SOURCE_ALIASES = {"islrtc-full": "islrtc"}
 # the queue's run_source() returned for that source: "finished" (0), "giving up for now" (2, also after too many
 # memory stops), "gated dataset not accessible yet" (3); the queue then moves to the next listed source
 QUEUE_TERMINAL = ("finished", "giving up for now", "gated dataset not accessible yet")
-# global options of the ingestion scripts that take a value (they precede the sub-command)
-VALUE_OPTIONS = ("--root",)
+# options of the ingestion scripts that take one value (argparse accepts them before the source / sub-command too:
+# ``ingest_isl_pose.py --budget-gb 26 openhands-raw``), so their values are never read as the source
+VALUE_OPTIONS = ("--root", "--workers", "--limit", "--tmp", "--max-s", "--out-subdir", "--poll-min", "--max-minutes",
+                 "--min-free-gb", "--per-class", "--max-rss-gb", "--dtype", "--target-fps", "--budget-gb",
+                 "--convert-workers", "--respawn-on-memory", "--subset", "--skip-uids", "--mode", "--block-mb")
+# ``ingest_isl_pose.py`` sources -> the profile source they write (isl500-links writes derived/isl500_links.jsonl,
+# which the ISL500 adapter reads)
+POSE_SOURCES = {"glosl": "glosl", "isl500": "isl500", "isl500-links": "isl500", "openhands-raw": "openhands_raw",
+                "openhands-fs": "openhands_fs"}
 _STAMP = r"\d{4}-\d\d-\d\d(?: \d\d:\d\d:\d\d)?"
 _LOG_EVENT = re.compile(rf"^{_STAMP} ([A-Za-z0-9_.-]+): (.*)$")
 _LOG_START = re.compile(rf"^{_STAMP} queue start \(pid (\d+)\):(.*)$")
@@ -278,15 +293,24 @@ def process_source(script: str, rest: list[str]) -> str | None:
     if not args or script == QUEUE_SCRIPT:
         return None
     sub = args[0]
+    # only known names: anything else (an option value read as a positional, a new sub-command) is unknown and
+    # blocks every profile, never "a source no profile reads"
     if script == "ingest_isl.py":
-        return "islrtc" if sub.startswith("islrtc") else sub if sub == "include" else None
+        return {"include": "include", "islrtc": "islrtc", "islrtc-recut": "islrtc"}.get(sub)
     if script == "ingest_isl_video.py":
         if sub == "islrtc-full":
             return "islrtc"
         # "run <source>" ingests, "list <source>" writes the source's item list (manifests/<source>_items.json)
-        return args[1].replace("-", "_") if sub in ("run", "list") and len(args) > 1 else None
+        if sub not in ("run", "list") or len(args) < 2:
+            return None
+        try:
+            from app.isl.data.video_sources.catalog import SOURCES
+        except Exception:  # noqa: BLE001 - catalog not importable: unknown (fail closed)
+            return None
+        src = args[1].replace("-", "_")
+        return src if src in SOURCES else None
     if script == "ingest_isl_pose.py":
-        return sub.replace("-", "_")
+        return POSE_SOURCES.get(sub)
     if script == GATED_SCRIPT:
         return next((a for a in args if a in GATED), None)
     return None
@@ -414,6 +438,18 @@ def expected_items(paths: IslPaths, name: str) -> tuple[set[str] | int | None, s
     return None, "unknown"
 
 
+def budget_job_end(paths: IslPaths, name: str) -> dict:
+    """How the last run of a budget-limited job ended, from the last non-empty line of its log: ``{clean, detail,
+    log}``. ``clean`` only for the ends in :data:`BUDGET_CLEAN_END`; a missing log or any other last line is not."""
+    log_f = paths.root / "logs" / BUDGET_LOGS.get(name, f"ingest_pose_{name}.log")
+    text = _tail(log_f, BUDGET_LOG_TAIL) if log_f.exists() else None
+    if text is None:
+        return {"clean": False, "log": str(log_f), "detail": f"no readable log {log_f.name} to confirm how it ended"}
+    last = next((ln.strip() for ln in reversed(text.splitlines()) if ln.strip()), "")
+    clean = any(m in last for m in BUDGET_CLEAN_END)
+    return {"clean": clean, "log": str(log_f), "detail": f"last log line: {last[:200]!r}"}
+
+
 def source_status(paths: IslPaths, name: str, running_scripts: set[str] | None = None,
                   running_sources: set[str] | None = None) -> dict:
     """Completeness of one source's manifest. ``running_sources``: sources a running job writes (only the gated
@@ -433,8 +469,16 @@ def source_status(paths: IslPaths, name: str, running_scripts: set[str] | None =
     if name in BUDGET_LIMITED:
         running = bool(running_scripts and "ingest_isl_pose.py" in running_scripts and (paths.manifests /
                                                                                           f"{name}.lock").exists())
-        st.update(expected=None, complete=bool(ids) and not running,
-                  note="budget-limited: complete once its ingestion job has ended" if ids else "not ingested")
+        if not ids:
+            st.update(expected=None, complete=False, note="not ingested")
+        elif running:
+            st.update(expected=None, complete=False, note="budget-limited: complete once its ingestion job has ended")
+        else:
+            end = budget_job_end(paths, name)
+            st.update(expected=None, complete=end["clean"], job_end=end,
+                      note=("budget-limited; its job ended normally: " if end["clean"] else
+                            "budget-limited, but its job did not end normally (restart it: it resumes; or start the "
+                            "run with --allow-partial): ") + end["detail"])
         return st
     if isinstance(exp, set):
         have = len(ids & exp)
