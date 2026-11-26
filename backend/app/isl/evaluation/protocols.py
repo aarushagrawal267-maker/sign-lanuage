@@ -81,7 +81,8 @@ def e3_decisions(inputs: list[FusionInputs], truths: list[str], clips: list[Clip
     results = [fuse(i, params) for i in inputs]
     out = {"label": label, "n": len(results), "fusion_fitted": params.fitted, "policies": {}}
     for pol in ("strict", "balanced", "lenient"):
-        out["policies"][pol] = summarize(results, truths, params, pol)
+        out["policies"][pol] = {**summarize(results, truths, params, pol), "threshold": params.accept[pol],
+                                "suggest_min_top5_mass": params.suggest_mass(pol)}
     b = out["policies"]["balanced"]
     out["metrics"] = {k: b[k] for k in ("top1", "top5", "coverage", "accepted_precision", "silent_error_rate",
                                        "suggest_rate", "suggest_top5_hit", "abstain_rate")}

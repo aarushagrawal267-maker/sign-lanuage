@@ -8,7 +8,8 @@ import numpy as np
 
 from app.features.build import FeatureError, build_features
 from app.isl.data.sources import Clip
-from app.isl.models.calibration import fit_fusion_weights, fit_temperature, fit_thresholds
+from app.isl.models.calibration import (fit_classifier_thresholds, fit_fusion_weights, fit_temperature,
+                                        fit_thresholds)
 from app.isl.models.fusion import FusionInputs, FusionParams, fuse
 from app.isl.training.common import engine_crops
 
@@ -50,11 +51,44 @@ def fit_fusion(rec, val_clips: list[Clip], profile: str, version: str = "fusion-
     params, trep = fit_thresholds(results, truths, params)
     rep["thresholds"] = {"accept": params.accept, "s_min": params.s_min,
                          "suggest_min_top5_mass": params.suggest_min_top5_mass,
-                         **{k: v for k, v in trep.items() if k.endswith("reached")}}
+                         "suggest_min_top5_mass_by_policy": params.suggest_min_top5_mass_by_policy,
+                         **{k: v for k, v in trep.items() if k.endswith("reached")},
+                         "per_policy": trep.get("accept_fit", {}).get("policies"),
+                         "best_lower_bound": trep.get("accept_fit", {}).get("best_lower_bound"),
+                         "note": trep.get("accept_fit", {}).get("note")}
     rep["achieved"] = params.achieved
+    params, rep["classifier_alone"] = fit_classifier_alone(rec, inputs, truths, params)
     params, rep["my_signs"] = choose_user_mode(rec, val_clips, params)
     rep["seconds"] = round(time.time() - t0, 1)
     return params, rep
+
+
+def fit_classifier_alone(rec, inputs: list[FusionInputs], truths: list[str],
+                         params: FusionParams) -> tuple[FusionParams, dict]:
+    """Per-policy thresholds of the classifier ALONE (the app's sliding mode, E1) on the validation evidence fit-fusion
+    already has, with the engine's rule: crop-mean probability at the checkpoint's temperature, margin
+    ``EngineConfig.min_margin``, >= 2 crops agree (docs 15.17). Stored in ``classifier_accept`` with the
+    classifier's fingerprint; without a classifier or validation data nothing is stored and the engine keeps the
+    checkpoint's single ``recommended_threshold``."""
+    from app.inference.engine import EngineConfig
+    from app.isl.recognizer import calibrated_probs, classifier_calibration, classifier_fingerprint
+
+    clf = getattr(rec, "classifier", None)
+    if clf is None or not inputs or inputs[0].cls_logp is None:
+        return params.with_(classifier_accept={}, classifier_fit={}), {"note": "no classifier: nothing fitted"}
+    temp, ck_thr, _ = classifier_calibration(clf)
+    names = list(inputs[0].cls_ids)
+    per_crop = [calibrated_probs(np.exp(np.atleast_2d(i.cls_logp)), temp) for i in inputs]
+    margin = EngineConfig().min_margin
+    accept, rep = fit_classifier_thresholds(per_crop, names, truths, margin, min_agree=params.min_agree)
+    rep.update(temperature=temp, checkpoint_threshold=ck_thr)
+    if accept is None:
+        return params.with_(classifier_accept={}, classifier_fit={}), rep
+    fit = {"fingerprint": classifier_fingerprint(clf), "temperature": temp, "margin": margin,
+           "min_agree": params.min_agree, "n": rep["n"], "n_in_classes": rep.get("n_in_classes"),
+           "best_lower_bound": rep.get("best_lower_bound"), "policies": rep.get("policies"),
+           "checkpoint_threshold": ck_thr, "note": rep.get("note")}
+    return params.with_(classifier_accept=accept, classifier_fit=fit), rep
 
 
 MIN_E4_TESTS = 30  # enrolled test takes needed before the user-sign classifier mode is chosen from data

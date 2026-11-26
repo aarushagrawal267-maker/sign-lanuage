@@ -50,12 +50,22 @@ def isl_env(tmp_path_factory):
     rec = load_recognizer(work, ISL_FEATURES, w["vocab"], profile="commercial-safe")
     params, rf = fit_fusion(rec, data.include_part("val"), "commercial-safe")
     params.save(work / "fusion.json")
+    # per-policy classifier-alone thresholds (docs 15.17): stored for this classifier, or none on too little data
+    from app.isl.recognizer import classifier_fingerprint
+
+    assert "classifier_alone" in rf and set(params.suggest_min_top5_mass_by_policy) == {"strict", "balanced", "lenient"}
+    if params.classifier_accept:
+        assert params.classifier_fit["fingerprint"] == classifier_fingerprint(rec.classifier)
+    else:
+        assert "defaults kept" in rf["classifier_alone"]["note"]
+    assert FusionParams.load(work / "fusion.json") == params
     doc = evaluate(work, data, ISL_FEATURES, smoke=True, vocab_path=w["vocab"])
     packs = root / "packs"
     rp = build_pack(work, "commercial-safe", ISL_FEATURES, packs / "isl", smoke=True, vocab_path=w["vocab"])
     # deterministic decisions for the API tests: never accept, always "did you mean"
     FusionParams.load(packs / "isl" / "fusion.json").with_(
-        accept={"strict": 1.01, "balanced": 1.01, "lenient": 1.01}, suggest_min_top5_mass=0.0, s_min=-1.0
+        accept={"strict": 1.01, "balanced": 1.01, "lenient": 1.01}, suggest_min_top5_mass=0.0,
+        suggest_min_top5_mass_by_policy={}, s_min=-1.0
     ).save(packs / "isl" / "fusion.json")
     os.environ["SLR_PACKS_DIRS"] = str(packs)
     from app.core.config import get_settings

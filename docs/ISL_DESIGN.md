@@ -2864,3 +2864,88 @@ effect for that pack. (2) A classifier-alone accept rule reaches only 85 % preci
 Sliding mode uses the classifier's validation threshold, which targets 85 % accuracy (`pick_threshold`), not the
 95 % of the fused balanced policy. (3) A pack without an index would apply fused thresholds fitted with retrieval to
 classifier-only fused probabilities. Such a pack never accepts in segment mode; it shows suggestions.
+
+### 15.17 Distinct per-policy thresholds: fused, classifier alone (sliding mode) and "did you mean" (AI Engineer, 26 Nov 2026)
+
+Fixes open items (1) and (2) of 15.16. Packs fitted before this change still load and behave exactly as before; the
+new behaviour starts with the next `cli fit-fusion` (in the running research run, its `fusion` step).
+
+**Diagnosis (commercial-safe, read-only scratch re-run of fit-fusion's validation evidence, 895 of 902 val clips,
+train-only index rebuilt in scratch because `work/index` is now the index_final build).** No policy can reach its
+target at this accuracy level (signer-independent top-1 0.72-0.75). This is a precision ceiling, not a Wilson-bound
+effect: fused accepted precision stays at 0.89-0.91 for every threshold from 0.85 to 0.99, and the best 95 % lower
+bound (LB) is 0.867 (t 0.96, 270 accepts, precision 0.907). The margin, crop-agreement and `s_min` guards change
+nothing above t 0.60. The fallback in `fit_thresholds` then gave every policy the same best-LB threshold (0.96 / 0.96
+/ 0.96), so the policy switch did nothing and every policy was the most conservative one. The 25 wrong val accepts
+at 0.96 are systematic confusions (clothing->dress 5, female->"woman / female" 4, office->blue 3, race->alright 3;
+all INCLUDE clips, 13 from signer group ps00). The classifier alone has the same ceiling (best LB 0.865 when every val
+clip counts). `suggest_min_top5_mass` 0.0 is what the rule returns (non-accepted val clips already have top-5 hits
+0.895), but it was fitted on the balanced pool only. With a lower lenient threshold, lenient's pool keeps only the
+hard cases, and its top-5 hit rate drops to 0.750 (val) and 0.743 (test), below the 80 % promise.
+
+**Fix.**
+* `calibration.choose_policy_thresholds` (used by `fit_thresholds` and the new `fit_classifier_thresholds`).
+  * A policy whose target is reachable keeps the old rule: the smallest threshold with LB >= target.
+  * Otherwise the targets keep their spacing below the best achievable bound LB* (ties go to the larger threshold).
+    Effective target = LB* - (0.98 - target), so 0 / 0.03 / 0.08 below LB*. When a more lenient target *is*
+    reachable, the unreachable ones are spread proportionally between the strictest reachable target and LB*.
+  * Each policy takes the smallest threshold whose LB reaches its effective target. The strictest unreachable policy
+    takes the LB* threshold, as before.
+  * The thresholds are ordered by construction. They differ whenever the data have distinct thresholds at those
+    bounds. When precision does not rise with confidence, they stay equal, and the code does not invent a difference.
+  * The report (`accept_fit`) and `fusion.json` `achieved[policy]` hold `rule` (target / fallback / default),
+    `target`, `target_reached`, `effective_target`, the `precision_lower_bound` actually achieved, precision, accepts
+    and coverage, plus a `note` naming the policies whose target was not reachable. The `<policy>_target_reached`
+    keys are kept.
+* "Did you mean": `suggest_min_top5_mass_by_policy` holds a mass fitted for each policy on its own suggestion pool,
+  with the same rule (smallest mass with >= 80 % top-5 hits). `decide` uses `FusionParams.suggest_mass(policy)`.
+  `suggest_min_top5_mass` stays as the balanced value, for older readers and for packs without the new field.
+  Anyone overriding the single value by hand (as the API test fixture does) must also clear the per-policy field.
+* Classifier alone (sliding mode). `fit_fusion.fit_classifier_alone` fits per-policy thresholds on the validation
+  evidence fit-fusion already collects. It uses the engine's rule: crop-mean probability at the checkpoint's
+  temperature, margin `EngineConfig.min_margin`, >= 2 crops agree. Every val clip counts, and one whose word is not a
+  classifier class can only be a wrong accept. The thresholds are stored in `fusion.json` as `classifier_accept`,
+  together with `classifier_fit`: the classifier's fingerprint (`recognizer.classifier_fingerprint`, a hash of meta
+  fields that change with every training run), the temperature, margin and per-policy report.
+  * `recognizer.classifier_policy_thresholds` uses them only when the fingerprint and temperature match the loaded
+    classifier. E1a and the CV folds swap other classifiers in next to the main fusion.json.
+  * Otherwise, and for every older pack, all policies use the checkpoint's `recommended_threshold`, as before.
+  * `IslRecognizer.classifier_threshold_for(policy)` feeds `RecognitionEngine.threshold` in sliding mode. A
+    user-set threshold still wins, and segment mode is unchanged.
+* E1 (`e1_closed_set`): the summary columns keep their 15.16 meaning (classifier-alone rule, not sure = 1 -
+  accepted), now at the policy the app uses by default (`decision.policy` = balanced). `decision` records the
+  per-policy thresholds, their source (fusion.json or checkpoint), and why it fell back. `policies` has every
+  policy's accepted / not sure / wrong accept / precision.
+  * E3 records each policy's threshold, suggest mass and validation target status, and says its summary row is
+    balanced (`metrics_policy`). The phase-1 E3 records the thresholds too.
+  * `report.md` gets a "Decision policies" table (E1b, E1c, E3 x strict / balanced / lenient).
+
+**What the new fit gives on the commercial-safe evidence** (scratch only; `artifacts/isl/commercial-safe` is
+unchanged and keeps 0.96 / 0.96 / 0.96 until it is re-fitted. A re-fit must use the train-only index, see above).
+
+| | strict | balanced | lenient |
+|---|---|---|---|
+| fused accept threshold (old: 0.96 for all) | 0.96 | 0.73 | 0.46 |
+| val LB achieved / effective target (targets 0.98 / 0.95 / 0.90 not reachable) | 0.867 / 0.867 | 0.838 / 0.837 | 0.790 / 0.787 |
+| suggest mass (old: 0.0 for all) | 0.0 | 0.0 | 0.65 |
+| E3 test (915): accepted / precision / wrong accept | 0.274 / 0.932 / 0.019 | 0.601 / 0.875 / 0.075 | 0.742 / 0.823 / 0.131 |
+| E3 test: suggest (top-5 hit) / not sure | 0.621 (0.882) / 0.105 | 0.294 (0.803) / 0.105 | 0.103 (0.851) / 0.155 |
+| classifier-alone threshold (old: checkpoint 0.60 for all) | 0.96 | 0.74 | 0.46 |
+| E1b (792): accepted / precision / wrong accept (old 0.60: 0.710 / 0.854 / 0.104) | 0.326 / 0.938 / 0.020 | 0.619 / 0.869 / 0.081 | 0.785 / 0.826 / 0.136 |
+
+Fused strict is what every policy was before. In sliding mode, every policy used 0.60 before; balanced is now slightly stricter (0.74). **Note the default changes**: for a re-fitted pack, balanced (the app
+default) accepts about 60 % of test queries at 87.5 % precision (7.5 % wrong accepts), instead of 27 % at 93 %.
+Users who want the old, conservative behaviour choose strict. The UI must show the achieved numbers, not the targets
+(none is reached). Raising precision itself needs better models or label fixes (for example `isl.female`, which is
+not a classifier class but is confused with "woman / female"), not threshold tuning.
+
+Tests: `backend/tests/isl/test_policy_thresholds.py`, with:
+* distinct ordered thresholds when the targets are unreachable;
+* no invented split when precision is flat;
+* the reachable / partly reachable cases;
+* per-policy suggest masses;
+* old-pack loading and behaviour;
+* sliding mode per policy, plus its fallbacks (old pack, swapped classifier, other temperature);
+* E1 / E3 / report.
+
+`test_pipeline_and_api.py` checks the real fit-fusion output.

@@ -40,7 +40,16 @@ class FusionParams:
     accept: dict = field(default_factory=lambda: {"strict": 0.85, "balanced": 0.7, "lenient": 0.55})
     margin: float = 0.10
     min_agree: int = 2
-    suggest_min_top5_mass: float = 0.25
+    suggest_min_top5_mass: float = 0.25  # every policy, unless suggest_min_top5_mass_by_policy has that policy
+    # per-policy "did you mean" mass (docs 15.17): each policy's suggestion pool differs once the accept thresholds
+    # differ. Empty in packs fitted before 15.17: the single value above is used for every policy, as before.
+    suggest_min_top5_mass_by_policy: dict = field(default_factory=dict)
+    # classifier ALONE (sliding mode, E1), docs 15.17: per-policy accept thresholds on the classifier's
+    # temperature-scaled probabilities, fitted by fit-fusion on validation. Valid only for the classifier recorded in
+    # ``classifier_fit`` (its fingerprint and temperature); empty in older packs -> the checkpoint's single
+    # recommended_threshold, as before.
+    classifier_accept: dict = field(default_factory=dict)
+    classifier_fit: dict = field(default_factory=dict)
     user_bonus: float = 1.0  # logit bonus of user signs in the retrieval softmax
     user_margin: float = 0.05  # cosine margin for the direct "My signs" override (7.3)
     user_theta_floor: float = 0.0  # lowest allowed per-sign acceptance cosine
@@ -61,6 +70,19 @@ class FusionParams:
         # decide() raise for the missing ones (HTTP 500 in the API). Missing values are filled from the present
         # ones (or the defaults) and kept ordered strict >= balanced >= lenient.
         object.__setattr__(self, "accept", normalize_accept(self.accept))
+        # optional per-policy values: unknown keys and non-numbers dropped; a missing policy falls back to the single
+        # value (suggest) or to the checkpoint threshold (classifier alone: all three or none)
+        sm = {}
+        for k, v in dict(self.suggest_min_top5_mass_by_policy or {}).items():
+            try:
+                if k in POLICIES and v is not None and math.isfinite(float(v)):
+                    sm[k] = float(v)
+            except (TypeError, ValueError):
+                continue
+        object.__setattr__(self, "suggest_min_top5_mass_by_policy", sm)
+        ca = {k: v for k, v in dict(self.classifier_accept or {}).items() if k in POLICIES and v is not None}
+        object.__setattr__(self, "classifier_accept", normalize_accept(ca) if ca else {})
+        object.__setattr__(self, "classifier_fit", dict(self.classifier_fit or {}))
         if self.user_cls_mode not in USER_CLS_MODES:
             raise ValueError(f"user_cls_mode must be one of {USER_CLS_MODES}, not {self.user_cls_mode!r}")
 
@@ -81,6 +103,10 @@ class FusionParams:
 
     def with_(self, **kw) -> FusionParams:
         return replace(self, **kw)
+
+    def suggest_mass(self, policy: str) -> float:
+        """Smallest top-5 mass for a "did you mean" under ``policy`` (the single value in packs before 15.17)."""
+        return float(self.suggest_min_top5_mass_by_policy.get(policy, self.suggest_min_top5_mass))
 
 
 DEFAULT_ACCEPT = {"strict": 0.85, "balanced": 0.7, "lenient": 0.55}
@@ -226,7 +252,7 @@ def fuse(inp: FusionInputs, p: FusionParams) -> FusionResult:
 def decide(p_sorted: np.ndarray, agree: int, crops: int, params: FusionParams, policy: str = "balanced",
            best_cos: float | None = None) -> tuple[str, str]:
     """accept   if p1 >= accept[policy] and p1 - p2 >= margin and enough crops agree
-       suggest  elif sum(top5) >= suggest_min_top5_mass
+       suggest  elif sum(top5) >= suggest_min_top5_mass (per policy when fitted so, ``FusionParams.suggest_mass``)
        abstain  otherwise ("Not sure - please sign again, or spell it").
     With ``best_cos`` below ``s_min`` the result is always ``abstain`` / ``out_of_vocabulary``."""
     if policy not in params.accept:
@@ -246,6 +272,6 @@ def decide(p_sorted: np.ndarray, agree: int, crops: int, params: FusionParams, p
         reason = "ambiguous"
     else:
         reason = "unstable"
-    if float(np.sum(p_sorted[:5])) >= params.suggest_min_top5_mass:
+    if float(np.sum(p_sorted[:5])) >= params.suggest_mass(policy):
         return "suggest", reason
     return "abstain", reason

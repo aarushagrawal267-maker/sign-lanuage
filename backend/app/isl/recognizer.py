@@ -14,7 +14,7 @@ from app.features.build import FeatureError, build_features
 from app.features.spec import FeatureConfig
 from app.inference.recognizer import Candidate, Recognition
 from app.isl.models.encoder import EncoderPredictor, FeatureStatsEmbedder, RawEmbedder
-from app.isl.models.fusion import USER_PREFIX, FusionInputs, FusionParams, decide, fuse
+from app.isl.models.fusion import POLICIES, USER_PREFIX, FusionInputs, FusionParams, decide, fuse
 from app.isl.models.index import EmbeddingIndex
 from app.landmarks.raw import RawSequence
 from app.models.checkpoint import Predictor
@@ -36,6 +36,54 @@ def classifier_calibration(predictor) -> tuple[float, float, bool]:
     t = float(t) if t is not None and float(t) > 0 else 1.0
     thr = meta.get("recommended_threshold")
     return t, float(thr) if thr is not None else DEFAULT_CLASSIFIER_THRESHOLD, thr is not None
+
+
+# what identifies one trained classifier: these meta fields change with every training run (train_seconds, history
+# timing) and with what it was trained on; no file hashing at load time
+_FINGERPRINT_KEYS = ("split", "class_names", "temperature", "recommended_threshold", "val_top1", "val_top5",
+                     "best_epoch", "train_seconds", "architecture", "model_kwargs")
+
+
+def classifier_fingerprint(predictor) -> str:
+    """Short identity of a classifier checkpoint, stored next to thresholds fitted for exactly that classifier."""
+    import hashlib
+    import json
+
+    meta = getattr(predictor, "meta", None) or {}
+    d = {k: meta.get(k) for k in _FINGERPRINT_KEYS}
+    if d["class_names"] is None:
+        d["class_names"] = list(getattr(predictor, "class_names", []) or [])
+    return hashlib.sha256(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def classifier_policy_thresholds(predictor, fusion: FusionParams | None) -> dict:
+    """Per-policy accept thresholds of the classifier ALONE (sliding mode, E1) on :func:`calibrated_probs`' scale.
+
+    ``fusion.classifier_accept`` (fitted per policy by fit-fusion on validation, docs 15.17) is used only when
+    ``fusion.classifier_fit`` names this very classifier (fingerprint and temperature): E1a and the cross-validation
+    folds swap in other classifiers next to the main pack's fusion.json. Otherwise - and for every pack fitted
+    before 15.17 - every policy uses the checkpoint's single ``recommended_threshold`` (``classifier_calibration``),
+    exactly as before. Returns {"thresholds", "temperature", "source", "per_policy", "checkpoint_threshold",
+    "threshold_in_checkpoint", "reason"}."""
+    temp, thr, fitted = classifier_calibration(predictor)
+    out = {"temperature": temp, "checkpoint_threshold": thr, "threshold_in_checkpoint": fitted,
+           "thresholds": {pol: thr for pol in POLICIES}, "per_policy": False,
+           "source": "checkpoint recommended_threshold (one value for every policy)"}
+    acc = dict(getattr(fusion, "classifier_accept", None) or {})
+    fit = dict(getattr(fusion, "classifier_fit", None) or {})
+    if not acc:
+        out["reason"] = "fusion.json has no per-policy classifier thresholds (fitted before docs 15.17)"
+        return out
+    if fit.get("fingerprint") != classifier_fingerprint(predictor):
+        out["reason"] = "fusion.json's classifier thresholds were fitted for another classifier checkpoint"
+        return out
+    ft = fit.get("temperature")
+    if ft is None or abs(float(ft) - temp) > 1e-6:
+        out["reason"] = f"fusion.json's classifier thresholds were fitted at temperature {ft}, the checkpoint has {temp}"
+        return out
+    out.update(thresholds={pol: float(acc[pol]) for pol in POLICIES}, per_policy=True, reason=None,
+               source="fusion.json classifier_accept (fitted per policy on validation by fit-fusion)")
+    return out
 
 
 def calibrated_probs(probs: np.ndarray, temperature: float) -> np.ndarray:
@@ -103,8 +151,17 @@ class IslRecognizer:
 
     @property
     def classifier_threshold(self) -> float | None:
-        """Accept threshold of the classifier alone (sliding mode), on :meth:`class_probs`' scale."""
+        """The checkpoint's single accept threshold of the classifier alone, on :meth:`class_probs`' scale (the
+        sliding-mode threshold of packs fitted before docs 15.17; see :meth:`classifier_threshold_for`)."""
         return classifier_calibration(self.classifier)[1] if self.classifier is not None else None
+
+    def classifier_threshold_for(self, policy: str = "balanced") -> float | None:
+        """Sliding-mode accept threshold for ``policy``: fitted per policy when this pack's fusion.json has it for
+        this classifier, else the checkpoint's single threshold (:func:`classifier_policy_thresholds`)."""
+        if self.classifier is None:
+            return None
+        th = classifier_policy_thresholds(self.classifier, self.fusion)["thresholds"]
+        return float(th.get(policy, th["balanced"]))
 
     def class_probs(self, crops: list[RawSequence]):
         """Closed-set probabilities of the classifier alone (sliding mode), temperature-scaled with the

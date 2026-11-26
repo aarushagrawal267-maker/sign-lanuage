@@ -39,10 +39,11 @@ import numpy as np
 from app.features.build import FeatureError, build_features
 from app.isl.evaluation.report import (PARTIAL_DATA_LABEL, format_interval, git_commit, grouped_bootstrap,
                                        interval_fields, interval_reason)
-from app.isl.models.calibration import fit_thresholds, summarize
+from app.isl.models.calibration import classifier_alone_decisions, fit_thresholds, summarize
 from app.isl.models.fusion import POLICIES, USER_PREFIX, FusionInputs, FusionParams, decide, fuse
 from app.isl.training.common import engine_crops
 
+E1_POLICY = "balanced"  # E1's summary columns: the sliding mode at the app's default policy (all in "policies")
 DECISION_KEYS = ("top1", "top5", "coverage", "accepted_precision", "not_sure_rate", "wrong_accept_rate",
                  "suggest_rate", "suggest_top5_hit")
 
@@ -120,30 +121,18 @@ def refused_entry(label: str, why: str, kind: str | None = None) -> dict:
             "reason": f"refused: {why}"}
 
 
-def classifier_alone_decisions(per_crop: list[np.ndarray], threshold: float, margin: float,
-                               min_agree: int = 2) -> tuple[np.ndarray, np.ndarray]:
-    """The engine's classifier-alone rule (sliding mode / classic engine) on one segment per row of ``per_crop``
-    ((crops, C) temperature-scaled probabilities): accept when the crop-mean top-1 probability >= ``threshold``,
-    beats the runner-up by ``margin`` and enough crops agree. There is no "did you mean" step: every segment that
-    is not accepted is "not sure". Returns (mean probabilities (N, C), accepted (N,) bool)."""
-    P = np.stack([p.mean(0) for p in per_crop])
-    srt = -np.sort(-P, axis=1)
-    p1, p2 = srt[:, 0], (srt[:, 1] if P.shape[1] > 1 else np.zeros(len(P)))
-    top = P.argmax(1)
-    agree = np.array([int((p.argmax(1) == t).sum()) for p, t in zip(per_crop, top)])
-    need = np.array([min(min_agree, len(p)) for p in per_crop])
-    return P, (p1 >= threshold) & (p1 - p2 >= margin) & (agree >= need)
-
-
 def e1_closed_set(rec, clips, label: str, split_name: str, kind: str) -> dict:
     """Classifier alone on ``clips``. Decision columns: the classifier-alone rule of the app's sliding mode, with the
-    classifier's own validation temperature and threshold (``classifier_calibration``), NOT the fused thresholds of
-    ``fusion.json`` (another probability scale: the commercial-safe report of 2026-11-26 compared raw classifier
-    probabilities with the fused 0.96 and showed "not sure" 0.95-1.0; docs/ISL_DESIGN.md 15.16)."""
+    classifier's own validation temperature and threshold, NOT the fused thresholds of ``fusion.json`` (another
+    probability scale: the commercial-safe report of 2026-11-26 compared raw classifier probabilities with the fused
+    0.96 and showed "not sure" 0.95-1.0; docs/ISL_DESIGN.md 15.16). The threshold is the sliding mode's for the
+    app's default policy (``E1_POLICY``, balanced): fitted per policy by fit-fusion when the pack has it for this
+    classifier, else the checkpoint's single threshold (``classifier_policy_thresholds``, docs 15.17). Every policy's
+    numbers are in ``policies``."""
     from sklearn.metrics import f1_score
 
     from app.inference.engine import EngineConfig
-    from app.isl.recognizer import calibrated_probs, classifier_calibration
+    from app.isl.recognizer import calibrated_probs, classifier_policy_thresholds
 
     if rec.classifier is None:
         return {"label": label, "run": False, "reason": "no classifier"}
@@ -153,7 +142,8 @@ def e1_closed_set(rec, clips, label: str, split_name: str, kind: str) -> dict:
     ids = list(rec.classifier.class_names)
     pos = {c: i for i, c in enumerate(ids)}
     sel = [c for c in clips if c.concept_id in pos]
-    temp, thr, thr_fitted = classifier_calibration(rec.classifier)
+    cal = classifier_policy_thresholds(rec.classifier, getattr(rec, "fusion", None))
+    temp, thr, thr_fitted = cal["temperature"], cal["thresholds"][E1_POLICY], cal["threshold_in_checkpoint"]
     per_crop, used = [], []
     for c in sel:
         try:
@@ -169,6 +159,15 @@ def e1_closed_set(rec, clips, label: str, split_name: str, kind: str) -> dict:
     y = np.array([pos[c.concept_id] for c in used])
     pred = P.argmax(1)
     hit = (pred == y).astype(float)
+    policies = {}
+    for pol in POLICIES:
+        _, a = classifier_alone_decisions(per_crop, cal["thresholds"][pol], margin)
+        policies[pol] = {"threshold": cal["thresholds"][pol], "coverage": float(a.mean()),
+                         "not_sure_rate": float(1 - a.mean()), "wrong_accept_rate": float((a & (hit == 0)).mean()),
+                         "accepted_precision": float(hit[a].mean()) if a.any() else None, "n_accepted": int(a.sum())}
+    src_note = ("fitted per policy on validation (fusion.json)" if cal["per_policy"] else
+                "the checkpoint's validation threshold, the same for every policy"
+                + ("" if thr_fitted else " (checkpoint has none: Predictor default)"))
     top5 = np.array([y[j] in np.argsort(-P[j])[:5] for j in range(len(y))], float)
     groups = _groups(used)
     per_cat = defaultdict(list)
@@ -185,14 +184,14 @@ def e1_closed_set(rec, clips, label: str, split_name: str, kind: str) -> dict:
             "decision": {"rule": "classifier alone (sliding-mode rule): accept when the crop-mean probability >= "
                                  "threshold, top-1 minus top-2 >= margin and >= 2 crops agree; no suggestion step, so "
                                  "not sure = 1 - accepted",
-                         "temperature": temp, "threshold": thr, "threshold_in_checkpoint": thr_fitted,
-                         "margin": margin,
-                         "source": "classifier checkpoint (fitted on the classifier's validation part)"},
-            "decision_note": f"classifier alone: accept when its probability at temperature {temp:.2f} >= its own "
-                             f"validation threshold {thr:.2f}"
-                             + ("" if thr_fitted else " (checkpoint has none: Predictor default)")
-                             + "; not sure = not accepted (no 'did you mean' step); the app's segment mode uses the "
-                             "fused decision (E3)",
+                         "policy": E1_POLICY, "temperature": temp, "threshold": thr,
+                         "threshold_in_checkpoint": thr_fitted, "checkpoint_threshold": cal["checkpoint_threshold"],
+                         "thresholds": cal["thresholds"], "per_policy": cal["per_policy"], "margin": margin,
+                         "source": cal["source"], "fallback_reason": cal.get("reason")},
+            "policies": policies,
+            "decision_note": f"classifier alone, {E1_POLICY} policy: accept when its probability at temperature "
+                             f"{temp:.2f} >= {thr:.2f} ({src_note}); not sure = not accepted (no 'did you mean' "
+                             "step); the app's segment mode uses the fused decision (E3)",
             **interval_fields({"top1": (hit.tolist(), groups), "top5": (top5.tolist(), groups)}),
             "interval_note": None if interval_reason(hit.tolist(), groups) is None else
             f"{interval_reason(hit.tolist(), groups)} in this test part: a signer-level interval needs more held-out "
@@ -220,8 +219,14 @@ def e3_fused(rec, clips, label: str) -> dict:
     by_src = defaultdict(list)
     for c, h in zip(used, ok):
         by_src[c.source].append(float(h))
+    ach = rec.fusion.achieved or {}
+    for pol, b in block["policies"].items():  # what each policy uses, and what validation said it achieves
+        a = ach.get(pol) or {}
+        b.update(threshold=rec.fusion.accept[pol], suggest_min_top5_mass=rec.fusion.suggest_mass(pol),
+                 val_target=a.get("target"), val_target_reached=a.get("target_reached"),
+                 val_precision_lower_bound=a.get("precision_lower_bound"), val_rule=a.get("rule"))
     return {"label": label, "run": True, "n": len(used), "n_groups": len(set(groups)),
-            "n_classes": len(set(truths)), "fusion_fitted": rec.fusion.fitted,
+            "n_classes": len(set(truths)), "fusion_fitted": rec.fusion.fitted, "metrics_policy": "balanced",
             "metrics": _metrics_from(block), **block, "risk_coverage": curve,
             "aurc": float(np.mean([c["risk"] for c in curve])),
             "top1_by_source": {k: {"n": len(v), "top1": float(np.mean(v))} for k, v in sorted(by_src.items())}}
@@ -814,6 +819,35 @@ def _e5_lines(p: dict) -> list[str]:
     return out + [""] if out else out
 
 
+def _policy_lines(doc: dict) -> list[str]:
+    """Per-policy decision numbers (docs 15.17): the main table shows E1 and E3 at the balanced policy only."""
+    rows = []
+    for pid in ("E1b", "E1c", "E3"):
+        p = doc["protocols"].get(pid) or {}
+        pols = p.get("policies") if p.get("run") else None
+        if not isinstance(pols, dict):
+            continue
+        how = (p.get("decision") or {}).get("source") if pid.startswith("E1") else "fusion.json accept (fused)"
+        for pol in ("strict", "balanced", "lenient"):
+            b = pols.get(pol) or {}
+            val = ""
+            if b.get("val_target") is not None:
+                val = (f"target {b['val_target']:.2f} {'reached' if b.get('val_target_reached') else 'NOT reached'}"
+                       f", val lower bound {_fmt(b.get('val_precision_lower_bound'))}")
+            rows.append(f"| {pid} | {pol} | {_fmt(b.get('threshold'))} | {_fmt(b.get('coverage'))} | "
+                        f"{_fmt(b.get('accepted_precision'))} | {_fmt(b.get('not_sure_rate'))} | "
+                        f"{_fmt(b.get('wrong_accept_rate'))} | {_fmt(b.get('suggest_rate'))} | {how}"
+                        + (f"; {val}" if val else "") + " |")
+    if not rows:
+        return []
+    return ["", "## Decision policies (strict / balanced / lenient)", "",
+            "The table above shows the balanced policy (the app's default). E1 = the classifier alone (sliding mode), "
+            "E3 = the fused decision (segment mode). A policy whose validation target (95 % lower bound of accepted "
+            "precision) was not reachable uses a graded fallback below the best achievable bound (docs 15.17).", "",
+            "| Protocol | policy | threshold | accepted | accepted precision | not sure | wrong accept | suggest | "
+            "thresholds from |", "|---|---|---|---|---|---|---|---|---|", *rows]
+
+
 def markdown_report(doc: dict) -> str:
     partial = bool(doc.get("partial_data")) and not doc.get("smoke")
     title = f"# ISL evaluation report ({doc['profile']})" + (" - PARTIAL DATA" if partial else "")
@@ -847,6 +881,7 @@ def markdown_report(doc: dict) -> str:
                   f"{cvb['top1_sd']:.3f}); pooled over {cvb['pooled_groups']} held-out signer groups: "
                   f"{cvb['pooled_top1']:.3f} (95% CI " + format_interval(ci, cvb['pooled_groups'],
                                                                        cvb.get('pooled_top1_interval_reason')) + ")"]
+    lines += _policy_lines(doc)
     e4 = doc["protocols"].get("E4", {})
     if e4.get("run"):
         lines += ["", f"## E4 My signs (user-sign classifier term: {e4.get('user_cls_mode', 'penalty')})", "",
