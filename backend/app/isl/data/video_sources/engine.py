@@ -20,6 +20,13 @@ delete the temp file, append a manifest row.
 * Remote refusal: an HF rows page the server keeps refusing (``hf_listing.RemoteRefused``) gives that item a
   ``fetch:`` row and stops the run (``stopped: "remote"``, ``remote_permanent``, ``remote_error``); the remaining
   items are not touched, so a refusal never turns into thousands of failed rows.
+* Circuit breaker: ``FETCH_FAIL_STREAK`` fetch failures in a row (no successful fetch in between) among items that
+  have no earlier manifest row stop the run the same way (``stopped: "remote"``, not permanent), so a throttling
+  or outage storm (429 / 403 / 5xx / wrong bytes) never marks the whole source as failed. Items that already
+  failed on an earlier run are retried but do not count, so a block of permanently missing files cannot stop
+  every run.
+* An unexpected error in a fetch thread (e.g. ``mkstemp`` out of descriptors) stops fetching with
+  ``stopped: "error"`` (the script exits 2, so the queue retries instead of logging the source as finished).
 """
 
 from __future__ import annotations
@@ -47,6 +54,26 @@ log = logging.getLogger(__name__)
 
 AUTO_URL_FETCH_THREADS = 8  # measured on mendeley_static: 8 concurrent downloads ~6x the sequential rate
 PARALLEL_KINDS = frozenset({"url"})  # fetch kinds that may be fetched concurrently
+# new items failing to fetch in a row before the run stops (the longest burst seen live was 95 sha256 mismatches
+# during a Mendeley hiccup, all fine on retry; a 403 / 429 storm with 8 threads writes ~16 failed rows/s)
+FETCH_FAIL_STREAK = 40
+
+
+class FailStreak:
+    """Consecutive fetch failures among first-try items (ids without an earlier manifest row); not thread-safe."""
+
+    def __init__(self, limit: int, retried: set[str]):
+        self.limit, self.retried, self.n = limit, retried, 0
+
+    def ok(self) -> None:
+        self.n = 0
+
+    def failed(self, item: Item) -> bool:
+        """Count a failed fetch; True when the run should stop."""
+        if item.id in self.retried:
+            return False
+        self.n += 1
+        return bool(self.limit) and self.n >= self.limit
 
 
 def choose_fetch_threads(items: list[Item], requested: int | None = None) -> int:
@@ -153,15 +180,19 @@ def rel_path(p: Path, paths: IslPaths) -> str:
 def run(spec: SourceSpec, items: list[Item], paths: IslPaths, fetcher: Fetcher, *, workers: int = 1,
         limit: int = 0, max_minutes: float = 0.0, min_free_gb: float = 10.0, extract: Callable | None = None,
         progress: Callable[[str], None] | None = None, clock=time.time, max_rss_gb: float = 0.0,
-        rss: Callable | None = None, fetch_threads: int | None = None) -> dict:
+        rss: Callable | None = None, fetch_threads: int | None = None,
+        fail_streak: int = FETCH_FAIL_STREAK) -> dict:
     """Process every not-yet-done item. ``extract(mode, src, out, step_fps, max_s) -> dict`` defaults to
     ``extract.work``; with ``workers <= 1`` it runs in this process (tests). ``fetch_threads``: concurrent
-    fetches (``None`` = auto, see :func:`choose_fetch_threads`; ``zip`` / ``hfrow`` items always use 1)."""
+    fetches (``None`` = auto, see :func:`choose_fetch_threads`; ``zip`` / ``hfrow`` items always use 1).
+    ``fail_streak``: circuit breaker (see the module docstring; 0 = off)."""
     if extract is None:
         from app.isl.data.video_sources.extract import work as extract
     man = paths.manifest(spec.manifest_name)
-    prior = read_manifest(man)
+    prior_all = read_manifest(man, only_ok=False)
+    prior = [r for r in prior_all if r.get("ok")]
     done = {r["id"] for r in prior}
+    streak = FailStreak(fail_streak, {r["id"] for r in prior_all if not r.get("ok")})
     # byte-identical files (same SHA-256) are extracted once; later copies get a row with ``duplicate_of``
     by_sha = {r["sha256"]: r for r in prior if r.get("sha256") and not r.get("duplicate_of")}
     waiting: dict[str, list[dict]] = {}  # sha -> duplicate rows waiting for the in-flight original
@@ -190,6 +221,26 @@ def run(spec: SourceSpec, items: list[Item], paths: IslPaths, fetcher: Fetcher, 
         m.update(it.meta)
         return m
 
+    def remote_stop(error: str, permanent: bool) -> None:
+        """Stop for a refusing / failing remote (the parallel producer calls this under its lock)."""
+        if stats["stopped"] != "memory":
+            stats["stopped"], stats["remote_permanent"] = "remote", permanent
+            stats["remote_error"] = error[:300]
+        log.warning("%s: stopping: %s", spec.name, error)
+
+    def streak_stop(it: Item, meta: dict) -> bool:
+        """Count a failed fetch; past ``fail_streak`` new items in a row stop the run (``remote``, not permanent)."""
+        if not streak.failed(it):
+            return False
+        remote_stop(f"{streak.n} new items failed to fetch in a row (last {it.id}: {meta.get('error')})", False)
+        return True
+
+    def error_stop(e: BaseException) -> None:
+        """An unexpected error while fetching: stop with ``stopped: "error"`` (exit 2, the queue retries)."""
+        if stats["stopped"] is None:
+            stats["stopped"], stats["fetch_error"] = "error", f"{type(e).__name__}: {e}"[:300]
+        log.error("%s: fetching failed; stopping further fetches", spec.name, exc_info=e)
+
     def producer():
         try:
             for it in todo:
@@ -211,12 +262,15 @@ def run(spec: SourceSpec, items: list[Item], paths: IslPaths, fetcher: Fetcher, 
                     meta.update({"ok": False, "error": f"fetch: {type(e).__name__}: {e}"[:300]})
                     q.put(("failed", it, meta, None))
                     if isinstance(e, RemoteRefused):  # the server keeps refusing: stop, the rest stays to do
-                        stats["stopped"], stats["remote_permanent"] = "remote", bool(e.permanent)
-                        stats["remote_error"] = str(e)[:300]
-                        log.warning("%s: stopping: %s", spec.name, e)
+                        remote_stop(str(e), bool(e.permanent))
+                        break
+                    if streak_stop(it, meta):
                         break
                     continue
+                streak.ok()
                 q.put(("ok", it, finfo, dest))
+        except BaseException as e:  # noqa: BLE001 - never let the run end as "finished" after this
+            error_stop(e)
         finally:
             fetcher.close_archives()
             q.put(None)
@@ -261,27 +315,29 @@ def run(spec: SourceSpec, items: list[Item], paths: IslPaths, fetcher: Fetcher, 
                         dest = None
                         meta = base_meta(it)
                         meta.update({"ok": False, "error": f"fetch: {type(e).__name__}: {e}"[:300]})
-                        if isinstance(e, RemoteRefused):  # the server keeps refusing: stop, the rest stays to do
-                            with lock:
+                        refused = isinstance(e, RemoteRefused)  # the server keeps refusing: stop, rest stays to do
+                        with lock:
+                            if refused:
+                                remote_stop(str(e), bool(e.permanent))
                                 halt.set()
-                                if stats["stopped"] != "memory":
-                                    stats["stopped"], stats["remote_permanent"] = "remote", bool(e.permanent)
-                                    stats["remote_error"] = str(e)[:300]
-                            log.warning("%s: stopping: %s", spec.name, e)
-                            if not stop.is_set():
-                                q.put(("failed", it, meta, None))
-                            return
+                            elif not halt.is_set() and streak_stop(it, meta):
+                                halt.set()
                         if not stop.is_set():
                             q.put(("failed", it, meta, None))
+                        if refused:
+                            return
                         continue
+                    with lock:
+                        streak.ok()
                     if stop.is_set():  # the run stopped while this was downloading: retried next run
                         dest.unlink(missing_ok=True)
                         return
                     entry, dest = ("ok", it, finfo, dest), None
                     q.put(entry)  # the consumer (or the drain loop in ``run``'s finally) owns the file now
-            except BaseException:
-                halt.set()
-                log.exception("%s: fetch thread failed; stopping further fetches", spec.name)
+            except BaseException as e:  # noqa: BLE001 - never let the run end as "finished" after this
+                with lock:
+                    halt.set()
+                    error_stop(e)
             finally:
                 if dest is not None:
                     dest.unlink(missing_ok=True)
@@ -293,9 +349,10 @@ def run(spec: SourceSpec, items: list[Item], paths: IslPaths, fetcher: Fetcher, 
             for t in threads:
                 t.start()
                 started.append(t)
-        except BaseException:  # could not start a thread: stop taking items, finish what is in flight
-            halt.set()
-            log.exception("%s: could not start fetch threads", spec.name)
+        except BaseException as e:  # noqa: BLE001 - could not start a thread: stop taking items, finish in-flight
+            with lock:
+                halt.set()
+                error_stop(e)
         finally:
             for t in started:
                 t.join()

@@ -19,7 +19,9 @@ Exit codes of `run`: 0 finished, 10 stopped after --max-minutes (more to do), 4 
 6 another run of the same manifest is active (lock manifests/<manifest>.lock or a process scan), 2 error.
 An HF alphabet listing that Hugging Face keeps refusing (429 / 503) exits 10 when it saved new rows (resumes next
 chunk) and 2 when it made no progress; raw/<source>/listing_status.json says how far it got. The same holds for the
-rows pages the run reads to fetch the images (engine stopped "remote"): 10 if this run extracted rows, else 2.
+rows pages the run reads to fetch the images (engine stopped "remote"), and for the engine's circuit breaker
+(40 new items failing to fetch in a row, e.g. a 429 / 403 storm): 10 if this run extracted rows, else 2.
+An unexpected error while fetching (engine stopped "error") exits 2, so the queue retries the source.
 HF alphabet sets take every row (no per-class cap) unless --per-class N is given.
 CISLR has exactly one ingestion path: this `run cislr` (the queue runs it as soon as the 1-byte probe of
 dataset.csv answers); scripts/ingest_isl_gated.py cislr delegates here and shares the lock.
@@ -405,6 +407,8 @@ def _run_locked(args, paths, spec, engine) -> int:
         return EXIT_MORE
     if stats["stopped"] == "remote":
         return remote_rc(stats)
+    if stats["stopped"] == "error":  # fetching broke off: items remain, never report the source as finished
+        return EXIT_ERR
     if args.limit and stats["todo"] >= args.limit:
         return EXIT_MORE
     return 0
