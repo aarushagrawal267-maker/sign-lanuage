@@ -270,12 +270,13 @@ def _resample(arr: np.ndarray, present: np.ndarray, t: np.ndarray, tq: np.ndarra
     return out, pres
 
 
-def _hand_shape(h: np.ndarray, pres: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """(L,21,3) body-frame hand -> wrist-relative, hand-size-normalized shape (L,60) and wrist pos (L,2)."""
+def _hand_shape(h: np.ndarray, pres: np.ndarray, floor: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
+    """(L,21,3) body-frame hand -> wrist-relative, hand-size-normalized shape (L,60) and wrist pos (L,2).
+    ``floor`` > 0 bounds the size from below (``FeatureConfig.hand_size_floor``); 0 keeps the original behaviour."""
     wrist = h[:, HAND_WRIST : HAND_WRIST + 1, :]
     rel = h - wrist
     size = np.linalg.norm(rel[:, HAND_MIDDLE_MCP, :2], axis=1)
-    size = np.where(size > 1e-6, size, 1.0)
+    size = np.maximum(size, floor) if floor > 0 else np.where(size > 1e-6, size, 1.0)
     shape = (rel[:, 1:, :] / size[:, None, None]).reshape(h.shape[0], -1)
     shape[~pres] = 0.0
     pos = h[:, HAND_WRIST, :2].copy()
@@ -290,8 +291,8 @@ def featurize(bf: BodyFrame, cfg: FeatureConfig) -> np.ndarray:
     pose, pp = _resample(bf.pose, bf.present["pose"], t, tq)
     left, lp = _resample(bf.left, bf.present["left"], t, tq)
     right, rp = _resample(bf.right, bf.present["right"], t, tq)
-    lshape, lpos = _hand_shape(left, lp)
-    rshape, rpos = _hand_shape(right, rp)
+    lshape, lpos = _hand_shape(left, lp, cfg.hand_size_floor)
+    rshape, rpos = _hand_shape(right, rp, cfg.hand_size_floor)
     static = [pose.reshape(L, -1), lshape, lpos, rshape, rpos]
     flags = [lp[:, None], rp[:, None]]
     comp_present = [pp, lp, lp, rp, rp]

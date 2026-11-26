@@ -53,11 +53,17 @@ class FeatureConfig:
     # Opt-in (ISL): mirror the body frame when the signer's LEFT hand is dominant so every clip is
     # "right-handed". Same layout and dimension; off by default so ASL checkpoints are unchanged.
     canonical_hand: bool = False
+    # Opt-in (ISL): lower bound for the 2D wrist-to-middle-MCP length that normalises the hand shape (body-frame
+    # units, i.e. shoulder widths). When that axis points along the camera axis (foreshortening) the 2D length goes
+    # to ~0 and the shape values blow up 10-1000x (26 Nov 2026 diagnosis of pre-training loss spikes). 0 = off.
+    hand_size_floor: float = 0.0
 
     def to_dict(self) -> dict:
         d = asdict(self)
         if not self.canonical_hand:  # keep the stored/served config of existing (ASL) models byte-identical
             d.pop("canonical_hand")
+        if not self.hand_size_floor:  # same: configs without the floor stay byte-identical
+            d.pop("hand_size_floor")
         return d
 
     @classmethod

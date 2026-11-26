@@ -24,7 +24,8 @@ from app.landmarks.raw import RawSequence
 
 log = logging.getLogger(__name__)
 
-ISL_FEATURES = FeatureConfig(seq_len=48, use_face=True, use_velocity=True, max_gap=5, canonical_hand=True)
+ISL_FEATURES = FeatureConfig(seq_len=48, use_face=True, use_velocity=True, max_gap=5, canonical_hand=True,
+                             hand_size_floor=0.1)
 
 
 def slice_bf(bf: BodyFrame, a: int, b: int) -> BodyFrame:
