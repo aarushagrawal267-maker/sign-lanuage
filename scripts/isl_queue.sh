@@ -17,7 +17,10 @@
 #
 # Exit codes handled per chunk: 0 done, 10 more to do, 4 low disk (wait), 3 gated, 5 stopped for memory
 # (--max-rss-gb, default MAX_RSS_GB=1.5 per process: restarted in fresh processes after 1 min, up to
-# MEM_RESTARTS times per source), 6 another run of that manifest is active (wait 5 min), other = error (5 tries).
+# MEM_RESTARTS times per source), 6 another run of that manifest is active (wait 5 min), 11 finished this pass but
+# N items failed to fetch (their rows are retried by a re-run: re-run after FETCH_RETRY_WAIT s, default 2 min, at
+# most FETCH_RETRY_PASSES extra passes, default 3, then move on; readiness still reports the rows),
+# other = error (5 tries). islrtc-full never returns 11 (it has no fetch-failure count).
 # Child processes do not inherit the queue lock (fd 9 is closed for them), so a chunk left running by a stopped
 # queue cannot block the next queue.
 #
@@ -40,6 +43,8 @@ MEM_RESTARTS="${MEM_RESTARTS:-20}"
 GATED_PROBE_MIN="${GATED_PROBE_MIN:-60}"
 CISLR_POLL_H="${CISLR_POLL_H:-6}"
 CISLR_POLL_DAYS="${CISLR_POLL_DAYS:-14}"
+FETCH_RETRY_PASSES="${FETCH_RETRY_PASSES:-3}"
+FETCH_RETRY_WAIT="${FETCH_RETRY_WAIT:-120}"
 # Order: tiny ISLRTC re-run, then the most useful sources first (most labelled words, letters), unlabelled last.
 SOURCES="${SOURCES:-islrtc-full wslp isl_fingerspelling mendeley_static isl_csltr mendeley_agri mendeley_emergency isl_csltr_words hf_akrit_alphabet hf_hemg_alphabet wslp_unlabelled}"
 export SLR_TORCH_THREADS="${SLR_TORCH_THREADS:-2}" GLOG_minloglevel=2 PYTHONUNBUFFERED=1
@@ -67,8 +72,18 @@ ISIGN_DONE=0
 IN_GATED=0
 LAST_PROBE=0
 
-run_source() {  # $1 = source name; returns 0 done, 2 gave up, 3 gated
-  local src="$1" tries=0 mem=0 rc
+fetch_failed_n() {  # $1 = source: N from the last "fetch_failed=N" line of its run output ("?" if none)
+  local n
+  n=$(tail -n 400 "$LOGDIR/video_$1.out" 2>/dev/null | grep -o 'fetch_failed=[0-9]*' | tail -n 1 | cut -d= -f2)
+  echo "${n:-?}"
+}
+
+wait_text() {  # FETCH_RETRY_WAIT as "2 min" (or "N s")
+  if [ "$FETCH_RETRY_WAIT" -ge 60 ] && [ $((FETCH_RETRY_WAIT % 60)) -eq 0 ]; then echo "$((FETCH_RETRY_WAIT / 60)) min"; else echo "${FETCH_RETRY_WAIT} s"; fi
+}
+
+run_source() {  # $1 = source name; returns 0 done (or fetch failures left after the retry passes), 2 gave up, 3 gated
+  local src="$1" tries=0 mem=0 fpass=0 rc
   while true; do
     maybe_gated
     wait_disk
@@ -91,6 +106,12 @@ run_source() {  # $1 = source name; returns 0 done, 2 gave up, 3 gated
          if [ "$mem" -ge "$MEM_RESTARTS" ]; then log "$src: too many memory stops; giving up for now"; return 2; fi
          sleep 60 ;;
       6) log "$src: another run of this manifest is active; waiting 5 min"; sleep 300 ;;
+      11) if [ "$fpass" -ge "$FETCH_RETRY_PASSES" ]; then
+            log "$src: fetch failures remain after $FETCH_RETRY_PASSES retry passes; moving on"; return 0
+          fi
+          fpass=$((fpass + 1))
+          log "$src: $(fetch_failed_n "$src") fetch failures; retry pass $fpass of $FETCH_RETRY_PASSES in $(wait_text)"
+          sleep "$FETCH_RETRY_WAIT" ;;
       *) tries=$((tries + 1)); log "$src: error rc=$rc (try $tries of 5, see $LOGDIR/video_${src}.out)"
          if [ "$tries" -ge 5 ]; then log "$src: giving up for now"; return 2; fi
          sleep $((300 * tries)) ;;

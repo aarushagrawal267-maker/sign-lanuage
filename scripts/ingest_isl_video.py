@@ -16,7 +16,10 @@ Usage (repository root; CPU work runs with nice 10):
 
 Exit codes of `run`: 0 finished, 10 stopped after --max-minutes (more to do), 4 stopped for low disk,
 3 gated dataset not accessible yet, 5 stopped for memory (--max-rss-gb; resumable, the queue restarts it),
-6 another run of the same manifest is active (lock manifests/<manifest>.lock or a process scan), 2 error.
+6 another run of the same manifest is active (lock manifests/<manifest>.lock or a process scan), 2 error,
+11 finished this pass (nothing left to start) but N items failed to fetch: their `fetch: ...` rows are retried by
+the next run (e.g. sha256-mismatch downloads that succeed on retry); the log line `fetch_failed=N` gives N and the
+queue re-runs the source up to 3 times (2 min apart) before moving on.
 An HF alphabet listing that Hugging Face keeps refusing (429 / 503) exits 10 when it saved new rows (resumes next
 chunk) and 2 when it made no progress; raw/<source>/listing_status.json says how far it got. The same holds for the
 rows pages the run reads to fetch the images (engine stopped "remote"), and for the engine's circuit breaker
@@ -48,6 +51,7 @@ os.environ.setdefault("GLOG_minloglevel", "2")
 
 log = logging.getLogger("ingest_isl_video")
 EXIT_MORE, EXIT_DISK, EXIT_GATED, EXIT_ERR, EXIT_MEMORY, EXIT_BUSY = 10, 4, 3, 2, 5, 6
+EXIT_FETCH_RETRY = 11  # finished this pass, but some items failed to fetch (a re-run retries them)
 
 
 # --------------------------------------------------------------------------------------------- helpers
@@ -411,7 +415,19 @@ def _run_locked(args, paths, spec, engine) -> int:
         return EXIT_ERR
     if args.limit and stats["todo"] >= args.limit:
         return EXIT_MORE
-    return 0
+    return finished_rc(spec.name, stats)
+
+
+def finished_rc(name: str, stats: dict) -> int:
+    """Exit code of a run that ended with no stop reason (no items left to start): 0, or 11
+    (:data:`EXIT_FETCH_RETRY`) when items failed to fetch this pass - their ``fetch: ...`` rows are retried by the
+    next run, so the source is not finished. Logs ``fetch_failed=N`` (scripts/isl_queue.sh reads N from it)."""
+    n = int(stats.get("fetch_failed") or 0)
+    if n <= 0:
+        return 0
+    log.warning("%s: finished this pass with fetch_failed=%d (exit %d: re-run the source to retry them)",
+                name, n, EXIT_FETCH_RETRY)
+    return EXIT_FETCH_RETRY
 
 
 def remote_rc(stats: dict) -> int:
