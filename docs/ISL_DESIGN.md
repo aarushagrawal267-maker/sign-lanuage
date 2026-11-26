@@ -2806,3 +2806,61 @@ Follow-ups D and 3 of 15.14, added while the research run was still in dedup / p
   so its encoder diff is expected to be `{}`.
 * Tests: `backend/tests/isl/test_resume_feature_config.py` (resume accepted on the same features and refused on
   others, for encoder and classifier; an old-code state is refused; meta records; warning only on a mismatch).
+
+### 15.16 E1 "not sure" and sliding mode used the fused threshold on classifier probabilities (Model QA, 26 Nov 2026)
+
+**What the commercial-safe report's E1 "not sure" column meant.** `artifacts/isl/commercial-safe/eval/report.md`
+(commit `a272419`) shows not sure 0.999 (E1b), 0.952 (E1a), 1.000 (E1c) next to top-1 0.723 / 0.955 / 0.915.
+That column was **not** an abstain rate. It was the share of test clips whose raw classifier probability (crop
+mean, temperature 1) was below **0.96**, the pack's *fused* balanced accept threshold (`fusion.json`; `e1_closed_set`
+at `a272419` `runners.py:151-163`). 0.96 is a value on another scale: the softmax of 0.5 x classifier log-probability
+(t_c 0.72) + retrieval (tau 0.1) + 1.0 x prior. The commercial-safe classifier trains with label smoothing, and its raw
+top-1 probability never gets that high on E1b (p90 0.881, p99 0.943, reproduced exactly: 1 of 792 clips reaches it).
+So the column only said "the classifier probability never reaches a threshold made for another score", and "not
+accepted" also counted clips the app would show as "did you mean" suggestions. E3's not sure (0.105) is the
+abstain rate only (`decision_block`, `runners.py:66`), so the two numbers in one column measured different things.
+The E1 top-1 / top-5 / macro-F1 numbers, and everything in E2-E8, are not affected.
+
+**The same mismatch in the live app.** In sliding mode (`Sliding window` on the Live and Analyze pages) an ISL pack
+decides on `IslRecognizer.class_probs` (raw classifier probabilities, `recognizer.py:82` at `a272419`) against
+`RecognitionEngine.threshold`, which returned the fused `accept[policy]` (`engine.py:152-160`, used by
+`_decision` at `engine.py:241` and `_push_sliding` at `engine.py:488`). With the commercial-safe pack that is 0.96 for
+every policy, so sliding mode would almost never commit a word. Segment mode, the default, uses the fused decision
+correctly: its numbers are E3.
+
+**Fix.**
+* `app/isl/recognizer.py`: `classifier_calibration(predictor)` reads the classifier checkpoint's own `temperature`
+  and `recommended_threshold`. `train_classifier` fits both on the classifier's validation part, and the threshold is
+  on temperature-scaled probabilities. If a checkpoint has no threshold, the Predictor default 0.6 is used and
+  flagged. `class_probs` now returns temperature-scaled probabilities, and `IslRecognizer.classifier_threshold`
+  exposes the threshold.
+* `app/inference/engine.py`: the threshold for sliding mode with a recogniser is `classifier_threshold`. A threshold
+  the user sets still wins. Segment mode keeps the fused thresholds.
+* `app/isl/evaluation/runners.py`: E1 (`e1_closed_set` and the new `classifier_alone_decisions`) applies the engine's
+  classifier-alone rule: crop-mean temperature-scaled p1 >= the classifier's own threshold, top-1 minus top-2 >=
+  `EngineConfig.min_margin` (0.10), and at least 2 crops agree. It reports `coverage`, `accepted_precision`,
+  `wrong_accept_rate`, and `not_sure_rate` = 1 - coverage (there is no suggestion step). A new `decision` block
+  records the temperature, threshold and margin. Top-1 / top-5 are now computed on the temperature-scaled crop mean,
+  the probabilities sliding mode shows (E1b commercial-safe: 0.722 instead of 0.723).
+* `markdown_report` has an **accepted** column, and its legend says what not sure means for each protocol: E1 =
+  1 - accepted, E2 / E3 = abstain only.
+* Tests: `backend/tests/isl/test_e1_classifier_decision.py`.
+
+**Corrected E1, commercial-safe checkpoints, read-only scratch re-run** (not written into the commercial-safe folder,
+whose report stays as it is):
+
+| | threshold (T) | accepted | not sure | wrong accept | accepted precision |
+|---|---|---|---|---|---|
+| E1b (792) | 0.60 (0.72) | 0.710 | 0.290 | 0.104 | 0.854 |
+| E1a (816) | 0.35 (0.72) | 0.975 | 0.025 | 0.036 | 0.964 |
+
+For comparison, the classifier alone *through the fused rule* (a pack without an index) on E1b gives accept 0.000 and
+suggest 1.000. The fused thresholds are only meaningful together with retrieval.
+
+**Open (not changed here).** (1) The commercial-safe `fusion.json` has accept 0.96 for strict, balanced *and*
+lenient: no policy reached its Wilson-lower-bound target on validation, so `fit_thresholds`
+(`calibration.py:137-138`) picked the same best-precision threshold for all three, and the app's policy switch has no
+effect for that pack. (2) A classifier-alone accept rule reaches only 85 % precision on E1b (10 % silent errors).
+Sliding mode uses the classifier's validation threshold, which targets 85 % accuracy (`pick_threshold`), not the
+95 % of the fused balanced policy. (3) A pack without an index would apply fused thresholds fitted with retrieval to
+classifier-only fused probabilities. Such a pack never accepts in segment mode; it shows suggestions.

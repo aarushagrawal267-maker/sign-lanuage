@@ -153,6 +153,11 @@ class RecognitionEngine:
         if self.cfg.threshold is not None:
             return float(self.cfg.threshold)
         if self.predictor is None and self.recognizer is not None:
+            # sliding mode decides on the classifier's own probabilities (class_probs): its own threshold, never
+            # the fused accept threshold, which is on the fused-probability scale (docs/ISL_DESIGN.md 15.16)
+            cls_thr = getattr(self.recognizer, "classifier_threshold", None)
+            if self.cfg.mode == "sliding" and cls_thr is not None:
+                return float(cls_thr)
             acc = getattr(getattr(self.recognizer, "fusion", None), "accept", None)
             if isinstance(acc, dict) and self.cfg.policy in acc:
                 return float(acc[self.cfg.policy])

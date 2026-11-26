@@ -120,9 +120,30 @@ def refused_entry(label: str, why: str, kind: str | None = None) -> dict:
             "reason": f"refused: {why}"}
 
 
+def classifier_alone_decisions(per_crop: list[np.ndarray], threshold: float, margin: float,
+                               min_agree: int = 2) -> tuple[np.ndarray, np.ndarray]:
+    """The engine's classifier-alone rule (sliding mode / classic engine) on one segment per row of ``per_crop``
+    ((crops, C) temperature-scaled probabilities): accept when the crop-mean top-1 probability >= ``threshold``,
+    beats the runner-up by ``margin`` and enough crops agree. There is no "did you mean" step: every segment that
+    is not accepted is "not sure". Returns (mean probabilities (N, C), accepted (N,) bool)."""
+    P = np.stack([p.mean(0) for p in per_crop])
+    srt = -np.sort(-P, axis=1)
+    p1, p2 = srt[:, 0], (srt[:, 1] if P.shape[1] > 1 else np.zeros(len(P)))
+    top = P.argmax(1)
+    agree = np.array([int((p.argmax(1) == t).sum()) for p, t in zip(per_crop, top)])
+    need = np.array([min(min_agree, len(p)) for p in per_crop])
+    return P, (p1 >= threshold) & (p1 - p2 >= margin) & (agree >= need)
+
+
 def e1_closed_set(rec, clips, label: str, split_name: str, kind: str) -> dict:
-    """Classifier alone on ``clips``; decision = classifier probability vs the fused balanced threshold."""
+    """Classifier alone on ``clips``. Decision columns: the classifier-alone rule of the app's sliding mode, with the
+    classifier's own validation temperature and threshold (``classifier_calibration``), NOT the fused thresholds of
+    ``fusion.json`` (another probability scale: the commercial-safe report of 2026-11-26 compared raw classifier
+    probabilities with the fused 0.96 and showed "not sure" 0.95-1.0; docs/ISL_DESIGN.md 15.16)."""
     from sklearn.metrics import f1_score
+
+    from app.inference.engine import EngineConfig
+    from app.isl.recognizer import calibrated_probs, classifier_calibration
 
     if rec.classifier is None:
         return {"label": label, "run": False, "reason": "no classifier"}
@@ -132,25 +153,24 @@ def e1_closed_set(rec, clips, label: str, split_name: str, kind: str) -> dict:
     ids = list(rec.classifier.class_names)
     pos = {c: i for i, c in enumerate(ids)}
     sel = [c for c in clips if c.concept_id in pos]
-    P, used = [], []
+    temp, thr, thr_fitted = classifier_calibration(rec.classifier)
+    per_crop, used = [], []
     for c in sel:
         try:
             probs, _ = rec.classifier.predict(_features(c, rec.feature_config))
         except (FeatureError, OSError, ValueError):
             continue
-        P.append(probs.mean(0))
+        per_crop.append(calibrated_probs(np.atleast_2d(probs), temp))
         used.append(c)
     if not used:
         return {"label": label, "run": False, "reason": "no test clips of the classifier's classes", "n": 0}
-    P = np.stack(P)
+    margin = EngineConfig().min_margin
+    P, acc = classifier_alone_decisions(per_crop, thr, margin)
     y = np.array([pos[c.concept_id] for c in used])
     pred = P.argmax(1)
     hit = (pred == y).astype(float)
     top5 = np.array([y[j] in np.argsort(-P[j])[:5] for j in range(len(y))], float)
     groups = _groups(used)
-    thr = float(rec.fusion.accept.get("balanced", 0.7))
-    p1 = P.max(1)
-    acc = p1 >= thr
     per_cat = defaultdict(list)
     for c, h in zip(used, hit):
         per_cat[c.category or "other"].append(h)
@@ -160,9 +180,19 @@ def e1_closed_set(rec, clips, label: str, split_name: str, kind: str) -> dict:
                         "macro_f1": float(f1_score(y, pred, labels=sorted(set(y.tolist())), average="macro",
                                                    zero_division=0)),
                         "coverage": float(acc.mean()), "not_sure_rate": float(1 - acc.mean()),
-                        "wrong_accept_rate": float((acc & (hit == 0)).mean())},
-            "decision_note": f"classifier alone: accept when its probability >= the fused balanced threshold {thr:.2f}; "
-                             "the app uses the fused decision (E3)",
+                        "wrong_accept_rate": float((acc & (hit == 0)).mean()),
+                        "accepted_precision": float(hit[acc].mean()) if acc.any() else None},
+            "decision": {"rule": "classifier alone (sliding-mode rule): accept when the crop-mean probability >= "
+                                 "threshold, top-1 minus top-2 >= margin and >= 2 crops agree; no suggestion step, so "
+                                 "not sure = 1 - accepted",
+                         "temperature": temp, "threshold": thr, "threshold_in_checkpoint": thr_fitted,
+                         "margin": margin,
+                         "source": "classifier checkpoint (fitted on the classifier's validation part)"},
+            "decision_note": f"classifier alone: accept when its probability at temperature {temp:.2f} >= its own "
+                             f"validation threshold {thr:.2f}"
+                             + ("" if thr_fitted else " (checkpoint has none: Predictor default)")
+                             + "; not sure = not accepted (no 'did you mean' step); the app's segment mode uses the "
+                             "fused decision (E3)",
             **interval_fields({"top1": (hit.tolist(), groups), "top5": (top5.tolist(), groups)}),
             "interval_note": None if interval_reason(hit.tolist(), groups) is None else
             f"{interval_reason(hit.tolist(), groups)} in this test part: a signer-level interval needs more held-out "
@@ -789,21 +819,26 @@ def markdown_report(doc: dict) -> str:
     title = f"# ISL evaluation report ({doc['profile']})" + (" - PARTIAL DATA" if partial else "")
     lines = [title, "", f"**{doc['label']}**", "",
              f"Created {doc['created']} at commit {doc.get('git_commit')}. Intervals: 95 % bootstrap over signer "
-             "groups, shown only with at least 5 groups (the group count is printed next to every interval). Not "
-             "sure = abstain rate; wrong accept = accepted and wrong / all queries.", "",
-             "| Protocol | n | groups | top-1 | 95% CI | top-5 | not sure | wrong accept | label |",
-             "|---|---|---|---|---|---|---|---|---|"]
+             "groups, shown only with at least 5 groups (the group count is printed next to every interval). "
+             "Accepted = shown as the answer without asking; wrong accept = accepted and wrong / all queries. Not "
+             "sure: E1a/E1b/E1c = 1 - accepted (the classifier alone, as in the app's sliding mode, at the "
+             "classifier's own validation temperature and threshold; it has no 'did you mean' step); E2/E3 = abstain "
+             "rate only (the rest, 1 - accepted - not sure, are 'did you mean' suggestions).", "",
+             "| Protocol | n | groups | top-1 | 95% CI | top-5 | accepted | not sure | wrong accept | label |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
     for pid, p in doc["protocols"].items():
         if p.get("run") is False or (not p.get("metrics") and p.get("run") is None and not p.get("n")):
-            lines.append(f"| {pid} | - | - | - | - | - | - | - | not run: {p.get('reason') or p.get('leakage') or ''} |")
+            lines.append(f"| {pid} | - | - | - | - | - | - | - | - | "
+                         f"not run: {p.get('reason') or p.get('leakage') or ''} |")
             continue
         m = p.get("metrics") or {}
         if "top1" not in m:
-            lines.append(f"| {pid} | {p.get('n', '-')} | {p.get('n_groups', '-')} | - | - | - | - | - | "
+            lines.append(f"| {pid} | {p.get('n', '-')} | {p.get('n_groups', '-')} | - | - | - | - | - | - | "
                          f"{p.get('label', '')} (details below) |")
             continue
         lines.append(f"| {pid} | {p.get('n')} | {p.get('n_groups', '-')} | {_fmt(m.get('top1'))} | {_ci_cell(p)} | "
-                     f"{_fmt(m.get('top5'))} | {_fmt(m.get('not_sure_rate'))} | {_fmt(m.get('wrong_accept_rate'))} | "
+                     f"{_fmt(m.get('top5'))} | {_fmt(m.get('coverage'))} | {_fmt(m.get('not_sure_rate'))} | "
+                     f"{_fmt(m.get('wrong_accept_rate'))} | "
                      f"{p.get('label', '')} |")
     cvb = doc["protocols"].get("E1b", {}).get("cv")
     if cvb:

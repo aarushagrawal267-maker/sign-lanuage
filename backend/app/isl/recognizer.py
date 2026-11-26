@@ -21,6 +21,33 @@ from app.models.checkpoint import Predictor
 from app.packs.vocabulary import ORIGIN, Vocabulary
 
 
+DEFAULT_CLASSIFIER_THRESHOLD = 0.6  # Predictor's default when a checkpoint has no recommended_threshold
+
+
+def classifier_calibration(predictor) -> tuple[float, float, bool]:
+    """``(temperature, accept threshold, fitted)`` of the classifier used ALONE (sliding mode, E1).
+
+    Both come from the classifier checkpoint: ``train_classifier`` fits ``temperature`` and the classic
+    ``recommended_threshold`` on the classifier's own validation part, the threshold on temperature-scaled
+    probabilities. The pack's fused thresholds (``fusion.json`` ``accept``) are on another scale - the softmax of
+    classifier + retrieval + prior - and must never be compared with a classifier probability (docs 15.16)."""
+    meta = getattr(predictor, "meta", None) or {}
+    t = meta.get("temperature")
+    t = float(t) if t is not None and float(t) > 0 else 1.0
+    thr = meta.get("recommended_threshold")
+    return t, float(thr) if thr is not None else DEFAULT_CLASSIFIER_THRESHOLD, thr is not None
+
+
+def calibrated_probs(probs: np.ndarray, temperature: float) -> np.ndarray:
+    """Softmax(log p / T) along the last axis: temperature-scaled class probabilities from T = 1 ones."""
+    if temperature == 1.0:
+        return probs
+    z = np.log(np.clip(probs, 1e-12, 1.0)) / max(float(temperature), 1e-3)
+    z = z - z.max(-1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(-1, keepdims=True)
+
+
 class IslRecognizer:
     def __init__(self, language: str, feature_config: FeatureConfig, vocab: Vocabulary, *, lexicon=None,
                  classifier: Predictor | None = None, encoder: EncoderPredictor | None = None,
@@ -70,7 +97,18 @@ class IslRecognizer:
     def _features(self, crops: list[RawSequence]) -> np.ndarray:
         return np.stack([build_features(c, self.feature_config) for c in crops])
 
+    @property
+    def classifier_temperature(self) -> float:
+        return classifier_calibration(self.classifier)[0] if self.classifier is not None else 1.0
+
+    @property
+    def classifier_threshold(self) -> float | None:
+        """Accept threshold of the classifier alone (sliding mode), on :meth:`class_probs`' scale."""
+        return classifier_calibration(self.classifier)[1] if self.classifier is not None else None
+
     def class_probs(self, crops: list[RawSequence]):
+        """Closed-set probabilities of the classifier alone (sliding mode), temperature-scaled with the
+        classifier's own validation temperature so they match :attr:`classifier_threshold`."""
         if self.classifier is None:
             return None
         t0 = time.perf_counter()
@@ -80,7 +118,7 @@ class IslRecognizer:
             return None
         fm = (time.perf_counter() - t0) * 1000
         probs, ms = self.classifier.predict(feats)
-        return probs, list(self.classifier.class_names), fm, ms
+        return calibrated_probs(probs, self.classifier_temperature), list(self.classifier.class_names), fm, ms
 
     def evidence(self, feats: np.ndarray, use_my_signs: bool = True) -> tuple[FusionInputs, dict]:
         """Run every component on (crops, T, D) features. Returns the fusion inputs and per-stage timings."""
