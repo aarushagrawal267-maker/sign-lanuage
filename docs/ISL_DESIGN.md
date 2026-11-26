@@ -2604,7 +2604,7 @@ age groups; research = 3 ISL-Fingerspelling signers + 3 age groups (6). E5 is le
 trains on everything else, including the whole-source sets) and reports letter top-1 pooled, per source
 (`letter_top1_<source>`) and per group (`folds`, plus the unweighted `letter_top1_group_mean`), each with
 `interval_fields` (95 % group bootstrap only with >= 5 groups, else the reason: commercial-safe "too few signer groups
-(3)"; research pooled has 6 groups, so an interval, its per-source rows have 3 each, so none), and word decoding for
+(3)"; research pooled has 6 groups but from two sources, so since 15.13 no pooled interval either; its per-source rows have 3 each, so none), and word decoding for
 held-out signers as before. The temperature is fitted on the pooled **out-of-fold logits** of those folds (letters
 and noise), so it never sees a photo of a held-out person's group; `meta.calibration` records `status`, the held-out
 units, n, NLL and ECE (15 bins) at T = 1 and at the fitted T. Status values: `grouped`; `not grouped` (no source with
@@ -2667,3 +2667,62 @@ coverage); too few held-out examples; E5 runner + report lines.
 hold-out it is not needed for E5 / calibration, but within-group bursts still weigh more than single photos.
 (2) Commercial-safe E5 has 3 groups, so it never gets an interval; more letter signers (own recordings, 7.x) are the
 only fix. (3) The `mendeley_static` licence question (15.11) is unchanged.
+
+### 15.13 Adversarial review + reality check of `f11c9c3` (letter model) (Code Reviewer, 26 Nov 2026, 00:05-00:30 UTC)
+
+Every claim of 15.12 was attacked with read-only checks on the real manifests / item lists, synthetic probes and a
+scratch smoke run (copies of `artifacts/isl/phase2-smoke/<profile>` and `isl_root_<profile>` in the session
+scratchpad; the real smoke `letters.pt` files kept their SHA-256, `cf7f09e0...` / `05871b72...`). No job was touched,
+no ingestion file edited, nothing trained beyond the smoke.
+
+| Attack | Evidence | Result |
+|---|---|---|
+| Cross-label byte copies (full Mendeley item list, 102,470 items, engine semantics: a `duplicate_of` row reuses the original's landmark path, `engine.write_duplicate`) | `dedupe_by_content` on Clips built from the list | 3 contents / 6 items dropped (3/4 once, 4/5 twice), 105 same-label copies dropped, 102,359 kept; 0 kept SHA-256 in two units, 0 kept SHA-256 twice; 0.78 s |
+| Byte copies across age groups (would leak through the age-group hold-out) | the 96 SHA-256 groups with > 1 item | 0 cross age group, 0 cross sleeve group (93 same label + group, 3 cross-label in one group) |
+| Group ids silently missing | real manifests + item lists | Mendeley: every item `static-<age>-<sleeves>` (6 groups, 9,070-33,417 items); ISL-FS: 3 signers (544 / 266 / 498 clips), 0 videos with two signers; OpenHands FS / HF: no ids -> whole source, training side |
+| akrit `test` rows / HF sets in a hold-out | code path + test | whole source, every fold's training side; never held out or calibrated on |
+| Cross-source copies (Hemg / akrit vs Mendeley) | catalog notes, item lists | not measurable yet (HF not ingested). Exact copies would be caught by the SHA-256 key and kept in their Mendeley group (Mendeley is read first); Hemg is 128x128 hand crops, Mendeley full photos, so byte copies are unlikely. Near-copies across sources: open |
+| Labels across sources | glosses of all four letter sources | all map through `symbol_of` (a-z / A-Z / 0-9 / zero-nine); Mendeley `E` and `9` have 2 variants each (E1/E2, 9a/9b: two handshapes, one label, correct); 8 Hindi vowels skipped as before. Visually close pairs (V / 2, O / 0) are real ISL ambiguity, not label conflicts |
+| Profile mixing in training | `LETTER_SOURCES`, `open_adapter(..., profile)` | commercial-safe reads only `mendeley_static`, licence checked per adapter: ok |
+| **Profile mixing after training** | `build_pack`, `IslPack.recognizer` | **gap (fixed here):** `build-pack` copied any `letters.pt` and the app's ADR-ISL-6 check compared classifier / encoder / index / fusion profiles but **not the letter model**, so a research letter model in a commercial-safe work folder or pack loaded silently |
+| **E5 pooled interval** | `evaluate_grouped` | **gap (fixed here):** research pooled letter top-1 got a "95 % CI (6 groups)" from a bootstrap over 3 ISL-FS signers + 3 Mendeley age groups. With ~90 % of the held-out examples from Mendeley, resamples mostly change the source mix, so the interval measured source difficulty, not person-to-person variation; the report header calls it a bootstrap over signer groups |
+| **Sampler wrap** (synthetic research scale, 218k examples, 37 classes, 12 subgroups, cap 4,000) | `BalancedEpochs` | **gap (fixed here):** when a subgroup wrapped, the new permutation could hand out examples just taken: 12,073 of 148,000 draws (8 %) repeated inside one epoch. Speed: plan 0.07 s, 40 epochs of sampling 0.15 s (no blow-up) |
+| E5 numbers | smoke checkpoints, report lines | pooled / per-source / group mean recomputed from `folds`: consistent; interval cells print a reason under 5 groups |
+| Smoke: `train-fingerspell --smoke --epochs 3`, then `evaluate --all` (driver smoke arguments), then `build-pack --smoke` | scratch copy, 2 threads, nice 10, load 11-15 | all exit 0 for both profiles: letter step 1-5 s, evaluate 88 s (commercial-safe) / 90 s (research); E5 + calibration lines as in 15.12 item 4 |
+
+**Fixes** (small, offline-tested; `test_letter_review_guards.py`, 2 tests, plus one in `test_pipeline_and_api.py`,
+each failing on `f11c9c3` and passing now):
+1. `pipeline.check_letters_profile`: `build-pack` refuses a `letters.pt` whose `meta.profile` is another profile, or
+   whose recorded letter sources (`meta.source`, `data.per_source`) include one the profile may not read (legacy
+   `train-letters` checkpoints without a profile, made from own recordings, still pass). Checked live: the scratch
+   research smoke model copied into the commercial-safe work folder -> `build-pack` exit 1, nothing written.
+2. `app/packs/isl.py`: the ADR-ISL-6 check now includes the trained letter model's profile (`ProfileMismatch` names
+   `letters`); the user's own alphabet calibration is not a trained component and is unaffected.
+3. E5: the pooled `letter_top1` interval is only computed when the held-out letters come from one source; otherwise
+   the reason is "pooled over N sources (...): intervals only per source" (a "too few signer groups" reason, when it
+   applies, wins). Per-source rows keep their own intervals (>= 5 groups of that source).
+4. `BalancedEpochs`: on a wrap, the examples just taken go to the end of the new pass, so no example is drawn twice
+   in one epoch (coverage and determinism unchanged).
+5. Log wording: "letter temperature kept at 1.0 (<status>)" (it said "not grouped" also for "too few held-out examples").
+
+**Checks.** Backend suite **553 passed** (63 s, `SLR_TORCH_THREADS=2`, nice 10). One earlier full run had 1 failure,
+`test_hf_fetch_and_headers.py::test_memory_guard_drops_the_page_cache` (19 / 19 when that file runs alone, 553 / 553 on
+the re-run): a flaky ingestion test (engine memory guard vs. its fetch thread), unrelated to these changes; the
+engine is loaded by the running queue, so it is left to the ingestion owner.
+
+**Open (not changed here).** (1) Near-copies across sources and inside Mendeley bursts are not clustered (15.12 open
+1); the hold-out units keep them out of E5 / calibration except across sources, which cannot be measured before
+the HF sets are ingested. (2) The fingerspell step records the letter sources' `clips` (including the dropped
+duplicate rows) as their "used" count in `sources.json`; harmless for the licence list today (every source with
+clips also contributes examples), but a source whose items were all skipped would still be listed. (3) The step has
+no resume: the research letter step (~1.9 h estimate, 15.12) restarts from scratch if interrupted. (4) The
+`mendeley_static` licence question (15.11) is unchanged; it is the commercial-safe letter model's only source.
+
+**Verdicts (letter model).**
+* **Commercial-safe: READY to train** once the data guard passes (code and smoke ok; dedup verified on the full item
+  list; age-group hold-out has no byte-copy leak; E5 will honestly show no interval with 3 age groups). **Not ready
+  to ship** until the owner settles the `mendeley_static` licence (15.11).
+* **Research: READY to train** after the commercial-safe run, once its data guard passes (code and smoke ok; E5
+  intervals per source only; HF sets whole on the training side). Its E5 numbers for Mendeley age groups assume the
+  HF sets hold no near-copies of Mendeley photos (not measurable until they are ingested; a check worth doing on the
+  full run's data before quoting the research E5 number).

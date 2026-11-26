@@ -192,7 +192,7 @@ def test_research_mix_keeps_whole_sources_on_training_side(static_root, tmp_path
 
 
 def test_interval_only_from_five_groups(tmp_path):
-    """Pooled letter top-1 gets an interval at >= 5 held-out groups (signers + age groups), not below."""
+    """Letter top-1 gets an interval at >= 5 held-out groups of one source, not below and not pooled over sources."""
     def mk(n_signers, n_ages):
         ls = LetterSet()
         rng = np.random.default_rng(0)
@@ -212,10 +212,15 @@ def test_interval_only_from_five_groups(tmp_path):
     assert r4["e5"]["intervals"]["letter_top1"] is None
     assert r4["e5"]["interval_reasons"]["letter_top1"] == "too few signer groups (4)"
     r5 = train_fingerspell(mk(2, 3), tmp_path / "b.pt", profile="research", epochs=2)
-    assert r5["e5"]["intervals"]["letter_top1"] is not None and r5["e5"]["interval_groups"]["letter_top1"] == 5
+    # 5 groups, but from two sources: no pooled interval (it would measure the source mix, not people)
+    assert r5["e5"]["intervals"]["letter_top1"] is None and r5["e5"]["interval_groups"]["letter_top1"] == 5
+    assert r5["e5"]["interval_reasons"]["letter_top1"].startswith("pooled over 2 sources")
     # per-source metrics carry their own (smaller) group counts and reasons
     assert r5["e5"]["interval_reasons"]["letter_top1_isl_fingerspelling"] == "too few signer groups (2)"
     assert r5["calibration"]["n_groups"] == 5
+    r5s = train_fingerspell(mk(5, 0), tmp_path / "c.pt", profile="research", epochs=2)  # one source, 5 signers
+    assert r5s["e5"]["intervals"]["letter_top1"] is not None and r5s["e5"]["interval_groups"]["letter_top1"] == 5
+    assert r5s["e5"]["intervals"]["letter_top1_isl_fingerspelling"] is not None
 
 
 def test_water_fill_and_balanced_epochs_cover_every_group():

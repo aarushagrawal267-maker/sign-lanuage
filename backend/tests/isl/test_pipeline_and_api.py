@@ -7,6 +7,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import sqlite3
 
 import numpy as np
@@ -332,6 +333,24 @@ def test_missing_models_pack_and_profile_mismatch(tmp_path, isl_env):
     broken.mkdir(parents=True)
     (broken / "pack.json").write_text("{not json")
     assert PackRegistry([tmp_path / "r3"]).get("bad").info.status == "error"
+
+
+def test_pack_loader_refuses_a_letter_model_of_another_profile(tmp_path, isl_env):
+    from app.isl.fingerspell.model import LETTERS, LetterClassifier
+    from app.isl.training.train_fingerspell import _save
+    from app.packs.registry import PackRegistry
+
+    src = isl_env["packs"] / "isl"  # commercial-safe pack of the shared world fixture
+    for prof, ok in (("commercial-safe", True), ("research", False)):
+        d = tmp_path / prof / "isl"
+        shutil.copytree(src, d)
+        _save(LetterClassifier(), d / "letters.pt", {"kind": "isl-letters", "labels": LETTERS, "profile": prof,
+                                                     "source": "mendeley_static", "n_signers": 1})
+        rec, _, problem = PackRegistry([tmp_path / prof]).get("isl").recognizer()
+        if ok:
+            assert rec is not None and rec.speller is not None, problem
+        else:
+            assert rec is None and "data profile" in problem and "letters" in problem
 
 
 def test_db_migration_adds_columns(tmp_path):

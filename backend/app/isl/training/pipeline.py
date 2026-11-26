@@ -155,12 +155,32 @@ def pack_licences(work: Path, profile: str | None = None) -> list[dict]:
     return [rows[k] for k in order]
 
 
+def check_letters_profile(path: Path, profile: str) -> None:
+    """Refuse a letter model trained for another data profile, or (commercial-safe) one whose recorded letter
+    sources include a source the profile may not read (ADR-ISL-6; legacy checkpoints without a profile pass)."""
+    import torch
+
+    from app.isl.profiles import LETTER_SOURCES
+
+    prof = get_profile(profile)
+    meta = torch.load(path, map_location="cpu", weights_only=False).get("meta") or {}
+    if meta.get("profile") and meta["profile"] != prof.name:
+        raise ValueError(f"{path} was trained for profile {meta['profile']!r}, not {prof.name!r}")
+    known = {s for v in LETTER_SOURCES.values() for s in v}
+    used = set(str(meta.get("source") or "").split(",")) | set(((meta.get("data") or {}).get("per_source") or {}))
+    bad = sorted((used & known) - set(LETTER_SOURCES[prof.name]))
+    if bad:
+        raise ValueError(f"{path} was trained on letter sources outside profile {prof.name!r}: {bad}")
+
+
 def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None = None, smoke: bool = False,
                vocab_path: Path | None = None) -> dict:
     from app.isl.fingerspell.lexicon import build_spelling_lexicon, write_spelling_lexicon
     from app.packs.vocabulary import Vocabulary
 
     prof = get_profile(profile)
+    if (work / "letters.pt").exists():
+        check_letters_profile(work / "letters.pt", prof.name)
     out = out or pack_dir(prof.name)
     tmp = out.with_name(out.name + ".tmp")
     shutil.rmtree(tmp, ignore_errors=True)

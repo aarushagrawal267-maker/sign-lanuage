@@ -337,7 +337,8 @@ class BalancedEpochs:
             cell[1] = cur + take
             return idx[cur:cur + take]
         head = idx[cur:]
-        cell[0] = idx = self.rng.permutation(idx)
+        # new pass: the examples just taken (``head``) go last, so one epoch never draws an example twice
+        cell[0] = idx = np.concatenate([self.rng.permutation(idx[:cur]), self.rng.permutation(head)])
         cell[1] = take - len(head)
         return np.concatenate([head, idx[:cell[1]]])
 
@@ -547,9 +548,17 @@ def evaluate_grouped(ls: LetterSet, epochs: int, seed: int, max_per_class: int |
         series[f"letter_top1_{s}"] = (hs[m_].tolist(), hu[m_].tolist())
     metrics["letter_top1_group_mean"] = float(np.mean([folds[u]["letter_top1"] for u in done
                                                        if folds[u].get("letter_top1") is not None]))
+    ivf = interval_fields(series)
+    srcs = sorted(set(hit_src))
+    if len(srcs) > 1 and ivf["intervals"].get("letter_top1") is not None:
+        # a bootstrap over units of different sources (video signers, photo age groups of very different sizes)
+        # measures how the source mix changes between resamples, not person-to-person variation: per source only
+        ivf["intervals"]["letter_top1"] = None
+        ivf["interval_reasons"]["letter_top1"] = (f"pooled over {len(srcs)} sources ({', '.join(srcs)}): intervals "
+                                                  "only per source")
     out = {"measurable": True, "groups": done, "group_kinds": {u: ls.kind(u) for u in done},
            "signers": [u for u in done if ls.kind(u) == "signer"], "n": len(hits), "metrics": metrics,
-           **interval_fields(series), "folds": folds,
+           **ivf, "folds": folds,
            "per_letter": {k: {"acc": v[0] / v[1], "n": v[1]} for k, v in sorted(per_letter.items())},
            "protocol": "leave-one-group-out: ISL-Fingerspelling signers and Mendeley static age groups are held out "
                        "one at a time; sources without group ids (HF alphabets, OpenHands fingerspelling) always stay "
@@ -619,7 +628,7 @@ def train_fingerspell(ls: LetterSet, out: Path, *, profile: str, epochs: int = 4
             cal = {"status": "not grouped", "temperature": 1.0,
                    "reason": why or "the grouped hold-out leaves no trainable remainder"}
     if cal["status"] != "grouped":
-        log.warning("letter temperature not grouped (kept 1.0): %s", cal.get("reason"))
+        log.warning("letter temperature kept at 1.0 (%s): %s", cal["status"], cal.get("reason"))
     T = float(cal["temperature"])
     fit_stats: dict = {}
     model = _fit_mlp(X, y, epochs, seed, max_per_class, sub, stats=fit_stats)

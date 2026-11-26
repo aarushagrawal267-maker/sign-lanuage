@@ -201,6 +201,8 @@ class IslPack:
             profiles["index"] = index.meta.profile
         if fusion.profile:
             profiles["fusion"] = fusion.profile
+        if speller is not None and pr["letters"]:  # the trained letter model (not the user's own alphabet)
+            profiles["letters"] = (getattr(speller.model, "meta", None) or {}).get("profile")
         bad = {k: v for k, v in profiles.items() if v and v != prof}
         if bad:
             raise ProfileMismatch(f"components built with another data profile than the pack ({prof}): {bad}")
