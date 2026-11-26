@@ -436,7 +436,8 @@ def run_islrtc(args) -> None:
     tmp_root.mkdir(parents=True, exist_ok=True)
     if sub == "islrtc":  # never delete the temp files of a concurrently running default job otherwise
         for stale in tmp_root.glob("islrtc_*"):
-            stale.unlink(missing_ok=True)
+            if stale.is_file():  # tmp/islrtc_recut/ is the re-extraction job's folder, not a stale download
+                stale.unlink(missing_ok=True)
 
     # Prefetch downloads in a thread so the CPU workers never wait on the network.
     import queue
