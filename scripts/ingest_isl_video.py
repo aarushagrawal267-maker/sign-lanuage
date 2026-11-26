@@ -8,7 +8,8 @@ Sources, licences and profiles: backend/app/isl/data/video_sources/catalog.py an
 Usage (repository root; CPU work runs with nice 10):
   python scripts/ingest_isl_video.py sources                       # catalogue + manifest counts
   python scripts/ingest_isl_video.py probe [SOURCE ...]            # are the files reachable? (CISLR: granted/pending)
-  python scripts/ingest_isl_video.py run SOURCE [--workers N|auto] [--limit N] [--max-minutes M] [--per-class N]
+  python scripts/ingest_isl_video.py run SOURCE [--workers N|auto] [--fetch-threads N|auto] [--limit N]
+                                    [--max-minutes M] [--per-class N]
   python scripts/ingest_isl_video.py list SOURCE [--per-class N]    # item list only (manifests/<source>_items.json)
   python scripts/ingest_isl_video.py islrtc-full [--paths A/Alphabet.mp4 ...]   # full-length ISLRTC compilations
   python scripts/ingest_isl_video.py status
@@ -24,6 +25,8 @@ CISLR has exactly one ingestion path: this `run cislr` (the queue runs it as soo
 dataset.csv answers); scripts/ingest_isl_gated.py cislr delegates here and shares the lock.
 --workers auto: 1 while INCLUDE (1 worker) and ISLRTC (3 workers) ingestion run, otherwise the CPUs they leave free
 (3 of 4 when neither runs).
+--fetch-threads auto (default): 8 concurrent downloads when every item is a plain URL (e.g. mendeley_static, where
+each image is mostly network latency), otherwise 1; zip members and HF rows always use 1 fetch thread.
 """
 
 from __future__ import annotations
@@ -371,6 +374,7 @@ def _run_locked(args, paths, spec, engine) -> int:
     if spec.mode in ("hands", "image"):
         ensure_hand_model()
     workers = auto_workers() if args.workers == "auto" else max(1, int(args.workers))
+    ft = str(getattr(args, "fetch_threads", "auto") or "auto")
     try:
         spec, items, fetcher = build_items(args.source, paths, per_class=args.per_class)
     except PermissionError as e:
@@ -383,11 +387,12 @@ def _run_locked(args, paths, spec, engine) -> int:
         log.error("%s: listing incomplete: %s", args.source, e)
         return rc
     engine.dump_items(paths.manifests / f"{spec.name}_items.json", items)  # what this run selected (audit)
-    log.info("%s: %d items listed, %d workers, profile %s, licence %s", spec.name, len(items), workers, spec.profile,
-             spec.licence)
+    fetch_threads = engine.choose_fetch_threads(items, None if ft == "auto" else max(1, int(ft)))
+    log.info("%s: %d items listed, %d workers, %d fetch threads, profile %s, licence %s", spec.name, len(items),
+             workers, fetch_threads, spec.profile, spec.licence)
     stats = engine.run(spec, items, paths, fetcher, workers=workers, limit=args.limit, max_minutes=args.max_minutes,
                        min_free_gb=args.min_free_gb, progress=log.info,
-                       max_rss_gb=getattr(args, "max_rss_gb", 0.0) or 0.0)
+                       max_rss_gb=getattr(args, "max_rss_gb", 0.0) or 0.0, fetch_threads=fetch_threads)
     log.info("%s run finished: %s", spec.name, stats)
     rows = getattr(fetcher, "rows", None)
     if rows is not None and rows.stats["requests"]:
@@ -529,6 +534,8 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("run")
     p.add_argument("source")
     p.add_argument("--workers", default="1", help="number of extraction processes, or 'auto'")
+    p.add_argument("--fetch-threads", default="auto",
+                   help="concurrent downloads, or 'auto' (8 when every item is a plain URL, else 1; zip / HF rows: 1)")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--max-minutes", type=float, default=0.0, help="stop taking new items after this long (exit 10)")
     p.add_argument("--min-free-gb", type=float, default=10.0)

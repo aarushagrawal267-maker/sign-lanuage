@@ -18,6 +18,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import threading
 import time
 import urllib.parse
 from collections import OrderedDict
@@ -36,10 +37,16 @@ def hf_url(repo: str, path: str, revision: str = "main") -> str:
     return f"{HF_BASE}/{repo}/resolve/{revision}/{urllib.parse.quote(path)}"
 
 
+POOL_MAXSIZE = 32  # keep-alive connections per host: >= the engine's concurrent url fetch threads (8)
+
+
 def _session():
     import requests
+    from requests.adapters import HTTPAdapter
 
     s = requests.Session()
+    for prefix in ("https://", "http://"):  # bigger pools so concurrent fetch threads reuse their connections
+        s.mount(prefix, HTTPAdapter(pool_connections=16, pool_maxsize=POOL_MAXSIZE))
     tok = os.environ.get("HF_TOKEN")
     if tok:
         s.headers["Authorization"] = f"Bearer {tok}"
@@ -48,12 +55,16 @@ def _session():
 
 
 _SESSION = None
+_SESSION_LOCK = threading.Lock()
 
 
 def session():
+    """One shared ``requests.Session`` per process (created once, thread-safe; concurrent GETs share its pool)."""
     global _SESSION
     if _SESSION is None:
-        _SESSION = _session()
+        with _SESSION_LOCK:
+            if _SESSION is None:
+                _SESSION = _session()
     return _SESSION
 
 

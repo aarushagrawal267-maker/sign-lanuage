@@ -2,7 +2,11 @@
 delete the temp file, append a manifest row.
 
 * Resume: ids with an ``ok: true`` row in ``data/isl/manifests/<manifest>.jsonl`` are skipped (failures are retried).
-* One fetcher thread prefetches at most ``2 x workers`` items, so temp disk use is a few clips/images.
+* Fetching runs in ``fetch_threads`` threads (auto: 8 when every item is a plain ``url`` download, whose time is
+  network latency, else 1) and prefetches at most ``2 x workers`` items (plus one per fetch thread in flight), so
+  temp disk use is a few clips/images. Zip members (``zip``: one shared seekable archive, read in archive order)
+  and HF rows (``hfrow``: the row-page cache is not thread-safe) always use exactly one fetch thread. With several
+  threads the manifest rows may come in a different order (resume is by id).
 * Zip members are read through one shared seekable archive object (``RangeFile``) in archive order, so range
   reads are sequential and the 8 MB block cache works.
 * Disk guard: before every fetch the free space under the data root must be >= ``min_free_gb``; otherwise the run
@@ -41,6 +45,21 @@ from app.isl.paths import IslPaths
 
 log = logging.getLogger(__name__)
 
+AUTO_URL_FETCH_THREADS = 8  # measured on mendeley_static: 8 concurrent downloads ~6x the sequential rate
+PARALLEL_KINDS = frozenset({"url"})  # fetch kinds that may be fetched concurrently
+
+
+def choose_fetch_threads(items: list[Item], requested: int | None = None) -> int:
+    """Fetch threads for ``items``: ``requested`` (``None`` = auto, 8) when every item is a ``url`` download,
+    otherwise 1 (zip archives must be read in order, the HF row-page cache is not thread-safe)."""
+    kinds = {(it.fetch or {}).get("kind") for it in items}
+    if not kinds or not kinds <= PARALLEL_KINDS:
+        return 1
+    if requested is None:
+        return AUTO_URL_FETCH_THREADS
+    return max(1, int(requested))
+
+
 class Fetcher:
     """Fetch an :class:`Item` to a local temp file. ``archives`` maps an archive key to an open ``ZipFile``
     (or a factory returning one); ``get`` replaces ``requests.get`` in tests. HF rows (kind ``hfrow``) get their
@@ -53,6 +72,7 @@ class Fetcher:
         self._archives = dict(archives or {})
         self._open: dict[str, zipfile.ZipFile] = {}
         self.get = get
+        self._get_lock = threading.Lock()
         self.sleep = sleep
         kw = {"rnd": rnd} if rnd is not None else {}
         self.rows = RowPages(self._get, sleep=sleep, clock=clock, policy=hf_policy or Policy(), **kw)
@@ -76,9 +96,11 @@ class Fetcher:
 
     def _get(self):
         if self.get is None:
-            from app.isl.data.remote import session
+            with self._get_lock:  # fetch threads may race here
+                if self.get is None:
+                    from app.isl.data.remote import session
 
-            self.get = session().get
+                    self.get = session().get
         return self.get
 
     def fetch(self, item: Item, dest: Path) -> dict:
@@ -131,9 +153,10 @@ def rel_path(p: Path, paths: IslPaths) -> str:
 def run(spec: SourceSpec, items: list[Item], paths: IslPaths, fetcher: Fetcher, *, workers: int = 1,
         limit: int = 0, max_minutes: float = 0.0, min_free_gb: float = 10.0, extract: Callable | None = None,
         progress: Callable[[str], None] | None = None, clock=time.time, max_rss_gb: float = 0.0,
-        rss: Callable | None = None) -> dict:
+        rss: Callable | None = None, fetch_threads: int | None = None) -> dict:
     """Process every not-yet-done item. ``extract(mode, src, out, step_fps, max_s) -> dict`` defaults to
-    ``extract.work``; with ``workers <= 1`` it runs in this process (tests)."""
+    ``extract.work``; with ``workers <= 1`` it runs in this process (tests). ``fetch_threads``: concurrent
+    fetches (``None`` = auto, see :func:`choose_fetch_threads`; ``zip`` / ``hfrow`` items always use 1)."""
     if extract is None:
         from app.isl.data.video_sources.extract import work as extract
     man = paths.manifest(spec.manifest_name)
@@ -151,6 +174,8 @@ def run(spec: SourceSpec, items: list[Item], paths: IslPaths, fetcher: Fetcher, 
              "secs": 0.0}
     if not todo:
         return stats
+    n_fetch = choose_fetch_threads(todo, fetch_threads)
+    stats["fetch_threads"] = n_fetch
     tmp_dir = paths.tmp / f"video_{spec.name}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     for stale in tmp_dir.glob("*"):  # leftovers of a killed run (this source only)
@@ -196,7 +221,93 @@ def run(spec: SourceSpec, items: list[Item], paths: IslPaths, fetcher: Fetcher, 
             fetcher.close_archives()
             q.put(None)
 
-    th = threading.Thread(target=producer, daemon=True, name=f"fetch-{spec.name}")
+    def producer_parallel():
+        """``n_fetch`` threads take items from one shared iterator. The stop / time / disk checks run under a
+        lock before each fetch; a refusal or an unexpected error stops further fetches. Items fetched after a stop
+        are deleted (retried next run). ``close_archives`` and the final ``None`` come once, after every thread."""
+        lock = threading.Lock()
+        pending_items = iter(todo)
+        halt = threading.Event()  # this producer decided to stop (time / disk / remote / error)
+
+        def take() -> Item | None:
+            with lock:
+                if stop.is_set() or halt.is_set():
+                    return None
+                if max_minutes and clock() - t0 > max_minutes * 60:
+                    if stats["stopped"] is None:
+                        stats["stopped"] = "time"
+                    halt.set()
+                    return None
+                if free_gb(paths.root) < min_free_gb:
+                    if stats["stopped"] is None:
+                        stats["stopped"] = "disk"
+                        log.warning("free disk below %.0f GB: stopping %s", min_free_gb, spec.name)
+                    halt.set()
+                    return None
+                return next(pending_items, None)
+
+        def fetch_loop():
+            dest = None
+            try:
+                while True:
+                    it = take()
+                    if it is None:
+                        return
+                    dest = temp_path(tmp_dir, "v_", it.suffix or ".bin")
+                    try:
+                        finfo = fetcher.fetch(it, dest)
+                    except Exception as e:  # noqa: BLE001
+                        dest.unlink(missing_ok=True)
+                        dest = None
+                        meta = base_meta(it)
+                        meta.update({"ok": False, "error": f"fetch: {type(e).__name__}: {e}"[:300]})
+                        if isinstance(e, RemoteRefused):  # the server keeps refusing: stop, the rest stays to do
+                            with lock:
+                                halt.set()
+                                if stats["stopped"] != "memory":
+                                    stats["stopped"], stats["remote_permanent"] = "remote", bool(e.permanent)
+                                    stats["remote_error"] = str(e)[:300]
+                            log.warning("%s: stopping: %s", spec.name, e)
+                            if not stop.is_set():
+                                q.put(("failed", it, meta, None))
+                            return
+                        if not stop.is_set():
+                            q.put(("failed", it, meta, None))
+                        continue
+                    if stop.is_set():  # the run stopped while this was downloading: retried next run
+                        dest.unlink(missing_ok=True)
+                        return
+                    entry, dest = ("ok", it, finfo, dest), None
+                    q.put(entry)  # the consumer (or the drain loop in ``run``'s finally) owns the file now
+            except BaseException:
+                halt.set()
+                log.exception("%s: fetch thread failed; stopping further fetches", spec.name)
+            finally:
+                if dest is not None:
+                    dest.unlink(missing_ok=True)
+
+        threads = [threading.Thread(target=fetch_loop, daemon=True, name=f"fetch-{spec.name}-{i}")
+                   for i in range(n_fetch)]
+        started = []
+        try:
+            for t in threads:
+                t.start()
+                started.append(t)
+        except BaseException:  # could not start a thread: stop taking items, finish what is in flight
+            halt.set()
+            log.exception("%s: could not start fetch threads", spec.name)
+        finally:
+            for t in started:
+                t.join()
+            fetcher.close_archives()
+            q.put(None)
+
+    if n_fetch > 1:
+        init = getattr(fetcher, "_get", None)  # create the shared HTTP session before the threads start
+        if callable(init):
+            init()
+    th = threading.Thread(target=producer_parallel if n_fetch > 1 else producer, daemon=True,
+                          name=f"fetch-{spec.name}")
     th.start()
     pool = ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn")) if workers > 1 else None
     pending: list[tuple[dict, Path, Future | dict]] = []
@@ -237,8 +348,10 @@ def run(spec: SourceSpec, items: list[Item], paths: IslPaths, fetcher: Fetcher, 
 
     def finish(entry):
         meta, dest, res = entry
-        info = res.result() if isinstance(res, Future) else res
-        dest.unlink(missing_ok=True)
+        try:
+            info = res.result() if isinstance(res, Future) else res
+        finally:  # also when the extraction raised: never leave the temp file behind
+            dest.unlink(missing_ok=True)
         meta.update(info)
         append_jsonl(man, meta)
         stats["ok" if info.get("ok") else "failed"] += 1
@@ -287,7 +400,12 @@ def run(spec: SourceSpec, items: list[Item], paths: IslPaths, fetcher: Fetcher, 
             meta["path"] = rel_path(out, paths)
             args = (spec.mode, str(dest), str(out), spec.step_fps, spec.max_s)
             if pool is None:
-                finish((meta, dest, extract(*args)))
+                try:
+                    res = extract(*args)
+                except BaseException:
+                    dest.unlink(missing_ok=True)
+                    raise
+                finish((meta, dest, res))
             else:
                 pending.append((meta, dest, pool.submit(extract, *args)))
                 while pending and (len(pending) >= 2 * workers or pending[0][2].done()):
@@ -311,7 +429,7 @@ def run(spec: SourceSpec, items: list[Item], paths: IslPaths, fetcher: Fetcher, 
         # drain the queue so the producer thread can exit, deleting fetched temp files
         while th.is_alive() or not q.empty():
             try:
-                e = q.get(timeout=1)
+                e = q.get(timeout=0.2)
             except queue.Empty:
                 continue
             if e and e[0] == "ok" and e[3] is not None:
