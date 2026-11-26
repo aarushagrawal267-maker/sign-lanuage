@@ -11,10 +11,10 @@ Two checks, both required before ``scripts/phase2_train.sh`` starts a full run:
   The queue (``scripts/isl_queue.sh``) blocks only the profiles that read a source it still has to process
   (:func:`queue_progress`): its list is the ``queue start (pid N): ...`` line it logged, cross-checked against the
   process's ``SOURCES`` environment variable or the script's default; its progress is the per-source lines after
-  that start line (a source is behind the queue once it logged ``finished``, ``giving up`` or ``gated dataset not
-  accessible``); its running child (``ingest_isl_video.py run <source>``) is always counted as still to process; and
+  that start line (a source is behind the queue once it logged ``finished``, ``giving up``, ``gated dataset not
+  accessible`` or, after its fetch-failure retry passes, ``moving on``); its running child (``ingest_isl_video.py run <source>``) is always counted as still to process; and
   while the list runs it may start CISLR / iSign (probed before every chunk), so those count too until they logged
-  ``finished``. Anything that cannot be read or does not agree (no start line for that pid, a list that differs from
+  ``finished`` (a CISLR run that moved on with fetch failures is not done: the queue probes and re-runs it). Anything that cannot be read or does not agree (no start line for that pid, a list that differs from
   the script, an unknown name) blocks every profile (fail closed). Once the log says "all listed sources processed"
   the queue only polls the gated datasets every 6 h for 14 days, which blocks nothing (a CISLR / iSign job it starts
   then is a process of its own and blocks research).
@@ -86,8 +86,10 @@ QUEUE_LOG_TAIL = 8_000_000  # bytes of queue.log read (the log grows by ~3 KB pe
 # queue list names that write another source's rows (``ingest_isl_video.py islrtc-full`` -> ISLRTC)
 QUEUE_SOURCE_ALIASES = {"islrtc-full": "islrtc"}
 # the queue's run_source() returned for that source: "finished" (0), "giving up for now" (2, also after too many
-# memory stops), "gated dataset not accessible yet" (3); the queue then moves to the next listed source
-QUEUE_TERMINAL = ("finished", "giving up for now", "gated dataset not accessible yet")
+# memory stops), "gated dataset not accessible yet" (3), "fetch failures remain after N retry passes; moving on" (4:
+# the source finished its passes with fetch failures left; the manifest check still counts those rows as missing);
+# the queue then moves to the next listed source
+QUEUE_TERMINAL = ("finished", "giving up for now", "gated dataset not accessible yet", "retry passes; moving on")
 # options of the ingestion scripts that take one value (argparse accepts them before the source / sub-command too:
 # ``ingest_isl_pose.py --budget-gb 26 openhands-raw``), so their values are never read as the source
 VALUE_OPTIONS = ("--root", "--workers", "--limit", "--tmp", "--max-s", "--out-subdir", "--poll-min", "--max-minutes",

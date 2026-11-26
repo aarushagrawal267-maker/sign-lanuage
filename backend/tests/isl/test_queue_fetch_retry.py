@@ -90,7 +90,8 @@ def test_stops_keep_their_codes_with_fetch_failures(run_locked):
 
 STUB = """#!/usr/bin/env bash
 # fake python: plays the exit codes listed in $STUB_DIR/codes_<source> (one per run, last one repeats)
-for a in "$@"; do case "$a" in --check) exit 3 ;; status) echo '{}'; exit 0 ;; esac; done
+# (--check SRC answers only when $STUB_DIR/grant_SRC exists)
+for a in "$@"; do case "$a" in --check) [ -f "$STUB_DIR/grant_$3" ] && exit 0; exit 3 ;; status) echo '{}'; exit 0 ;; esac; done
 src="$3"
 f="$STUB_DIR/codes_$src"; n="$STUB_DIR/runs_$src"
 k=$(( $(cat "$n" 2>/dev/null || echo 0) + 1 )); echo "$k" > "$n"
@@ -100,7 +101,8 @@ exit "$rc"
 """
 
 
-def _run_queue(tmp_path, codes: dict[str, list[int]]) -> tuple[str, dict[str, int]]:
+def _run_queue(tmp_path, codes: dict[str, list[int]], sources: str | None = None, grant: tuple = (),
+               **env_extra: str) -> tuple[str, dict[str, int]]:
     if not shutil.which("flock"):
         pytest.skip("flock not installed")
     root = tmp_path / "repo"
@@ -114,14 +116,17 @@ def _run_queue(tmp_path, codes: dict[str, list[int]]) -> tuple[str, dict[str, in
     py.chmod(0o755)
     for src, cs in codes.items():
         (stub_dir / f"codes_{src}").write_text("\n".join(map(str, cs)) + "\n")
-    env = dict(os.environ, PY=str(py), STUB_DIR=str(stub_dir), SOURCES=" ".join(codes), MIN_FREE_GB="-1",
-               CISLR_POLL_DAYS="0", FETCH_RETRY_WAIT="0")
+    for g in grant:
+        (stub_dir / f"grant_{g}").write_text("")
+    env = dict(os.environ, PY=str(py), STUB_DIR=str(stub_dir), SOURCES=sources or " ".join(codes), MIN_FREE_GB="-1",
+               CISLR_POLL_DAYS="0", FETCH_RETRY_WAIT="0", **env_extra)
     env.pop("FETCH_RETRY_PASSES", None)
     p = subprocess.run(["bash", str(root / "scripts" / "isl_queue.sh")], env=env, cwd=tmp_path, timeout=60,
                        capture_output=True, text=True)
     assert p.returncode == 0, p.stderr
     log = (root / "data" / "isl" / "logs" / "queue.log").read_text()
-    runs = {src: int((stub_dir / f"runs_{src}").read_text()) for src in codes}
+    runs = {src: int((stub_dir / f"runs_{src}").read_text()) if (stub_dir / f"runs_{src}").exists() else 0
+            for src in codes}
     return log, runs
 
 
@@ -150,6 +155,21 @@ def test_queue_moves_on_after_three_retry_passes(tmp_path):
                     "srca: fetch failures remain after 3 retry passes; moving on",
                     "srcb: finished"]
     assert "all listed sources processed; status:" in log and "giving up" not in log
+
+
+def test_cislr_that_moved_on_is_not_done(tmp_path):
+    """A CISLR run left with fetch failures after its retry passes is not marked done (run_source returns 4, not
+    0), so the next gated probe runs it again; before, "moving on" returned 0 and CISLR was never retried."""
+    log, runs = _run_queue(tmp_path, {"cislr": [11], "srca": [0], "srcb": [0]}, sources="srca srcb",
+                           grant=("cislr",), GATED_PROBE_MIN="0")
+    assert runs == {"cislr": 8, "srca": 1, "srcb": 1}  # probed before each list source: 1 + 3 retry passes, twice
+    moved = [m for m in _msgs(log) if m == "cislr: fetch failures remain after 3 retry passes; moving on"]
+    assert len(moved) == 2 and "srcb: finished" in log
+    assert "all listed sources processed; status:" in log and "giving up" not in log
+    # the same with CISLR finishing on its second probe: done after that, not run again
+    log, runs = _run_queue(tmp_path / "b", {"cislr": [11, 11, 11, 11, 0], "srca": [0], "srcb": [0], "srcc": [0]},
+                           sources="srca srcb srcc", grant=("cislr",), GATED_PROBE_MIN="0")
+    assert runs == {"cislr": 5, "srca": 1, "srcb": 1, "srcc": 1} and "cislr: finished" in log
 
 
 def test_queue_script_parses_and_documents_exit_11():

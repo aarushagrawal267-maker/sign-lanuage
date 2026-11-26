@@ -323,7 +323,7 @@ dropped, and if a process stays above, the chunk stops cleanly (exit 5, fetched 
 queue restarts the source in fresh processes after 1 min (at most 20 times per source); CISLR / iSign are probed
 every cycle (section 3.2). Exit codes of `run` the queue handles: 0 finished, 10 chunk done (more to do), 4 low
 disk, 3 gated, 5 memory, 6 manifest lock held, 11 finished this pass with fetch failures (re-run after 2 min, at
-most 3 extra passes, then move on), anything else (2) an error (5 tries, 5-20 min apart, then "giving up").
+most 3 extra passes, then move on; a CISLR run that moved on is re-run at the next gated probe), anything else (2) an error (5 tries, 5-20 min apart, then "giving up").
 
 **Adapters** (`video_sources/adapters.py`, `VIDEO_ADAPTERS`): one `Clip` reader per manifest (quality filter
 `n_frames >= 8` for videos, `>= 1` for images, `hands_frac >= 0.2`; unlabelled and `duplicate_of` rows skipped by
@@ -690,7 +690,9 @@ its page once, unless the page is under 2 min old. Failures:
   26 Nov 2026: mendeley_static's last pass "finished" with 140 sha256-mismatch downloads that succeed on retry, and
   the queue never re-ran it); `isl_queue.sh` logs `<src>: N fetch failures; retry pass k of 3 in 2 min`, re-runs
   the source and after 3 retry passes still failing logs `<src>: fetch failures remain after 3 retry passes; moving
-  on` and goes on with the list (readiness still reports the rows; `FETCH_RETRY_PASSES`, `FETCH_RETRY_WAIT`);
+  on` and goes on with the list (readiness still reports the rows and counts the source as behind the queue;
+  `FETCH_RETRY_PASSES`, `FETCH_RETRY_WAIT`). `run_source` then returns 4, not 0, so a CISLR run that moved on is
+  not marked done and the next gated probe re-runs it;
   `remote` / `error` / time / memory / disk stops keep their codes; `islrtc-full` never returns 11;
 * the rows API keeps refusing (`RemoteRefused`) -> that item gets a `fetch: RemoteRefused ...` row and the run stops
   (`stopped: "remote"`): exit 10 if the run extracted rows and the refusal was not a permanent 4xx (the next chunk

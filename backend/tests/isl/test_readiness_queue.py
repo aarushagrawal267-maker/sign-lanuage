@@ -121,6 +121,18 @@ def test_terminal_lines_and_out_of_order_logs(tmp_path):
     assert q["remaining"] == ["wslp", "isl_csltr_words", "hf_akrit_alphabet", "wslp_unlabelled"]
     assert q["current"] == "isl_csltr_words" and q["error"] is None
     assert w.check("commercial-safe")["ready"]
+    # a source that ran out of fetch-failure retry passes is behind the queue too (its rows still count as missing
+    # in the manifest check); a CISLR run that moved on is not done: the queue probes and re-runs it
+    w.log.write_text("")
+    w.logs(f"queue start (pid 300): {DEFAULT}", "islrtc-full: finished", "wslp: finished",
+           "mendeley_static: fetch failures remain after 3 retry passes; moving on",
+           "cislr: fetch failures remain after 3 retry passes; moving on", "isign: finished",
+           "isl_csltr_words: finished", "hf_akrit_alphabet: start chunk (free disk 30 GB)")
+    q = queue_of(w.check("commercial-safe"))
+    assert q["queue"]["remaining"] == ["hf_akrit_alphabet", "wslp_unlabelled"] and q["queue"]["error"] is None
+    assert q["queue"]["gated_pending"] == ["cislr"] and not q["blocking"]
+    assert w.check("commercial-safe")["ready"]
+    assert rd._terminal("mendeley_static: fetch failures remain after 5 retry passes; moving on")
     # no source started yet: the whole list remains
     w.log.write_text("")
     w.logs(f"queue start (pid 300): {DEFAULT}")

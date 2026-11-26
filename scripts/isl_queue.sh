@@ -19,7 +19,8 @@
 # (--max-rss-gb, default MAX_RSS_GB=1.5 per process: restarted in fresh processes after 1 min, up to
 # MEM_RESTARTS times per source), 6 another run of that manifest is active (wait 5 min), 11 finished this pass but
 # N items failed to fetch (their rows are retried by a re-run: re-run after FETCH_RETRY_WAIT s, default 2 min, at
-# most FETCH_RETRY_PASSES extra passes, default 3, then move on; readiness still reports the rows),
+# most FETCH_RETRY_PASSES extra passes, default 3, then move on: run_source returns 4, which the list loop ignores
+# but which leaves CISLR not done, so the gated polling re-runs it; readiness still reports the rows),
 # other = error (5 tries). islrtc-full never returns 11 (it has no fetch-failure count).
 # Child processes do not inherit the queue lock (fd 9 is closed for them), so a chunk left running by a stopped
 # queue cannot block the next queue.
@@ -82,7 +83,7 @@ wait_text() {  # FETCH_RETRY_WAIT as "2 min" (or "N s")
   if [ "$FETCH_RETRY_WAIT" -ge 60 ] && [ $((FETCH_RETRY_WAIT % 60)) -eq 0 ]; then echo "$((FETCH_RETRY_WAIT / 60)) min"; else echo "${FETCH_RETRY_WAIT} s"; fi
 }
 
-run_source() {  # $1 = source name; returns 0 done (or fetch failures left after the retry passes), 2 gave up, 3 gated
+run_source() {  # $1 = source name; returns 0 done, 2 gave up, 3 gated, 4 fetch failures left after the retry passes
   local src="$1" tries=0 mem=0 fpass=0 rc
   while true; do
     maybe_gated
@@ -107,7 +108,7 @@ run_source() {  # $1 = source name; returns 0 done (or fetch failures left after
          sleep 60 ;;
       6) log "$src: another run of this manifest is active; waiting 5 min"; sleep 300 ;;
       11) if [ "$fpass" -ge "$FETCH_RETRY_PASSES" ]; then
-            log "$src: fetch failures remain after $FETCH_RETRY_PASSES retry passes; moving on"; return 0
+            log "$src: fetch failures remain after $FETCH_RETRY_PASSES retry passes; moving on"; return 4
           fi
           fpass=$((fpass + 1))
           log "$src: $(fetch_failed_n "$src") fetch failures; retry pass $fpass of $FETCH_RETRY_PASSES in $(wait_text)"
@@ -149,7 +150,7 @@ maybe_gated() {  # probe CISLR / iSign (data files) at most every GATED_PROBE_MI
   IN_GATED=1
   if [ "$CISLR_DONE" = 0 ] && "$PY" scripts/ingest_isl_gated.py --check cislr >> "$LOGDIR/video_cislr.out" 2>&1 9>&-; then
     log "cislr: dataset.csv answers (access granted); ingesting"
-    run_source cislr && CISLR_DONE=1
+    run_source cislr && CISLR_DONE=1  # only 0 = done (4 = fetch failures left: probed and re-run later)
   fi
   if [ "$ISIGN_DONE" = 0 ] && "$PY" scripts/ingest_isl_gated.py --check isign >> "$LOGDIR/isign.out" 2>&1 9>&-; then
     log "isign: iSign_v1.1.csv answers (access granted); ingesting the uids GloSL lacks"
