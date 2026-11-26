@@ -16,6 +16,7 @@ clips against a gallery of ISLRTC references plus a few training clips per conce
 
 from __future__ import annotations
 
+import logging
 import random
 import time
 from collections import defaultdict
@@ -35,7 +36,19 @@ from app.isl.training.multisource import SAMPLE_WEIGHTS
 from app.models.checkpoint import frame_mask
 from app.training.trainer import TrainConfig, set_seed
 
+log = logging.getLogger(__name__)
+
 ENCODER_VERSION = "isl-enc-1"
+
+
+def feature_config_diff(init_fc: dict | None, fcfg: FeatureConfig) -> dict:
+    """Fields where a warm-start checkpoint's feature config differs from ``fcfg``: ``{field: [init, current]}``.
+    Both sides are compared with their defaults filled in (``to_dict`` omits e.g. a zero ``hand_size_floor``), so an
+    old checkpoint without a field counts as having the default. ``init_fc is None`` (not recorded) gives ``{}``."""
+    if init_fc is None:
+        return {}
+    a, b = asdict(FeatureConfig.from_dict(init_fc)), asdict(fcfg)
+    return {k: [a[k], b[k]] for k in b if a.get(k) != b[k]}
 
 
 class _EncoderWithHead(nn.Module):
@@ -127,6 +140,12 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
     n_batches = batches_per_epoch or max(1, len(train_clips) // max(1, p * k))
     enc = SignEncoder(fcfg.dim, hidden=cfg.hidden, layers=cfg.layers, emb_dim=emb_dim, dropout=cfg.dropout)
     init = load_encoder_weights(enc, Path(init_from)) if init_from else None
+    init_fc = init["meta"].get("feature_config") if init else None
+    init_fc_diff = feature_config_diff(init_fc, fcfg)
+    if init_fc_diff:  # accepted as a warm start (e.g. a pretrain without the hand-size floor), but made visible
+        log.warning("warm start %s was trained with another feature config (field: [init, current]) %s; "
+                    "kept as the init, recorded in meta pretraining.init_feature_config (docs/ISL_DESIGN.md 15.15)",
+                    init_from, init_fc_diff)
     arc = SubCenterArcFace(emb_dim, len(concepts), k=3)
     both = _EncoderWithHead(enc, arc)
     supcon = SupConLoss(0.1)
@@ -176,7 +195,9 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
             "feature_config": fcfg.to_dict(), "profile": data.profile, "language": "isl", "smoke": smoke,
             "train_config": asdict(cfg), "excluded_concepts": sorted(excl),
             "pretraining": ({"init_from": init["path"], "loaded_tensors": init["loaded"], "skipped": init["skipped"],
-                             **(init["meta"].get("pretraining") or {})} if init else None),
+                             **(init["meta"].get("pretraining") or {}),
+                             "init_feature_config": init_fc, "init_feature_config_diff": init_fc_diff}
+                            if init else None),
             "data": {**data.summary(), "train_items": len(train_clips), "concepts": len(concepts),
                      "train_sources": dict(src_counts), "val_queries": len(vq), "gallery": len(gal)}}
 
@@ -186,7 +207,8 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
     lc = LoopConfig(epochs=cfg.epochs, steps_per_epoch=n_batches, lr=cfg.lr, weight_decay=cfg.weight_decay,
                     patience=cfg.patience, max_minutes=max_minutes, seed=cfg.seed,
                     extra={"kind": "encoder", "model": model_kwargs, "p": p, "k": k, "concepts": len(concepts),
-                           "items": len(train_clips), "excluded": len(excl), "init": str(init_from or "")})
+                           "items": len(train_clips), "excluded": len(excl), "init": str(init_from or ""),
+                           "features": fcfg.to_dict()})
     res = run_loop(both, batches, loss_fn, lc, state_path or Path(str(out) + ".state"), val_fn=val_fn,
                    select_key="val_r1", save_best=save_best, fresh=not resume,
                    progress=(lambda m: progress(None, m)) if progress else None)

@@ -126,7 +126,7 @@ def train_classifier(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainCo
     lc = LoopConfig(epochs=cfg.epochs, steps_per_epoch=n_steps, lr=cfg.lr, weight_decay=cfg.weight_decay,
                     patience=cfg.patience, max_minutes=max_minutes, seed=cfg.seed,
                     extra={"kind": "classifier", "model": cfg.model_kwargs(), "classes": len(classes),
-                           "items": len(clips)})
+                           "items": len(clips), "features": fcfg.to_dict()})
     res = run_loop(model, batches, loss_fn, lc, state_path or Path(str(out) + ".state"), val_fn=val_fn,
                    select_key="val_macro_f1", save_best=save_best, fresh=not resume,
                    progress=(lambda m: progress(None, m)) if progress else None)

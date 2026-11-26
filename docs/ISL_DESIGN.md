@@ -2784,3 +2784,25 @@ commercial-safe `pretrain` re-run without `--force` is refused rather than retur
   pack would have reused the old pack's vectors. Fixed: the key now includes a hash of the encoder weights and the
   feature config (`mysigns/store.py`, `embedder_key`). The per-sign threshold `theta`, computed at enrolment with the
   old encoder, is not recomputed yet.
+
+### 15.15 Feature config in the resume signatures; warm-start feature config in meta (AI Engineer, 26 Nov 2026)
+
+Follow-ups D and 3 of 15.14, added while the research run was still in dedup / pretrain (no
+`artifacts/isl/research/**/*.state` existed, so no research state is invalidated).
+
+* **Resume signature.** `train_encoder.py` and `train_classifier.py` now put `"features": fcfg.to_dict()` into the
+  `LoopConfig.extra` of the resumable loop. `loop.py` hashes the whole config (minus `save_every_s`, `max_minutes`,
+  `patience`), so a `.state` saved under another feature config (e.g. before `hand_size_floor=0.1`) raises
+  `StateMismatch` instead of being continued on different inputs. A state written by the older code has no
+  `features` key, so its hash differs too: it is refused, never silently resumed. Consequence: the existing
+  commercial-safe `encoder` / `oneshot` / `classifier` / `e1a` / `cv` states are refused on a re-run without
+  `--force <step>` (steps with a `.done` stamp are skipped anyway).
+* **Warm start.** `meta.pretraining` of a fine-tuned encoder now records `init_feature_config` (the init
+  checkpoint's `feature_config`, `None` if it has none) and `init_feature_config_diff` (`{field: [init, current]}`,
+  defaults filled in, so an unfloored config counts as `hand_size_floor: 0.0`). When the diff is non-empty,
+  `train_encoder` logs a warning (logger `app.isl.training.train_encoder`, reaches the driver log via stderr). Every
+  difference warns, the hand-size floor included: the commercial-safe warm start from the unfloored pretrain is
+  accepted, but it is now visible in the log and the meta. The research run pre-trains with the floor (15.14),
+  so its encoder diff is expected to be `{}`.
+* Tests: `backend/tests/isl/test_resume_feature_config.py` (resume accepted on the same features and refused on
+  others, for encoder and classifier; an old-code state is refused; meta records; warning only on a mismatch).
