@@ -57,37 +57,98 @@ def fit_fusion(rec, val_clips: list[Clip], profile: str, version: str = "fusion-
                          "best_lower_bound": trep.get("accept_fit", {}).get("best_lower_bound"),
                          "note": trep.get("accept_fit", {}).get("note")}
     rep["achieved"] = params.achieved
-    params, rep["classifier_alone"] = fit_classifier_alone(rec, inputs, truths, params)
+    params, rep["classifier_alone"] = fit_classifier_alone(rec, inputs, truths, params, clips=used)
     params, rep["my_signs"] = choose_user_mode(rec, val_clips, params)
     rep["seconds"] = round(time.time() - t0, 1)
     return params, rep
 
 
-def fit_classifier_alone(rec, inputs: list[FusionInputs], truths: list[str],
-                         params: FusionParams) -> tuple[FusionParams, dict]:
-    """Per-policy thresholds of the classifier ALONE (the app's sliding mode, E1) on the validation evidence fit-fusion
-    already has, with the engine's rule: crop-mean probability at the checkpoint's temperature, margin
-    ``EngineConfig.min_margin``, >= 2 crops agree (docs 15.17). Stored in ``classifier_accept`` with the
-    classifier's fingerprint; without a classifier or validation data nothing is stored and the engine keeps the
-    checkpoint's single ``recommended_threshold``."""
+def sliding_windows(rec, raw, cfg=None) -> list[tuple]:
+    """Replay one recorded clip through the app's sliding mode (``RecognitionEngine``, ``cfg`` or the defaults) with a
+    threshold nothing reaches, and record every classified window: (t ms, EMA probabilities, streak, sign boundary
+    before it, the engine's class key of the top class). EMA, streak and boundaries do not depend on commits, so
+    ``calibration.sliding_commits`` gives the commits for any threshold from this one recording (docs 15.18)."""
+    from dataclasses import replace
+
+    from app.inference.engine import EngineConfig, RecognitionEngine
+
+    eng = RecognitionEngine(None, recognizer=rec, config=replace(cfg or EngineConfig(), mode="sliding",
+                                                                     threshold=2.0))
+    eng.set_size(raw.width, raw.height)
+    out, boundary = [], False
+    for i in range(len(raw.t_ms)):
+        had = eng.ema is not None
+        msg = eng.push(raw.frame_to_json(i))
+        if "provisional" in msg:
+            out.append((float(msg["t"]), np.array(eng.ema, float), int(eng.streak), boundary, eng.streak_class))
+            boundary = False
+        elif had and eng.ema is None:  # hands gone: the engine allows a repeat of the last commit after this
+            boundary = True
+    return out
+
+
+def replay_sliding(rec, clips: list[Clip], cfg=None) -> tuple[list, list[int], int]:
+    """``sliding_windows`` for every clip: (windows per replayed clip, classifier class index of its word or -1,
+    clips that could not be replayed)."""
+    pos = {c: i for i, c in enumerate(rec.classifier.class_names)}
+    windows, truths, failed = [], [], 0
+    for c in clips:
+        try:
+            w = sliding_windows(rec, c.load(), cfg)
+        except (FeatureError, OSError, ValueError):
+            failed += 1
+            continue
+        windows.append(w)
+        truths.append(pos.get(c.concept_id, -1))
+    return windows, truths, failed
+
+
+def fit_classifier_alone(rec, inputs: list[FusionInputs], truths: list[str], params: FusionParams,
+                         clips: list[Clip] | None = None) -> tuple[FusionParams, dict]:
+    """Per-policy thresholds of the classifier ALONE (the app's sliding mode, E1), stored in ``classifier_accept``
+    with the classifier's fingerprint.
+
+    With ``clips`` (fit-fusion passes its validation clips) they are fitted on what sliding mode actually does:
+    every clip replayed through ``RecognitionEngine`` in sliding mode at the default ``EngineConfig`` (single-crop
+    windows, EMA, a streak of ``agree_n`` windows, repeat suppression, cooldown), one clip = one unit (docs 15.18).
+    Without clips (or when none can be replayed) the segment-level proxy of docs 15.17 is used (crop-mean
+    probability of three crops, >= 2 crops agree) and ``classifier_fit.rule`` says so: on commercial-safe it
+    overstated sliding-mode precision by 4-11 points. When the replay has too few commits, nothing is stored and the
+    engine keeps the checkpoint's single ``recommended_threshold``."""
     from app.inference.engine import EngineConfig
+    from app.isl.models.calibration import fit_sliding_thresholds
     from app.isl.recognizer import calibrated_probs, classifier_calibration, classifier_fingerprint
 
     clf = getattr(rec, "classifier", None)
     if clf is None or not inputs or inputs[0].cls_logp is None:
         return params.with_(classifier_accept={}, classifier_fit={}), {"note": "no classifier: nothing fitted"}
     temp, ck_thr, _ = classifier_calibration(clf)
-    names = list(inputs[0].cls_ids)
-    per_crop = [calibrated_probs(np.exp(np.atleast_2d(i.cls_logp)), temp) for i in inputs]
-    margin = EngineConfig().min_margin
-    accept, rep = fit_classifier_thresholds(per_crop, names, truths, margin, min_agree=params.min_agree)
-    rep.update(temperature=temp, checkpoint_threshold=ck_thr)
+    ecfg = EngineConfig()
+    margin = ecfg.min_margin
+    windows, failed = [], 0
+    if clips:
+        windows, wtruths, failed = replay_sliding(rec, clips, ecfg)
+    if windows:
+        accept, rep = fit_sliding_thresholds(windows, wtruths, margin, ecfg.agree_n, ecfg.cooldown_ms)
+        rule = "sliding replay"
+        extra = {"engine": {k: getattr(ecfg, k) for k in ("window_ms", "interval_ms", "min_frames", "min_hand_ratio",
+                                                          "ema_alpha", "agree_n", "cooldown_ms", "end_absent_ms",
+                                                          "min_margin")},
+                 "replay_failed": failed, "unit": rep.get("unit")}
+    else:
+        names = list(inputs[0].cls_ids)
+        per_crop = [calibrated_probs(np.exp(np.atleast_2d(i.cls_logp)), temp) for i in inputs]
+        accept, rep = fit_classifier_thresholds(per_crop, names, truths, margin, min_agree=params.min_agree)
+        rule = "segment proxy"
+        extra = {"min_agree": params.min_agree, "replay_failed": failed,
+                 "proxy_note": "three-crop segment proxy, not the sliding-mode rule: its lower bounds overstate "
+                               "sliding mode (docs 15.18)"}
+    rep.update(temperature=temp, checkpoint_threshold=ck_thr, rule=rule, replay_failed=failed)
     if accept is None:
         return params.with_(classifier_accept={}, classifier_fit={}), rep
-    fit = {"fingerprint": classifier_fingerprint(clf), "temperature": temp, "margin": margin,
-           "min_agree": params.min_agree, "n": rep["n"], "n_in_classes": rep.get("n_in_classes"),
-           "best_lower_bound": rep.get("best_lower_bound"), "policies": rep.get("policies"),
-           "checkpoint_threshold": ck_thr, "note": rep.get("note")}
+    fit = {"fingerprint": classifier_fingerprint(clf), "temperature": temp, "margin": margin, "rule": rule,
+           "n": rep["n"], "n_in_classes": rep.get("n_in_classes"), "best_lower_bound": rep.get("best_lower_bound"),
+           "policies": rep.get("policies"), "checkpoint_threshold": ck_thr, "note": rep.get("note"), **extra}
     return params.with_(classifier_accept=accept, classifier_fit=fit), rep
 
 

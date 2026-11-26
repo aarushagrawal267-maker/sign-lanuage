@@ -7,7 +7,8 @@ target cannot be reached on the available data, the policies get graded effectiv
 bound (``choose_policy_thresholds``, docs 15.17), so strict / balanced / lenient still differ, and the *measured*
 numbers - including each policy's achieved lower bound - are stored in ``FusionParams.achieved`` (the UI shows
 those, never the target). The classifier alone (sliding mode) gets its own per-policy thresholds the same way
-(``fit_classifier_thresholds``). ``ts`` scans are ascending.
+(``fit_sliding_thresholds`` on validation clips replayed through the real sliding mode, docs 15.18; the
+segment-level ``fit_classifier_thresholds`` is only the fallback). ``ts`` scans are ascending.
 """
 
 from __future__ import annotations
@@ -285,4 +286,93 @@ def fit_classifier_thresholds(per_crop: list[np.ndarray], class_names: list[str]
     rep["n_in_classes"] = int(sum(t in set(class_names) for t in truths))
     n_acc, n_ok = _scan(p1, base, correct)
     accept, trep = choose_policy_thresholds(THRESHOLD_GRID, n_acc, n_ok, targets, min_accepted, len(per_crop))
+    return (normalize_accept(accept) if accept is not None else None), {**rep, **trep}
+
+
+# ------------------------------------------------------------------ classifier alone, real sliding-mode rule
+# A sliding-mode window as recorded by ``fit_fusion.sliding_windows``: (t ms, EMA probabilities, streak, sign
+# boundary before this window[, the engine's class key]). Recorded once with a never-accepting threshold; the commits
+# for any threshold then follow from the engine's rule below, because EMA and streak do not depend on what was
+# committed. The key is what the engine compares for repeat suppression (its vocabulary index of the top class);
+# without it the classifier index is used.
+SlidingWindow = tuple  # (float, np.ndarray, int, bool[, int])
+
+
+def _sliding_prep(windows: list[SlidingWindow]) -> list[tuple[float, float, float, int, int, bool, int]]:
+    out = []
+    for w in windows:
+        t, ema, streak, boundary = w[:4]
+        ema = np.asarray(ema, float)
+        srt = np.sort(ema)[::-1]
+        cls = int(ema.argmax())
+        out.append((float(t), float(srt[0]), float(srt[0] - srt[1]) if len(srt) > 1 else float("inf"),
+                    cls, int(streak), bool(boundary), int(w[4]) if len(w) > 4 and w[4] is not None else cls))
+    return out
+
+
+def _sliding_run(prep, threshold: float, margin: float, agree_n: int, cooldown_ms: float) -> list[int]:
+    last_key, last_t, out = None, -1e18, []
+    for t, p1, gap, cls, streak, boundary, key in prep:
+        if boundary:
+            last_key = None
+        if p1 < threshold or gap < margin or streak < agree_n:
+            continue
+        if key == last_key or t - last_t < cooldown_ms:
+            continue
+        last_key, last_t = key, t
+        out.append(cls)
+    return out
+
+
+def sliding_commits(windows: list[SlidingWindow], threshold: float, margin: float, agree_n: int,
+                    cooldown_ms: float) -> list[int]:
+    """Classes the app's sliding mode commits for one recorded clip at ``threshold``: exactly
+    ``RecognitionEngine._push_sliding`` / ``_decision`` - EMA top-1 >= threshold, top-1 minus top-2 >= margin, the
+    same top class for >= ``agree_n`` windows in a row, no repeat of the last commit until a sign boundary (hands
+    gone), and ``cooldown_ms`` between commits (docs 15.18)."""
+    return _sliding_run(_sliding_prep(windows), threshold, margin, agree_n, cooldown_ms)
+
+
+def sliding_commit_counts(windows: list[list[SlidingWindow]], truths: list[int], ts: np.ndarray, margin: float,
+                          agree_n: int, cooldown_ms: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per threshold in ``ts``, over recorded clips (``truths[i]`` = class index of clip i's word, -1 when it is not a
+    classifier class): (clips with >= 1 commit, clips with >= 1 commit that are all the clip's word, commits).
+    The unit is the clip (one signer performing one sign), not the window: windows of one clip are not independent."""
+    preps = [_sliding_prep(w) for w in windows]
+    n_acc, n_ok, n_com = [], [], []
+    for t in np.asarray(ts, float):
+        a = o = k = 0
+        for prep, y in zip(preps, truths):
+            cs = _sliding_run(prep, float(t), margin, agree_n, cooldown_ms)
+            k += len(cs)
+            if cs:
+                a += 1
+                o += int(y >= 0 and all(c == y for c in cs))
+        n_acc.append(a)
+        n_ok.append(o)
+        n_com.append(k)
+    return np.array(n_acc), np.array(n_ok), np.array(n_com)
+
+
+def fit_sliding_thresholds(windows: list[list[SlidingWindow]], truths: list[int], margin: float, agree_n: int,
+                           cooldown_ms: float, targets: dict | None = None,
+                           min_accepted: int = 5) -> tuple[dict | None, dict]:
+    """Per-policy sliding-mode thresholds of the classifier alone from validation clips replayed through the app's
+    sliding mode (docs 15.18). A clip counts as accepted when sliding mode commits anything during it, and as correct
+    when every commit is the clip's word; a clip whose word is not a classifier class can only be wrong. Same targets
+    and graded fallback as the fused thresholds (``choose_policy_thresholds``), so ``precision_lower_bound`` is a
+    bound on what sliding mode does on validation, not on the segment-level proxy of ``fit_classifier_thresholds``
+    (on commercial-safe the proxy's balanced 0.74 has a sliding-mode lower bound of 0.763, not 0.835)."""
+    targets = {pol: float((targets or {}).get(pol, TARGETS[pol])) for pol in POLICIES}
+    rep: dict = {"n": len(windows), "n_in_classes": int(sum(y >= 0 for y in truths)), "margin": margin,
+                 "agree_n": agree_n, "cooldown_ms": cooldown_ms,
+                 "unit": "clip: accepted = sliding mode commits at least once; correct = every commit is its word"}
+    if not windows:
+        return None, {**rep, "note": "no replayed validation clips"}
+    n_acc, n_ok, n_com = sliding_commit_counts(windows, truths, THRESHOLD_GRID, margin, agree_n, cooldown_ms)
+    accept, trep = choose_policy_thresholds(THRESHOLD_GRID, n_acc, n_ok, targets, min_accepted, len(windows))
+    if accept is not None:
+        for pol, b in trep["policies"].items():
+            i = int(np.flatnonzero(np.isclose(THRESHOLD_GRID, b["threshold"]))[0])
+            b["commits_per_clip"] = round(float(n_com[i] / len(windows)), 4)
     return (normalize_accept(accept) if accept is not None else None), {**rep, **trep}

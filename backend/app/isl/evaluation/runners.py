@@ -165,6 +165,9 @@ def e1_closed_set(rec, clips, label: str, split_name: str, kind: str) -> dict:
         policies[pol] = {"threshold": cal["thresholds"][pol], "coverage": float(a.mean()),
                          "not_sure_rate": float(1 - a.mean()), "wrong_accept_rate": float((a & (hit == 0)).mean()),
                          "accepted_precision": float(hit[a].mean()) if a.any() else None, "n_accepted": int(a.sum())}
+    sliding = _e1_sliding_replay(rec, used, cal["thresholds"], kind)
+    for pol in POLICIES if sliding else ():
+        policies[pol]["sliding_replay"] = sliding[pol]
     src_note = ("fitted per policy on validation (fusion.json)" if cal["per_policy"] else
                 "the checkpoint's validation threshold, the same for every policy"
                 + ("" if thr_fitted else " (checkpoint has none: Predictor default)"))
@@ -189,6 +192,10 @@ def e1_closed_set(rec, clips, label: str, split_name: str, kind: str) -> dict:
                          "thresholds": cal["thresholds"], "per_policy": cal["per_policy"], "margin": margin,
                          "source": cal["source"], "fallback_reason": cal.get("reason")},
             "policies": policies,
+            "sliding_replay_note": None if not sliding else
+            "policies.<policy>.sliding_replay: the same clips replayed through the app's real sliding mode "
+            "(single-crop windows, EMA, streak, cooldown; docs 15.18); accepted = it committed during the clip, "
+            "wrong accept = at least one commit was another word. The columns above are the three-crop segment proxy.",
             "decision_note": f"classifier alone, {E1_POLICY} policy: accept when its probability at temperature "
                              f"{temp:.2f} >= {thr:.2f} ({src_note}); not sure = not accepted (no 'did you mean' "
                              "step); the app's segment mode uses the fused decision (E3)",
@@ -198,6 +205,32 @@ def e1_closed_set(rec, clips, label: str, split_name: str, kind: str) -> dict:
             "signers (the cross-validation folds pool them)",
             "_hits": hit.tolist(), "_groups": groups,
             "per_category_top1": {k: round(float(np.mean(v)), 4) for k, v in sorted(per_cat.items())}}
+
+
+def _e1_sliding_replay(rec, clips, thresholds: dict, kind: str) -> dict | None:
+    """E1b / E1c: the test clips replayed through the app's real sliding mode at each policy's threshold (docs 15.18).
+    The decision columns of E1 are a segment-level proxy (three crops of the whole clip, >= 2 agree); sliding mode
+    classifies single-crop windows, smooths them (EMA) and commits after a streak, which on commercial-safe gave
+    4-11 points lower precision than the proxy. Only for the main classifier (not the CV folds or E1a)."""
+    if kind not in ("primary", "extra_signers") or not hasattr(rec, "class_probs") \
+            or not all(hasattr(c, "load") for c in clips):
+        return None
+    from app.inference.engine import EngineConfig
+    from app.isl.models.calibration import sliding_commit_counts
+    from app.isl.training.fit_fusion import replay_sliding
+
+    ecfg = EngineConfig()
+    windows, truths, failed = replay_sliding(rec, clips, ecfg)
+    if not windows:
+        return None
+    n, out = len(windows), {}
+    for pol in POLICIES:
+        a, o, k = (int(x[0]) for x in sliding_commit_counts(windows, truths, [thresholds[pol]], ecfg.min_margin,
+                                                             ecfg.agree_n, ecfg.cooldown_ms))
+        out[pol] = {"threshold": thresholds[pol], "n": n, "replay_failed": failed, "coverage": a / n,
+                    "not_sure_rate": 1 - a / n, "wrong_accept_rate": (a - o) / n,
+                    "accepted_precision": o / a if a else None, "n_accepted": a, "commits_per_clip": k / n}
+    return out
 
 
 def e3_fused(rec, clips, label: str) -> dict:
@@ -838,12 +871,20 @@ def _policy_lines(doc: dict) -> list[str]:
                         f"{_fmt(b.get('accepted_precision'))} | {_fmt(b.get('not_sure_rate'))} | "
                         f"{_fmt(b.get('wrong_accept_rate'))} | {_fmt(b.get('suggest_rate'))} | {how}"
                         + (f"; {val}" if val else "") + " |")
+            sr = b.get("sliding_replay") if pid.startswith("E1") else None
+            if isinstance(sr, dict):  # what sliding mode itself does at this threshold (docs 15.18)
+                rows.append(f"| {pid} sliding replay | {pol} | {_fmt(sr.get('threshold'))} | "
+                            f"{_fmt(sr.get('coverage'))} | {_fmt(sr.get('accepted_precision'))} | "
+                            f"{_fmt(sr.get('not_sure_rate'))} | {_fmt(sr.get('wrong_accept_rate'))} | - | "
+                            f"{how}; real sliding mode, per clip |")
     if not rows:
         return []
     return ["", "## Decision policies (strict / balanced / lenient)", "",
             "The table above shows the balanced policy (the app's default). E1 = the classifier alone (sliding mode), "
             "E3 = the fused decision (segment mode). A policy whose validation target (95 % lower bound of accepted "
-            "precision) was not reachable uses a graded fallback below the best achievable bound (docs 15.17).", "",
+            "precision) was not reachable uses a graded fallback below the best achievable bound (docs 15.17). "
+            "E1 rows are the three-crop segment proxy; 'sliding replay' rows are the same clips through the real "
+            "sliding mode (docs 15.18).", "",
             "| Protocol | policy | threshold | accepted | accepted precision | not sure | wrong accept | suggest | "
             "thresholds from |", "|---|---|---|---|---|---|---|---|---|", *rows]
 

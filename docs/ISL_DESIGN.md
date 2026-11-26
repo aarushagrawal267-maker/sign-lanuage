@@ -2949,3 +2949,67 @@ Tests: `backend/tests/isl/test_policy_thresholds.py`, with:
 * E1 / E3 / report.
 
 `test_pipeline_and_api.py` checks the real fit-fusion output.
+
+### 15.18 Sliding-mode thresholds fitted on the real sliding mode, not the segment proxy (Model QA review of 15.17, 26 Nov 2026)
+
+**Finding (High for the guarantee, Medium for users).** 15.17 fitted the per-policy classifier-alone thresholds
+(`classifier_accept`) on a segment-level proxy: the crop-mean probability of three crops of the *whole* clip, with
+>= 2 crops agreeing. The app's sliding mode does something else. It classifies one crop per 2 s window every 200 ms,
+smooths the windows (EMA 0.5), commits after the same top word for 3 windows in a row, and can commit several times
+during one sign (transitions, partial signs). Replaying fit-fusion's own commercial-safe validation clips (895) and
+the E1b test clips (792) through the real `RecognitionEngine` in sliding mode (read-only scratch,
+`scratchpad/thresholds/review/`):
+
+| | strict | balanced | lenient |
+|---|---|---|---|
+| 15.17 threshold (proxy fit) | 0.96 | 0.74 | 0.46 |
+| validation lower bound stored in fusion.json (proxy) | 0.865 | 0.835 | 0.785 |
+| validation lower bound of sliding mode at that threshold | 0.819 | 0.763 | 0.658 |
+| E1b test, sliding mode: clips with a commit / precision / clips with a wrong commit | 0.162 / 0.922 / 0.013 | 0.628 / 0.803 / 0.124 | 0.806 / 0.708 / 0.235 |
+| 15.17's E1b proxy numbers for the same thresholds | 0.326 / 0.938 / 0.020 | 0.619 / 0.869 / 0.081 | 0.785 / 0.826 / 0.136 |
+
+So the stored bounds were not bounds on sliding mode, and the proxy understated wrong commits by 4-10 points.
+Lenient at 0.46 put a wrong word on 23.5 % of test clips, more than the old single 0.60 (17.6 %).
+
+**Fix.**
+* `fit_fusion.sliding_windows` replays a recorded clip through `RecognitionEngine` (sliding mode, default
+  `EngineConfig`) with a threshold that nothing reaches. It records every classified window: time, EMA probabilities,
+  streak, sign boundary (hands gone), and the engine's class key. EMA, streak and boundaries do not depend on
+  commits. `calibration.sliding_commits` then gives the commits for any threshold, using the engine's rule: threshold,
+  margin, streak >= `agree_n`, no repeat until a boundary, `cooldown_ms`. A test checks that it equals the live
+  engine's commits for several thresholds, including a sign boundary.
+* `fit_classifier_alone` (called by fit-fusion with its validation clips) fits `classifier_accept` with
+  `calibration.fit_sliding_thresholds`. The unit is the **clip**: accepted means sliding mode committed during it,
+  and correct means every commit was the clip's word. A word that is not a classifier class can only be wrong. The
+  fit uses the same targets and graded fallback as 15.17 (`choose_policy_thresholds`).
+  * `classifier_fit` records `rule` ("sliding replay"), the engine settings, the unit and `replay_failed`.
+  * If no clip can be replayed, the 15.17 proxy is used and labelled (`rule` "segment proxy", `proxy_note`).
+  * Packs fitted with 15.17 keep working; only the label is missing.
+* E1b / E1c (main classifier only, not the CV folds or E1a) add `policies.<policy>.sliding_replay`: the same test
+  clips through the real sliding mode at that policy's threshold. report.md's "Decision policies" table gets
+  "sliding replay" rows. The 15.16 / 15.17 E1 columns keep their meaning, which is the three-crop proxy.
+
+**On commercial-safe (scratch, the new fit on the same validation clips; about 61 s single-threaded):**
+
+| | strict | balanced | lenient |
+|---|---|---|---|
+| sliding-mode threshold | 0.92 | 0.81 | 0.68 |
+| validation lower bound (sliding mode, per clip) / precision | 0.819 / 0.861 | 0.791 / 0.827 | 0.741 / 0.776 |
+| E1b test, sliding mode: clips with a commit / precision / clips with a wrong commit | 0.330 / 0.908 / 0.030 | 0.564 / 0.841 / 0.090 | 0.670 / 0.785 / 0.144 |
+
+Every test precision is above its validation bound. All three thresholds are still fallbacks, because sliding mode
+cannot reach 0.90 at this accuracy. The research run's `fusion` step uses this code (it starts a fresh process).
+
+**Not changed, for the record (lens: are the reported numbers what their labels say?).**
+* The "95 % lower bound" is computed on the same validation data the threshold was chosen from: strict takes the
+  maximum over about 80 thresholds. It is optimistic after this selection, not a simultaneous 95 % bound. On
+  commercial-safe, test still met every bound.
+* The 15.17 fallback has no absolute floor. A weak pack's lenient policy can end up far below 0.90, and the report
+  says so (`precision_lower_bound`, `target_reached` false). The "did you mean" 80 % top-5 rule uses the point
+  estimate, not a lower bound. Lenient's pool on commercial-safe validation: 64 of 77 = 0.831, lower bound about 0.73.
+* The commercial-safe numbers in 15.17 / 15.18 come from `include-session-cv5-fold0`. Validation and test share all
+  four pseudo-signer groups (ps00-ps03), so they are **session**-independent, not signer-independent as 15.17's
+  diagnosis says.
+* Engine quirk (pre-existing): two classifier classes of commercial-safe are not in the pack vocabulary. Their
+  `class_index` is -1, so sliding mode's streak and repeat suppression treat them as one word. The replay keeps the
+  engine's key, so the fit matches what the engine does.
