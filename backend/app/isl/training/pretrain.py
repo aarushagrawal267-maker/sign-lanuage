@@ -11,9 +11,16 @@ objectives that fit a CPU budget:
   are the whole clip with different augmentations (SimCLR-style).
 * **masked-frame modelling**: about 25 % of the frames of view A (spans of 3) are replaced by a learned mask
   token after the input projection; a linear head reconstructs their feature vectors from the BiGRU states
-  (MSE on masked frames that have a hand).
+  (on masked frames that have a hand). The MFM targets are the raw, unnormalised features, so the loss is
+  **robust**: smooth L1 (Huber, ``beta`` 1) against targets clamped to +-``mfm_clip`` (10). With the
+  hand-size floor 99.99 % of hand-frame feature values are within +-10 (median |x| 0.17, p99 2.3), but rare
+  landmark misdetections still reach ~120; under plain MSE one such frame dominated a whole step (docs 15.14
+  "Hand-size floor"). ``mfm_loss="mse"`` trains with the version-1 objective (``isl-enc-pre-1``) for comparisons.
 
-Loss = NT-Xent(A_masked, B) + ``mfm_weight`` x MFM. The encoder is the same ``SignEncoder`` that fine-tuning
+Loss = NT-Xent(A_masked, B) + ``mfm_weight`` x MFM. The best checkpoint is the epoch with the lowest
+validation NT-Xent + ``mfm_weight`` x robust MFM (``val``, higher = better, is minus that sum); the raw
+validation MSE is still reported as ``val_mfm``, the robust term as ``val_mfm_robust``. The encoder is the same
+``SignEncoder`` that fine-tuning
 uses, saved as an ordinary encoder checkpoint (``meta.pretraining`` records sources, clips, steps) that
 ``train_encoder(init_from=...)`` warm-starts from. Labels are never read. Evaluation clips are excluded by the
 caller (``multisource.pretrain_clips(exclude_ids=...)``), so test videos are not seen even without labels.
@@ -43,7 +50,9 @@ from app.models.checkpoint import frame_mask
 
 log = logging.getLogger(__name__)
 
-PRETRAIN_VERSION = "isl-enc-pre-1"
+PRETRAIN_VERSION = "isl-enc-pre-2"  # 2: robust MFM loss + selection on it; feature config in the resume signature
+MFM_CLIP = 10.0  # |target| cap: ~p99.99 of hand-frame feature values with the hand-size floor (max ~120)
+MFM_BETA = 1.0  # smooth L1: quadratic below 1 (p90 |x| ~1.0), linear above (bounded gradient per element)
 
 
 @dataclass
@@ -58,6 +67,8 @@ class PretrainConfig:
     lr: float = 1e-3
     temperature: float = 0.1
     mfm_weight: float = 1.0
+    mfm_loss: str = "smooth_l1"  # "smooth_l1" (robust, clamped targets) or "mse" (version 1 objective)
+    mfm_clip: float = MFM_CLIP
     mask_ratio: float = 0.25
     mask_span: int = 3
     win_min_s: float = 1.0
@@ -87,6 +98,13 @@ def nt_xent(za: torch.Tensor, zb: torch.Tensor, temperature: float) -> tuple[tor
     loss = F.cross_entropy(s, target)
     acc = float((s.argmax(1) == target).float().mean())
     return loss, acc
+
+
+def mfm_losses(pred: torch.Tensor, target: torch.Tensor, clip: float = MFM_CLIP) -> tuple[torch.Tensor, torch.Tensor]:
+    """(robust, mse) reconstruction losses of masked frames: smooth L1 (beta ``MFM_BETA``) against targets
+    clamped to +-``clip``, and plain MSE against the raw targets (reported only)."""
+    robust = F.smooth_l1_loss(pred, target.clamp(-clip, clip), beta=MFM_BETA)
+    return robust, F.mse_loss(pred, target)
 
 
 def span_mask(valid: np.ndarray, ratio: float, span: int, rng: np.random.Generator) -> np.ndarray:
@@ -195,7 +213,11 @@ def pretrain_encoder(clips: list[Clip], out: Path, fcfg: FeatureConfig, cfg: Pre
             idx = [train_idx[min(len(train_idx) - 1, int(np.searchsorted(cum, rng.random())))] for _ in range(cfg.batch)]
             yield (epoch, s, idx)
 
+    if cfg.mfm_loss not in ("smooth_l1", "mse"):
+        raise ValueError(f"mfm_loss must be 'smooth_l1' or 'mse', not {cfg.mfm_loss!r}")
+
     def forward(m: _Pretrainer, xa: torch.Tensor, xb: torch.Tensor, rng: np.random.Generator):
+        """(contrastive, training MFM loss, robust MFM, raw MFM MSE, view accuracy)"""
         ma, mb = frame_mask(xa, fcfg), frame_mask(xb, fcfg)
         hand = ((xa[..., flags] > 0.5) | (xa[..., flags + 1] > 0.5)).numpy()
         rep = torch.from_numpy(span_mask(hand, cfg.mask_ratio, cfg.mask_span, rng))
@@ -203,11 +225,10 @@ def pretrain_encoder(clips: list[Clip], out: Path, fcfg: FeatureConfig, cfg: Pre
         zb, _ = m.enc.encode(xb, mb)
         l_c, acc = nt_xent(za, zb, cfg.temperature)
         if rep.any():
-            pred = m.recon(ha[rep])
-            l_m = F.mse_loss(pred, xa[rep])
+            l_rob, l_mse = mfm_losses(m.recon(ha[rep]), xa[rep], cfg.mfm_clip)
         else:
-            l_m = torch.zeros(())
-        return l_c, l_m, acc
+            l_rob = l_mse = torch.zeros(())
+        return l_c, (l_rob if cfg.mfm_loss == "smooth_l1" else l_mse), l_rob, l_mse, acc
 
     def loss_fn(m, item):
         epoch, s, idx = item
@@ -215,7 +236,7 @@ def pretrain_encoder(clips: list[Clip], out: Path, fcfg: FeatureConfig, cfg: Pre
         b = make_batch(idx, rng)
         if b is None:
             return torch.zeros((), requires_grad=True)
-        l_c, l_m, _ = forward(m, *b, rng)
+        l_c, l_m, _, _, _ = forward(m, *b, rng)
         return l_c + cfg.mfm_weight * l_m
 
     val_cache: list = []
@@ -229,23 +250,30 @@ def pretrain_encoder(clips: list[Clip], out: Path, fcfg: FeatureConfig, cfg: Pre
                 b = make_batch(idx, rng)
                 if b is not None:
                     val_cache.append(b)
-        lc, lm, accs = [], [], []
+        lc, lr, lm, accs = [], [], [], []
         with torch.no_grad():
             for xa, xb in val_cache:
-                c, mm, a = forward(m, xa, xb, np.random.default_rng([cfg.seed, 7]))
+                c, _, rob, mse, a = forward(m, xa, xb, np.random.default_rng([cfg.seed, 7]))
                 lc.append(float(c))
-                lm.append(float(mm))
+                lr.append(float(rob))
+                lm.append(float(mse))
                 accs.append(a)
         if not lc:
             return {"val": 0.0}
-        return {"val_contrastive": float(np.mean(lc)), "val_mfm": float(np.mean(lm)), "val_view_acc": float(np.mean(accs)),
-                "val": -(float(np.mean(lc)) + cfg.mfm_weight * float(np.mean(lm)))}
+        # selection uses the robust MFM whatever the training loss: the raw MSE of the fixed validation batches is
+        # dominated by the few outlier frames they happen to contain
+        return {"val_contrastive": float(np.mean(lc)), "val_mfm": float(np.mean(lm)),
+                "val_mfm_robust": float(np.mean(lr)), "val_view_acc": float(np.mean(accs)),
+                "val": -(float(np.mean(lc)) + cfg.mfm_weight * float(np.mean(lr)))}
 
     sources = dict(Counter(c.source for c in clips))
     meta = {"kind": "isl-encoder", "encoder_version": PRETRAIN_VERSION, "feature_config": fcfg.to_dict(),
             "model_kwargs": {"hidden": cfg.hidden, "layers": cfg.layers, "emb_dim": cfg.emb_dim, "dropout": cfg.dropout},
             "profile": profile, "language": "isl", "smoke": smoke,
-            "pretraining": {"objective": "temporal NT-Xent + masked-frame modelling", "config": asdict(cfg),
+            "pretraining": {"objective": "temporal NT-Xent + masked-frame modelling",
+                            "mfm_loss": (f"smooth_l1(beta={MFM_BETA}) on targets clamped to +-{cfg.mfm_clip}"
+                                         if cfg.mfm_loss == "smooth_l1" else "mse"),
+                            "selection": "val NT-Xent + mfm_weight x robust MFM", "config": asdict(cfg),
                             "sources": sources, "clips": len(clips), "labels_used": False, **(extra_meta or {})}}
 
     def save_best(epoch: int, row: dict) -> None:
@@ -253,7 +281,9 @@ def pretrain_encoder(clips: list[Clip], out: Path, fcfg: FeatureConfig, cfg: Pre
 
     lc = LoopConfig(epochs=cfg.epochs, steps_per_epoch=cfg.steps_per_epoch, lr=cfg.lr, patience=max(3, cfg.epochs),
                     max_minutes=max_minutes, seed=cfg.seed,
-                    extra={"pretrain": asdict(cfg), "clips": len(clips), "dim": fcfg.dim})
+                    extra={"pretrain": asdict(cfg), "clips": len(clips), "dim": fcfg.dim,
+                           # a state from another objective version or feature config is refused, not continued
+                           "version": PRETRAIN_VERSION, "features": fcfg.to_dict()})
     res = run_loop(model, batches, loss_fn, lc, state_path or out.with_suffix(".state.pt"), val_fn=val_fn,
                    select_key="val", save_best=save_best, fresh=fresh,
                    progress=(lambda m: progress(m)) if progress else None)

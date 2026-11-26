@@ -97,6 +97,24 @@ def test_training_reports_and_results_file(isl_env):
     assert r["pack"]["id"] == "isl" and "classifier.pt" in r["pack"]["files"]
 
 
+def test_pack_and_component_metas_record_the_hand_size_floor(isl_env):
+    """The hand-size floor (ISL_FEATURES, 0.1) must reach every artifact the run writes and the live recogniser:
+    a model trained with the floor and served without it (or the reverse) sees other features."""
+    import torch
+
+    from app.packs.registry import get_registry
+
+    pack = isl_env["packs"] / "isl"
+    man = json.loads((pack / "pack.json").read_text())
+    assert man["feature_config"]["hand_size_floor"] == 0.1
+    for f in ("classifier.pt", "encoder.pt"):
+        meta = torch.load(pack / f, map_location="cpu", weights_only=False)["meta"]
+        assert meta["feature_config"]["hand_size_floor"] == 0.1, f
+    idx_meta = [json.loads(p.read_text()) for p in pack.rglob("meta.json")]
+    assert idx_meta and all(m["feature_config"]["hand_size_floor"] == 0.1 for m in idx_meta)
+    assert get_registry().get("isl").feature_config.hand_size_floor == 0.1
+
+
 def test_registry_lists_both_languages(isl_env):
     c = isl_env["client"]
     j = c.get("/api/languages").json()

@@ -13,7 +13,7 @@ from app.dataset.synthetic import make_sequence
 from app.isl.data.sources import Clip
 from app.isl.training.common import ISL_FEATURES
 from app.isl.training.loop import LoopConfig, StateMismatch, balanced_batches, pk_batches, run_loop
-from app.isl.training.pretrain import PretrainConfig, nt_xent, pretrain_encoder, span_mask
+from app.isl.training.pretrain import MFM_CLIP, PretrainConfig, mfm_losses, nt_xent, pretrain_encoder, span_mask
 
 TINY = PretrainConfig(hidden=16, layers=1, emb_dim=16, batch=6, epochs=2, steps_per_epoch=3, val_batches=1)
 
@@ -50,7 +50,7 @@ def test_pretrain_saves_encoder_resumes_and_warm_starts(unlabelled, tmp_path):
     r = pretrain_encoder(unlabelled, out, ISL_FEATURES, TINY, profile="research", threads=1, smoke=True, fresh=True)
     assert r["finished"] and out.exists() and r["sources"] == {"glosl": 7, "include": 7}
     enc = EncoderPredictor(out)
-    assert enc.version == "isl-enc-pre-1" and enc.meta["pretraining"]["labels_used"] is False
+    assert enc.version == "isl-enc-pre-2" and enc.meta["pretraining"]["labels_used"] is False
     z, _ = enc.embed(np.zeros((2, ISL_FEATURES.seq_len, ISL_FEATURES.dim), np.float32))
     assert z.shape == (2, 16) and np.allclose(np.linalg.norm(z, axis=1), 1, atol=1e-4)
     # a finished run resumes as finished (no more training)
@@ -66,6 +66,68 @@ def test_pretrain_saves_encoder_resumes_and_warm_starts(unlabelled, tmp_path):
     assert rep["loaded"] > 0 and rep["skipped"] == []
     e2 = SignEncoder(ISL_FEATURES.dim, hidden=16, layers=1, emb_dim=32)
     assert load_encoder_weights(e2, out)["skipped"] == ["head.2.bias", "head.2.weight"]
+
+
+def test_mfm_loss_is_robust_to_outlier_targets():
+    """One misdetected frame (feature value ~1000) dominated the plain MSE (pre-training loss spikes); the robust
+    loss clamps the target to +-MFM_CLIP and is linear above 1, so its gradient per element is bounded."""
+    target = torch.zeros(8, 10)
+    target[0, 0] = 1000.0
+    pred = torch.zeros(8, 10, requires_grad=True)
+    robust, mse = mfm_losses(pred, target)
+    assert float(mse.detach()) == pytest.approx(1000.0 ** 2 / 80)
+    assert float(robust.detach()) == pytest.approx((MFM_CLIP - 0.5) / 80)  # smooth L1 (beta 1) of a clamped 10
+    robust.backward()
+    assert float(pred.grad.abs().max()) == pytest.approx(1 / 80)
+    small = torch.full((4, 3), 0.4)
+    r, m = mfm_losses(torch.zeros(4, 3), small)  # quadratic region: half the MSE, same minimum
+    assert float(r) == pytest.approx(0.5 * float(m))
+
+
+def test_pretrain_selects_on_robust_mfm_and_records_it(unlabelled, tmp_path):
+    out = tmp_path / "pre.pt"
+    r = pretrain_encoder(unlabelled, out, ISL_FEATURES, TINY, profile="research", threads=1, smoke=True, fresh=True)
+    meta = torch.load(out, map_location="cpu", weights_only=False)["meta"]
+    hist = meta["history"]
+    for row in hist:  # the old fields are still reported, plus the robust term the selection uses
+        assert {"val_contrastive", "val_mfm", "val_mfm_robust", "val_view_acc", "val"} <= set(row)
+        assert row["val"] == pytest.approx(-(row["val_contrastive"] + TINY.mfm_weight * row["val_mfm_robust"]))
+    assert meta["best_epoch"] == max(hist, key=lambda h: h["val"])["epoch"] == r["best_epoch"]
+    assert meta["encoder_version"] == "isl-enc-pre-2"
+    assert meta["pretraining"]["mfm_loss"].startswith("smooth_l1") and meta["pretraining"]["config"]["mfm_clip"] == 10.0
+    with pytest.raises(ValueError):
+        pretrain_encoder(unlabelled, tmp_path / "x.pt", ISL_FEATURES, PretrainConfig(**{**TINY.__dict__, "mfm_loss": "l1"}),
+                         profile="research", threads=1, smoke=True, fresh=True)
+    # the version-1 objective stays available for comparisons; selection is still on the robust term
+    r_mse = pretrain_encoder(unlabelled, tmp_path / "mse.pt", ISL_FEATURES,
+                             PretrainConfig(**{**TINY.__dict__, "mfm_loss": "mse", "epochs": 1}),
+                             profile="research", threads=1, smoke=True, fresh=True)
+    assert r_mse["finished"] and "val_mfm_robust" in r_mse["last"]
+
+
+def test_pretrain_refuses_a_state_from_another_objective_or_feature_config(unlabelled, tmp_path, monkeypatch):
+    """A research pretrain must not silently continue a state trained with the other loss (version 1) or with
+    other features (hand-size floor): the loop signature includes both, so the resume is refused."""
+    from dataclasses import replace
+
+    import app.isl.training.pretrain as pre
+
+    out = tmp_path / "pre.pt"
+    one = PretrainConfig(**{**TINY.__dict__, "epochs": 1})
+    with monkeypatch.context() as mp:
+        mp.setattr(pre, "PRETRAIN_VERSION", "isl-enc-pre-1")  # a state written by the old code
+        pretrain_encoder(unlabelled, out, ISL_FEATURES, one, profile="research", threads=1, smoke=True, fresh=True)
+    with pytest.raises(StateMismatch):
+        pretrain_encoder(unlabelled, out, ISL_FEATURES, one, profile="research", threads=1, smoke=True)
+    pretrain_encoder(unlabelled, out, ISL_FEATURES, one, profile="research", threads=1, smoke=True, fresh=True)
+    assert pretrain_encoder(unlabelled, out, ISL_FEATURES, one, profile="research", threads=1,
+                            smoke=True)["resumed_from"]["finished"] is True
+    with pytest.raises(StateMismatch):  # same settings, features without the floor
+        pretrain_encoder(unlabelled, out, replace(ISL_FEATURES, hand_size_floor=0.0), one, profile="research",
+                         threads=1, smoke=True)
+    with pytest.raises(StateMismatch):  # same settings, the other MFM loss
+        pretrain_encoder(unlabelled, out, ISL_FEATURES, PretrainConfig(**{**one.__dict__, "mfm_loss": "mse"}),
+                         profile="research", threads=1, smoke=True)
 
 
 def test_finetune_records_pretraining(tmp_path, unlabelled):

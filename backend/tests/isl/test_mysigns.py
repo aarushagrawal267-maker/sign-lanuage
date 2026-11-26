@@ -253,3 +253,42 @@ def test_alphabet_store_survives_bad_file_and_parallel_adds(tmp_path):
     for t in threads:
         t.join()
     assert set(AlphabetStore(tmp_path).counts()) == set(letters)
+
+
+def test_user_index_reembeds_when_the_encoder_changes_under_the_same_version(tmp_path):
+    """Every ISL encoder is ``isl-enc-1`` and the pack id is always ``isl``: a new pack (new weights, or another
+    feature config such as the hand-size floor) must not reuse the old pack's cached vectors."""
+    import torch
+
+    from app.isl.mysigns.store import embedder_key
+
+    class _Enc:  # EncoderPredictor stand-in: same version string, its own weights
+        version, dim = "isl-enc-1", 4
+
+        def __init__(self, seed: int):
+            torch.manual_seed(seed)
+            self.model = torch.nn.Linear(FCFG.dim, 4)
+            self.feature_config = FCFG
+
+        def embed(self, feats):
+            with torch.no_grad():
+                z = self.model(torch.from_numpy(feats).float()).mean(1)
+            return torch.nn.functional.normalize(z, dim=-1).numpy(), 0.0
+
+    st = MySignsStore(tmp_path, "isl")
+    sid = st.add("Poha", _takes(2), embedder=_emb()).sign.sign_id
+    a, b = RawEmbedder(_Enc(0), FCFG), RawEmbedder(_Enc(1), FCFG)
+    assert a.version == b.version and embedder_key(a) != embedder_key(b)
+    assert embedder_key(a) == embedder_key(RawEmbedder(_Enc(0), FCFG))  # same weights -> same cache
+    za = st.user_index(a).emb.copy()
+    zb = MySignsStore(tmp_path, "isl").user_index(b).emb  # restart after installing the new pack
+    assert not np.allclose(za, zb) and np.allclose(zb, b.embed_raws(st.takes(sid)), atol=1e-6)
+    assert np.allclose(MySignsStore(tmp_path, "isl").user_index(a).emb, za)  # the old pack's cache is still valid
+    # feature-statistics fallback: same "featstats-1" version, other feature config -> other vectors
+    floored = FeatureConfig(seq_len=24, canonical_hand=True, hand_size_floor=0.1)
+    f0, f1 = _emb(), RawEmbedder(FeatureStatsEmbedder(floored), floored)
+    assert f0.version == f1.version and embedder_key(f0) != embedder_key(f1)
+    st.user_index(f0)
+    assert len(list(st.dir.glob("emb_featstats-1-*.npy"))) == 1
+    st.user_index(f1)
+    assert len(list(st.dir.glob("emb_featstats-1-*.npy"))) == 2

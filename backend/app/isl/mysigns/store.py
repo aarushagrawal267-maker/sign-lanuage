@@ -4,20 +4,24 @@ Storage (local, git-ignored)::
 
     data/my_signs/<pack_id>/signs.jsonl         one row per sign version (last row per sign_id wins; deletes are tombstones)
     data/my_signs/<pack_id>/takes/<id>/<n>.npz  RawSequence of each take (landmarks only, never video)
-    data/my_signs/<pack_id>/emb_<version>.npy   cached embeddings (+ emb_<version>.rows.json)
+    data/my_signs/<pack_id>/emb_<key>.npy       cached embeddings (+ emb_<key>.rows.json), key = embedder_key()
 
-Embeddings depend on the encoder version, so takes are always kept as landmarks and re-embedded lazily when the
-pack's encoder changes. Rows also carry ``gloss`` and ``takes`` (relative paths) so the data layer's
+Embeddings depend on the encoder, so takes are always kept as landmarks and re-embedded lazily when the pack's
+encoder changes. The cache key is the encoder version **plus** a hash of its weights and feature config: every
+ISL encoder is ``isl-enc-1`` and the pack id is always ``isl``, so the version alone would keep a new pack's
+users on the old pack's vectors. Rows also carry ``gloss`` and ``takes`` (relative paths) so the data layer's
 ``MySignsAdapter`` can read them.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
 import threading
 import uuid
+import weakref
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -141,6 +145,38 @@ def _pairwise_mean(z: np.ndarray) -> float:
         return 1.0
     s = z @ z.T
     return float((s.sum() - np.trace(s)) / (n * (n - 1)))
+
+
+_EMBEDDER_KEYS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def embedder_key(embedder) -> str:
+    """Identity of the vectors an embedder produces: ``<version>-<sha256[:12]>`` over its feature config(s) and,
+    for a trained encoder, its weights. Computed once per embedder object (loaded encoders are not trained
+    further). An embedder without a feature config or a model (test doubles) is keyed by its version."""
+    try:
+        return _EMBEDDER_KEYS[embedder]
+    except (KeyError, TypeError):
+        pass
+    h = hashlib.sha256()
+    inner = getattr(embedder, "embedder", None)
+    for obj in (embedder, inner):
+        fc = getattr(obj, "feature_config", None)
+        if fc is not None and hasattr(fc, "to_dict"):
+            h.update(json.dumps(fc.to_dict(), sort_keys=True, default=str).encode())
+    for obj in (embedder, inner):
+        model = getattr(obj, "model", None)
+        if model is not None and hasattr(model, "state_dict"):
+            for name, t in model.state_dict().items():
+                h.update(name.encode())
+                h.update(t.detach().cpu().numpy().tobytes())
+            break
+    key = f"{embedder.version}-{h.hexdigest()[:12]}"
+    try:
+        _EMBEDDER_KEYS[embedder] = key
+    except TypeError:
+        pass
+    return key
 
 
 class MySignsStore:
@@ -274,15 +310,16 @@ class MySignsStore:
     # ------------------------------------------------------------ embedding
     def user_index(self, embedder, include_disabled: bool = False) -> EmbeddingIndex | None:
         """Index over every take of every enabled sign; row ``concept_id`` = ``mysign:<sign_id>``.
-        Cached in memory and on disk per (encoder version, signs.jsonl stamp)."""
-        key = (embedder.version, self.stamp(), include_disabled)
+        Cached in memory and on disk per (``embedder_key``, signs.jsonl stamp)."""
+        ekey = embedder_key(embedder)
+        key = (ekey, self.stamp(), include_disabled)
         with self._lock:
             if self._cache.get("key") == key:
                 return self._cache["index"]
             signs = self.list(include_disabled=include_disabled)
             signs = [s for s in signs if include_disabled or s.enabled]
             rows, _embs = [], []
-            disk = self.dir / f"emb_{re.sub(r'[^A-Za-z0-9_.-]', '_', embedder.version)}.npy"
+            disk = self.dir / f"emb_{re.sub(r'[^A-Za-z0-9_.-]', '_', ekey)}.npy"
             disk_rows = disk.with_suffix(".rows.json")
             cached: dict[str, np.ndarray] = {}
             if disk.exists() and disk_rows.exists():

@@ -39,3 +39,21 @@ def test_config_round_trip_and_old_configs_unchanged():
     assert FeatureConfig.from_dict(FeatureConfig().to_dict()).hand_size_floor == 0.0
     assert ISL_FEATURES.hand_size_floor == 0.1
     assert FeatureConfig.from_dict(ISL_FEATURES.to_dict()) == ISL_FEATURES
+
+
+def test_build_features_passes_the_floor_through():
+    """End to end through ``build_features``: a regression to ``_hand_shape(left, lp)`` (floor dropped in
+    featurize) would pass the unit tests above but fail here."""
+    from dataclasses import replace
+
+    from app.dataset.synthetic import make_sequence
+    from app.features.build import build_features
+
+    raw = make_sequence(1, signer=0, n_frames=40, fps=25.0)
+    for hand in (raw.left, raw.right):  # middle MCP straight in front of the wrist: 2D size ~1e-4 of the image
+        hand[:, HAND_MIDDLE_MCP, :2] = hand[:, HAND_WRIST, :2] + 1e-4
+        hand[:, HAND_MIDDLE_MCP, 2] = hand[:, HAND_WRIST, 2] - 0.1
+    floored = build_features(raw, ISL_FEATURES)
+    unfloored = build_features(raw, replace(ISL_FEATURES, hand_size_floor=0.0))
+    assert np.isfinite(floored).all() and np.abs(floored).max() < 50
+    assert np.abs(unfloored).max() > 200  # the bug the floor fixes

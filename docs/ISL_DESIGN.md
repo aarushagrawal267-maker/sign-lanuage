@@ -64,7 +64,7 @@ sentences, then Frontend Developer) and the project owner.
 |---|---|---|
 | `RawSequence` (.npz: pose 33x4, hands 21x3, face 20x3, t_ms, NaN = missing) | `backend/app/landmarks/raw.py` | Canonical clip format for **every** ISL source and for "My signs" takes. INCLUDE/ISLRTC ingestion already writes it. |
 | Holistic extractor | `backend/app/landmarks/extractor.py` | Used by `scripts/ingest_isl.py` and by CISLR ingestion. |
-| `FeatureConfig`, raw/feature layout | `backend/app/features/spec.py` | Unchanged layout. Two **opt-in** flags added (`canonical_hand`, default off) so ASL dims and behaviour stay identical. |
+| `FeatureConfig`, raw/feature layout | `backend/app/features/spec.py` | Unchanged layout. Two **opt-in** fields added (`canonical_hand`, default off; `hand_size_floor`, default 0 = off, 0.1 for ISL, see 15.14) so ASL dims and behaviour stay identical. |
 | `to_body_frame`, `augment`, `featurize`, `build_features` | `backend/app/features/build.py` | Used as is. Strong augmentation for ISL composes `augment` with extra ops in a new module. |
 | `RecurrentClassifier`, `InputProjection`, `MaskedAttentionPool` | `backend/app/models/networks.py` | ISL closed-set classifier = the same class. Encoder trunk reuses projection + BiGRU + attention pool. |
 | Checkpoint format + `Predictor` | `backend/app/models/checkpoint.py` | ISL classifier checkpoints use the same `{"state_dict","meta"}` format, so `Predictor` loads them. |
@@ -241,7 +241,8 @@ Search order (later roots override earlier ones with the same `id`): `models/pac
   "output_languages": ["en", "hi"],
   "capabilities": ["words", "retrieval", "spelling", "my_signs", "sentence"],
   "profile": "commercial-safe",
-  "feature_config": {"seq_len": 48, "use_face": true, "use_velocity": true, "max_gap": 5, "canonical_hand": true},
+  "feature_config": {"seq_len": 48, "use_face": true, "use_velocity": true, "max_gap": 5, "canonical_hand": true,
+                     "hand_size_floor": 0.1},
   "vocabulary": "vocabulary.jsonl",
   "lexicons": {"hi": "lexicon_hi.jsonl"},
   "components": {
@@ -857,6 +858,10 @@ category from WordNet lexnames (`noun.animal → animals`, `noun.food → food`,
   (ties → no mirror). This removes left/right-handed differences deterministically, which matters for one-shot retrieval
   where augmentation cannot cover the reference side. Default false, so ASL is unchanged and `FeatureConfig.from_dict` of old
   checkpoints still works. The TypeScript port `frontend/src/static/features.ts` must implement it before ISL runs in the static demo.
+* Opt-in `hand_size_floor: float = 0.0` (added 26 Nov 2026, 15.14): lower bound, in shoulder widths, on the 2D
+  wrist-to-middle-MCP length that normalises the hand-shape block. ISL uses 0.1; 0 keeps the original behaviour and is
+  left out of `to_dict()`, so ASL configs and packs built before the change (no key) mean floor 0. The static TypeScript
+  port must implement it too before ISL runs there.
 * `augment_strong` (`backend/app/isl/augment.py`) composes the existing `augment` with: wider speed (±35%), rotation ±15°,
   scale ±15%, shift ±0.15, **arm-length scaling** about the shoulders (±10%, simulates other body proportions),
   per-finger joint-angle noise (σ 4°), contiguous hand dropout chunks (up to 4 frames), random 0–2 frame time shift between hands,
@@ -1055,7 +1060,8 @@ runtime `Vocabulary`), `api/languages.py`, the language-aware WebSocket and anal
 the model commands of `isl/cli.py` (`train-classifier`, `train-encoder`, `build-index`, `train-letters`, `fit-fusion`,
 `evaluate`, `build-pack`, `smoke`). Deviations from sections 4, 6 and 7, with reasons:
 
-* **ASL stays byte-identical.** `FeatureConfig.to_dict()` leaves `canonical_hand` out when it is false, and the engine's
+* **ASL stays byte-identical.** `FeatureConfig.to_dict()` leaves `canonical_hand` out when it is false (and
+  `hand_size_floor` when it is 0), and the engine's
   `describe()` leaves the recogniser-only fields (`policy`, `use_my_signs`, `spell_end_ms`, `max_spell_ms`) out when there
   is no recogniser, so ASL checkpoints, `/api/features/spec`, `hello` and `config_ack` are unchanged (`hello` only gains
   `language` and `languages`). The ASL WebSocket keeps the original predictor engine path; `ClassifierRecognizer` reproduces
@@ -1805,7 +1811,8 @@ centroids, or one row per clip for one-clip-per-word sources, with per-source ro
 **Self-supervised pre-training** (`training/pretrain.py`): same `SignEncoder`, two CPU-feasible objectives:
 temporal contrastive NT-Xent between two augmented crops (1-4 s) of the same sequence that are close in time
 (whole-clip SimCLR views for short word clips), plus masked-frame modelling (25 % of frames in spans of 3 replaced by a
-learned token after the input projection, reconstructed from the BiGRU states). Sources are sampled ~ 1/sqrt(size)
+learned token after the input projection, reconstructed from the BiGRU states; since 26 Nov 2026 with a robust loss,
+see 15.14). Sources are sampled ~ 1/sqrt(size)
 per clip so one huge corpus does not drown the others. The checkpoint is an ordinary encoder checkpoint
 (`meta.pretraining` lists sources, clip counts, config, `labels_used: false`); fine-tuning warm-starts from it
 (`--init auto`, recorded in the encoder's meta). **Evaluation clips are excluded from pre-training** (INCLUDE val/test
@@ -2726,3 +2733,51 @@ no resume: the research letter step (~1.9 h estimate, 15.12) restarts from scrat
   intervals per source only; HF sets whole on the training side). Its E5 numbers for Mendeley age groups assume the
   HF sets hold no near-copies of Mendeley photos (not measurable until they are ingested; a check worth doing on the
   full run's data before quoting the research E5 number).
+
+### 15.14 Hand-size floor (AI Engineer, 26 Nov 2026)
+
+**Bug.** The hand-shape block divides each hand's wrist-relative landmarks by the 2D wrist-to-middle-MCP length
+(`_hand_shape` in `backend/app/features/build.py`). When the hand points at the camera (foreshortened), that length
+goes to about 0 and the hand-shape features, and the velocity features computed from them, blow up. Over the
+commercial-safe pre-training clips the largest feature value was about **2027**, and about **2 %** of clips had a value
+above 100. The pre-training loss spikes came from this: in epoch 13 (train loss 42.95, against 2-6 for most epochs) two
+steps made up about **95 %** of the epoch's loss. The diagnosis and checks are scratch-only (not in the repo).
+
+**Fix** (commit `697120d`). New `FeatureConfig.hand_size_floor`: the length is bounded from below by the floor (in
+shoulder widths, the body-frame unit). `ISL_FEATURES.hand_size_floor = 0.1`. Default 0 = old behaviour, and 0 is left
+out of `to_dict()`, so ASL configs and older ISL packs are byte-identical. The value is written into the encoder,
+classifier and index metas and into `pack.json`, and every training, evaluation and live path reads it from there,
+so a pack is trained and served with the same features. On a 1,500-clip sample with the floor, the median absolute
+hand-frame feature value is 0.17, p99 2.3, p99.99 10, max about 120 (rare landmark misdetections).
+
+**The commercial-safe run.** Its pre-training process started (10:39 UTC) before the commit and kept the code it had
+loaded, so `artifacts/isl/commercial-safe/pretrained_encoder.pt` was trained on **unfloored** features (its meta
+`feature_config` has no `hand_size_floor`; best epoch 18 of 20). It was kept: on the same validation batches, unfloored
+vs floored input gives NT-Xent 0.1361 vs 0.1350, view-matching accuracy 0.9911 vs 0.9914, and mean embedding cosine
+0.997 between the two. It is only a warm start; the encoder and later steps (started 12:42 UTC) train and evaluate on
+floored features, and their metas say so. The fine-tuned encoder's meta does not yet record that its warm start was
+unfloored (follow-up 3). The research run pre-trains with the floor.
+
+**Robust MFM loss (pre-training version `isl-enc-pre-2`).** Even with the floor, masked-frame modelling reconstructs
+raw, unnormalised features, so one misdetected frame (value ~100) still dominated a plain MSE step. `pretrain.py` now
+uses smooth L1 (beta 1) against targets clamped to +-10 (`MFM_CLIP`, about the p99.99 above): quadratic for normal
+values, linear above 1, so the gradient per element is bounded. The best checkpoint is chosen on validation NT-Xent +
+`mfm_weight` x robust MFM (`val`); `val_contrastive`, `val_mfm` (raw MSE) and `val_view_acc` are still reported, and
+`val_mfm_robust` is new. `mfm_loss="mse"` keeps the version-1 training loss for comparisons. The pre-training resume
+signature now includes the pre-training version and the feature config, so a state from the old loss or from
+other features is refused (`StateMismatch`; re-run with `--force pretrain`), never continued. Note: with the new code a
+commercial-safe `pretrain` re-run without `--force` is refused rather than returning "finished".
+
+**Follow-ups.**
+* **C (report only):** `backend/app/isl/fingerspell/features.py` (`_shape`) and `backend/app/isl/data/dedup.py` use
+  the same 2D denominator. Letter features have no config, so changing them would silently change the input of the
+  shipped `letters.pt`; needs a versioned letter-feature change and a retrain.
+* **D:** the encoder and classifier resume signatures (`train_encoder.py`, `train_classifier.py`, via `loop.py`'s
+  `extra`) still ignore `feature_config`, so a resume across a feature change would mix features. To be added after the
+  run (adding it while a state exists would refuse that state).
+* 3: `train_encoder.py` should record the warm start's `feature_config` in `meta.pretraining` and warn when it differs
+  in more than `hand_size_floor`.
+* My signs: the embedding cache was keyed by the encoder version only (`isl-enc-1` for every ISL encoder), so a new
+  pack would have reused the old pack's vectors. Fixed: the key now includes a hash of the encoder weights and the
+  feature config (`mysigns/store.py`, `embedder_key`). The per-sign threshold `theta`, computed at enrolment with the
+  old encoder, is not recomputed yet.
