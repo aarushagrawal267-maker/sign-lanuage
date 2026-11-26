@@ -2761,9 +2761,12 @@ unfloored (follow-up 3). The research run pre-trains with the floor.
 **Robust MFM loss (pre-training version `isl-enc-pre-2`).** Even with the floor, masked-frame modelling reconstructs
 raw, unnormalised features, so one misdetected frame (value ~100) still dominated a plain MSE step. `pretrain.py` now
 uses smooth L1 (beta 1) against targets clamped to +-10 (`MFM_CLIP`, about the p99.99 above): quadratic for normal
-values, linear above 1, so the gradient per element is bounded. The best checkpoint is chosen on validation NT-Xent +
+values, linear above 1, so the gradient per element is bounded. In the quadratic region smooth L1 is half the
+squared error, so at the same `mfm_weight` (1) normal frames weigh about half as much against NT-Xent as in
+version 1; the research run is the first full run with this balance. The best checkpoint is chosen on validation NT-Xent +
 `mfm_weight` x robust MFM (`val`); `val_contrastive`, `val_mfm` (raw MSE) and `val_view_acc` are still reported, and
-`val_mfm_robust` is new. `mfm_loss="mse"` keeps the version-1 training loss for comparisons. The pre-training resume
+`val_mfm_robust` is new. `mfm_loss="mse"` keeps the version-1 training loss for comparisons (still stamped `isl-enc-pre-2` and selected on
+the robust term). The pre-training resume
 signature now includes the pre-training version and the feature config, so a state from the old loss or from
 other features is refused (`StateMismatch`; re-run with `--force pretrain`), never continued. Note: with the new code a
 commercial-safe `pretrain` re-run without `--force` is refused rather than returning "finished".

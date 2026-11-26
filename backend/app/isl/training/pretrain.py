@@ -15,7 +15,9 @@ objectives that fit a CPU budget:
   **robust**: smooth L1 (Huber, ``beta`` 1) against targets clamped to +-``mfm_clip`` (10). With the
   hand-size floor 99.99 % of hand-frame feature values are within +-10 (median |x| 0.17, p99 2.3), but rare
   landmark misdetections still reach ~120; under plain MSE one such frame dominated a whole step (docs 15.14
-  "Hand-size floor"). ``mfm_loss="mse"`` trains with the version-1 objective (``isl-enc-pre-1``) for comparisons.
+  "Hand-size floor"). ``mfm_loss="mse"`` trains with the version-1 loss for comparisons (the checkpoint is
+  still ``isl-enc-pre-2`` and selected on the robust term, so it is not a version-1 run). In the quadratic region
+  smooth L1 is half the MSE, so at the same ``mfm_weight`` typical frames weigh about half as much as in version 1.
 
 Loss = NT-Xent(A_masked, B) + ``mfm_weight`` x MFM. The best checkpoint is the epoch with the lowest
 validation NT-Xent + ``mfm_weight`` x robust MFM (``val``, higher = better, is minus that sum); the raw
