@@ -79,7 +79,10 @@ def test_collect_examples_letters_noise_words(letters):
     assert (ab["start"], ab["end"]) == (0, 20)
 
 
-def test_train_letters_loso_and_load_in_speller(letters, tmp_path):
+def test_train_letters_loso_and_load_in_speller(letters, tmp_path, monkeypatch):
+    from app.isl.training import train_fingerspell as tf
+
+    monkeypatch.setattr(tf, "MIN_CAL_EXAMPLES", 10)
     from app.isl.fingerspell.decoder import LexiconTrie, SpellDecoder
     from app.isl.fingerspell.model import LetterPredictor
     from app.isl.fingerspell.speller import Speller
@@ -89,7 +92,9 @@ def test_train_letters_loso_and_load_in_speller(letters, tmp_path):
     r = train_fingerspell(ls, out, profile="research", epochs=8, lexicon_words=["cab"], smoke=True)
     assert r["n_signers"] == 2 and set(r["letters"]) == {"A", "B", "C", "7"}
     e5 = r["e5"]
-    assert e5["measurable"] and e5["signers"] == ["signer_0", "signer_1"] and e5["n"] > 0
+    assert e5["measurable"] and e5["signers"] == ["isl_fingerspelling:signer_0", "isl_fingerspelling:signer_1"]
+    assert e5["groups"] == e5["signers"] and e5["n"] > 0  # images / OpenHands clips have no group ids: never held out
+    assert r["calibration"]["status"] == "grouped" and r["calibration"]["n_groups"] == 2
     assert 0.0 <= e5["metrics"]["letter_top1"] <= 1.0 and "words" in e5
     lp = LetterPredictor(out)
     assert lp.n_signers == 2 and lp.meta["e5"]["measurable"]
@@ -100,13 +105,14 @@ def test_train_letters_loso_and_load_in_speller(letters, tmp_path):
 
 def test_one_signer_is_reported_as_not_measurable(letters, tmp_path):
     ls, _ = letters
-    keep = [i for i, g in enumerate(ls.group) if g != "signer_1"]
+    keep = [i for i, g in enumerate(ls.group) if g != "isl_fingerspelling:signer_1"]
     from app.isl.training.train_fingerspell import LetterSet
 
     one = LetterSet([ls.X[i] for i in keep], [ls.y[i] for i in keep], [ls.group[i] for i in keep],
-                    [ls.source[i] for i in keep], [w for w in ls.words if w["group"] != "signer_1"])
+                    [ls.source[i] for i in keep], [w for w in ls.words if w["group"] != "isl_fingerspelling:signer_1"])
     r = train_fingerspell(one, tmp_path / "l.pt", profile="research", epochs=2)
     assert r["e5"]["measurable"] is False and "needs at least 2" in r["e5"]["reason"]
+    assert r["calibration"]["status"] == "not grouped" and r["temperature"] == 1.0
 
 
 class _Ad:

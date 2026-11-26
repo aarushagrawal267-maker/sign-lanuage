@@ -49,7 +49,7 @@ training ones --resume / --max-minutes (exit code 75 = stopped with state saved,
                          fine-tune from the pre-trained encoder
   train-oneshot --folds 0 1
                          E2 encoders with each fold's concepts held out of all supervised training
-  train-fingerspell      letter model from every letter source (+ leave-one-signer-out E5)
+  train-fingerspell      letter model from every letter source (+ leave-one-group-out E5)
   evaluate --all         E1a/E1b/E1c/E2/E3/E4/E5/E6/E7/E8 -> <work>/eval and <pack>/eval report.json + report.md
   bench                  CPU seconds per training step for the model sizes (for the time budget)
   readiness [--allow-partial --work DIR]

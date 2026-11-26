@@ -2571,3 +2571,99 @@ after the commercial-safe run (13-24 h) in any case, so in practice **27 Nov abo
    `nohup scripts/phase2_train.sh --profile research --threads 4 >> data/isl/logs/phase2_driver.out 2>&1 &`.
 6. After each run, `artifacts/isl/<profile>/eval/report.md` must not say PARTIAL DATA or SMOKE, and its trim-eval
    line must say `ok`.
+
+### 15.12 Letter model: content duplicates, grouped hold-out, balanced sampling (AI Engineer, 25-26 Nov 2026, 23:40-00:15 UTC)
+
+Fixes the two letter-model gaps left open in 15.11 ("Open" item 1 and the commercial-safe verdict) before the full
+phase-2 run. Code: `backend/app/isl/training/train_fingerspell.py`, E5 runner / report lines in
+`backend/app/isl/evaluation/runners.py`; tests `backend/tests/isl/test_fingerspell_groups.py` (11, synthetic
+manifests in a temporary data root read through the real adapters) and `test_fingerspell_train.py` (updated). No
+ingestion file was touched (`engine.py`, `adapters.py`, `pose_sources/` unchanged); nothing was trained except the
+scratch smoke below.
+
+**1. Content duplicates.** `letter_data` now also reads the `duplicate_of` rows (it sets `include_duplicates` on its
+own adapter instances), and `dedupe_by_content` groups every item (images, letter clips, fingerspelling clips, across
+all sources of the profile) by content: same landmark file + slice (a `duplicate_of` row reuses the original's file,
+so a chain is one content) or same SHA-256 of the whole source file (copies extracted twice, or the same photo in two
+sources; never used for sliced clips). A content filed under two or more labels is dropped **completely** (all its
+items, so neither label is learnt from it); a content repeated under one label is kept once (the first in manifest
+order, i.e. the original). Every drop is logged; counts and up to 20 examples (ids + labels) go into the
+checkpoint's `data.dedup` (`cross_label_contents`, `cross_label_items`, `same_label_copies`, `per_source`). On the
+full Mendeley item list (expected SHA-256) this drops the 3 cross-label pairs of 15.11 (6 items: digits 3/4 once,
+4/5 twice) and 105 same-label copies of 93 photos (108 duplicate rows in DATASETS 3.9 = 3 cross-label + 105). Near-copies
+that are not byte-identical (Mendeley bursts, Hemg augmentations) are not caught here; the grouped hold-out below is
+what keeps them from inflating E5 and the temperature.
+
+**2. Grouped hold-out for E5 and calibration (one logic for both).** Every example has a unit (`unit_of`):
+ISL-Fingerspelling = signer (`isl_fingerspelling:signer_00`); Mendeley static = **age group**
+(`mendeley_static:adults`; the manifest group is age x sleeves, but one person can be in both sleeve groups, so a
+sleeve group is never held out alone); HF alphabets, OpenHands fingerspelling and anything without group ids = the
+whole source, which **always stays on the training side** (akrit's own `test` rows are never a test or calibration
+set). The held-out units are every unit of a source with at least 2 grouped units: commercial-safe = the 3 Mendeley
+age groups; research = 3 ISL-Fingerspelling signers + 3 age groups (6). E5 is leave-one-unit-out over them (each fold
+trains on everything else, including the whole-source sets) and reports letter top-1 pooled, per source
+(`letter_top1_<source>`) and per group (`folds`, plus the unweighted `letter_top1_group_mean`), each with
+`interval_fields` (95 % group bootstrap only with >= 5 groups, else the reason: commercial-safe "too few signer groups
+(3)"; research pooled has 6 groups, so an interval, its per-source rows have 3 each, so none), and word decoding for
+held-out signers as before. The temperature is fitted on the pooled **out-of-fold logits** of those folds (letters
+and noise), so it never sees a photo of a held-out person's group; `meta.calibration` records `status`, the held-out
+units, n, NLL and ECE (15 bins) at T = 1 and at the fitted T. Status values: `grouped`; `not grouped` (no source with
+2+ grouped units, or no fold with a trainable remainder: T stays 1.0 and the reason is printed; the old random 10 %
+fallback is gone); `too few held-out examples` (< 200 held-out examples: T stays 1.0). The fold models are trained
+on less data than the final model, so the fitted T is, if anything, slightly too soft (the safe side for a
+"suggest" feature). There is still no early stopping or epoch selection (fixed epochs), so nothing else is chosen on
+held-out data. With `evaluate=False` the temperature uses one held-out unit per grouped source (the smallest with
+>= 200 letter examples). The report (`report.md`, E5 section) now prints one line per letter metric with its interval
+cell or reason, the word line, and the calibration line; the E5 label says leave-one-group-out. Old checkpoints show
+"calibration: not recorded".
+
+**3. `max_per_class` decision: keep 4,000 per class per epoch, but sample, do not drop.** Each epoch takes up to
+4,000 examples per class, split evenly over the class's subgroups (signers; Mendeley age x sleeves; whole sources;
+a small subgroup gives all it has, the rest is shared by the others, and the remainder rotates every epoch), read
+cyclically through a seeded permutation per subgroup. So over the epochs every example is used (`training.coverage`
+in the checkpoint) and the data no longer depends on one random subset; deterministic for a seed. Before, each fit
+kept one random 4,000 per class for all epochs. Measured on this machine (2 threads, nice 10, load 19-21 from the
+ingestion jobs, 25 Nov 23:55 UTC; synthetic features of the real shapes, `_fit_mlp`, batch 128):
+
+| letter set | examples | per epoch | s / epoch | coverage after 2 epochs |
+|---|---|---|---|---|
+| commercial-safe (Mendeley letters + digits, 6 subgroups) | 84,600 | 84,600 (cap binds only for E / 9) | 16.1 | 1.00 |
+| commercial-safe, no cap | 84,600 | 84,600 | 14.4 | 1.00 |
+| research (+ Hemg 42.7k, akrit 10.8k, ISL-FS ~77k frames, OpenHands 2.3k) | 217,944 | 144,000 | 24.7 | 0.92 (1.00 well before 40 epochs) |
+| research, no cap | 217,944 | 217,944 | 40.7 | 1.00 |
+
+For commercial-safe the cap changes nothing (only E and 9, ~4,300 photos each, are above it, and they are cycled).
+For research it saves 40 % of the time per epoch while still using every example, and it stops the near-duplicate-
+heavy sources (Hemg augmentations, ISL-FS consecutive frames) from outvoting the others inside a class. Estimated
+letter-step time at 40 epochs, 2 threads under today's load (estimate): commercial-safe 3 age folds (training
+remainders 41.7k-83.8k photos) + final fit ~ **30-35 min** (was ~20 min: calibration fit + final) plus feature
+loading of 102k files; research 6 folds + final at ~144k per epoch ~ **1.9 h** (was ~1.4 h: 3 signer folds +
+calibration fit + final). The full run uses
+`--threads 4`, so likely less.
+
+**4. Smoke, scratch copy (25 Nov 23:59 UTC).** `artifacts/isl/phase2-smoke/<profile>` and `isl_root_<profile>`
+copied to the session scratchpad, `SLR_ISL_WORKDIR` pointed there, `cli --root <copy> train-fingerspell --smoke
+--epochs 3 --threads 2`, nice 10; the real smoke folders were not written (SHA-256 of both `letters.pt` unchanged).
+Data on disk at that time: `mendeley_static` 8 rows, `isl_fingerspelling` 4, `openhands_fs` 172, HF sets none.
+* commercial-safe: 7 Mendeley items (1 Hindi vowel skipped) -> 6 examples in 2 age groups (adults 4, kids 2); dedup
+  0; both folds skipped (remainder < 10), so **E5 not run** ("no held-out group had letter examples and a trainable
+  remainder") and **calibration `not grouped`, T 1.0**; 1.3 s.
+* research: 183 items -> 2,535 examples (36 letters, 20 noise): ISL-FS signer_00 238 (one signer: not a grouped
+  source yet), OpenHands 2,291 (whole source, training side), Mendeley adults 4 / kids 2; dedup 0. E5 over the 2 age
+  groups: n 6, letter top-1 0.167 (group mean 0.125), interval "none: too few signer groups (2)";
+  **calibration `too few held-out examples`** (6 < 200), T 1.0; 0.13 s per epoch; 2.4 s.
+These smoke numbers only show the plumbing; the data guard keeps the full runs from starting before the manifests
+are complete.
+
+**Checks.** Backend suite **550 passed** (53 s, `SLR_TORCH_THREADS=2`, nice 10). New tests: unit kinds; dedup through
+the real Mendeley adapter (a `duplicate_of` copy under another label: both dropped; same-label copy: kept once; two
+extractions with one SHA-256 under two labels: both dropped; slices of one file are distinct); commercial E5 +
+calibration by age group (3 groups: no interval, reason printed; coverage 1.0 with a cap of 10); the hold-out without
+E5; HF-only research = `not grouped`, T 1.0, akrit `test` rows never held out; whole sources in every fold's training
+side; interval at 5 groups and none at 4; water-fill / balanced epochs (even split, rotation, determinism, full
+coverage); too few held-out examples; E5 runner + report lines.
+
+**Open.** (1) Near-duplicate clustering (landmark distance or perceptual hash) is still not done; with the age-group
+hold-out it is not needed for E5 / calibration, but within-group bursts still weigh more than single photos.
+(2) Commercial-safe E5 has 3 groups, so it never gets an interval; more letter signers (own recordings, 7.x) are the
+only fix. (3) The `mendeley_static` licence question (15.11) is unchanged.

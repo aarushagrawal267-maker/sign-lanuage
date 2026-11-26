@@ -15,7 +15,7 @@ E2   open-vocabulary one-shot: per fold, an encoder trained with the fold's conc
 E3   fused system (classifier + retrieval + fusion) with accept / suggest / abstain per policy
 E4   My signs few-shot: enrol k takes of a test signer's word, test on their other takes; false accepts of user
      signs on words they did not enrol
-E5   fingerspelling, leave-one-signer-out (computed when the letter model is trained; read from its checkpoint)
+E5   fingerspelling, leave-one-group-out over signers and Mendeley age groups (computed with the letter model)
 E6   latency per segment
 E7   ASL regression: the bundled ASL model's results file is unchanged
 E8   trim quality (``cli trim-eval`` report of the run's trimmer, version-checked, + the trim method mix)
@@ -471,15 +471,21 @@ def e5_from_letters(path: Path) -> dict:
 
     meta = torch.load(path, map_location="cpu", weights_only=False)["meta"]
     e5 = meta.get("e5") or {}
-    lab = ("Fingerspelling, leave-one-signer-out over the letter-annotated continuous fingerspelling signers "
-           f"({len(e5.get('signers') or [])}); letter accuracy on letter frames, words via hold detection + "
-           "dictionary decoding. Experimental while fewer than 5 signers exist.")
+    groups = e5.get("groups") or e5.get("signers") or []
+    lab = ("Fingerspelling, leave-one-group-out over the grouped letter sources (ISL-Fingerspelling signers, "
+           f"Mendeley static age groups; {len(groups)} held-out groups; sources without group ids stay on the "
+           "training side); letter accuracy on letter frames / photos, words via hold detection + dictionary "
+           "decoding. Experimental while fewer than 5 signers exist.")
+    cal = meta.get("calibration") or {"status": "not recorded (letter model trained before 15.12)",
+                                      "temperature": meta.get("temperature")}
     if not e5.get("measurable"):
-        return {"label": lab, "run": False, "reason": e5.get("reason", "not measured"), "data": meta.get("data")}
-    return {"label": lab, "run": True, "n": e5.get("n"), "n_groups": len(e5.get("signers") or []),
+        return {"label": lab, "run": False, "reason": e5.get("reason", "not measured"), "data": meta.get("data"),
+                "calibration": cal}
+    return {"label": lab, "run": True, "n": e5.get("n"), "n_groups": len(groups),
             "metrics": e5.get("metrics"), "intervals": e5.get("intervals"),
             "interval_reasons": e5.get("interval_reasons") or {}, "interval_groups": e5.get("interval_groups") or {},
-            "per_letter": e5.get("per_letter"),
+            "groups": groups, "group_kinds": e5.get("group_kinds"), "folds": e5.get("folds"),
+            "per_letter": e5.get("per_letter"), "calibration": cal, "training": meta.get("training"),
             "words": e5.get("words"), "data": meta.get("data"),
             "note": "spelled words are always 'suggest' in the app (never auto-accepted): wrong-accept rate 0 by design"}
 
@@ -753,6 +759,31 @@ def _ci_cell(p: dict, key: str = "top1") -> str:
     return f"none: {why[key]}" if why.get(key) else "-"
 
 
+def _e5_lines(p: dict) -> list[str]:
+    """E5 bullets: every letter accuracy with its interval cell (or the reason there is none) and the calibration."""
+    out = []
+    m = p.get("metrics") or {}
+    for key in sorted(k for k in m if k.startswith("letter_top1")):
+        if key in (p.get("intervals") or {}):
+            out.append(f"* {key}: {_fmt(m[key])} (95% CI {_ci_cell(p, key)}; groups "
+                       f"{(p.get('interval_groups') or {}).get(key, '-')})")
+        else:
+            out.append(f"* {key}: {_fmt(m[key])} (unweighted mean over {p.get('n_groups', '-')} held-out groups; "
+                       "no interval)")
+    w = p.get("words") or {}
+    if w:
+        out.append(f"* word top-1: {_fmt(w.get('top1'))} (n {w.get('n')}, 95% CI "
+                   + format_interval(w.get("top1_interval"), w.get("n_groups"), w.get("top1_interval_reason")) + ")")
+    c = p.get("calibration") or {}
+    if c:
+        out.append(f"* calibration: **{c.get('status')}**, temperature {_fmt(c.get('temperature'))}"
+                   + (f", fitted on {c.get('n')} held-out examples of {c.get('n_groups')} groups "
+                      f"({', '.join(c.get('held_out_units') or [])}; {c.get('how')}); NLL {_fmt(c.get('nll_t1'))} -> "
+                      f"{_fmt(c.get('nll'))}, ECE {_fmt(c.get('ece_t1'))} -> {_fmt(c.get('ece'))}"
+                      if c.get("status") == "grouped" else f" ({c.get('reason', '')})"))
+    return out + [""] if out else out
+
+
 def markdown_report(doc: dict) -> str:
     partial = bool(doc.get("partial_data")) and not doc.get("smoke")
     title = f"# ISL evaluation report ({doc['profile']})" + (" - PARTIAL DATA" if partial else "")
@@ -834,6 +865,8 @@ def markdown_report(doc: dict) -> str:
                                  f"{_fmt(syn.get('early_frac'))} (n {syn.get('n')}, learned ends "
                                  f"{syn.get('learned_ends')})")
                 lines.append("")
-            lines += ["```", json.dumps({x: y for x, y in p.items() if x not in ("trim_eval",)},
+            if k == "E5":
+                lines += _e5_lines(p)
+            lines += ["```", json.dumps({x: y for x, y in p.items() if x not in ("trim_eval", "per_letter", "data")},
                                         indent=1, default=str)[:1500], "```"]
     return "\n".join(lines) + "\n"

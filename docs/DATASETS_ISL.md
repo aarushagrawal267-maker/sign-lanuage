@@ -672,6 +672,9 @@ ISL-Fingerspelling signer (a random 10 % only when no signer ids exist, which wo
 If any split, calibration hold-out or validation set ever draws from them, put a whole source on one side (one group
 per source), or first cluster near-duplicates (landmark distance after normalisation, or a perceptual hash of the
 image) and split by cluster.
+**Done (26 Nov, ISL_DESIGN 15.12):** the letter model keeps each HF set (and OpenHands fingerspelling) whole on the
+training side of every E5 fold and of the calibration; akrit's `test` rows are never held out; a profile without a
+grouped letter source reports calibration `not grouped` (temperature 1.0) instead of the old random 10 %.
 
 **`hfrow` fetch (`hf_listing.RowPages`, used by `engine.Fetcher`).** The old path made up to 6 tries per page,
 ignored `Retry-After`, slept at most 120 s and dropped a page's cached URLs one by one (a memory-guard drop or a
@@ -755,9 +758,13 @@ and light). So photos of one signer and take are near-identical. Rules:
   random 10 % of all letter samples: near-copies of training photos, which makes the temperature too confident (worse
   now: 10x more copies). Hold out one age group of mendeley_static there instead, and give these rows a group
   (`static-<age>-<sleeves>` is in the manifest's `group` field; for splits use the age only);
+  **done (ISL_DESIGN 15.12):** E5 and the temperature now hold out whole age groups (leave-one-age-group-out; the
+  sleeve groups are only sampling subgroups), and byte-identical copies filed under two labels are dropped from the
+  letter set (both items), same-label copies kept once;
 * `max_per_class` (4,000 per letter, random over sources) now drops part of the photos in each fit, and the source
   dominates the letter data (up to ~4,600 per gloss for E / 9 with both variants): weight per source / group if the
-  other sources' signers should count.
+  other sources' signers should count. **Decided (ISL_DESIGN 15.12):** 4,000 per class *per epoch*, split evenly over the
+  class's subgroups (age x sleeves, signers, whole sources) and cycled, so every photo is used over the epochs.
 
 **Licence: needs review before commercial use.** The Mendeley page's licence field is CC BY 4.0 (`data_licence` in the
 cached metadata), but the dataset description itself says: "This dataset can be used only for research purposes
