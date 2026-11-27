@@ -53,6 +53,11 @@ training ones --resume / --max-minutes (exit code 75 = stopped with state saved,
                          fine-tune from the pre-trained encoder
   train-oneshot --folds 0 1
                          E2 encoders with each fold's concepts held out of all supervised training
+                         (both: --bridge-p 12 --source-weights include=0.5,isl500=0.35,mendeley=0.15 = the bridge
+                         sampler; --val-protocol dictionary = select on INCLUDE/ISL500/Mendeley -> ISLRTC; docs 15.40)
+  encoder-probe --encoder PATH [--out FILE] [--bar FILE|R1]
+                         any encoder.pt on the dictionary validation protocol (per-source recall@1/@5 against the
+                         ISLRTC rows; read-only, writes only --out); --bar warns below a previous probe's INCLUDE r1
   train-fingerspell      letter model from every letter source (+ leave-one-group-out E5)
   evaluate --all         E1a/E1b/E1c/E2/E3/E4/E5/E6/E7/E8 -> <work>/eval and <pack>/eval report.json + report.md
   bench                  CPU seconds per training step for the model sizes (for the time budget)
@@ -565,7 +570,7 @@ def _record_sources(work: Path, rep: dict, role: str, used: dict | None = None) 
     f.write_text(json.dumps(cur, indent=1, ensure_ascii=False))
 
 
-def _model_ctx(paths: IslPaths, args):
+def _model_ctx(paths: IslPaths, args, record: bool = True):
     from app.core.config import get_settings
     from app.isl.profiles import get_profile
     from app.isl.training.common import ISL_FEATURES, load_isl_data, load_vocab, set_threads
@@ -585,6 +590,8 @@ def _model_ctx(paths: IslPaths, args):
     if getattr(args, "all_sources", False):
         rep = attach_all_sources(data, paths, vocab, profile, seed=args.seed,
                                  max_per_source=getattr(args, "max_per_source", 0) or None, link=data.link)
+        if not record:  # a read-only command (encoder-probe): nothing is written into the work folder
+            return profile, data, ISL_FEATURES, work
         write_extra_concepts(data.linker, work / "extra_concepts.jsonl")
         used = Counter(c.source for c in data.extra if c.concept_id)
         used.update({"include": sum(1 for c in data.include if c.concept_id), "islrtc": len(data.islrtc)})
@@ -641,14 +648,91 @@ def cmd_train_encoder(paths: IslPaths, args) -> int:
 
     profile, data, fcfg, work = _model_ctx(paths, args)
     _print({"data": data.summary()})
-    res = train_encoder(data, work / "encoder.pt", fcfg, _train_cfg(args, SMOKE_ENC),
+    out = Path(args.ckpt) if getattr(args, "ckpt", None) else work / "encoder.pt"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    res = train_encoder(data, out, fcfg, _train_cfg(args, SMOKE_ENC),
                         emb_dim=args.emb_dim or (128 if args.smoke else 256), p=args.p, k=args.k, smoke=args.smoke,
                         threads=args.threads, batches_per_epoch=args.batches or (20 if args.smoke else None),
                         progress=lambda f, m: _log(f"  encoder {m}"), init_from=_init_path(args, work),
                         use_extra=args.all_sources, resume=args.resume, max_minutes=args.max_minutes,
-                        exclude_sources=_exclude_sources(args))
+                        exclude_sources=_exclude_sources(args), **_encoder_options(args))
     _print(res)
     return 0 if res.get("finished", True) else EX_PARTIAL
+
+
+def _encoder_options(args) -> dict:
+    """The bridge sampler and validation options of train-encoder / train-oneshot (docs 15.40); none given = the
+    old sampler and validation, and no new key in the resume signature."""
+    return {"bridge_p": int(getattr(args, "bridge_p", 0) or 0), "bridge_weights": getattr(args, "source_weights", None),
+            "val_protocol": getattr(args, "val_protocol", None) or "mixed",
+            "dict_val_per_signer": int(getattr(args, "dict_val_per_signer", 300))}
+
+
+def _bridge_weights_arg(v: str) -> dict | None:
+    """argparse type of ``--source-weights`` (bridge signer sources; docs 15.40; exit 2 on a bad value)."""
+    from app.isl.training.train_encoder import parse_bridge_weights
+
+    try:
+        return parse_bridge_weights(v)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
+def cmd_encoder_probe(paths: IslPaths, args) -> int:
+    """Any encoder checkpoint on the dictionary validation protocol (QA plan 1.5, critics 3 and 14; docs 15.40).
+
+    Read-only: loads the data like the training steps (``--all-sources``, the work folder's link settings) but
+    writes nothing into the work folder; the result goes to stdout and ``--out``. The split defaults to the
+    encoder's own. ``--bar`` (a probe JSON or a number) warns when the INCLUDE -> ISLRTC recall@1 is below it."""
+    import torch
+
+    from app.isl.training.multisource import read_link_settings
+    from app.isl.training.train_encoder import probe_encoder
+
+    def refuse(msg: str) -> int:
+        print(f"encoder-probe: {msg}", file=sys.stderr)
+        return 2
+
+    from app.isl.profiles import get_profile
+    from app.isl.training.pipeline import workdir
+
+    profile = get_profile(args.profile or "commercial-safe").name
+    enc = Path(args.encoder) if args.encoder else workdir(profile) / "encoder.pt"
+    if not enc.is_file():
+        return refuse(f"no encoder checkpoint {enc} (--encoder)")
+    meta = torch.load(enc, map_location="cpu", weights_only=False).get("meta") or {}
+    enc_split = (meta.get("data") or {}).get("split")
+    if not args.split and enc_split:
+        args.split = enc_split
+    bar = None
+    if args.bar:
+        b = Path(args.bar)
+        try:
+            bar = float(json.loads(b.read_text())["include_r1"]) if b.is_file() else float(args.bar)
+        except (ValueError, KeyError, TypeError):
+            return refuse(f"--bar {args.bar}: a probe JSON with include_r1, or a number")
+    if args.work:
+        args.link_settings_override = read_link_settings(Path(args.work))
+    args.all_sources = True
+    args.profile = profile
+    profile, data, _fcfg, _work = _model_ctx(paths, args, record=False)
+    res = probe_encoder(data, enc, per_signer=args.per_signer, threads=args.threads)
+    res["encoder_profile"] = meta.get("profile")
+    if enc_split and data.split.get("name") != enc_split:
+        res["warning_split"] = (f"probed on split {data.split.get('name')}, the encoder was selected on {enc_split}: "
+                                "its validation clips may be another split's training clips")
+    if bar is not None:
+        inc = res.get("include_r1")
+        res["bar"] = {"include_r1": bar, "source": args.bar, "below": inc is None or inc < bar}
+        if res["bar"]["below"]:
+            res["warning_bar"] = f"INCLUDE -> ISLRTC r1 {inc} is below the bar {bar} ({args.bar})"
+            print(f"encoder-probe: WARNING {res['warning_bar']}", file=sys.stderr)
+    if args.out:
+        o = Path(args.out)
+        o.parent.mkdir(parents=True, exist_ok=True)
+        o.write_text(json.dumps(res, indent=1, default=str))
+    _print(res)
+    return 0
 
 
 def _exclude_sources(args) -> tuple[str, ...]:
@@ -797,7 +881,7 @@ def cmd_train_oneshot(paths: IslPaths, args) -> int:
                             progress=lambda f, m, _k=k: _log(f"  oneshot fold{_k} {m}"),
                             init_from=_init_path(args, work), use_extra=args.all_sources, resume=args.resume,
                             max_minutes=args.max_minutes, version=f"isl-enc-1-oneshot{k}",
-                            exclude_sources=_exclude_sources(args))
+                            exclude_sources=_exclude_sources(args), **_encoder_options(args))
         out[k] = {**res, "held_out": len(fd["held_out_concepts"]), "held_out_expanded": len(held)}
         if not res.get("finished", True):
             code = EX_PARTIAL
@@ -1318,7 +1402,7 @@ COMMANDS = {
     "build-pack": cmd_build_pack, "smoke": cmd_smoke, "hindi": cmd_hindi,
     "link-sources": cmd_link_sources, "pretrain": cmd_pretrain, "train-oneshot": cmd_train_oneshot,
     "train-fingerspell": cmd_train_fingerspell, "bench": cmd_bench, "readiness": cmd_readiness,
-    "pretrain-dedup": cmd_pretrain_dedup, "variant-audit": cmd_variant_audit,
+    "pretrain-dedup": cmd_pretrain_dedup, "variant-audit": cmd_variant_audit, "encoder-probe": cmd_encoder_probe,
 }
 
 
@@ -1348,7 +1432,8 @@ def _model_args(sp, train: bool = False) -> None:
                         help="stop after this long with the state saved (exit code 75); run again with --resume")
         sp.add_argument("--init", default=None, help="encoder warm start: a checkpoint, 'auto' (pretrained) or 'none'")
         sp.add_argument("--min-signers", type=int, default=2, help="classifier: signer groups a class needs")
-        sp.add_argument("--ckpt", help="classifier: checkpoint path (default <work>/classifier.pt)")
+        sp.add_argument("--ckpt", help="classifier / train-encoder: checkpoint path (default <work>/classifier.pt, "
+                                        "<work>/encoder.pt)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1431,6 +1516,20 @@ def build_parser() -> argparse.ArgumentParser:
         if name in ("train-encoder", "train-oneshot"):
             spx.add_argument("--exclude-sources", default="", type=_exclude_sources_arg,
                              help="comma-separated sources left out of encoder supervision, e.g. wslp (docs 15.32)")
+            spx.add_argument("--bridge-p", type=int, default=0,
+                             help="bridge sampler (docs 15.40): this many of the P concepts per batch are bridge "
+                                  "concepts (an ISLRTC row and a signer clip), drawn as one ISLRTC row + one signer "
+                                  "clip; multi concepts then need two recording groups. Plan value 12. Default 0 = "
+                                  "the old sampler")
+            spx.add_argument("--source-weights", type=_bridge_weights_arg, default=None,
+                             help="signer source of a bridge pair: 'include=0.5,isl500=0.35,mendeley=0.15' (the "
+                                  "default with --bridge-p; renormalised over the sources a concept has)")
+            spx.add_argument("--val-protocol", choices=["mixed", "dictionary"], default="mixed",
+                             help="epoch selection: mixed (default, as before: val_r1 against ISLRTC + training "
+                                  "clips) or dictionary (INCLUDE val, ISL500 val per signer, Mendeley val against "
+                                  "the ISLRTC rows only; select 0.5 r1_include + 0.5 mean r1 of the others)")
+            spx.add_argument("--dict-val-per-signer", type=int, default=300,
+                             help="dictionary protocol: ISL500 validation clips per signer (0 = all)")
     lk = sub.add_parser("link-sources")
     _model_args(lk)
     lk.add_argument("--link-aliases", action="store_true",
@@ -1467,6 +1566,12 @@ def build_parser() -> argparse.ArgumentParser:
     vau.add_argument("--dict-include-max-rank", type=int, default=20)
     vau.add_argument("--reverse-min-agreement", type=float, default=0.3)
     vau.add_argument("--max-per-class", type=int, default=0, help="score at most N train clips per word (0 = all)")
+    ep = sub.add_parser("encoder-probe")
+    _model_args(ep)
+    ep.add_argument("--encoder", help="encoder checkpoint (default <work>/encoder.pt)")
+    ep.add_argument("--work", help="work folder whose link_settings.json links the data (default: the profile's)")
+    ep.add_argument("--per-signer", type=int, default=300, help="ISL500 validation clips per signer (0 = all)")
+    ep.add_argument("--bar", help="a probe JSON (its include_r1) or a number: warn when INCLUDE r1 is below it")
     pdd = sub.add_parser("pretrain-dedup")
     _model_args(pdd)
     pdd.add_argument("--max-chunks", type=int, default=0, help="smoke: check at most N Sign Library chunks")

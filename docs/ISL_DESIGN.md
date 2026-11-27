@@ -4365,3 +4365,110 @@ classifier and cv stamps of other settings give the warning, current ones do not
 groups on the review's real counts; the classifier's temperature is the weighted fit of the best checkpoint's
 validation logits; `--temperature-fit` works with `macro_f1` and is in the resume signature; with only Mendeley
 validation clips `val_worst_major_f1` falls back to the pooled macro F1.
+
+### 15.40 Encoder: a dictionary-anchored sampler and a validation that sees the dictionary (QA plan 1.5, critics 3, 11 and 14, 27 Nov 2026)
+
+**Why.** The research encoder never learned INCLUDE <-> ISLRTC: the mean true-pair cosine stayed at the pretrained
+level (critic 1). The P x K sampler draws a concept and then two clips by source weight. A concept with 200 ISL500
+clips and one ISLRTC row almost never gives an INCLUDE + ISLRTC pair (about 13 per epoch in total). And the old
+`val_r1` is about 94 % ISL500 queries against a gallery that also holds training clips, so it cannot see the
+dictionary either.
+
+**The bridge sampler (`loop.pk_batches`, `bridge_plan`; `train-encoder` / `train-oneshot --bridge-p N`).**
+* A bridge concept has an ISLRTC row and at least one signer clip (INCLUDE, ISL500 or Mendeley) in the training list.
+* Every batch first takes `N` bridge concepts (plan: 12 of P = 32). Each gives one ISLRTC row plus K-1 signer clips.
+* The signer source is drawn by `--source-weights` (default `include=0.5,isl500=0.35,mendeley=0.15`), renormalised over
+  the sources that concept has. `mendeley` means every `mendeley_*` source. A dictionary source is refused (it is the
+  anchor side), and so is an unknown name.
+* Then "multi" concepts fill the batch up to half of P (the bridge concepts count toward that half). A multi concept
+  now needs two recording groups: two ISLRTC rows of one word are one group, the dictionary
+  (`signer_group_key(dictionary_group=True)`). The rest is uniform, as before.
+* Without `--bridge-p` the draws are exactly the old ones (a test compares them with the old code).
+* The meta has `sampler`: the bridge concepts per signer source, the multi concepts, and the expected anchor <-> source
+  pairs per concept over the planned run (`expected_pairs_per_label`). The plan's target is at least 50 INCLUDE pairs
+  per INCLUDE concept. The first log line prints the same.
+
+**The dictionary validation (`--val-protocol dictionary`; default `mixed` = the old one).**
+* Queries: every INCLUDE validation clip, ISL500 validation clips stratified at 300 per signer
+  (`--dict-val-per-signer`, 0 = all) and every Mendeley validation clip. A query whose word has no ISLRTC row is left
+  out (it cannot be retrieved). The counts before and after are in meta `val_dictionary_sets`.
+* Gallery: the ISLRTC rows only, no training clip.
+* Held-out concepts of a one-shot fold are in neither the queries nor the gallery (critic 11). So fold selection never
+  sees a held-out concept. The same code serves the encoder and the oneshot folds.
+* Features are cached once (float16); the old and the new sets share one cache, so each clip is embedded once per epoch.
+* Every history row has `val_dict_r1_<src>`, `val_dict_r5_<src>` and `val_dict_n_<src>` for `include`, `isl500` and
+  `mendeley`, the pooled `val_dict_r1`, and the old `val_r1` / `val_r5` as a secondary. Each epoch logs one line:
+  `val dictionary: include->islrtc r1 ... isl500->islrtc r1 ...; select ...; old val_r1 ...`.
+* The epoch is selected on `val_dict_select = 0.5 * r1_include + 0.5 * mean(r1 of the other sources)`. With one side
+  missing it is that side alone. The meta records `val_protocol`, `select_key` and the best epoch's `val_dict`.
+
+**Resume signature.** `LoopConfig.extra` gets `bridge` (N, weights, anchor, the bridge concepts' hash) and
+`val_protocol` / `val_dict` (per-signer count and the query and gallery hashes) only when they are on (rule of 15.19).
+A state of the old settings still resumes with the old options; a change of either is refused (`StateMismatch`).
+
+**Measuring any encoder: `cli encoder-probe` (critic 3).** It runs one encoder checkpoint on exactly this protocol.
+* Read-only: it loads the data like the training steps, writes nothing into the work folder, and prints the result
+  (`--out FILE` also writes it). The split defaults to the encoder's own.
+* The encoder's `excluded_concepts` and excluded sources are left out, as in training.
+* `--bar FILE|R1`: a previous probe JSON (its `include_r1`) or a number. Below it, the result has `warning_bar` and the
+  command prints a warning. This is the plan's "warn when INCLUDE -> ISLRTC r1 falls below the previous value".
+* `--work DIR` reads that folder's `link_settings.json` (default: the profile's work folder).
+* Smoke on a copy of the commercial-safe encoder (300 ISLRTC rows, 1 thread): 15 s, 0.86 GB. The full protocol is
+  about 15k clips, about 1 min at 1 thread and about 1.5 GB.
+
+**The encoder gate bar (critic 3).** The plan's bar of 0.352 came from another protocol. Measure the commercial-safe
+encoder on this protocol and use its number. Run both encoders on the same data (the research profile, so ISL500 is
+measured too), from `backend/`:
+
+    nice -n 10 ../.venv/bin/python -m app.isl.cli encoder-probe --profile research \
+      --vocab ../artifacts/isl/research/vocabulary.jsonl --threads 2 \
+      --encoder ../artifacts/isl/commercial-safe/encoder.pt --out <scratch>/probe_cs.json
+    nice -n 10 ../.venv/bin/python -m app.isl.cli encoder-probe --profile research \
+      --vocab ../artifacts/isl/research/vocabulary.jsonl --threads 2 \
+      --encoder <new encoder.pt> --bar <scratch>/probe_cs.json --out <scratch>/probe_new.json
+
+Gate: `include_r1` of the new encoder >= `include_r1` of `probe_cs.json`, and `by_source.isl500.r1` >= 0.25 (plan).
+
+**A short encoder probe run first (critic 14).** The driver has a new `--until STEP`: stop after STEP; later steps are
+neither run nor forgotten. Two scratch arms of about 3 epochs, each logging INCLUDE -> ISLRTC r1 per epoch:
+
+    PHASE2_TAG=encprobe-bridge ENC_EPOCHS=3 ENC_STEPS=400 scripts/phase2_train.sh --profile research --from encoder --until encoder
+    PHASE2_TAG=encprobe-plain ENC_EPOCHS=3 ENC_STEPS=400 ENC_BRIDGE_P=0 scripts/phase2_train.sh --profile research --from encoder --until encoder
+
+* Both use the dictionary validation (research default), so the per-epoch lines compare directly.
+* Each is a scratch run (15.19-15.20): own work folder `artifacts/isl/runs/<tag>/research`, the earlier steps seeded
+  from `artifacts/isl/research`. About 3 x 400 x 0.54 s plus validation: about 20-25 min per arm at 4 threads.
+* The research work folder has no `link_settings.json` yet (it was linked before 15.34), so a probe seeded from it links
+  without aliases. That is fine for this comparison; the full run relinks with `--from link`.
+* `encoder-probe` on each arm's `encoder.pt` gives the same numbers as the gate.
+
+**Driver.**
+* `ENC_BRIDGE_P` (research 12, commercial-safe 0), `ENC_SOURCE_WEIGHTS` (empty = the default weights; needs
+  `ENC_BRIDGE_P` > 0) and `ENC_VAL` (research `dictionary`, commercial-safe `mixed`). They go to the encoder AND the
+  oneshot step. A bad value exits 2 before anything runs.
+* Full research runs now default to 800 steps per epoch for the encoder AND oneshot (the plan; oneshot read
+  `ENC_STEPS` before too). `ONESHOT_STEPS` sets oneshot alone. Commercial-safe keeps 400 and 300: its commands are
+  unchanged.
+* The encoder and oneshot stamps and the start line record `bridge_p=... source_weights=... val=...`; `--dry-run`
+  prints an `encoder:` line with the settings.
+* Cost: research encoder 40 x 800 steps is about 5.8 h, oneshot 2 folds x 20 x 800 about 5.5 h (plan table).
+
+**Not changed.** The running Batch 0.6 chain: the driver file was replaced, not edited in place, so the running bash
+keeps its own copy; fit-fusion, evaluate, build-index and build-pack import nothing new. ASL is untouched.
+
+**Open.**
+* The selection key gives Mendeley (about 12 validation clips with a dictionary row) the same weight as ISL500
+  (600). That is the plan's formula; it is noisy. A `clips / 20` damping, as in the temperature fit (15.39), would be
+  a small follow-up if the per-epoch curves jump.
+* The INCLUDE validation clips now also choose the encoder epoch. That adds to the selection reuse of critic 8.
+
+Tests (`backend/tests/isl/test_encoder_bridge.py`): the default draws equal the old code's; in a toy world every batch
+of P = 32 has at least 12 ISLRTC <-> signer pairs (the old sampler under 6), also with K = 3; the signer source shares
+follow the weights within 2 % and renormalise per concept; two ISLRTC rows are no multi concept; the expected pairs
+match the draws; weight parsing and the CLI refuse a dictionary source and bad values (exit 2); the validation gallery
+has only ISLRTC rows, held-out concepts are in neither set, ISL500 is stratified per signer; the per-source metrics and
+the selection key; a toy training run has the per-source keys in every history row, selects on the key and refuses a
+changed bridge or protocol on resume; the default run adds no resume key; `encoder-probe` writes nothing into the work
+folder, matches the encoder's own best epoch, warns below a bar and leaves out a fold encoder's held-out concepts; the
+driver's research defaults, commercial-safe unchanged, bad values refused, and `--from encoder --until encoder` runs
+and forgets only the encoder.

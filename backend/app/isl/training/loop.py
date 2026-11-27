@@ -315,9 +315,20 @@ def expected_draw_shares(labels: list[int], weights: list[float] | None, keys: l
 
 
 def pk_batches(labels: list[int], p: int, k: int, n_batches: int, seed: int, epoch: int,
-               weights: list[float] | None = None) -> Iterator[list[int]]:
+               weights: list[float] | None = None, *, groups: list[str] | None = None,
+               bridge: "BridgePlan | None" = None) -> Iterator[list[int]]:
     """P labels x K items (with replacement for small labels); half of P from multi-item labels. With
-    ``weights`` (per item, e.g. per source) the K items of a label are drawn by weight."""
+    ``weights`` (per item, e.g. per source) the K items of a label are drawn by weight.
+
+    ``groups`` (the recording group of every item, e.g. ``signer_group_key(c, dictionary_group=True)``): a "multi"
+    label then needs at least 2 distinct groups (two ISLRTC rows of one word are one group, the dictionary), not
+    just 2 items. ``bridge`` (:func:`bridge_plan`, docs/ISL_DESIGN.md 15.40): first ``bridge.p`` bridge labels per
+    batch, each with K = one anchor (ISLRTC) item plus K-1 signer clips, the signer source drawn by
+    ``bridge.weights`` over the sources that label has; then multi labels up to half of P (the bridge labels count
+    toward that half), then uniform. Without both the draws are exactly the old ones."""
+    if groups is not None or bridge is not None:
+        yield from _bridge_pk_batches(labels, p, k, n_batches, seed, epoch, weights, groups, bridge)
+        return
     rng = random.Random(f"{seed}:{epoch}")
     by = defaultdict(list)
     for i, y in enumerate(labels):
@@ -338,3 +349,101 @@ def pk_batches(labels: list[int], p: int, k: int, n_batches: int, seed: int, epo
             else:
                 batch += rng.sample(idx, k) if len(idx) >= k else [rng.choice(idx) for _ in range(k)]
         yield batch
+
+
+@dataclass
+class BridgePlan:
+    """The bridge labels of :func:`pk_batches` (docs/ISL_DESIGN.md 15.40): per label, its anchor items (ISLRTC rows)
+    and its signer items by signer source (``include`` / ``isl500`` / ``mendeley``...), with the source weights."""
+    p: int
+    weights: dict[str, float]
+    anchors: dict[int, list[int]]
+    signers: dict[int, dict[str, list[int]]]
+
+    @property
+    def labels(self) -> list[int]:
+        return sorted(self.anchors)
+
+    def source_probs(self, y: int) -> dict[str, float]:
+        """Probability of each signer source for one signer clip of label ``y`` (weights renormalised over the
+        sources ``y`` has)."""
+        av = {s: self.weights[s] for s in self.signers[y]}
+        tot = sum(av.values())
+        return {s: w / tot for s, w in sorted(av.items())}
+
+
+def bridge_plan(labels: list[int], anchor: list[bool], signer_source: list[str | None], weights: dict[str, float],
+                p: int) -> BridgePlan:
+    """``anchor[i]``: item i is a dictionary anchor (an ISLRTC row); ``signer_source[i]``: the signer source key of
+    item i (a key of ``weights``) or None. A bridge label has at least one anchor and one signer item whose source
+    has a weight > 0."""
+    anchors: dict[int, list[int]] = defaultdict(list)
+    signers: dict[int, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+    for i, y in enumerate(labels):
+        if anchor[i]:
+            anchors[y].append(i)
+        elif signer_source[i] is not None and weights.get(signer_source[i], 0.0) > 0:
+            signers[y][signer_source[i]].append(i)
+    keep = sorted(set(anchors) & set(signers))
+    return BridgePlan(int(p), {s: float(w) for s, w in weights.items() if w > 0},
+                      {y: anchors[y] for y in keep}, {y: dict(signers[y]) for y in keep})
+
+
+def _bridge_pk_batches(labels, p, k, n_batches, seed, epoch, weights, groups, bridge):
+    rng = random.Random(f"{seed}:{epoch}")
+    by = defaultdict(list)
+    for i, y in enumerate(labels):
+        by[y].append(i)
+    if groups is not None:
+        gs = defaultdict(set)
+        for i, y in enumerate(labels):
+            gs[y].add(groups[i])
+        multi = sorted(y for y in by if len(gs[y]) > 1)
+    else:
+        multi = sorted(y for y, v in by.items() if len(v) > 1)
+    allc = sorted(by)
+    p = min(p, len(allc))
+    blabels = bridge.labels if bridge is not None else []
+    bprobs = {y: bridge.source_probs(y) for y in blabels}
+    for _ in range(n_batches):
+        nb = min(bridge.p, len(blabels), p) if bridge is not None else 0
+        bchosen = set(rng.sample(blabels, nb)) if nb else set()
+        avail = [y for y in multi if y not in bchosen]
+        n_multi = min(len(avail), max(0, p // 2 - nb))
+        chosen = bchosen | (set(rng.sample(avail, n_multi)) if n_multi else set())
+        rest = [y for y in allc if y not in chosen]
+        chosen |= set(rng.sample(rest, min(len(rest), p - len(chosen))))
+        batch = []
+        for y in sorted(chosen):
+            if y in bchosen:
+                batch.append(rng.choice(bridge.anchors[y]))
+                srcs = list(bprobs[y])
+                for _ in range(max(1, k - 1)):
+                    s = rng.choices(srcs, weights=[bprobs[y][x] for x in srcs])[0] if len(srcs) > 1 else srcs[0]
+                    batch.append(rng.choice(bridge.signers[y][s]))
+                continue
+            idx = by[y]
+            if weights is not None and len(idx) > k:
+                batch += rng.choices(idx, weights=[weights[i] for i in idx], k=k)
+            else:
+                batch += rng.sample(idx, k) if len(idx) >= k else [rng.choice(idx) for _ in range(k)]
+        yield batch
+
+
+def expected_bridge_pairs(bridge: BridgePlan, p: int, k: int, n_labels: int, steps: int, source: str) -> dict:
+    """Expected anchor <-> ``source`` pairs per bridge label that has ``source`` over ``steps`` batches (for the
+    meta: the plan's target is >= 50 INCLUDE <-> ISLRTC pairs per INCLUDE concept over the run)."""
+    labs = bridge.labels
+    if not labs:
+        return {"labels": 0}
+    nb = min(bridge.p, len(labs), p, n_labels)
+    per = []
+    for y in labs:
+        pr = bridge.source_probs(y).get(source)
+        if pr:
+            per.append(steps * nb / len(labs) * max(1, k - 1) * pr)
+    if not per:
+        return {"labels": 0}
+    per.sort()
+    return {"labels": len(per), "min": round(per[0], 1), "median": round(per[len(per) // 2], 1),
+            "max": round(per[-1], 1)}

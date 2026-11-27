@@ -12,8 +12,19 @@ held-out-concept one-shot protocol E2); ``exclude_sources`` removes whole source
 second view of the ISLRTC dictionary videos whose "pairs" with ISLRTC teach nothing, docs/ISL_DESIGN.md 15.32);
 training runs in the resumable loop (``loop.py``).
 
-Validation (model selection): retrieval recall@1 / @5 of held-out INCLUDE (+ signer-held-out extra) validation
-clips against a gallery of ISLRTC references plus a few training clips per concept and source.
+Validation (model selection), ``val_protocol``:
+
+* ``mixed`` (default, as before): retrieval recall@1 / @5 of held-out INCLUDE (+ signer-held-out extra) validation
+  clips against a gallery of ISLRTC references plus a few training clips per concept and source (``val_r1``).
+* ``dictionary`` (QA plan 1.5, docs/ISL_DESIGN.md 15.40): queries = every INCLUDE validation clip, ISL500
+  validation stratified at ``dict_val_per_signer`` clips per signer and every Mendeley validation clip; gallery = the
+  ISLRTC dictionary rows only (no training clip). Per-source recall@1 / @5 are logged; the epoch is selected on
+  ``val_dict_select = 0.5 * r1_include + 0.5 * mean(r1 of the other sources)``. The old ``val_r1`` is still logged.
+  Held-out concepts (one-shot folds) are left out of both queries and gallery (critic 11).
+
+Sampler: the P x K sampler of ``loop.pk_batches``; with ``bridge_p`` > 0 (docs 15.40) that many labels per batch are
+"bridge" concepts (an ISLRTC row and a signer clip) drawn as one ISLRTC row + one signer clip, the signer source by
+``bridge_weights``, and a "multi" label needs two recording groups (the dictionary is one group).
 """
 
 from __future__ import annotations
@@ -32,9 +43,10 @@ from torch import nn
 from app.features.spec import FeatureConfig
 from app.isl.models.encoder import SignEncoder, load_encoder_weights
 from app.isl.models.losses import SubCenterArcFace, SupConLoss
-from app.isl.training.common import ClipDataset, IslData, LazyClipDataset, class_space_of, set_threads
-from app.isl.training.loop import (LoopConfig, atomic_save, clips_digest, digest, file_digest, pk_batches, run_loop,
-                                   train_config_signature)
+from app.isl.training.common import (DICTIONARY_SOURCES, ClipDataset, IslData, LazyClipDataset, class_space_of,
+                                     set_threads, signer_group_key)
+from app.isl.training.loop import (LoopConfig, atomic_save, bridge_plan, clips_digest, digest, expected_bridge_pairs,
+                                   file_digest, pk_batches, run_loop, train_config_signature)
 from app.isl.training.multisource import SAMPLE_WEIGHTS
 from app.models.checkpoint import frame_mask
 from app.training.trainer import TrainConfig, set_seed
@@ -42,6 +54,17 @@ from app.training.trainer import TrainConfig, set_seed
 log = logging.getLogger(__name__)
 
 ENCODER_VERSION = "isl-enc-1"
+
+# validation protocols (docs 15.40): "mixed" = the old one (default), "dictionary" = QA plan 1.5
+VAL_PROTOCOLS = ("mixed", "dictionary")
+# the query sources of the dictionary protocol (a family key: every mendeley_* source is "mendeley")
+DICT_VAL_SOURCES = ("include", "isl500", "mendeley")
+DICT_VAL_PER_SIGNER = 300  # ISL500 validation clips per signer (stratified sample)
+DICT_SELECT_KEY = "val_dict_select"
+# bridge sampler (QA plan 1.5): the signer source of a bridge pair; renormalised over the sources a concept has
+DEFAULT_BRIDGE_WEIGHTS = {"include": 0.5, "isl500": 0.35, "mendeley": 0.15}
+DEFAULT_BRIDGE_P = 12
+BRIDGE_ANCHOR = "islrtc"
 
 
 def feature_config_diff(init_fc: dict | None, fcfg: FeatureConfig) -> dict:
@@ -110,6 +133,160 @@ def _features_cache(clips, fcfg) -> tuple[np.ndarray, list]:
     return (np.stack(feats) if feats else np.zeros((0, fcfg.seq_len, fcfg.dim), np.float16)), kept
 
 
+def source_family(source: str) -> str:
+    """``mendeley`` for every ``mendeley_*`` source, else the source name (the per-source validation keys)."""
+    return "mendeley" if source.startswith("mendeley") else source
+
+
+def signer_key(source: str, weights: dict[str, float]) -> str | None:
+    """The key of ``weights`` a training source draws under as a bridge signer clip: its own name when named, else
+    its family (``mendeley``), else None (not a signer source of the bridge)."""
+    if source in weights:
+        return source
+    fam = source_family(source)
+    return fam if fam in weights else None
+
+
+def parse_bridge_weights(spec) -> dict[str, float] | None:
+    """``--source-weights``: ``include=0.5,isl500=0.35,mendeley=0.15`` (the default), ``default`` or a dict. Keys are
+    signer sources or the ``mendeley`` family; a dictionary source (the anchor side) or an unknown name is refused,
+    and so are negative, non-finite or all-zero weights. None / ``none`` -> None (the default weights)."""
+    from app.isl.profiles import WORD_SOURCES
+    from app.isl.training.source_quota import parse_source_quota
+
+    if spec is None or (isinstance(spec, str) and spec.strip().lower() in ("", "none", "default")):
+        return None
+    try:
+        w = parse_source_quota(spec)
+    except ValueError as e:
+        raise ValueError(str(e).replace("source quota", "source weights")) from None
+    known = ({s for v in WORD_SOURCES.values() for s in v} - set(DICTIONARY_SOURCES)) | {"mendeley"}
+    bad = sorted(set(w) - known)
+    if bad:
+        raise ValueError(f"source weights: {bad} cannot be a bridge signer source (the dictionary is the anchor "
+                         f"side); signer sources: {sorted(known)}")
+    return w
+
+
+def dictionary_val_sets(data: IslData, excl: set[str] = frozenset(), xsrc=(), per_signer: int = DICT_VAL_PER_SIGNER,
+                        seed: int = 0) -> tuple[list, list, dict]:
+    """Queries and gallery of the ``dictionary`` validation protocol (docs 15.40).
+
+    Gallery: every ISLRTC dictionary row of a concept not in ``excl`` (no training clip). Queries: every INCLUDE
+    validation clip, ISL500 validation clips stratified at ``per_signer`` per signer, every Mendeley validation clip,
+    of concepts not in ``excl`` (held-out one-shot concepts never take part, critic 11), of sources not in ``xsrc``
+    and with a dictionary row (a query whose word has no row cannot be retrieved). Returns ``(queries, gallery,
+    info)``; ``info`` counts the queries per source before and after the dictionary-row filter."""
+    xs = set(xsrc or ())
+    excl = set(excl or ())
+    gal = [c for c in data.islrtc if c.concept_id and c.concept_id not in excl]
+    gconcepts = {c.concept_id for c in gal}
+    cand = [c for c in data.include_part("val") if c.source not in xs and c.concept_id not in excl]
+    isl = defaultdict(list)
+    for c in data.extra_part("val"):
+        if c.source in xs or c.concept_id in excl:
+            continue
+        fam = source_family(c.source)
+        if fam == "isl500":
+            isl[c.group or c.clip_id].append(c)
+        elif fam in DICT_VAL_SOURCES:
+            cand.append(c)
+    rng = random.Random(f"{seed}:dictionary-val")
+    for g in sorted(isl):
+        v = sorted(isl[g], key=lambda c: c.clip_id)
+        cand += rng.sample(v, per_signer) if 0 < per_signer < len(v) else v
+    q = [c for c in cand if c.concept_id in gconcepts]
+    by_src = defaultdict(lambda: [0, 0])
+    for c in cand:
+        by_src[source_family(c.source)][0] += 1
+    for c in q:
+        by_src[source_family(c.source)][1] += 1
+    info = {"gallery": len(gal), "gallery_concepts": len(gconcepts), "per_signer": per_signer,
+            "isl500_signers": len(isl), "excluded_concepts": len(excl),
+            "queries": {s: {"candidates": a, "with_dictionary_row": b} for s, (a, b) in sorted(by_src.items())}}
+    return q, gal, info
+
+
+def _top5(q: np.ndarray, g: np.ndarray, g_lab: list) -> tuple[list, np.ndarray]:
+    """Best gallery score per label (max over a label's rows), then the 5 best labels per query."""
+    labs = sorted(set(g_lab))
+    pos = {c: i for i, c in enumerate(labs)}
+    order = np.argsort(np.array([pos[c] for c in g_lab]), kind="stable")
+    gi = np.array([pos[g_lab[j]] for j in order])
+    starts = np.flatnonzero(np.r_[True, gi[1:] != gi[:-1]])
+    out = []
+    for a in range(0, len(q), 512):
+        s = q[a:a + 512] @ g[order].T
+        cs = np.maximum.reduceat(s, starts, axis=1)
+        out.append(np.argsort(-cs, axis=1, kind="stable")[:, :5])
+    return labs, (np.concatenate(out) if out else np.zeros((0, 5), np.int64))
+
+
+def dictionary_val_metrics(q: np.ndarray, q_clips: list, g: np.ndarray, g_lab: list) -> dict:
+    """Per-source recall@1 / @5 of the dictionary protocol: ``val_dict_r1_<src>``, ``val_dict_r5_<src>``,
+    ``val_dict_n_<src>`` for every query source family present, the pooled ``val_dict_r1`` / ``val_dict_r5`` and the
+    selection key ``val_dict_select = 0.5 * r1_include + 0.5 * mean(r1 of the other sources)`` (only one side
+    present: that side; no query: 0)."""
+    out: dict = {}
+    if len(q) == 0 or len(g) == 0:
+        out.update(val_dict_r1=0.0, val_dict_r5=0.0, val_dict_n=0)
+        out[DICT_SELECT_KEY] = 0.0
+        return out
+    labs, top = _top5(q, g, g_lab)
+    hit1 = defaultdict(int)
+    hit5 = defaultdict(int)
+    n = defaultdict(int)
+    for b, c in enumerate(q_clips):
+        s = source_family(c.source)
+        t = [labs[j] for j in top[b]]
+        n[s] += 1
+        hit1[s] += int(t[0] == c.concept_id)
+        hit5[s] += int(c.concept_id in t)
+    for s in sorted(n):
+        out[f"val_dict_r1_{s}"] = hit1[s] / n[s]
+        out[f"val_dict_r5_{s}"] = hit5[s] / n[s]
+        out[f"val_dict_n_{s}"] = n[s]
+    out["val_dict_r1"] = sum(hit1.values()) / len(q_clips)
+    out["val_dict_r5"] = sum(hit5.values()) / len(q_clips)
+    out["val_dict_n"] = len(q_clips)
+    out[DICT_SELECT_KEY] = dictionary_select(out)
+    return out
+
+
+def dictionary_select(m: dict) -> float:
+    """``0.5 * r1_include + 0.5 * mean(r1 of the other query sources)`` from a :func:`dictionary_val_metrics` row."""
+    inc = m.get("val_dict_r1_include") if m.get("val_dict_n_include") else None
+    others = [m[f"val_dict_r1_{s}"] for s in sorted({k[len("val_dict_n_"):] for k in m if k.startswith("val_dict_n_")})
+              if s != "include" and m.get(f"val_dict_n_{s}")]
+    oth = sum(others) / len(others) if others else None
+    if inc is not None and oth is not None:
+        return 0.5 * inc + 0.5 * oth
+    return float(inc if inc is not None else (oth if oth is not None else 0.0))
+
+
+class _FeatureBank:
+    """Validation features cached once (float16) for several clip lists that share clips (the old and the
+    dictionary protocol): every clip is featurised and embedded once per epoch."""
+
+    def __init__(self, lists: dict[str, list], fcfg: FeatureConfig):
+        uniq, key_of = [], {}
+        for v in lists.values():
+            for c in v:
+                key = (c.clip_id, c.start, c.end)
+                if key not in key_of:
+                    key_of[key] = len(uniq)
+                    uniq.append(c)
+        feats, kept = _features_cache(uniq, fcfg)
+        row = {(c.clip_id, c.start, c.end): i for i, c in enumerate(kept)}
+        self.feats = feats
+        self.rows = {n: np.array([row[(c.clip_id, c.start, c.end)] for c in v if (c.clip_id, c.start, c.end) in row],
+                                 np.int64) for n, v in lists.items()}
+        self.clips = {n: [c for c in v if (c.clip_id, c.start, c.end) in row] for n, v in lists.items()}
+
+    def embed(self, enc, fcfg) -> np.ndarray:
+        return embed_array(enc, self.feats, fcfg)
+
+
 def encoder_training_clips(data: IslData, exclude: set[str], use_extra: bool = True,
                            exclude_sources: tuple[str, ...] | list[str] | set[str] = ()) -> list:
     """Supervised training clips: INCLUDE train + ISLRTC + (extra sources' train part), minus every clip of an
@@ -158,7 +335,16 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
                   resume: bool = False, max_minutes: float = 0.0, state_path: Path | None = None,
                   max_val_queries: int = 1500, max_gallery: int = 8000, per_concept_gallery: int = 2,
                   version: str = ENCODER_VERSION, cache_items: int = 12000,
-                  exclude_sources: tuple[str, ...] | list[str] = ()) -> dict:
+                  exclude_sources: tuple[str, ...] | list[str] = (), bridge_p: int = 0,
+                  bridge_weights: dict | None = None, val_protocol: str = "mixed",
+                  dict_val_per_signer: int = DICT_VAL_PER_SIGNER) -> dict:
+    """``bridge_p`` > 0 turns the bridge sampler on (that many bridge labels per batch, signer sources drawn by
+    ``bridge_weights``, default :data:`DEFAULT_BRIDGE_WEIGHTS`); ``val_protocol="dictionary"`` selects the epoch on the
+    dictionary protocol (docs 15.40). Defaults: exactly the old sampler and validation."""
+    if val_protocol not in VAL_PROTOCOLS:
+        raise ValueError(f"val_protocol must be one of {VAL_PROTOCOLS}, not {val_protocol!r}")
+    if bridge_p < 0:
+        raise ValueError("bridge_p must be >= 0")
     set_threads(threads)
     set_seed(cfg.seed)
     t0 = time.time()
@@ -186,8 +372,37 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
     both = _EncoderWithHead(enc, arc)
     supcon = SupConLoss(0.1)
 
+    # bridge sampler (docs 15.40): off unless bridge_p > 0, so the default draws are exactly the old ones
+    bw = dict(parse_bridge_weights(bridge_weights) or DEFAULT_BRIDGE_WEIGHTS) if bridge_p > 0 else None
+    plan, groups, sampler = None, None, {"kind": "pk", "p": p, "k": k}
+    if bw is not None:
+        groups = [signer_group_key(c, dictionary_group=True) for c in train_clips]
+        plan = bridge_plan(labels, [c.source == BRIDGE_ANCHOR for c in train_clips],
+                           [signer_key(c.source, bw) for c in train_clips], bw, bridge_p)
+        gs = defaultdict(set)
+        for y, g in zip(labels, groups):
+            gs[y].add(g)
+        by_src = defaultdict(int)
+        for y in plan.labels:
+            for s_ in plan.signers[y]:
+                by_src[s_] += 1
+        sampler = {"kind": "bridge", "p": p, "k": k, "bridge_p": bridge_p, "weights": bw, "anchor": BRIDGE_ANCHOR,
+                   "bridge_labels": len(plan.labels), "bridge_labels_by_source": dict(sorted(by_src.items())),
+                   "multi_labels": sum(1 for v in gs.values() if len(v) > 1), "multi_rule": "two recording groups",
+                   "expected_pairs_per_label": {
+                       s_: expected_bridge_pairs(plan, p, k, len(concepts), cfg.epochs * n_batches, s_)
+                       for s_ in sorted(by_src)}}
+        if not plan.labels:
+            log.warning("bridge sampler: no concept has an %s row and a signer clip of %s; plain P x K batches",
+                        BRIDGE_ANCHOR, sorted(bw))
+        if progress:
+            progress(None, f"bridge sampler: {len(plan.labels)} bridge concepts {sampler['bridge_labels_by_source']}, "
+                           f"{bridge_p} of P={p} per batch; expected pairs per label over the run "
+                           f"{sampler['expected_pairs_per_label']}")
+
     def batches(epoch: int):
-        for s, idx in enumerate(pk_batches(labels, p, k, n_batches, cfg.seed, epoch, weights)):
+        for s, idx in enumerate(pk_batches(labels, p, k, n_batches, cfg.seed, epoch, weights, groups=groups,
+                                           bridge=plan)):
             yield (epoch, s, idx)
 
     def loss_fn(m, item):
@@ -213,15 +428,38 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
             per[(c.concept_id, c.source)].append(c)
     for v in per.values():
         gal += rng.sample(v, min(per_concept_gallery, len(v)))
-    q_feats, vq = _features_cache(vq, fcfg)
-    g_feats, gal = _features_cache(gal, fcfg)
-    q_lab = [c.concept_id for c in vq]
-    g_lab = [c.concept_id for c in gal]
+    dict_info = None
+    if val_protocol == "mixed":
+        q_feats, vq = _features_cache(vq, fcfg)
+        g_feats, gal = _features_cache(gal, fcfg)
+        q_lab = [c.concept_id for c in vq]
+        g_lab = [c.concept_id for c in gal]
 
-    def val_fn(m) -> dict:
-        if not len(q_feats) or not len(g_feats):
-            return {"val_r1": 0.0, "val_r5": 0.0}
-        return retrieval_metrics(embed_array(m.enc, q_feats, fcfg), q_lab, embed_array(m.enc, g_feats, fcfg), g_lab)
+        def val_fn(m) -> dict:
+            if not len(q_feats) or not len(g_feats):
+                return {"val_r1": 0.0, "val_r5": 0.0}
+            return retrieval_metrics(embed_array(m.enc, q_feats, fcfg), q_lab, embed_array(m.enc, g_feats, fcfg),
+                                     g_lab)
+    else:  # dictionary protocol (docs 15.40); the old val_r1 is still computed on its own sets, as a secondary
+        dq, dg, dict_info = dictionary_val_sets(data, excl, xsrc, dict_val_per_signer, cfg.seed)
+        bank = _FeatureBank({"q": vq, "g": gal, "dq": dq, "dg": dg}, fcfg)
+        vq, gal, dq, dg = bank.clips["q"], bank.clips["g"], bank.clips["dq"], bank.clips["dg"]
+        q_lab = [c.concept_id for c in vq]
+        g_lab = [c.concept_id for c in gal]
+        dg_lab = [c.concept_id for c in dg]
+        dict_info = {**dict_info, "queries_used": len(dq), "gallery_used": len(dg)}
+
+        def val_fn(m) -> dict:
+            z = bank.embed(m.enc, fcfg)
+            r = ({"val_r1": 0.0, "val_r5": 0.0} if not len(vq) or not len(gal) else
+                 retrieval_metrics(z[bank.rows["q"]], q_lab, z[bank.rows["g"]], g_lab))
+            d = dictionary_val_metrics(z[bank.rows["dq"]], dq, z[bank.rows["dg"]], dg_lab)
+            if progress:
+                per = " ".join(f"{s}->islrtc r1 {d[f'val_dict_r1_{s}']:.3f} (n={d[f'val_dict_n_{s}']})"
+                               for s in DICT_VAL_SOURCES if f"val_dict_n_{s}" in d)
+                progress(None, f"val dictionary: {per}; select {d[DICT_SELECT_KEY]:.4f}; old val_r1 "
+                               f"{r['val_r1']:.4f}")
+            return {**r, **d}
 
     model_kwargs = {"hidden": cfg.hidden, "layers": cfg.layers, "emb_dim": emb_dim, "dropout": cfg.dropout}
     src_counts = defaultdict(int)
@@ -239,7 +477,10 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
                              "init_feature_config": init_fc, "init_feature_config_diff": init_fc_diff}
                             if init else None),
             "data": {**data.summary(), "train_items": len(train_clips), "concepts": len(concepts),
-                     "train_sources": dict(src_counts), "val_queries": len(vq), "gallery": len(gal)}}
+                     "train_sources": dict(src_counts), "val_queries": len(vq), "gallery": len(gal)},
+            "sampler": sampler, "val_protocol": val_protocol,
+            "select_key": DICT_SELECT_KEY if val_protocol == "dictionary" else "val_r1",
+            **({"val_dictionary_sets": dict_info} if dict_info is not None else {})}
 
     def save_best(epoch: int, row: dict) -> None:
         atomic_save({"state_dict": enc.state_dict(), "meta": {**meta, "best_epoch": epoch}}, out)
@@ -257,24 +498,76 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
                            "val": [max_val_queries, max_gallery, per_concept_gallery, clips_digest(vq),
                                    clips_digest(gal)],
                            # only when set, so a state of the default settings written before 15.32 still resumes
-                           **({"exclude_sources": xsrc} if xsrc else {})})
+                           **({"exclude_sources": xsrc} if xsrc else {}),
+                           # bridge sampler and dictionary validation (docs 15.40): only when on (rule of 15.19)
+                           **({"bridge": {"p": bridge_p, "weights": bw, "anchor": BRIDGE_ANCHOR,
+                                          "multi": "groups", "labels": digest(plan.labels)}} if plan is not None
+                              else {}),
+                           **({"val_protocol": val_protocol,
+                               "val_dict": [dict_val_per_signer, clips_digest(dq), clips_digest(dg)]}
+                              if val_protocol == "dictionary" else {})})
+    select_key = DICT_SELECT_KEY if val_protocol == "dictionary" else "val_r1"
     res = run_loop(both, batches, loss_fn, lc, state_path or Path(str(out) + ".state"), val_fn=val_fn,
-                   select_key="val_r1", save_best=save_best, fresh=not resume,
+                   select_key=select_key, save_best=save_best, fresh=not resume,
                    progress=(lambda m: progress(None, m)) if progress else None)
     if not out.exists():
         raise RuntimeError("encoder training produced no checkpoint")
     ck = torch.load(out, map_location="cpu", weights_only=False)
     best = next((h for h in res.history if h["epoch"] == res.best_epoch), {})
+    val_dict = {k: v for k, v in best.items() if k.startswith("val_dict")} or None
     ck["meta"].update(val_r1=best.get("val_r1"), val_r5=best.get("val_r5"), history=res.history,
-                      train_seconds=time.time() - t0, step_seconds=res.step_seconds, finished=res.finished)
+                      train_seconds=time.time() - t0, step_seconds=res.step_seconds, finished=res.finished,
+                      **({"val_dict": val_dict} if val_dict else {}))
     atomic_save(ck, out)
     return {"checkpoint": str(out), "concepts": len(concepts), "train_items": len(train_clips),
             "train_sources": dict(src_counts), "best_epoch": res.best_epoch, "val_r1": best.get("val_r1"),
             "val_r5": best.get("val_r5"), "val_queries": len(vq), "finished": res.finished,
             "resumed_from": res.resumed_from, "step_seconds": res.step_seconds, "pretrained": bool(init),
             "class_space": class_space,
+            **({"val_protocol": val_protocol, "select_key": select_key, "val_dict": val_dict,
+                "sampler": sampler} if val_protocol != "mixed" or plan is not None else {}),
+            "seconds": round(time.time() - t0, 1)}
+
+
+def probe_encoder(data: IslData, ckpt: Path, *, per_signer: int = DICT_VAL_PER_SIGNER, seed: int | None = None,
+                  threads: int = 2) -> dict:
+    """Measure any encoder checkpoint on the ``dictionary`` validation protocol (docs 15.40, critic 3): the concepts
+    it was trained without (``excluded_concepts``, one-shot folds) are left out of queries and gallery, and so are
+    the sources it was trained without. ``data`` must be loaded with the encoder's split (the caller checks)."""
+    from app.isl.models.encoder import encoder_kwargs
+
+    set_threads(threads)
+    ck = torch.load(ckpt, map_location="cpu", weights_only=False)
+    meta = ck.get("meta") or {}
+    if meta.get("kind") != "isl-encoder":
+        raise ValueError(f"{ckpt} is not an ISL encoder checkpoint (kind={meta.get('kind')!r})")
+    fcfg = FeatureConfig.from_dict(meta["feature_config"])
+    enc = SignEncoder(fcfg.dim, **encoder_kwargs(meta))
+    enc.load_state_dict(ck["state_dict"])
+    excl = set(meta.get("excluded_concepts") or [])
+    xsrc = encoder_excluded_sources(meta)
+    seed = int((meta.get("train_config") or {}).get("seed", 0)) if seed is None else seed
+    t0 = time.time()
+    dq, dg, info = dictionary_val_sets(data, excl, xsrc, per_signer, seed)
+    bank = _FeatureBank({"dq": dq, "dg": dg}, fcfg)
+    z = bank.embed(enc, fcfg)
+    m = dictionary_val_metrics(z[bank.rows["dq"]], bank.clips["dq"], z[bank.rows["dg"]],
+                               [c.concept_id for c in bank.clips["dg"]])
+    by = {s: {"n": m[f"val_dict_n_{s}"], "r1": round(m[f"val_dict_r1_{s}"], 4), "r5": round(m[f"val_dict_r5_{s}"], 4)}
+          for s in sorted({k[len("val_dict_n_"):] for k in m if k.startswith("val_dict_n_")})}
+    return {"kind": "isl-encoder-probe", "protocol": "dictionary", "encoder": str(ckpt),
+            "encoder_sha256": file_digest(ckpt), "encoder_version": meta.get("encoder_version"),
+            "profile": data.profile, "split": data.split.get("name"), "encoder_split": (meta.get("data") or {}).get("split"),
+            "excluded_concepts": len(excl), "excluded_sources": xsrc, "seed": seed,
+            "by_source": by, "r1": round(m["val_dict_r1"], 4), "r5": round(m["val_dict_r5"], 4),
+            "select": round(m[DICT_SELECT_KEY], 4), "include_r1": by.get("include", {}).get("r1"),
+            "queries_used": len(bank.clips["dq"]), "gallery_used": len(bank.clips["dg"]), "sets": info,
+            "trained_val": {"val_protocol": meta.get("val_protocol", "mixed"), "val_r1": meta.get("val_r1"),
+                            "val_dict": meta.get("val_dict")},
             "seconds": round(time.time() - t0, 1)}
 
 
 __all__ = ["ENCODER_VERSION", "ClipDataset", "embed_items", "retrieval_metrics", "train_encoder",
-           "encoder_training_clips", "encoder_excluded_sources", "check_exclude_sources"]
+           "encoder_training_clips", "encoder_excluded_sources", "check_exclude_sources", "dictionary_val_sets",
+           "dictionary_val_metrics", "dictionary_select", "parse_bridge_weights", "probe_encoder",
+           "DEFAULT_BRIDGE_WEIGHTS", "DEFAULT_BRIDGE_P", "VAL_PROTOCOLS"]

@@ -27,6 +27,9 @@
 #                    In a scratch run, steps before STEP that have no stamp are seeded, not run (see --tag)
 #   --only STEP      run just this step (ignores its stamp; a training step resumes from its state file, and a
 #                    finished state returns the old weights: use --force STEP to retrain it)
+#   --until STEP     stop after STEP (later steps are neither run nor forgotten). E.g. an encoder probe in a scratch
+#                    run: PHASE2_TAG=encprobe ENC_EPOCHS=3 scripts/phase2_train.sh --profile research --from encoder
+#                    --until encoder (docs 15.40)
 #   --force S1,S2    forget these steps' stamps and training state, then run normally (comma-separated list)
 #   --tag NAME       a scratch run (also env PHASE2_TAG): its own work folder (artifacts/isl/runs/NAME/<profile>
 #                    unless PHASE2_WORK_BASE is set), its own stamps / log / readiness file under <work>/driver/,
@@ -70,6 +73,13 @@
 #   CLS_SELECT=worst_source|macro_f1   classifier and cv select the epoch on the lowest validation macro F1 of INCLUDE and
 #     ISL500 and fit the temperature on source-balanced validation (--select-on). Research worst_source, else macro_f1.
 #   Full research runs also default to CLS_STEPS=800 and CLS_PATIENCE=8 (commercial-safe 300 and 10; e1a keeps 10).
+# Encoder sampler and validation (docs 15.40, QA plan 1.5; research on, commercial-safe off), encoder AND oneshot:
+#   ENC_BRIDGE_P=12|0   bridge concepts per batch of P=32 (one ISLRTC row + one signer clip; --bridge-p; 0 = off)
+#   ENC_SOURCE_WEIGHTS=include=0.5,isl500=0.35,mendeley=0.15   signer source of a bridge pair (--source-weights;
+#     empty = that default)
+#   ENC_VAL=dictionary|mixed   epoch selection on INCLUDE / ISL500 / Mendeley -> ISLRTC rows (--val-protocol)
+#   Full research runs also default to ENC_STEPS=800 for the encoder AND oneshot (ONESHOT_STEPS overrides oneshot
+#   alone); commercial-safe keeps 400 (encoder) and 300 (oneshot).
 # EVAL_COMPARE_TO=<report.json>: the evaluate step runs `evaluate --all --compare-to <report.json>` (E1b and E4 like
 # for like against that report, e.g. artifacts/isl/commercial-safe/eval/report.json; docs 15.27, 15.28, 15.31).
 # One profile per run (refused with --profile both); a missing file is refused before anything runs (exit 2).
@@ -89,6 +99,7 @@ SMOKE=0
 FROM=""
 ONLY=""
 FORCE=""
+UNTIL=""
 THREADS="${THREADS:-2}"
 MAX_PARTS=1000
 STEP_MIN=0
@@ -109,6 +120,7 @@ while [[ $# -gt 0 ]]; do
     --from) need "$1" "${2:-}"; FROM="$2"; shift 2 ;;
     --only) need "$1" "${2:-}"; ONLY="$2"; shift 2 ;;
     --force) need "$1" "${2:-}"; FORCE="$2"; shift 2 ;;
+    --until) need "$1" "${2:-}"; UNTIL="$2"; shift 2 ;;
     --threads) need "$1" "${2:-}"; THREADS="$2"; shift 2 ;;
     --max-parts) need "$1" "${2:-}"; MAX_PARTS="$2"; shift 2 ;;
     --step-minutes) need "$1" "${2:-}"; STEP_MIN="$2"; shift 2 ;;
@@ -132,7 +144,7 @@ if [[ "$PROFILE" == "both" ]]; then
   rc=0
   for p in commercial-safe research; do
     "$0" --profile "$p" $([[ $SMOKE == 1 ]] && echo --smoke) ${FROM:+--from "$FROM"} ${ONLY:+--only "$ONLY"} \
-      ${FORCE:+--force "$FORCE"} --threads "$THREADS" --max-parts "$MAX_PARTS" --step-minutes "$STEP_MIN" \
+      ${FORCE:+--force "$FORCE"} ${UNTIL:+--until "$UNTIL"} --threads "$THREADS" --max-parts "$MAX_PARTS" --step-minutes "$STEP_MIN" \
       $([[ $ALLOW_PARTIAL == 1 ]] && echo --allow-partial) $([[ $CHECK_ONLY == 1 ]] && echo --check-only) \
       $([[ $LIST == 1 ]] && echo --list) ${RUN_TAG:+--tag "$RUN_TAG"} $([[ $DRY_RUN == 1 ]] && echo --dry-run) \
       $([[ $ALLOW_SHARED == 1 ]] && echo --allow-shared-data) \
@@ -143,7 +155,7 @@ fi
 case "$PROFILE" in commercial-safe|research) ;; *) echo "profile must be commercial-safe, research or both" >&2; exit 2 ;; esac
 
 is_step() { local x; for x in "${STEPS[@]}"; do [[ "$x" == "$1" ]] && return 0; done; return 1; }
-for s in ${FROM:+"$FROM"} ${ONLY:+"$ONLY"}; do is_step "$s" || { echo "unknown step $s (see --help)" >&2; exit 2; }; done
+for s in ${FROM:+"$FROM"} ${ONLY:+"$ONLY"} ${UNTIL:+"$UNTIL"}; do is_step "$s" || { echo "unknown step $s (see --help)" >&2; exit 2; }; done
 FORCE_STEPS=()
 if [[ -n "$FORCE" ]]; then
   IFS=',' read -r -a FORCE_STEPS <<< "$FORCE"
@@ -205,8 +217,11 @@ else
   CAP=""
   H="${HIDDEN:-192}"; L="${LAYERS:-2}"; E="${EMB:-256}"
   PRE="--hidden $H --layers $L --emb-dim $E --epochs ${PRE_EPOCHS:-20} --batches ${PRE_STEPS:-400} --batch-size ${PRE_BATCH:-48}"
-  ENC="--hidden $H --layers $L --emb-dim $E --epochs ${ENC_EPOCHS:-40} --batches ${ENC_STEPS:-400} --p 32 --k 2 --patience 10"
-  ONE="--hidden $H --layers $L --emb-dim $E --epochs ${ONESHOT_EPOCHS:-20} --batches ${ENC_STEPS:-300} --p 32 --k 2 --patience 6 --folds ${ONESHOT_FOLDS:-0 1}"
+  # research: 800 encoder AND oneshot steps (docs 15.40; ENC_STEPS sets both, ONESHOT_STEPS oneshot alone);
+  # commercial-safe as before (400 / 300)
+  if [[ "$PROFILE" == "research" ]]; then ES_DEF=800; OS_DEF=800; else ES_DEF=400; OS_DEF=300; fi
+  ENC="--hidden $H --layers $L --emb-dim $E --epochs ${ENC_EPOCHS:-40} --batches ${ENC_STEPS:-$ES_DEF} --p 32 --k 2 --patience 10"
+  ONE="--hidden $H --layers $L --emb-dim $E --epochs ${ONESHOT_EPOCHS:-20} --batches ${ONESHOT_STEPS:-${ENC_STEPS:-$OS_DEF}} --p 32 --k 2 --patience 6 --folds ${ONESHOT_FOLDS:-0 1}"
   # research: more steps and a shorter patience on the worst-source key (docs 15.38); commercial-safe as before
   if [[ "$PROFILE" == "research" ]]; then CS_DEF=800; CP_DEF=8; else CS_DEF=300; CP_DEF=10; fi
   CLS="--hidden $H --layers $L --epochs ${CLS_EPOCHS:-40} --batches ${CLS_STEPS:-$CS_DEF} --patience ${CLS_PATIENCE:-$CP_DEF}"
@@ -239,6 +254,22 @@ fi
 CQ_ARG=""; [[ "$CLS_QUOTA" != none ]] && CQ_ARG="--source-quota $CLS_QUOTA"
 [[ "$CLS_SEL" != macro_f1 ]] && CQ_ARG="$CQ_ARG --select-on $CLS_SEL"
 ENC_XSRC="${ENC_EXCLUDE_SOURCES-$XS_DEFAULT}"
+# encoder bridge sampler and dictionary validation (docs 15.40): research on, commercial-safe off
+if [[ "$PROFILE" == "research" ]]; then EB_DEFAULT=12; EV_DEFAULT="dictionary"; else EB_DEFAULT=0; EV_DEFAULT="mixed"; fi
+ENC_BP="${ENC_BRIDGE_P:-$EB_DEFAULT}"
+ENC_SW="${ENC_SOURCE_WEIGHTS:-}"
+ENC_VP="${ENC_VAL:-$EV_DEFAULT}"
+[[ "$ENC_BP" =~ ^[0-9]+$ ]] || { echo "ENC_BRIDGE_P: a whole number (0 = off)" >&2; exit 2; }
+case "$ENC_VP" in mixed|dictionary) ;; *) echo "ENC_VAL must be mixed or dictionary" >&2; exit 2 ;; esac
+if [[ -n "$ENC_SW" && ! "$ENC_SW" =~ ^[a-z0-9_]+=[0-9.]+(,[a-z0-9_]+=[0-9.]+)*$ ]]; then
+  echo "ENC_SOURCE_WEIGHTS: name=weight,... (e.g. include=0.5,isl500=0.35,mendeley=0.15)" >&2; exit 2
+fi
+[[ -n "$ENC_SW" && "$ENC_BP" == 0 ]] && { echo "ENC_SOURCE_WEIGHTS needs ENC_BRIDGE_P > 0" >&2; exit 2; }
+EB_ARG=""
+[[ "$ENC_BP" != 0 ]] && EB_ARG="--bridge-p $ENC_BP"
+[[ -n "$ENC_SW" ]] && EB_ARG="$EB_ARG --source-weights $ENC_SW"
+[[ "$ENC_VP" != mixed ]] && EB_ARG="$EB_ARG --val-protocol $ENC_VP"
+ENC_SETTINGS="bridge_p=$ENC_BP source_weights=${ENC_SW:-default} val=$ENC_VP"
 WSLP_TWINS="${INDEX_WSLP_TWINS:-$TW_DEFAULT}"
 # linker aliases (docs 15.34): research on, commercial-safe off; only the link step passes it (later steps read the
 # work folder's link_settings.json; the start line prints the folder's real state when link is not run, docs 15.35)
@@ -268,7 +299,7 @@ step_settings() {
   case "$1" in
     classifier|cv) echo " dict_group=$DICT_GROUP quota=$CLS_QUOTA select=$CLS_SEL" ;;
     e1a) echo " dict_group=$DICT_GROUP" ;;
-    encoder|oneshot) echo " enc_exclude=${ENC_XSRC:--}" ;;
+    encoder|oneshot) echo " enc_exclude=${ENC_XSRC:--} $ENC_SETTINGS" ;;
     index|index_final) echo " wslp_twins=$WSLP_TWINS" ;;
     link) echo " link_aliases=$LINK_ALIASES variant_links=$VL_FILE" ;;
   esac
@@ -399,8 +430,8 @@ run_step() {
     bench) cli bench --threads "$THREADS" --steps $([[ $SMOKE == 1 ]] && echo 1 || echo 5) --hidden-sizes ${HIDDEN:-192} ;;
     pretrain_dedup) cli pretrain-dedup $COMMON --all-sources $CAP $PDD ;;  # Sign Library copies / eval-clip matches
     pretrain) train pretrain $COMMON $CAP $PRE ;;
-    encoder) train train-encoder $COMMON --all-sources $CAP $ENC --init auto $XS_ARG ;;
-    oneshot) train train-oneshot $COMMON --all-sources $CAP $ONE --init auto $XS_ARG ;;
+    encoder) train train-encoder $COMMON --all-sources $CAP $ENC --init auto $XS_ARG $EB_ARG ;;
+    oneshot) train train-oneshot $COMMON --all-sources $CAP $ONE --init auto $XS_ARG $EB_ARG ;;
     classifier) train train-classifier $COMMON --all-sources $CAP $CLS $DG_ARG $CQ_ARG ;;
     cv)  # classifiers for the other folds of the primary split: E1b mean / spread and a signer-grouped interval
       local base
@@ -444,6 +475,8 @@ if [[ $DRY_RUN == 1 ]]; then
   echo "wslp/dictionary: classifier dictionary group=$DICT_GROUP, encoder excludes=${ENC_XSRC:--}, index wslp twins=$WSLP_TWINS"
   echo "linker: aliases and WSLP number stripping=$LINK_ALIASES (link step only)"
   echo "classifier: source quota=$CLS_QUOTA, selection=$CLS_SEL (classifier and cv), settings: $CLS"
+  echo "encoder: $ENC_SETTINGS (encoder and oneshot), settings: $ENC; oneshot: $ONE"
+  [[ -n "$UNTIL" ]] && echo "until: $UNTIL (later steps are not run)"
   echo "variant links: VARIANT_LINKS=$VARIANT_LINKS, $WORK/variant_links.json: $VL_FILE (link step only)"
 fi
 
@@ -458,18 +491,34 @@ fi
 # failed run is resumed by running again WITHOUT --from (re-running with --from would forget finished steps again)
 FORGET=("${FORCE_STEPS[@]}")
 SEED=()
+if [[ -n "$UNTIL" && -n "$FROM" ]]; then  # --from after --until would run nothing
+  for s in "${STEPS[@]}"; do
+    [[ "$s" == "$UNTIL" ]] && break
+    [[ "$s" == "$FROM" ]] && { FROM_OK=1; break; }
+  done
+  [[ "$FROM" == "$UNTIL" ]] && FROM_OK=1
+  [[ "${FROM_OK:-0}" == 1 ]] || { echo "--from $FROM comes after --until $UNTIL" >&2; exit 2; }
+fi
 if [[ -n "$FROM" && -z "$ONLY" ]]; then
   reached=0
   for s in "${STEPS[@]}"; do
     [[ "$s" == "$FROM" ]] && reached=1
-    if [[ $reached == 1 ]]; then in_list "$s" "${FORGET[@]}" || FORGET+=("$s"); continue; fi
+    [[ $reached == 2 ]] && break  # after --until: kept as they are
+    if [[ $reached == 1 ]]; then
+      in_list "$s" "${FORGET[@]}" || FORGET+=("$s")
+      [[ "$s" == "$UNTIL" ]] && reached=2
+      continue
+    fi
     # scratch run: an earlier step without a stamp is seeded from the real work folder, never run (docs 15.20)
     if [[ $SCRATCH == 1 && ! -f "$STAMPS/$s.done" ]] && ! in_list "$s" "${FORGET[@]}"; then SEED+=("$s"); fi
   done
 fi
 RUN=()
+past_until=0
 for s in "${STEPS[@]}"; do
   if [[ -n "$ONLY" ]]; then [[ "$s" == "$ONLY" ]] && RUN+=("$s"); continue; fi
+  [[ $past_until == 1 ]] && continue
+  [[ "$s" == "$UNTIL" ]] && past_until=1
   in_list "$s" "${SEED[@]}" && continue
   if in_list "$s" "${FORGET[@]}" || [[ ! -f "$STAMPS/$s.done" ]]; then RUN+=("$s"); fi
 done
@@ -553,7 +602,10 @@ if [[ $DRY_RUN == 1 ]]; then
   fi
   for s in "${FORGET[@]}"; do forget "$s"; done
   for s in "${SEED[@]}"; do seed_step "$s" || exit $?; done
+  past_until=0
   for s in "${STEPS[@]}"; do
+    [[ $past_until == 1 ]] && { echo "would stop before $s (--until $UNTIL)"; break; }
+    [[ "$s" == "$UNTIL" ]] && past_until=1
     if in_list "$s" "${RUN[@]}"; then echo "would run $s"
     elif [[ -z "$ONLY" ]] && ! in_list "$s" "${SEED[@]}"; then
       echo "would skip $s (done $(cat "$STAMPS/$s.done"))"; stamp_warn "$s"
@@ -588,7 +640,7 @@ mkdir -p "$WORK"
 free_gb=$(df -Pk "$REPO" | awk 'NR==2 {print int($4/1048576)}')
 if [[ "$free_gb" -lt 10 ]]; then log "only ${free_gb} GB free (< 10 GB floor): not starting"; exit 3; fi
 
-log "phase 2 driver: profile=$PROFILE smoke=$SMOKE tag=${RUN_TAG:--} allow_partial=$ALLOW_PARTIAL threads=$THREADS work=$WORK stamps=$STAMPS${COMPARE_TO:+ compare_to=$COMPARE_TO} $WSLP_SETTINGS cls_quota=$CLS_QUOTA cls_select=$CLS_SEL git=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+log "phase 2 driver: profile=$PROFILE smoke=$SMOKE tag=${RUN_TAG:--} allow_partial=$ALLOW_PARTIAL threads=$THREADS work=$WORK stamps=$STAMPS${COMPARE_TO:+ compare_to=$COMPARE_TO} $WSLP_SETTINGS cls_quota=$CLS_QUOTA cls_select=$CLS_SEL enc: $ENC_SETTINGS${UNTIL:+ until=$UNTIL} git=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
 [[ -n "${LA_WARN:-}" ]] && log "warning: $LA_WARN"
 if [[ ${#SEED[@]} -gt 0 ]]; then
   for s in "${SEED[@]}"; do seed_step "$s" || { log "seeding $s FAILED"; exit 2; }; done
@@ -597,8 +649,11 @@ if [[ ${#SEED[@]} -gt 0 ]]; then
   fi
 fi
 for s in "${FORGET[@]}"; do forget "$s"; done  # eager: STEP and every later step at once (see the plan above)
+until_done=0
 for s in "${STEPS[@]}"; do
   if [[ -n "$ONLY" && "$s" != "$ONLY" ]]; then continue; fi
+  if [[ $until_done == 1 ]]; then log "stop before $s (--until $UNTIL)"; break; fi
+  [[ -z "$ONLY" && "$s" == "$UNTIL" ]] && until_done=1
   if [[ -z "$ONLY" && -f "$STAMPS/$s.done" ]]; then log "skip $s (done $(cat "$STAMPS/$s.done"))"; stamp_warn "$s"; continue; fi
   if [[ $SCRATCH == 1 && $ALLOW_SHARED == 0 ]] && in_list "$s" "${SHARED_STEPS[@]}"; then
     log "step $s refused: a scratch run must not rewrite the shared data (--allow-shared-data)"; exit 2
