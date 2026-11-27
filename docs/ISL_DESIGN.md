@@ -3187,3 +3187,60 @@ driver's layout (final index in `<work>/index`), an old-format index and a retra
 app loader; `build-index --all-include` writes `index_final` and never `index`; `fit-fusion` on the eval-including
 index exits 6 and writes no `fusion.json`; the driver passes `--out` for both index steps and the 0.6 re-run order
 is index, fusion, trim_eval, evaluate, index_final, pack.
+
+### 15.22 The index leak guard sees every row; stale and missing indexes (review of 15.21, 27 Nov 2026)
+
+**Gap.** `contains_eval = false` only said "built from the training parts of the split assignment in force at build
+time". The meta did not say which split or which clips. The direct clip check only saw rows with a `clip` id. Most
+rows have none: INCLUDE centroids, multi-clip `centroid` rows and `signer_centroid` rows. Two cases slipped through:
+(a) the split assignment changes (Batch 1 changes the ISL500 `signer_split`), and `--force fusion,evaluate` runs
+without rebuilding `index`, so old centroids hold clips that are now val / test clips; (b) `fit-fusion` or `evaluate`
+runs with `--split <other>` against an index built for the primary split. In both, the guard passed and
+`report.json` said `training_parts_only: true`.
+
+**Fix.**
+* Two new fields in `index/meta.json`: `split` (the name of the split that chose the clips) and
+  `train_clip_ids_sha256` (SHA-256 of the sorted INCLUDE and other-source clip ids given to the build;
+  `index.clip_ids_sha256`). `index_final` records them too (there: every reference).
+* Every `centroid` and `signer_centroid` row lists its clips in `clips`. `EmbeddingIndex.row_clip_ids()` returns
+  `clip` and `clips` of every row, and the clip check uses it. So the check covers every row. The shipped pack's
+  `rows.jsonl` grows by the clip ids (about 1 MB per 30,000 clips). The app ignores the field.
+* `check_for_evaluation` now also refuses: an index that does not record `split` and `train_clip_ids_sha256`
+  (written before this change, including by 15.21's code: rebuild with the `index` step); a different `split`; a
+  different training-clip digest. The digest of the current data comes from
+  `build_index.index_training_clip_ids(data)`: INCLUDE `train` part plus other sources' `train` part, labelled only.
+  This is exactly what the `index` step indexes.
+* `fit_fusion(..., data=)` and `check_index_for_fitting(rec, clips, data)` pass the split and the training clips.
+  `cli fit-fusion`, the smoke command, phase-1 `evaluate` and `evaluate --all` pass `data`.
+* `report.json` `leakage_guards.index` adds `split`, `split_checked` and `train_clip_ids_checked`.
+  `training_parts_only` is true only when `contains_eval` is false and both were checked.
+* **Rule:** the digest must match exactly. New data (a source finished ingesting) also changes it, even when no clip
+  moved between parts. Then fit-fusion and evaluate are refused (exit 6) until `index` is rebuilt. This is on
+  purpose: the index then also matches the data the run measures.
+
+**A recogniser with an index but no encoder path** (custom or test callers) is refused by
+`check_index_for_fitting` (`LeakageError`). Before, the SHA check was skipped silently.
+
+**Stale `index_final`.** If `index` was rebuilt and `index_final` was not, `index_final` holds older data or older
+row logic. Two changes:
+* The driver's `index` step, on success, forgets the stamps of `fusion`, `evaluate`, `index_final` and `pack`. They
+  used the old index or ship next to it, so they run again.
+* `pipeline.shipped_index(work)` picks the shipped index. It is `index_final` unless that one's `created` is older
+  than `index`'s. Then it is `index`, with a note. `build-pack` prints the note and writes it to `pack.json`
+  `components.index.note`. `load_recognizer(for_app=True)` makes the same choice.
+
+**Missing `work/index`.** In the default (measuring) mode, `load_recognizer` used to build a recogniser without
+retrieval when `work/index` was missing. Fit-fusion then fitted classifier-only parameters and evaluate said "no
+retrieval index", with no error. Now, when the encoder exists and `work/index` is missing but `index_final`,
+`index.old` or `index.tmp` exists, it raises `IndexMissingError` (a `LeakageError`, so the CLI exits 6). `index.old`
+and `index.tmp` are what a save killed between its two renames leaves. We do not restore `index.old` automatically:
+the message says to run the `index` step. A work folder with no index at all still loads without retrieval, as
+before.
+
+Tests: `test_index_leak_guard.py` (split and digest rules, centroid clips, a pre-15.22 index refused, the recogniser
+without an encoder path, fit-fusion after one INCLUDE train clip moves to val (refused by the row check and by the
+digest), `--split <other>` refused in the API and the CLI, a missing `work/index` next to `index.old` /
+`index_final`, `evaluate_all` writes the guard summary, CLI `evaluate --all` and phase-1 `evaluate` exit 6 on the
+eval-including index and write no report, the pack falls back from an older `index_final`, the driver's `index` step
+forgets the later stamps). `test_eval_runners.py`: other-source centroids list their clips, and every listed clip is
+a training clip.

@@ -2,7 +2,9 @@
 
 The training-only ``work/index`` is what fit-fusion and evaluation read; the eval-including ``work/index_final`` is
 only shipped in the pack. Fitting / evaluating on an index that contains evaluation clips, that does not say whether
-it does (an older index file), or that was embedded with another encoder file is refused with ``LeakageError``."""
+it does (an older index file), or that was embedded with another encoder file is refused with ``LeakageError``.
+15.22: the index also records its split and a digest of the clips it was built from, and every centroid row lists its
+clips, so a changed split assignment or another split is refused too."""
 
 from __future__ import annotations
 
@@ -15,8 +17,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from app.isl.models.index import (EmbeddingIndex, IndexEncoderMismatch, IndexMeta, IndexVersionMismatch,
-                                  LeakageError, file_sha256)
+from app.isl.models.index import (EmbeddingIndex, IndexEncoderMismatch, IndexMeta, IndexMissingError,
+                                  IndexVersionMismatch, LeakageError, clip_ids_sha256, file_sha256)
 from app.isl.training.common import ISL_FEATURES, load_isl_data
 from app.training.trainer import TrainConfig
 from tests.isl.isl_world import make_world
@@ -29,11 +31,16 @@ def _rows(n=4):
              "clip": f"islrtc/{i}"} for i in range(n)]
 
 
-def _save(folder: Path, contains_eval=None, encoder_sha256="", rows=None) -> EmbeddingIndex:
+TRAIN_IDS = ["include/t1", "include/t2"]
+
+
+def _save(folder: Path, contains_eval=None, encoder_sha256="", rows=None, split="s1",
+          train_ids=TRAIN_IDS) -> EmbeddingIndex:
     rows = rows or _rows()
     emb = np.random.default_rng(0).normal(size=(len(rows), 8)).astype(np.float32)
     idx = EmbeddingIndex.build(emb, rows, "enc-x", {"seq_len": 48}, "commercial-safe", contains_eval=contains_eval,
-                               encoder_sha256=encoder_sha256)
+                               encoder_sha256=encoder_sha256, split=split,
+                               train_clip_ids_sha256=clip_ids_sha256(train_ids) if train_ids is not None else "")
     idx.save(folder)
     return idx
 
@@ -100,6 +107,42 @@ def test_check_for_evaluation_rules(tmp_path):
         ok.check_for_evaluation(enc, eval_clip_ids=["islrtc/2"])
 
 
+def test_check_for_evaluation_split_and_training_clips(tmp_path):
+    """docs 15.22: the index records its split and which clips it was built from; centroids list their clips."""
+    enc = _enc_file(tmp_path)
+    sha = file_sha256(enc)
+    rows = _rows() + [{"variant_id": "v9", "concept_id": "isl.c0", "source": "include", "kind": "centroid",
+                       "n_clips": 2, "clips": ["include/t1", "include/t2"]}]
+    ok = _save(tmp_path / "ok", contains_eval=False, encoder_sha256=sha, rows=rows)
+    rep = ok.check_for_evaluation(enc, eval_clip_ids=["include/v1"], split="s1", train_clip_ids=TRAIN_IDS[::-1])
+    assert rep["split"] == "s1" and rep["split_checked"] and rep["train_clip_ids_checked"]
+    assert ok.row_clip_ids() >= {"include/t1", "include/t2", "islrtc/0"}
+    with pytest.raises(LeakageError, match="evaluation clips"):  # a centroid built from a clip being measured
+        ok.check_for_evaluation(enc, eval_clip_ids=["include/t2"])
+    with pytest.raises(LeakageError, match="split 'other'"):  # fit-fusion / evaluate --split <other>
+        ok.check_for_evaluation(enc, split="other")
+    with pytest.raises(LeakageError, match="other training clips"):  # the assignment changed since the build
+        ok.check_for_evaluation(enc, split="s1", train_clip_ids=["include/t1"])
+    # an index written before 15.22 (contains_eval False, but no split / clip digest): refused
+    for kw in ({"split": ""}, {"train_ids": None}):
+        with pytest.raises(LeakageError, match="does not record its split"):
+            _save(tmp_path / "pre", contains_eval=False, encoder_sha256=sha, **kw).check_for_evaluation(enc)
+
+
+def test_check_index_for_fitting_needs_the_encoder_file(tmp_path):
+    from app.isl.training.fit_fusion import check_index_for_fitting
+
+    enc = _enc_file(tmp_path)
+    idx = _save(tmp_path / "index", contains_eval=False, encoder_sha256=file_sha256(enc))
+    assert check_index_for_fitting(types.SimpleNamespace(index=None, encoder=None), []) is None
+    with pytest.raises(LeakageError, match="no encoder file path"):
+        check_index_for_fitting(types.SimpleNamespace(index=idx, encoder=None), [])
+    with pytest.raises(LeakageError, match="no encoder file path"):
+        check_index_for_fitting(types.SimpleNamespace(index=idx, encoder=types.SimpleNamespace()), [])
+    assert check_index_for_fitting(types.SimpleNamespace(index=idx, encoder=types.SimpleNamespace(path=enc)),
+                                   [])["encoder_sha256_checked"]
+
+
 def test_fit_fusion_refuses_an_index_with_eval_clips(tmp_path):
     from app.isl.training.fit_fusion import fit_fusion
 
@@ -134,9 +177,10 @@ def world(tmp_path_factory):
     train_encoder(data, work / "encoder.pt", ISL_FEATURES, TrainConfig(**TINY), emb_dim=16, p=4, k=2, smoke=True,
                   threads=1, batches_per_epoch=2)
     enc = EncoderPredictor(work / "encoder.pt")
-    r_train = build_index(enc, data.islrtc, data.include_part("train"), work / "index", "commercial-safe")
+    split = data.split["name"]
+    r_train = build_index(enc, data.islrtc, data.include_part("train"), work / "index", "commercial-safe", split=split)
     r_final = build_index(enc, data.islrtc, [c for c in data.include if c.concept_id], work / "index_final",
-                          "commercial-safe", contains_eval=True)
+                          "commercial-safe", contains_eval=True, split=split)
     return {"w": w, "data": data, "work": work, "r_train": r_train, "r_final": r_final}
 
 
@@ -152,6 +196,85 @@ def test_build_index_records_contains_eval_and_encoder_sha(world):
     assert world["r_train"]["contains_eval"] is False and world["r_train"]["encoder_sha256"] == sha
     assert world["r_final"]["contains_eval"] is True and world["r_final"]["encoder_sha256"] == sha
     assert world["r_final"]["centroids"] >= world["r_train"]["centroids"]
+    # 15.22: split + digest of the training clips; every INCLUDE centroid lists its clips
+    from app.isl.training.build_index import index_training_clip_ids
+
+    data = world["data"]
+    assert world["r_train"]["split"] == data.split["name"]
+    assert world["r_train"]["train_clip_ids_sha256"] == clip_ids_sha256(index_training_clip_ids(data))
+    idx = EmbeddingIndex.load(work / "index")
+    cents = [r for r in idx.rows if r["kind"] == "centroid"]
+    assert cents and all(len(r["clips"]) == r["n_clips"] for r in cents)
+    assert {i for r in cents for i in r["clips"]} <= {c.clip_id for c in data.include_part("train")}
+
+
+def _moved(data, clip_id: str, part: str = "val"):
+    """A copy of ``data`` whose split assignment puts one clip into another part (as a changed split would)."""
+    import copy
+
+    d = copy.copy(data)
+    d.assign = {**data.assign, clip_id: part}
+    return d
+
+
+def test_fit_fusion_refuses_an_index_built_under_another_assignment(world):
+    """The review's case (a): the split assignment changes (e.g. a new val_frac) and fusion is re-fitted without
+    rebuilding the index. A clip that was a training clip (inside an INCLUDE centroid) is now a validation clip."""
+    from app.isl.training.fit_fusion import fit_fusion
+    from app.isl.training.pipeline import load_recognizer
+
+    data = world["data"]
+    rec = load_recognizer(world["work"], ISL_FEATURES, world["w"]["vocab"], profile="commercial-safe")
+    moved = data.include_part("train")[0].clip_id
+    d2 = _moved(data, moved)
+    # the centroid lists the moved clip: refused by the row check alone (no data given) ...
+    with pytest.raises(LeakageError, match="evaluation clips"):
+        fit_fusion(rec, d2.labelled_part("val"), "commercial-safe")
+    # ... and by the training-clip digest with the data
+    with pytest.raises(LeakageError, match="other training clips"):
+        fit_fusion(rec, d2.labelled_part("val"), "commercial-safe", data=d2)
+    # case (b): fit-fusion --split <other> against the primary split's index
+    import copy
+
+    d3 = copy.copy(data)
+    d3.split = {**data.split, "name": "another-split"}
+    with pytest.raises(LeakageError, match="split 'another-split'"):
+        fit_fusion(rec, d3.labelled_part("val"), "commercial-safe", data=d3)
+    # the unchanged data passes and the report carries the guard summary
+    _, rep = fit_fusion(rec, data.labelled_part("val"), "commercial-safe", data=data)
+    assert rep["index_guard"]["split_checked"] and rep["index_guard"]["train_clip_ids_checked"]
+
+
+def test_load_recognizer_refuses_a_missing_training_index_next_to_another(world, tmp_path):
+    """No silent classifier-only fit / evaluation when work/index is gone but index_final or a half-swapped save is
+    there (docs 15.22)."""
+    from app.isl.training.pipeline import load_recognizer
+
+    work = _copy_work(world, tmp_path)
+    vocab = world["w"]["vocab"]
+    (work / "index").replace(work / "index.old")  # killed between the two replace() calls of save()
+    with pytest.raises(IndexMissingError, match="index.old"):
+        load_recognizer(work, ISL_FEATURES, vocab, profile="commercial-safe")
+    shutil.rmtree(work / "index.old")
+    with pytest.raises(IndexMissingError, match="index_final"):
+        load_recognizer(work, ISL_FEATURES, vocab, profile="commercial-safe")
+    assert load_recognizer(work, ISL_FEATURES, vocab, profile="commercial-safe", for_app=True).index is not None
+    assert load_recognizer(work, ISL_FEATURES, vocab, profile="commercial-safe", with_index=False).index is None
+    shutil.rmtree(work / "index_final")  # no index at all: a classifier-only recogniser, as before
+    assert load_recognizer(work, ISL_FEATURES, vocab, profile="commercial-safe").index is None
+
+
+def test_evaluate_all_records_the_index_guard(world, tmp_path):
+    from app.isl.evaluation.runners import evaluate_all
+
+    work = _copy_work(world, tmp_path)
+    w = world["w"]
+    doc = evaluate_all(work, world["data"], ISL_FEATURES, profile="commercial-safe", smoke=True, vocab_path=w["vocab"],
+                       paths=w["paths"], out_dirs=[], e4_ks=(1,), latency_n=1)
+    g = doc["leakage_guards"]["index"]
+    assert g["dir"] == "index" and g["training_parts_only"] is True and g["contains_eval"] is False
+    assert g["encoder_sha256_checked"] and g["split_checked"] and g["train_clip_ids_checked"]
+    assert g["eval_clip_ids_checked"] > 0 and g["split"] == world["data"].split["name"]
 
 
 def test_load_recognizer_uses_training_index_for_evaluation_and_final_index_for_the_app(world):
@@ -217,6 +340,20 @@ def test_pack_ships_index_final_and_refuses_a_stale_one(world, tmp_path):
     r2 = build_pack(work, "commercial-safe", ISL_FEATURES, tmp_path / "pack2", smoke=True,
                     vocab_path=world["w"]["vocab"])
     assert json.loads((Path(r2["pack"]) / "pack.json").read_text())["components"]["index"]["built_from"] == "index"
+    # an index_final older than index (index rebuilt without index_final): not shipped, and the pack says why
+    shutil.copytree(world["work"] / "index_final", work / "index_final")
+    m = json.loads((work / "index" / "meta.json").read_text())
+    (work / "index" / "meta.json").write_text(json.dumps({**m, "created": "2099-01-01T00:00:00Z"}))
+    r3 = build_pack(work, "commercial-safe", ISL_FEATURES, tmp_path / "pack2b", smoke=True,
+                    vocab_path=world["w"]["vocab"])
+    ci = json.loads((Path(r3["pack"]) / "pack.json").read_text())["components"]["index"]
+    assert ci["built_from"] == "index" and ci["contains_eval"] is False and "older than index" in ci["note"]
+    from app.isl.training.pipeline import load_recognizer
+
+    app = load_recognizer(work, ISL_FEATURES, world["w"]["vocab"], profile="commercial-safe", for_app=True)
+    assert app.index.meta.contains_eval is False  # the app path makes the same choice
+    shutil.rmtree(work / "index_final")
+    (work / "index" / "meta.json").write_text(json.dumps(m))
     # an index_final embedded with an older encoder file is never shipped
     shutil.copytree(world["work"] / "index_final", work / "index_final")
     (work / "encoder.pt").write_bytes((work / "encoder.pt").read_bytes() + b"\0")
@@ -268,6 +405,26 @@ def test_cli_build_index_writes_index_final_and_fit_fusion_refuses_it(world, tmp
     shutil.copytree(work / "index_final", work / "index")
     assert cli.main(root + ["fit-fusion", *common]) == cli.EX_LEAKAGE
     assert not (work / "fusion.json").exists()
+    # evaluate --all is refused the same way (exit 6) and writes no report
+    out = tmp_path / "packout"
+    assert cli.main(root + ["evaluate", *common, "--all", "--smoke", "--out", str(out)]) == cli.EX_LEAKAGE
+    assert not (work / "eval" / "report.json").exists() and not (out / "eval" / "report.json").exists()
+    # so is the phase-1 evaluate
+    assert cli.main(root + ["evaluate", *common, "--smoke"]) == cli.EX_LEAKAGE
+    # an index built for the primary split, used with --split <other>: refused (docs 15.22)
+    shutil.rmtree(work / "index")
+    assert cli.main(root + ["build-index", *common]) == 0
+    assert json.loads((work / "index" / "meta.json").read_text())["split"] == w["split"]
+    sp = json.loads((w["paths"].splits / f"{w['split']}.json").read_text())
+    other = w["paths"].splits / "test-split-b.json"  # same assignment, another name: refused all the same
+    other.write_text(json.dumps({**sp, "name": "test-split-b"}))
+    try:
+        common2 = [a if a != w["split"] else "test-split-b" for a in common]
+        assert cli.main(root + ["fit-fusion", *common2]) == cli.EX_LEAKAGE
+        assert not (work / "fusion.json").exists()
+        assert cli.main(root + ["fit-fusion", *common]) == 0  # its own split: fine
+    finally:
+        other.unlink()
 
 
 def test_driver_index_steps_write_separate_folders(tmp_path):
@@ -285,6 +442,11 @@ def test_driver_index_steps_write_separate_folders(tmp_path):
     for step in ("index", "index_final"):
         r = _run_driver(tmp_path, "--only", step, work_base=tmp_path / "art", isl_root=isl)
         assert r.returncode == 0, r.stdout + r.stderr
+    # a rebuilt index forgets the later steps that used it or ship next to it (docs 15.22)
+    stamps = work / "driver" / "phase2_commercial-safe.stamps"
+    assert not any((stamps / f"{s}.done").exists() for s in ("fusion", "evaluate", "pack"))
+    assert (stamps / "index.done").exists() and (stamps / "index_final.done").exists()  # re-run by --only after it
+    assert (stamps / "trim_eval.done").exists()
     calls = [c for c in _calls(tmp_path) if " build-index " in c]
     assert len(calls) == 2
     assert calls[0].endswith(f"--out {work / 'index'}") and "--all-include" not in calls[0]

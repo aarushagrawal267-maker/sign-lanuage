@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -44,6 +45,23 @@ def pack_dir(profile: str) -> Path:
     return get_settings().artifacts_dir / "packs" / PACK_IDS[get_profile(profile).name]
 
 
+def shipped_index(work: Path) -> tuple[Path | None, str | None]:
+    """The index a work folder ships to the app: ``index_final`` (every reference) when it exists and is not older
+    than the training-only ``index``, else ``index`` (None when neither exists). An ``index_final`` older than
+    ``index`` was built from older data or row logic (``index`` was rebuilt without ``index_final``): it is not
+    shipped and the second value says why (docs/ISL_DESIGN.md 15.22)."""
+    fin, tr = work / "index_final" / "meta.json", work / "index" / "meta.json"
+    if not fin.exists():
+        return (tr.parent if tr.exists() else None), None
+    if tr.exists():
+        cf = json.loads(fin.read_text()).get("created") or ""
+        ct = json.loads(tr.read_text()).get("created") or ""
+        if cf < ct:  # ISO UTC strings ("" = unknown: an older index_final, also not shipped over a newer index)
+            return tr.parent, (f"index_final ({cf or 'no time'}) is older than index ({ct}): index was rebuilt "
+                               "without index_final; shipping the training-only index (run the index_final step)")
+    return fin.parent, None
+
+
 def load_recognizer(work: Path, fcfg: FeatureConfig, vocab_path: Path | None = None, profile: str = "commercial-safe",
                     fusion: FusionParams | None = None, with_index: bool = True, for_app: bool = False):
     """An ``IslRecognizer`` over the components present in a work folder (no My signs).
@@ -51,8 +69,10 @@ def load_recognizer(work: Path, fcfg: FeatureConfig, vocab_path: Path | None = N
     Default (fit-fusion, evaluation, every measuring caller): the index is ``<work>/index`` and must pass the leak
     guard (``EmbeddingIndex.check_for_evaluation``): built from training parts only (``contains_eval`` False, not
     unknown) with this very ``encoder.pt`` (SHA-256), else ``LeakageError``. ``for_app=True`` (a recogniser that is
-    used, not measured): ``<work>/index_final`` when it exists (every reference, validation and test clips too),
-    else ``<work>/index``; only the encoder SHA-256 is checked (``IndexEncoderMismatch``). docs 15.21."""
+    used, not measured): ``<work>/index_final`` when it exists and is not older than ``index`` (every reference,
+    validation and test clips too), else ``<work>/index``; only the encoder SHA-256 is checked
+    (``IndexEncoderMismatch``). docs 15.21. In the default mode a missing ``<work>/index`` next to an
+    ``index_final`` / ``index.old`` / ``index.tmp`` raises ``IndexMissingError`` (15.22)."""
     from app.isl.models.encoder import EncoderPredictor
     from app.isl.models.index import EmbeddingIndex
     from app.isl.recognizer import IslRecognizer
@@ -64,8 +84,20 @@ def load_recognizer(work: Path, fcfg: FeatureConfig, vocab_path: Path | None = N
     enc = EncoderPredictor(work / "encoder.pt") if (work / "encoder.pt").exists() else None
     idx = None
     folder = work / "index"
-    if for_app and (work / "index_final" / "meta.json").exists():
-        folder = work / "index_final"
+    if for_app:
+        folder = shipped_index(work)[0] or folder
+    if with_index and enc is not None and not for_app and not (folder / "meta.json").exists():
+        # measuring without retrieval because work/index is missing, while another index is there, would fit or
+        # report classifier-only numbers without saying so (docs 15.22)
+        other = [work / n for n in ("index_final", "index.old", "index.tmp") if (work / n).exists()]
+        if other:
+            from app.isl.models.index import IndexMissingError
+
+            raise IndexMissingError(
+                f"{folder} is missing but {', '.join(str(o) for o in other)} exists: fit-fusion and evaluation need "
+                "the training-only index; run the 'index' step (scripts/phase2_train.sh --force index,... or "
+                "`python -m app.isl.cli build-index` without --all-include). index.old / index.tmp are left by an "
+                "interrupted index save")
     if with_index and enc is not None and (folder / "meta.json").exists():
         if for_app:
             idx = EmbeddingIndex.load(folder, expect_encoder_version=enc.version, encoder_path=enc.path)
@@ -86,7 +118,7 @@ def evaluate(work: Path, data, fcfg: FeatureConfig, smoke: bool, part: str = "te
 
     rec = load_recognizer(work, fcfg, vocab_path, profile=data.profile)
     clips = data.include_part(part)
-    check_index_for_fitting(rec, clips)  # no index row of a clip being measured (docs 15.21)
+    check_index_for_fitting(rec, clips, data)  # no index row of a clip being measured; this split's clips (15.22)
     inputs, truths, used = collect_evidence(rec, clips)
     si = data.split.get("signer_independent")
     lab = data.split.get("label") or data.split.get("name")
@@ -209,8 +241,11 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
             files[name] = _sha(tmp / name)
     # the shipped index: <work>/index_final (every reference, validation and test clips too: fine for the app, which
     # is not measured with it), else the training-only <work>/index. Never one embedded with another encoder file.
+    # (an index_final older than index is not shipped: see shipped_index)
     index_info = None
-    src_index = next((work / n for n in ("index_final", "index") if (work / n / "meta.json").exists()), None)
+    src_index, index_note = shipped_index(work)
+    if index_note:
+        print(f"build-pack: {index_note}", file=sys.stderr)
     if src_index is not None:
         from app.isl.models.index import EmbeddingIndex, IndexMeta
 
@@ -222,6 +257,8 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
         files["index/embeddings.f16.npy"] = _sha(tmp / "index" / "embeddings.f16.npy")
         index_info = {"built_from": src_index.name, "contains_eval": imeta.contains_eval,
                       "encoder_sha256": imeta.encoder_sha256 or None}
+        if index_note:
+            index_info["note"] = index_note
     # the results the app serves (/api/languages/<id>/results): the phase-2 ``evaluate --all`` report when it exists
     # (same top-level fields: label, smoke, partial_data, protocols), never a phase-1 ``results.json`` left in a
     # reused work folder by an older run; the phase-1 ``evaluate`` results only when there is no phase-2 report

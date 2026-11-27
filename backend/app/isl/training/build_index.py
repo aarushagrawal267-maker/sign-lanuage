@@ -12,7 +12,8 @@ separate rows); sources with one clip per concept give one row per clip (``kind 
 Two indexes per work folder (docs/ISL_DESIGN.md 15.21): ``work/index`` from the training parts only
 (``contains_eval = False``), which fit-fusion and evaluation use, and ``work/index_final`` from every reference
 (``--all-include``, ``contains_eval = True``), which only the shipped pack uses. Both record the SHA-256 of the
-encoder file they were embedded with.
+encoder file they were embedded with, the split whose assignment chose the clips and a digest of those clip ids;
+every centroid row lists the clips it was built from (``clips``), so the leak guard sees every row (15.22).
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ import numpy as np
 from app.features.build import featurize
 from app.isl.data.sources import Clip
 from app.isl.models.encoder import EncoderPredictor
-from app.isl.models.index import EmbeddingIndex, file_sha256
+from app.isl.models.index import EmbeddingIndex, clip_ids_sha256, file_sha256
 from app.isl.training.common import ClipDataset, Item, items_for, slice_bf
 
 
@@ -35,6 +36,17 @@ def _embed_feats(enc: EncoderPredictor, feats: list[np.ndarray], batch: int = 12
     for a in range(0, len(feats), batch):
         out.append(enc.embed(np.stack(feats[a:a + batch]))[0])
     return np.concatenate(out) if out else np.zeros((0, enc.dim), np.float32)
+
+
+def index_clip_ids(include: list[Clip], extra: list[Clip] | None) -> list[str]:
+    """The INCLUDE and other-source clip ids an index build is given (labelled ones only: the rest is skipped)."""
+    return [c.clip_id for c in include if c.concept_id] + [c.clip_id for c in (extra or []) if c.concept_id]
+
+
+def index_training_clip_ids(data) -> list[str]:
+    """The clip ids the ``index`` step (training parts only) would use with this data and split assignment; the
+    leak guard compares their digest with ``train_clip_ids_sha256`` of the index (docs/ISL_DESIGN.md 15.22)."""
+    return index_clip_ids(data.include_part("train"), data.extra_part("train"))
 
 
 def _extra_rows(enc: EncoderPredictor, clips: list[Clip], weights: dict, max_group_centroids: int,
@@ -80,24 +92,28 @@ def _extra_rows(enc: EncoderPredictor, clips: list[Clip], weights: dict, max_gro
             continue
         vecs.append(unit(np.mean([z for _, z in lst], axis=0)))
         rows.append({"variant_id": lst[0][0].variant_id, "concept_id": cid, "source": src, "kind": "centroid",
-                     "weight": w, "n_clips": len(lst)})
+                     "weight": w, "n_clips": len(lst), "clips": sorted(c.clip_id for c, _ in lst)})
         groups = defaultdict(list)
         for c, z in lst:
             if c.group:
-                groups[c.group].append(z)
+                groups[c.group].append((c.clip_id, z))
         if len(groups) > 1:
             for g in sorted(groups, key=lambda g: (-len(groups[g]), g))[:max_group_centroids]:
-                vecs.append(unit(np.mean(groups[g], axis=0)))
+                vecs.append(unit(np.mean([z for _, z in groups[g]], axis=0)))
                 rows.append({"variant_id": lst[0][0].variant_id, "concept_id": cid, "source": src,
-                             "kind": "signer_centroid", "weight": w, "group": g, "n_clips": len(groups[g])})
+                             "kind": "signer_centroid", "weight": w, "group": g, "n_clips": len(groups[g]),
+                             "clips": sorted(i for i, _ in groups[g])})
     return vecs, rows
 
 
 def build_index(enc: EncoderPredictor, islrtc: list[Clip], include: list[Clip], out_dir: Path, profile: str,
                 alt_weight: float = 0.95, centroid_weight: float = 1.0, extra: list[Clip] | None = None,
-                source_weights: dict | None = None, max_group_centroids: int = 3, contains_eval: bool = False) -> dict:
+                source_weights: dict | None = None, max_group_centroids: int = 3, contains_eval: bool = False,
+                split: str = "") -> dict:
     """``contains_eval``: the caller says whether ``include`` / ``extra`` hold any validation or test clip (True for
-    ``--all-include``); it is written to the index meta and evaluation refuses such an index."""
+    ``--all-include``); it is written to the index meta and evaluation refuses such an index. ``split``: the name of
+    the split whose assignment chose ``include`` / ``extra`` (recorded with a digest of their clip ids; an index
+    without it is refused for fitting and evaluation, docs 15.22)."""
     t0 = time.time()
     fcfg = enc.feature_config
     concepts = {c.concept_id for c in islrtc} | {c.concept_id for c in include}
@@ -119,13 +135,13 @@ def build_index(enc: EncoderPredictor, islrtc: list[Clip], include: list[Clip], 
     if inc_items:
         z = _embed_feats(enc, ClipDataset(inc_items, fcfg, train=False)._cache)
         for it, v in zip(inc_items, z):
-            by[(it.clip.concept_id, it.clip.variant_id)].append(v)
+            by[(it.clip.concept_id, it.clip.variant_id)].append((it.clip.clip_id, v))
     cents, crow = [], []
-    for (cid, vid), vs in sorted(by.items()):
-        m = np.mean(vs, axis=0)
+    for (cid, vid), lst in sorted(by.items(), key=lambda kv: kv[0]):
+        m = np.mean([v for _, v in lst], axis=0)
         cents.append(m / max(1e-8, np.linalg.norm(m)))
         crow.append({"variant_id": vid, "concept_id": cid, "source": "include", "kind": "centroid",
-                     "weight": centroid_weight, "n_clips": len(vs)})
+                     "weight": centroid_weight, "n_clips": len(lst), "clips": sorted(i for i, _ in lst)})
     if cents:
         emb = np.concatenate([emb, np.stack(cents)]) if len(emb) else np.stack(cents)
         rows += crow
@@ -143,10 +159,12 @@ def build_index(enc: EncoderPredictor, islrtc: list[Clip], include: list[Clip], 
         raise RuntimeError("nothing to index")
     enc_path = getattr(enc, "path", None)
     idx = EmbeddingIndex.build(emb, rows, enc.version, fcfg.to_dict(), profile, contains_eval=bool(contains_eval),
-                               encoder_sha256=file_sha256(enc_path) if enc_path is not None else "")
+                               encoder_sha256=file_sha256(enc_path) if enc_path is not None else "", split=split or "",
+                               train_clip_ids_sha256=clip_ids_sha256(index_clip_ids(include, extra)))
     idx.save(out_dir)
     return {"rows": len(rows), "concepts": len(idx.concepts), "first_sign": sum(r["kind"] == "first_sign" for r in rows),
             "alt_end": sum(r["kind"] == "alt_end" for r in rows), "centroids": len(crow), "extra_rows": n_extra,
             "rows_per_source": dict(Counter(r["source"] for r in rows)),
             "contains_eval": idx.meta.contains_eval, "encoder_sha256": idx.meta.encoder_sha256,
+            "split": idx.meta.split, "train_clip_ids_sha256": idx.meta.train_clip_ids_sha256,
             "seconds": round(time.time() - t0, 1), "dir": str(out_dir)}

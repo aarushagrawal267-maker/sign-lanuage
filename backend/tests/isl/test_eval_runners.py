@@ -184,7 +184,7 @@ def phase2(tmp_path_factory):
     train_encoder(data, work / "encoder.pt", ISL_FEATURES, cfg, emb_dim=16, p=4, k=2, smoke=True, threads=1,
                   batches_per_epoch=3)
     build_index(EncoderPredictor(work / "encoder.pt"), data.islrtc, data.include_part("train"), work / "index",
-                "research", extra=data.extra_part("train"))
+                "research", extra=data.extra_part("train"), split=data.split["name"])
     rec = load_recognizer(work, ISL_FEATURES, w["vocab"], profile="research")
     params, _ = fit_fusion(rec, data.labelled_part("val"), "research")
     params.save(work / "fusion.json")
@@ -249,6 +249,17 @@ def test_evaluate_all_writes_report_with_rates_and_groups(phase2, tmp_path):
     assert "WITHOUT labels" in p["E2"]["label"] and "reference clips E2 retrieves against" in p["E2"]["label"]
     # no pre-training in this build: the guard says so instead of claiming True
     assert doc["leakage_guards"]["pretraining_excludes_eval_clips"] is None
+    # the index guard covered the other sources too: their centroids list their clips (docs 15.22)
+    ig = doc["leakage_guards"]["index"]
+    assert ig["training_parts_only"] is True and ig["train_clip_ids_checked"] and ig["eval_clip_ids_checked"] > 0
+    from app.isl.models.index import EmbeddingIndex
+
+    rows = EmbeddingIndex.load(work / "index").rows
+    multi = [r for r in rows if r["kind"] in ("centroid", "signer_centroid")]
+    assert multi and all(len(r["clips"]) == r["n_clips"] for r in multi)
+    assert {i for r in rows for i in r.get("clips", [r.get("clip")]) if i} <= (
+        {c.clip_id for c in data.islrtc} | {c.clip_id for c in data.include_part("train")}
+        | {c.clip_id for c in data.extra_part("train")})
     assert "Leakage guards" in (out / "report.md").read_text()
     # every interval either exists with its group count or has a reason
     for k in ("E1b", "E1c"):

@@ -46,7 +46,7 @@ def isl_env(tmp_path_factory):
     re_ = train_encoder(data, work / "encoder.pt", ISL_FEATURES, TrainConfig(**TINY), emb_dim=16, p=4, k=2, smoke=True,
                         threads=1, batches_per_epoch=3)
     ri = build_index(EncoderPredictor(work / "encoder.pt"), data.islrtc, data.include_part("train"), work / "index",
-                     "commercial-safe")
+                     "commercial-safe", split=data.split["name"])
     rec = load_recognizer(work, ISL_FEATURES, w["vocab"], profile="commercial-safe")
     params, rf = fit_fusion(rec, data.include_part("val"), "commercial-safe")
     params.save(work / "fusion.json")

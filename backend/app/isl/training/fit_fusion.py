@@ -30,19 +30,34 @@ def collect_evidence(rec, clips: list[Clip], use_my_signs: bool = False) -> tupl
     return inputs, truths, used
 
 
-def check_index_for_fitting(rec, clips: list[Clip]) -> dict | None:
-    """Leak guard (docs 15.21): the retrieval index ``rec`` uses must be the training-only one of this very encoder
-    file and hold no row of these clips; ``LeakageError`` otherwise. None when ``rec`` has no index."""
+def check_index_for_fitting(rec, clips: list[Clip], data=None) -> dict | None:
+    """Leak guard (docs 15.21, 15.22): the retrieval index ``rec`` uses must be the training-only one of this very
+    encoder file and hold no row built from these clips; ``LeakageError`` otherwise. With ``data`` (``IslData``), the
+    index must also record this data's split and exactly the training clips the ``index`` step would use now. None
+    when ``rec`` has no index. A recogniser with an index but no encoder file path is refused: the index cannot be
+    shown to match the encoder."""
+    from app.isl.models.index import LeakageError
+
     idx = getattr(rec, "index", None)
     if idx is None:
         return None
-    enc = getattr(rec, "encoder", None)
-    return idx.check_for_evaluation(getattr(enc, "path", None), eval_clip_ids=[c.clip_id for c in clips])
+    enc_path = getattr(getattr(rec, "encoder", None), "path", None)
+    if enc_path is None:
+        raise LeakageError("the recogniser has a retrieval index but no encoder file path, so the index cannot be "
+                           "shown to be embedded with this encoder (docs 15.21)")
+    kw: dict = {}
+    if data is not None:
+        from app.isl.training.build_index import index_training_clip_ids
+
+        kw = {"split": str(data.split.get("name") or ""), "train_clip_ids": index_training_clip_ids(data)}
+    return idx.check_for_evaluation(enc_path, eval_clip_ids=[c.clip_id for c in clips], **kw)
 
 
-def fit_fusion(rec, val_clips: list[Clip], profile: str, version: str = "fusion-1") -> tuple[FusionParams, dict]:
+def fit_fusion(rec, val_clips: list[Clip], profile: str, version: str = "fusion-1",
+               data=None) -> tuple[FusionParams, dict]:
+    """``data``: the run's ``IslData``, for the full index leak guard (split + training clips, docs 15.22)."""
     t0 = time.time()
-    guard = check_index_for_fitting(rec, val_clips)  # before any work: an eval-including index is refused
+    guard = check_index_for_fitting(rec, val_clips, data)  # before any work: an eval-including index is refused
     inputs, truths, used = collect_evidence(rec, val_clips)
     base = FusionParams(profile=profile, version=version)
     rep: dict = {"val_queries": len(inputs)}

@@ -637,8 +637,9 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     test_inc = data.include_part("test")
     from app.isl.training.fit_fusion import check_index_for_fitting
 
-    # no index row of a clip that is measured (test) or that fitted the thresholds (val); docs 15.21
-    index_guard = check_index_for_fitting(rec, test_inc + data.extra_part("test") + data.labelled_part("val"))
+    # no index row built from a clip that is measured (test) or that fitted the thresholds (val), and the index was
+    # built from exactly this split's current training clips (docs 15.21, 15.22)
+    index_guard = check_index_for_fitting(rec, test_inc + data.extra_part("test") + data.labelled_part("val"), data)
     # E1b / E1c / E3 on the primary split's test part
     log("E1b")
     prot["E1b"] = e1_closed_set(rec, test_inc, f"E1b core words, closed set, INCLUDE test part of {split_name} ({lab}; "
@@ -783,7 +784,10 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
             "classifier_refused": cls_why, "dedup": getattr(data, "multisource", {}).get("dedup"),
             "links": getattr(data, "multisource", {}).get("links"),
             "pretraining_excludes_eval_clips": pre_guard.get("excludes_eval_clips"), "pretraining_check": pre_guard,
-            "index": ({"dir": "index", "training_parts_only": True, **index_guard} if index_guard is not None
+            "index": ({"dir": "index", "training_parts_only": (index_guard["contains_eval"] is False
+                                                               and index_guard["split_checked"]
+                                                               and index_guard["train_clip_ids_checked"]),
+                       **index_guard} if index_guard is not None
                       else {"dir": None, "note": "no retrieval index"})}
     if smoke:
         label = ("SMOKE RUN on partial data with tiny settings: proves the pipeline runs end to end. These numbers "

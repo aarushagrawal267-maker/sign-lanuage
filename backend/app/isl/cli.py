@@ -884,7 +884,7 @@ def cmd_build_index(paths: IslPaths, args) -> int:
     include = data.include_part("train") if not args.all_include else [c for c in data.include if c.concept_id]
     extra = [c for c in data.extra if args.all_include or data.extra_assign.get(c.clip_id) == "train"]
     _print(build_index(enc, data.islrtc, include, out, profile, extra=extra or None,
-                       contains_eval=bool(args.all_include)))
+                       contains_eval=bool(args.all_include), split=str(data.split.get("name") or "")))
     return 0
 
 
@@ -894,7 +894,8 @@ def cmd_fit_fusion(paths: IslPaths, args) -> int:
 
     profile, data, fcfg, work = _model_ctx(paths, args)
     rec = load_recognizer(work, fcfg, _vocab_path(args), profile=profile)
-    params, rep = fit_fusion(rec, data.labelled_part("val"), profile)
+    # data: the leak guard also checks the index's split and training clips against this run's (docs 15.22)
+    params, rep = fit_fusion(rec, data.labelled_part("val"), profile, data=data)
     assert set(params.accept) == {"strict", "balanced", "lenient"}, params.accept  # decide() needs all three
     params.save(work / "fusion.json")
     _print(rep)
@@ -989,10 +990,10 @@ def cmd_smoke(paths: IslPaths, args) -> int:
                                       progress=lambda f, m: _log(f"  encoder {m}"))
     _log(f"[smoke] encoder: {report['encoder']}")
     report["index"] = build_index(EncoderPredictor(work / "encoder.pt"), data.islrtc, data.include_part("train"),
-                                  work / "index", profile)
+                                  work / "index", profile, split=str(data.split.get("name") or ""))
     _log(f"[smoke] index: {report['index']}")
     rec = load_recognizer(work, fcfg, profile=profile)
-    params, report["fusion"] = fit_fusion(rec, data.include_part("val"), profile)
+    params, report["fusion"] = fit_fusion(rec, data.include_part("val"), profile, data=data)
     params.save(work / "fusion.json")
     _log(f"[smoke] fusion: {report['fusion'].get('weights')} {report['fusion'].get('thresholds')}")
     doc = evaluate(work, data, fcfg, smoke=True)

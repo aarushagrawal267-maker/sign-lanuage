@@ -310,8 +310,11 @@ run_step() {
       mkdir -p "$WORK/e1a"
       train train-classifier $COMMON $CAP $CLS --batches ${E1A_STEPS:-$([[ $SMOKE == 1 ]] && echo 6 || echo 120)} --split include-official --ckpt "$WORK/e1a/classifier.pt" ;;
     fingerspell) cli train-fingerspell --profile "$PROFILE" --threads "$THREADS" --vocab "$VOCAB" $SM $LET ;;
-    # training parts only, into <work>/index: fit-fusion and evaluate read it and refuse anything else (docs 15.21)
-    index) cli build-index $COMMON --all-sources $CAP --out "$WORK/index" ;;
+    # training parts only, into <work>/index: fit-fusion and evaluate read it and refuse anything else (docs 15.21).
+    # A rebuilt index makes the later steps that used or must follow it stale: forget their stamps (docs 15.22),
+    # so an older index_final (other data / row logic) is never shipped next to it
+    index) cli build-index $COMMON --all-sources $CAP --out "$WORK/index" \
+        && rm -f "$STAMPS/fusion.done" "$STAMPS/evaluate.done" "$STAMPS/index_final.done" "$STAMPS/pack.done" ;;
     fusion) cli fit-fusion $COMMON --all-sources $CAP ;;
     trim_eval)  # E8: evaluate exactly the trimmer of the trim step (same learned-model choice) into the work folder
       # a new trim-eval makes an older report / pack stale: forget their stamps so they are rebuilt from it

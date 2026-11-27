@@ -5,12 +5,14 @@ Files in the index folder::
     embeddings.f16.npy   (N, D) float16, L2-normalised
     rows.jsonl           {"row", "variant_id", "concept_id", "source", "kind", "weight"}
     meta.json            {"encoder_version", "dim", "n", "created", "feature_config", "profile", "sha256",
-                          "contains_eval", "encoder_sha256"}
+                          "contains_eval", "encoder_sha256", "split", "train_clip_ids_sha256"}
 
 ``contains_eval`` says whether the index holds references of validation / test clips (``build-index --all-include``,
 the shipped ``index_final``); ``encoder_sha256`` is the SHA-256 of the encoder file the rows were embedded with
 (``ENCODER_VERSION`` is a constant, so it cannot tell two trainings apart). Index files written before these fields
 existed load with ``contains_eval = None`` (unknown) and ``encoder_sha256 = ""`` (docs/ISL_DESIGN.md 15.21).
+``split`` and ``train_clip_ids_sha256`` say which split's training parts were indexed and which clips exactly; rows
+built from several clips (centroids) list them in ``clips`` (docs/ISL_DESIGN.md 15.22).
 
 ~25k x 256 cosine scores are one small matrix product (a few ms on CPU), so no ANN library is needed.
 """
@@ -39,7 +41,18 @@ class LeakageError(RuntimeError):
     """An evaluation / fitting input may contain the clips it is measured on (docs/ISL_DESIGN.md 15.21)."""
 
 
+class IndexMissingError(LeakageError):
+    """A measuring caller (fit-fusion, evaluation) found no training-only ``work/index`` while another index is there
+    (``index_final``, or ``index.old`` / ``index.tmp`` of an interrupted save): it would otherwise run without
+    retrieval and say nothing (docs/ISL_DESIGN.md 15.22)."""
+
+
 _SHA_CACHE: dict[tuple, str] = {}
+
+
+def clip_ids_sha256(ids) -> str:
+    """SHA-256 of a set of clip ids (sorted, one per line): which clips an index was built from."""
+    return hashlib.sha256("\n".join(sorted({str(i) for i in ids})).encode("utf-8")).hexdigest()
 
 
 def file_sha256(path: Path) -> str:
@@ -69,6 +82,10 @@ class IndexMeta:
     # None: unknown (an index file written before this field existed)
     contains_eval: bool | None = None
     encoder_sha256: str = ""  # SHA-256 of the encoder file used ("" = unknown: older index or no file)
+    # the split whose assignment chose the indexed clips, and clip_ids_sha256 of the INCLUDE + other-source clips
+    # given to the build ("" = unknown: an index written before docs 15.22; refused for fitting / evaluation)
+    split: str = ""
+    train_clip_ids_sha256: str = ""
 
     def to_json(self) -> dict:
         return dict(self.__dict__)
@@ -103,12 +120,14 @@ class EmbeddingIndex:
     # ------------------------------------------------------------------ io
     @classmethod
     def build(cls, emb: np.ndarray, rows: list[dict], encoder_version: str, feature_config: dict | None = None,
-              profile: str = "", contains_eval: bool | None = None, encoder_sha256: str = "") -> EmbeddingIndex:
+              profile: str = "", contains_eval: bool | None = None, encoder_sha256: str = "", split: str = "",
+              train_clip_ids_sha256: str = "") -> EmbeddingIndex:
         rows = [{**r, "row": i} for i, r in enumerate(rows)]
         emb = np.asarray(emb, np.float32)
         meta = IndexMeta(encoder_version, int(emb.shape[1]) if emb.ndim == 2 and emb.size else 0, len(rows),
                          datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), feature_config or {}, profile,
-                         contains_eval=contains_eval, encoder_sha256=encoder_sha256)
+                         contains_eval=contains_eval, encoder_sha256=encoder_sha256, split=split or "",
+                         train_clip_ids_sha256=train_clip_ids_sha256)
         if meta.dim == 0:
             raise ValueError("cannot build an empty index")
         return cls(emb, rows, meta)
@@ -161,7 +180,17 @@ class EmbeddingIndex:
         return cls(emb, rows, meta)
 
     # ------------------------------------------------------------ leak guard
-    def check_for_evaluation(self, encoder_path: Path | None = None, eval_clip_ids=None, where: str = "") -> dict:
+    def row_clip_ids(self) -> set[str]:
+        """Every clip id an index row was built from: ``clip`` (one-clip rows) and ``clips`` (centroids)."""
+        out: set[str] = set()
+        for r in self.rows:
+            if r.get("clip"):
+                out.add(r["clip"])
+            out.update(r.get("clips") or ())
+        return out
+
+    def check_for_evaluation(self, encoder_path: Path | None = None, eval_clip_ids=None, where: str = "",
+                             split: str | None = None, train_clip_ids=None) -> dict:
         """Refuse (``LeakageError``) an index that cannot be shown to be clean for fitting or evaluation:
 
         * ``contains_eval`` is True (``--all-include`` / ``index_final``: it holds validation and test references);
@@ -169,7 +198,13 @@ class EmbeddingIndex:
           driver's ``index_final`` step overwrote ``work/index``, so an old ``work/index`` may hold evaluation
           clips: rebuild it with the ``index`` step (no ``--all-include``);
         * ``encoder_path`` is given and the index records another (or no) encoder SHA-256;
-        * a row names one of ``eval_clip_ids`` (a direct check on the rows that carry a clip id).
+        * the index does not record its ``split`` and ``train_clip_ids_sha256`` (written before docs 15.22: its
+          centroid rows do not list their clips either);
+        * ``split`` is given and differs from the recorded one (e.g. ``fit-fusion --split <other>``);
+        * ``train_clip_ids`` is given (the clips the ``index`` step would use now) and their digest differs from the
+          recorded one: the split assignment or the data changed since the build, so old centroids may hold clips
+          that are validation / test clips now;
+        * a row was built from one of ``eval_clip_ids`` (``clip`` of one-clip rows, ``clips`` of centroids).
 
         Returns a small summary for reports."""
         m = self.meta
@@ -192,15 +227,27 @@ class EmbeddingIndex:
             if have != m.encoder_sha256:
                 raise LeakageError(f"{name} was embedded with another encoder file (sha256 {m.encoder_sha256[:12]}... "
                                    f"vs {have[:12]}... of {encoder_path}): stale index; {fix}")
+        if not m.split or not m.train_clip_ids_sha256:
+            raise LeakageError(f"{name} does not record its split and the clips it was built from (written before "
+                               f"docs 15.22; its centroids do not list their clips), so it cannot be shown to hold "
+                               f"no validation / test clip; {fix}")
+        if split is not None and m.split != split:
+            raise LeakageError(f"{name} was built from the training parts of split {m.split!r}, but this run uses "
+                               f"split {split!r}: its rows may hold this split's validation / test clips; {fix}")
+        if train_clip_ids is not None and clip_ids_sha256(train_clip_ids) != m.train_clip_ids_sha256:
+            raise LeakageError(f"{name} was built from other training clips than the current data has (the split "
+                               f"assignment or the data changed since the build): old centroids may hold clips that "
+                               f"are validation / test clips now; {fix}")
         n_checked = 0
         if eval_clip_ids is not None:
             ids = set(eval_clip_ids)
-            hit = sorted({r["clip"] for r in self.rows if r.get("clip") in ids})
+            hit = sorted(self.row_clip_ids() & ids)
             n_checked = len(ids)
             if hit:
-                raise LeakageError(f"{name} has rows of {len(hit)} evaluation clips (e.g. {hit[:3]}); {fix}")
-        return {"contains_eval": m.contains_eval, "encoder_sha256": m.encoder_sha256,
-                "encoder_sha256_checked": encoder_path is not None, "eval_clip_ids_checked": n_checked}
+                raise LeakageError(f"{name} has rows built from {len(hit)} evaluation clips (e.g. {hit[:3]}); {fix}")
+        return {"contains_eval": m.contains_eval, "encoder_sha256": m.encoder_sha256, "split": m.split,
+                "encoder_sha256_checked": encoder_path is not None, "split_checked": split is not None,
+                "train_clip_ids_checked": train_clip_ids is not None, "eval_clip_ids_checked": n_checked}
 
     # --------------------------------------------------------------- search
     def scores(self, q: np.ndarray) -> np.ndarray:
