@@ -56,6 +56,9 @@
 # LINK_ALIASES=1|0 (docs 15.34; research 1, commercial-safe 0): the link step strips WSLP's "(N)" numbering
 #   (adult(1) -> isl.adult) and turns on the twin alias groups (female / woman-female, ...) for the work folder
 #   (link-sources --link-aliases -> <work>/link_settings.json, read by every later step). Only the link step reads it.
+# VARIANT_LINKS=auto|none (docs 15.36; default auto for both profiles): the link step reads <work>/variant_links.json
+#   (written by `cli variant-audit` into THIS work folder only) when it exists and freezes its relinks and SHA-256 into
+#   link_settings.json; none = ignore it. No file (every run so far, every scratch run): nothing changes.
 # EVAL_COMPARE_TO=<report.json>: the evaluate step runs `evaluate --all --compare-to <report.json>` (E1b and E4 like
 # for like against that report, e.g. artifacts/isl/commercial-safe/eval/report.json; docs 15.27, 15.28, 15.31).
 # One profile per run (refused with --profile both); a missing file is refused before anything runs (exit 2).
@@ -210,6 +213,13 @@ WSLP_TWINS="${INDEX_WSLP_TWINS:-$TW_DEFAULT}"
 LINK_ALIASES="${LINK_ALIASES:-$([[ "$PROFILE" == "research" ]] && echo 1 || echo 0)}"
 case "$LINK_ALIASES" in 0|1) ;; *) echo "LINK_ALIASES must be 0 or 1" >&2; exit 2 ;; esac
 LA_ARG=""; [[ $LINK_ALIASES == 1 ]] && LA_ARG="--link-aliases"
+# variant forms (docs 15.36): the link step reads this work folder's variant_links.json when present (auto)
+VARIANT_LINKS="${VARIANT_LINKS:-auto}"
+case "$VARIANT_LINKS" in auto|none) ;; *) echo "VARIANT_LINKS must be auto or none" >&2; exit 2 ;; esac
+VL_ARG=""; [[ $VARIANT_LINKS == none ]] && VL_ARG="--variant-links none"
+if [[ $VARIANT_LINKS == none ]]; then VL_FILE="off"
+elif [[ -f "$WORK/variant_links.json" ]]; then VL_FILE="sha256:$(sha256sum "$WORK/variant_links.json" | cut -c1-16)"
+else VL_FILE="none"; fi
 case "$DICT_GROUP" in 0|1) ;; *) echo "CLS_DICTIONARY_GROUP must be 0 or 1" >&2; exit 2 ;; esac
 case "$WSLP_TWINS" in keep|drop|auto) ;; *) echo "INDEX_WSLP_TWINS must be keep, drop or auto" >&2; exit 2 ;; esac
 [[ "$ENC_XSRC" =~ ^[a-z0-9_,]*$ ]] || { echo "ENC_EXCLUDE_SOURCES: comma-separated source names" >&2; exit 2; }
@@ -225,7 +235,7 @@ step_settings() {
     classifier|cv|e1a) echo " dict_group=$DICT_GROUP" ;;
     encoder|oneshot) echo " enc_exclude=${ENC_XSRC:--}" ;;
     index|index_final) echo " wslp_twins=$WSLP_TWINS" ;;
-    link) echo " link_aliases=$LINK_ALIASES" ;;
+    link) echo " link_aliases=$LINK_ALIASES variant_links=$VL_FILE" ;;
   esac
 }
 # a scratch run: a full run with a tag or its own work folder (smoke runs have their own private ISL root). It must
@@ -297,7 +307,7 @@ in_list() { local x n="$1"; shift; for x in "$@"; do [[ "$x" == "$n" ]] && retur
 step_outputs() {  # what a step leaves in the work folder for later steps (a leading ! = required); for seeding
   case "$1" in
     vocab) echo "!vocabulary.jsonl" ;;
-    link) echo "extra_concepts.jsonl sources.json multisource.json link_settings.json" ;;
+    link) echo "extra_concepts.jsonl sources.json multisource.json link_settings.json variant_links.json" ;;
     pretrain_dedup) echo "pretrain_dedup.json" ;;
     pretrain) echo "!pretrained_encoder.pt pretrain_clips.txt" ;;
     encoder) echo "!encoder.pt" ;;
@@ -341,7 +351,7 @@ run_step() {
       cli dedup --sources include islrtc cislr wslp isl500 mendeley_emergency mendeley_agri ;;
     vocab) cli vocab --no-trims --out "$VOCAB" ;;  # to the work folder (commit to models/packs/isl after review)
     splits) cli splits --vocab "$VOCAB" ;;  # fetches the official INCLUDE lists only when missing
-    link) cli link-sources $COMMON --all-sources $CAP $LA_ARG ;;
+    link) cli link-sources $COMMON --all-sources $CAP $LA_ARG $VL_ARG ;;
     bench) cli bench --threads "$THREADS" --steps $([[ $SMOKE == 1 ]] && echo 1 || echo 5) --hidden-sizes ${HIDDEN:-192} ;;
     pretrain_dedup) cli pretrain-dedup $COMMON --all-sources $CAP $PDD ;;  # Sign Library copies / eval-clip matches
     pretrain) train pretrain $COMMON $CAP $PRE ;;
@@ -389,6 +399,7 @@ if [[ $DRY_RUN == 1 ]]; then
   [[ -n "$COMPARE_TO" ]] && echo "evaluate compares to: $COMPARE_TO"
   echo "wslp/dictionary: classifier dictionary group=$DICT_GROUP, encoder excludes=${ENC_XSRC:--}, index wslp twins=$WSLP_TWINS"
   echo "linker: aliases and WSLP number stripping=$LINK_ALIASES (link step only)"
+  echo "variant links: VARIANT_LINKS=$VARIANT_LINKS, $WORK/variant_links.json: $VL_FILE (link step only)"
 fi
 
 if [[ $LIST == 1 ]]; then
@@ -432,7 +443,18 @@ else
   fi
 fi
 WSLP_SETTINGS="${WSLP_SETTINGS% link_aliases=*} link_aliases=$LA_STATE"
-[[ $DRY_RUN == 1 ]] && echo "linker this run: link_aliases=$LA_STATE"
+# variant links (docs 15.36): the file the link step reads, or the folder's frozen state when link is not run
+if in_list link "${RUN[@]}"; then
+  VL_STATE="$VL_FILE"
+else
+  vl_dir="$WORK"; in_list link "${SEED[@]}" && vl_dir="$SEED_WORK"
+  if [[ ! -f "$vl_dir/link_settings.json" ]]; then vl_folder="none"
+  elif grep -q '"variants"' "$vl_dir/link_settings.json"; then vl_folder="on"
+  else vl_folder="off"; fi
+  VL_STATE="(link step not run; folder: $vl_folder)"
+fi
+WSLP_SETTINGS="$WSLP_SETTINGS variant_links=$VL_STATE"
+[[ $DRY_RUN == 1 ]] && echo "linker this run: link_aliases=$LA_STATE variant_links=$VL_STATE"
 # (not for --check-only, which runs no step)
 if [[ $SCRATCH == 1 && $ALLOW_SHARED == 0 && $CHECK_ONLY == 0 ]]; then
   for s in "${RUN[@]}"; do

@@ -43,6 +43,9 @@ source of the profile, linked to concepts, signer-held-out splits, duplicates dr
 training ones --resume / --max-minutes (exit code 75 = stopped with state saved, run again with --resume):
 
   link-sources           read + link every labelled source -> <work>/multisource.json, sources.json, extra_concepts.jsonl
+                         (--variant-links auto|none|FILE: variant forms of a variant-audit, docs 15.36)
+  variant-audit --reference-work artifacts/isl/commercial-safe
+                         research: ISL500 words signed in another form than INCLUDE's -> <work>/variant_links.json
   pretrain               self-supervised encoder pre-training (temporal contrastive + masked frames) on every
                          unlabelled / sentence source of the profile -> <work>/pretrained_encoder.pt
   train-encoder --init auto
@@ -1002,18 +1005,148 @@ def cmd_build_pack(paths: IslPaths, args) -> int:
     return 0
 
 
+def _variant_links_file(work: Path, choice: str | None) -> Path | None:
+    """``--variant-links``: ``auto`` (default) = ``<work>/variant_links.json`` when it exists; ``none`` = never; else a
+    file path (must exist). docs 15.36, critic 7: only this work folder's audit, or a file named explicitly."""
+    from app.isl.training.variant_audit import VARIANT_LINKS
+
+    c = (choice or "auto").strip()
+    if c in ("none", "off"):
+        return None
+    if c == "auto":
+        f = Path(work) / VARIANT_LINKS
+        return f if f.exists() else None
+    f = Path(c)
+    if not f.is_file():
+        raise FileNotFoundError(f"--variant-links {c}: no such file")
+    return f
+
+
 def cmd_link_sources(paths: IslPaths, args) -> int:
     """Read every labelled source of the profile, link glosses to concepts, split signers, drop duplicates.
-    Writes ``<work>/link_settings.json`` (docs 15.34): every later step of the work folder links the same way."""
+    Writes ``<work>/link_settings.json`` (docs 15.34): every later step of the work folder links the same way.
+    A variant-links file (``cli variant-audit``, docs 15.36) is frozen into it with its SHA-256."""
+    from app.core.config import get_settings
+    from app.isl.profiles import get_profile
     from app.isl.training.multisource import link_settings, write_link_settings
+    from app.isl.training.pipeline import workdir
+    from app.isl.training.variant_audit import VariantLinksError, load_variant_links
 
+    profile = get_profile(args.profile or get_settings().isl_profile).name
+    try:
+        vf = _variant_links_file(workdir(profile), getattr(args, "variant_links", "auto"))
+        variants, vmeta = load_variant_links(vf, profile) if vf is not None else ({}, {})
+    except (FileNotFoundError, VariantLinksError) as e:
+        print(f"link-sources: {e}", file=sys.stderr)
+        return 2
     args.all_sources = True
-    args.link_settings_override = link_settings(bool(getattr(args, "link_aliases", False)))
+    args.link_settings_override = link_settings(bool(getattr(args, "link_aliases", False)), variants, vmeta)
     profile, data, fcfg, work = _model_ctx(paths, args)
     data.link = write_link_settings(work, args.link_settings_override, data.linker)
     _print({"data": data.summary(), "multisource": data.multisource, "work": str(work),
-            "link": {k: v for k, v in data.link.items() if k != "alias_of"} | {"alias_groups": len(set(
-                data.alias_of.values()))}})
+            "link": {k: v for k, v in data.link.items() if k not in ("alias_of", "variants")} | {
+                "alias_groups": len(set(data.alias_of.values())),
+                "variant_relinks": sum(len(m) for m in (data.link.get("variants") or {}).values())}})
+    return 0
+
+
+def _artifacts_isl_base() -> Path:
+    """The parent of the profile work folders (``SLR_ISL_WORKDIR`` or ``artifacts/isl``), without creating one."""
+    import os
+
+    from app.core.config import get_settings
+
+    e = os.environ.get("SLR_ISL_WORKDIR")
+    return Path(e) if e else get_settings().artifacts_dir / "isl"
+
+
+def cmd_variant_audit(paths: IslPaths, args) -> int:
+    """QA plan 1.3, critics 7 and 13 (docs 15.36): which ISL500 words are another sign form than INCLUDE's.
+
+    The commercial-safe classifier (never trained on ISL500) scores ISL500 TRAIN clips; words with few top-5 hits
+    are cross-checked against the ISLRTC dictionary with the commercial-safe encoder (and optionally the reverse
+    direction). Writes ``<work>/variant_links.json`` of THIS profile's work folder (or ``--out``), never
+    ``data/isl/derived``. The link step of that work folder reads it."""
+    from app.isl.models.encoder import EncoderPredictor
+    from app.isl.models.index import EmbeddingIndex, file_sha256
+    from app.isl.profiles import WORD_SOURCES, get_profile
+    from app.isl.training import variant_audit as va
+    from app.isl.training.common import load_isl_data, load_vocab, set_threads
+    from app.isl.training.multisource import attach_all_sources, link_settings
+    from app.isl.training.pipeline import workdir
+    from app.isl.vocab.aliases import TWIN_ALIASES, resolve_aliases
+    from app.models.checkpoint import Predictor
+
+    def refuse(msg: str) -> int:
+        print(f"variant-audit: {msg}", file=sys.stderr)
+        return 2
+
+    set_threads(args.threads)
+    profile = get_profile(args.profile or "research").name
+    if va.VARIANT_SOURCE not in WORD_SOURCES[profile]:
+        return refuse(f"profile {profile} has no {va.VARIANT_SOURCE} clips (research only)")
+    ref = Path(args.reference_work) if args.reference_work else _artifacts_isl_base() / "commercial-safe"
+    if not (ref / "classifier.pt").exists():
+        return refuse(f"no reference classifier {ref / 'classifier.pt'} (--reference-work)")
+    clf = Predictor(ref / "classifier.pt")
+    ref_prof = clf.meta.get("profile")
+    if ref_prof not in WORD_SOURCES or va.VARIANT_SOURCE in WORD_SOURCES[ref_prof]:
+        return refuse(f"the reference classifier's profile is {ref_prof!r}: it must be one that never trains on "
+                      f"{va.VARIANT_SOURCE} (commercial-safe), or the audit scores its own training clips")
+    out = Path(args.out) if args.out else workdir(profile) / va.VARIANT_LINKS
+    try:
+        Path(out).resolve().relative_to(Path(paths.derived).resolve())
+        return refuse(f"{out} is inside the shared {paths.derived}: write the audit into the work folder (critic 7)")
+    except ValueError:
+        pass
+    prov = {"classifier": str(ref / "classifier.pt"), "classifier_sha256": file_sha256(ref / "classifier.pt"),
+            "classifier_profile": ref_prof, "classifier_split": clf.meta.get("split"),
+            "classifier_classes": len(clf.class_names)}
+    enc = dictionary = None
+    if not args.no_dictionary:
+        idx_dir = Path(args.reference_index) if args.reference_index else ref / "index"
+        if not (ref / "encoder.pt").exists() or not (idx_dir / "meta.json").exists():
+            return refuse(f"the dictionary cross-check needs {ref / 'encoder.pt'} and {idx_dir} (critic 13); "
+                          "--no-dictionary skips it (then no word is relinked without --reverse-classifier)")
+        enc = EncoderPredictor(ref / "encoder.pt")
+        if enc.feature_config.to_dict() != clf.feature_config.to_dict():
+            return refuse("the reference encoder and classifier use different feature configs")
+        idx = EmbeddingIndex.load(idx_dir, expect_encoder_version=enc.version, encoder_path=ref / "encoder.pt")
+        dictionary = va.dictionary_from_index(idx)
+        prov |= {"encoder": str(ref / "encoder.pt"), "encoder_sha256": file_sha256(ref / "encoder.pt"),
+                 "index": str(idx_dir), "index_sha256": idx.meta.sha256,
+                 "dictionary_concepts": len(dictionary) if dictionary else 0}
+    vocab = load_vocab(_vocab_path(args))
+    data = load_isl_data(paths, vocab, profile, args.split, max_islrtc=args.max_islrtc or None, seed=args.seed)
+    # the base linking (no twins, no variants): the audit judges the concepts the linker gives without it
+    attach_all_sources(data, paths, vocab, profile, seed=args.seed,
+                       max_per_source=getattr(args, "max_per_source", 0) or None, link=link_settings(False))
+    twins = resolve_aliases(TWIN_ALIASES, data.linker.known | set(data.linker.new))
+    rev_score = rev_names = None
+    rev_clips = None
+    if args.reverse_classifier:
+        rc = Predictor(Path(args.reverse_classifier))
+        if args.reverse_part == "train" and rc.meta.get("split") == data.split.get("name"):
+            return refuse("the reverse classifier was trained on these INCLUDE train clips; use --reverse-part val")
+        rev_score, rev_names = va.model_scorer(rc), list(rc.class_names)
+        rev_clips = data.include_part(args.reverse_part)
+        prov |= {"reverse_classifier": str(args.reverse_classifier),
+                 "reverse_classifier_sha256": file_sha256(Path(args.reverse_classifier)),
+                 "reverse_classifier_profile": rc.meta.get("profile"), "reverse_part": args.reverse_part,
+                 "reverse_note": "every classifier also trains on INCLUDE train clips: a jointly trained model "
+                                 "says 'no difference' easily, so its veto is weak evidence"}
+    models = va.AuditModels(list(clf.class_names), va.model_scorer(clf, enc), dictionary, rev_names, rev_score, prov)
+    params = va.AuditParams(min_clips=args.min_clips, max_agreement=args.max_agreement,
+                            dict_rank_floor=args.dict_rank_floor, dict_rank_ratio=args.dict_rank_ratio,
+                            dict_include_max_rank=args.dict_include_max_rank,
+                            reverse_min_agreement=args.reverse_min_agreement, max_per_class=args.max_per_class,
+                            seed=args.seed)
+    isl500 = data.extra_part("train", (va.VARIANT_SOURCE,))
+    doc = va.run_audit(isl500, data.include_part("train"), models, params, twins, rev_clips, progress=_log)
+    meta = va.write_variant_links(out, doc, profile=profile, work=workdir(profile),
+                                  extra={"data": {"split": data.split.get("name"), "isl500_train_clips": len(isl500),
+                                                  "include_train_clips": len(data.include_part("train"))}})
+    _print({"variant_links": meta, "summary": doc["summary"], "relinks": doc["relinks"]})
     return 0
 
 
@@ -1126,7 +1259,7 @@ COMMANDS = {
     "build-pack": cmd_build_pack, "smoke": cmd_smoke, "hindi": cmd_hindi,
     "link-sources": cmd_link_sources, "pretrain": cmd_pretrain, "train-oneshot": cmd_train_oneshot,
     "train-fingerspell": cmd_train_fingerspell, "bench": cmd_bench, "readiness": cmd_readiness,
-    "pretrain-dedup": cmd_pretrain_dedup,
+    "pretrain-dedup": cmd_pretrain_dedup, "variant-audit": cmd_variant_audit,
 }
 
 
@@ -1230,6 +1363,26 @@ def build_parser() -> argparse.ArgumentParser:
                     help="strip WSLP's '(N)' numbering (adult(1) -> isl.adult) and use the twin alias groups (female / "
                          "woman-female, ...); written to <work>/link_settings.json, which every later step reads "
                          "(docs 15.34). Default: link as before")
+    lk.add_argument("--variant-links", default="auto",
+                    help="variant forms (cli variant-audit, docs 15.36): auto = <work>/variant_links.json when it "
+                         "exists (default), none = never, or a file of this profile. Frozen into link_settings.json")
+    vau = sub.add_parser("variant-audit")
+    _model_args(vau)
+    vau.add_argument("--reference-work", help="work folder of the reference models (default: the commercial-safe "
+                                              "work folder): classifier.pt, encoder.pt, index/")
+    vau.add_argument("--reference-index", help="dictionary index (default <reference-work>/index)")
+    vau.add_argument("--no-dictionary", action="store_true", help="skip the dictionary cross-check (critic 13)")
+    vau.add_argument("--reverse-classifier", help="a classifier trained on ISL500: scores INCLUDE clips (reverse check)")
+    vau.add_argument("--reverse-part", choices=["train", "val"], default="val",
+                     help="INCLUDE part the reverse classifier scores (never test; train is refused for a "
+                          "classifier trained on that split)")
+    vau.add_argument("--min-clips", type=int, default=20)
+    vau.add_argument("--max-agreement", type=float, default=0.3)
+    vau.add_argument("--dict-rank-floor", type=int, default=10)
+    vau.add_argument("--dict-rank-ratio", type=float, default=3.0)
+    vau.add_argument("--dict-include-max-rank", type=int, default=20)
+    vau.add_argument("--reverse-min-agreement", type=float, default=0.3)
+    vau.add_argument("--max-per-class", type=int, default=0, help="score at most N train clips per word (0 = all)")
     pdd = sub.add_parser("pretrain-dedup")
     _model_args(pdd)
     pdd.add_argument("--max-chunks", type=int, default=0, help="smoke: check at most N Sign Library chunks")

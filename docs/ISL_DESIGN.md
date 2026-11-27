@@ -4079,3 +4079,76 @@ behave as in Batch 0. Tests: `backend/tests/isl/test_linker_aliases.py` (the rac
 comment; WSLP-only stripping; a settings file whose map differs from the code's; a group with a class is closed;
 `fit_thresholds` sees the summed groups, roots, strict truths and the group-closed set; per-group counts, top5_strict,
 stale; the driver's start line).
+
+### 15.36 Variant forms instead of forced merges: the variant audit (QA plan 1.3, critics 7 and 13, 27 Nov 2026)
+
+**Finding.** ISL500 and INCLUDE sometimes sign one word in two different ways. The QA review found 40 of 160 linked
+classes with cross-dataset agreement below 0.3 (for example short, tight~clothes, hot, child, pink, lock). The linker
+gives both forms one concept id. So the encoder is pulled to put two different signs together, and the classifier has
+one class for two forms.
+
+**What changed.** Everything is opt-in. With no audit file, linking, training, fit-fusion, evaluate and `build-pack`
+behave as before.
+* `app/isl/training/variant_audit.py` (new) and `cli variant-audit` (research only; refused for commercial-safe,
+  which has no ISL500, exit 2). It reads the research data with the base linking (no twins, no variants) and scores
+  **ISL500 train clips only** (no validation or test clip) with the reference models of `--reference-work`
+  (default: the commercial-safe work folder). The reference classifier must come from a profile that never trains on
+  ISL500 (checked from its meta, else exit 2).
+* **Step 1, classifier agreement.** For each ISL500 word the reference classifier knows (or a twin of it), the share
+  of train clips whose top 5 holds the word or a twin. Words with at least `--min-clips` (20) clips and agreement
+  below `--max-agreement` (0.3) are candidates.
+* **Step 2, dictionary cross-check (critic 13).** Low agreement can be signer shift: new signers, same sign. Moving
+  those clips away would take supervision from INCLUDE. So, with the commercial-safe encoder, the centroid of the
+  word's ISL500 train clips and the centroid of its INCLUDE train clips both retrieve against the ISLRTC rows of the
+  reference index (concept-level rank: each concept scored by its best row). The verdict:
+  * `different_form`: INCLUDE finds the word's dictionary row within rank 20 (`--dict-include-max-rank`), and ISL500
+    finds it only below max(10, 3 x INCLUDE's rank) (`--dict-rank-floor`, `--dict-rank-ratio`);
+  * `no_difference`: ISL500 finds it about as well (signer shift);
+  * `inconclusive`: no dictionary row, no INCLUDE train clip, or INCLUDE does not find the row either.
+* **Step 3, reverse direction (optional, `--reverse-classifier`).** A classifier trained on ISL500 scores INCLUDE
+  clips of the word (`--reverse-part val` by default, never test; `train` is refused for a classifier trained on that
+  split). Agreement of 0.3 or more means the forms are compatible. Every classifier we have also trains on INCLUDE,
+  so this veto is weak evidence; the file says so.
+* **Decision.** Relink only on evidence of another form: the dictionary says `different_form` and the reverse check
+  (when run) does not say `no_difference`; or the dictionary is inconclusive and the reverse check says
+  `different_form`. Without a dictionary and without a reverse check, nothing is relinked.
+* **Evidence per word** in the file: clip and signer counts, top-1 and top-5 agreement, what the clips were predicted
+  as, both dictionary ranks, the top 3 dictionary concepts of each centroid, the centroid cosine, the reverse
+  agreement, the decision and its reason. The summary also counts how often the dictionary rule says "another form"
+  on words the classifier agrees on: a high rate means the cross-check cannot tell forms apart with that encoder.
+* **The relink.** Every ISL500 clip of a relinked word (train, val and test, so ISL500's own labels stay consistent)
+  gets `isl.<word>~isl500`. That concept is an alias of `isl.<word>` (docs 15.34): the fused decision sums the group,
+  so the word shown is the same. Its row in `extra_concepts.jsonl` copies the word's headword and display and has
+  `alias_of`; `build-pack` gives it the word's Hindi row. INCLUDE, ISLRTC and the other sources keep the word. A
+  variant id that already is a vocabulary concept is never used.
+
+**Scope (critic 7).** The audit is written to `<work>/variant_links.json` of the profile's work folder, or `--out`.
+A path inside `data/isl/derived` is refused. `link-sources --variant-links auto|none|FILE`: `auto` (default) reads
+`<work>/variant_links.json` only when it exists in that work folder; a file of another profile is refused (exit 2).
+The link step freezes the relinks into `link_settings.json` (`variants`, and `variant_links` with the file name and
+its SHA-256), adds the variant pairs to the frozen `alias_of`, and counts the moved clips (`variant_relinked`). Later
+steps read only that frozen copy, so a re-audit changes nothing until the link step runs again. A scratch run that
+runs its own link step has no audit file and links as before. Relinked clips change the training labels, so the
+training-list hash of 15.19 refuses an old state.
+
+**Evaluation.** Strict labels stay the metrics and the gates (critic 12). An INCLUDE "hot" clip predicted as
+`isl.hot~isl500` is wrong on strict labels and right on alias labels; E1b `alias_labels.by_group` shows how many clips
+each variant group moves. The one-shot guard (`expand`) holds out a word's variant with the word.
+
+**Driver.** `VARIANT_LINKS=auto|none` (default `auto` for both profiles): `none` passes `--variant-links none` to the
+link step. The start line, the link stamp and the dry run show `variant_links=` (`none`, `off`, `sha256:<16 hex>`, or
+the folder's frozen state when the link step does not run). `variant_links.json` is a link output for seeding. The
+audit itself is not a driver step: run it before the Batch 1 run, for example
+`python -m app.isl.cli variant-audit --profile research --reference-work ../artifacts/isl/commercial-safe --threads 1`,
+read the evidence, then run `scripts/phase2_train.sh --profile research --from link`. No audit has been run on the
+real data yet, so no work folder has the file and the running chain is not affected.
+
+Tests: `backend/tests/isl/test_variant_audit.py`. A fake classifier gives the expected relink ("hot", another form)
+with its evidence; a word with low agreement whose ISL500 centroid still finds its dictionary row (signer shift) is
+not relinked; without a dictionary nothing is relinked; the reverse direction can veto; the dictionary rule's
+thresholds; the file is checked for profile and form and hashed; the linker relinks only that source and word, writes
+the variant row, freezes the settings, and a later step links the same way; alias-scored E1b counts a variant
+prediction as correct and strict does not; `link-sources` reads only this work folder's file, keeps the frozen copy
+after the file changes, ignores it with `none`, and refuses another profile's file; `variant-audit` end to end with
+tiny commercial-safe models scores ISL500 train clips only and refuses a commercial-safe run, a reference trained on
+ISL500 and an output in `data/isl/derived`; the pack gives a variant the word's Hindi; the driver's setting.

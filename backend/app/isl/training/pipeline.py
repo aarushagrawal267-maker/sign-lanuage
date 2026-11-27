@@ -314,12 +314,27 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
         ids = {r["concept_id"] for r in Vocabulary.load(tmp / "vocabulary.jsonl").rows}
         with (PACK_DIR / "lexicon_hi.jsonl").open(encoding="utf-8") as src, \
                 (tmp / "lexicon_hi.jsonl").open("w", encoding="utf-8") as dst:
+            # a variant concept (``alias_of`` its word, docs 15.36) shows its word's Hindi
+            var_of: dict[str, list[str]] = {}
+            for r in Vocabulary.load(tmp / "vocabulary.jsonl").rows:
+                if r.get("alias_of") and r.get("concept_id"):
+                    var_of.setdefault(r["alias_of"], []).append(r["concept_id"])
+            have_hi = set()
             for ln in src:
                 try:
-                    if json.loads(ln).get("concept_id") in ids:
-                        dst.write(ln)
+                    row = json.loads(ln)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(row, dict):
+                    continue
+                if row.get("concept_id") in ids:
+                    dst.write(ln if ln.endswith("\n") else ln + "\n")
+                    have_hi.add(row["concept_id"])
+                for v in var_of.get(row.get("concept_id"), ()):
+                    if v not in have_hi:
+                        dst.write(json.dumps({**row, "concept_id": v, "alias_of": row["concept_id"]},
+                                             ensure_ascii=False) + "\n")
+                        have_hi.add(v)
     write_spelling_lexicon(build_spelling_lexicon(Vocabulary.load(tmp / "vocabulary.jsonl").rows),
                            tmp / "spelling_lexicon.txt")
     enc_version = None

@@ -173,13 +173,22 @@ class GlossLinker:
     linking (only for the sources in ``aliases.STRIP_NUMBERING_SOURCES``: WSLP), so "Adult(1)" links to
     ``isl.adult`` instead of a new ``isl.adult-1``; ``aliases`` (alias -> root, e.g.
     ``app.isl.vocab.aliases.TWIN_ALIASES``) gives :attr:`alias_of`, the alias groups of known concepts.
-    Both off by default: links exactly as before."""
+    Both off by default: links exactly as before.
+
+    ``variants`` (docs 15.36, ``cli variant-audit``): source -> {concept: variant concept}, e.g.
+    ``{"isl500": {"isl.hot": "isl.hot~isl500"}}``. Every clip of that source linked to the concept gets the variant
+    concept instead (a new concept that shows the same word, ``alias_of`` the concept). Off by default."""
 
     LINKABLE_KINDS = {"word", "multiword", "synonym_list", "number", "phrase", "letter", None}
 
-    def __init__(self, entries: Iterable = (), *, strip_numbering: bool = False, aliases: dict | None = None):
+    def __init__(self, entries: Iterable = (), *, strip_numbering: bool = False, aliases: dict | None = None,
+                 variants: dict | None = None):
         self.strip_numbering = bool(strip_numbering)
-        self.alias_table = dict(aliases or {})
+        self.variants: dict[str, dict[str, str]] = {str(s): {str(w): str(v) for w, v in (m or {}).items()}
+                                                    for s, m in (variants or {}).items() if m}
+        # variant concepts are aliases of their concept (docs 15.36): the word shown stays the same
+        self.alias_table = dict(aliases or {}) | {v: w for m in self.variants.values() for w, v in m.items()}
+        self._display: dict[str, dict] = {}  # concept -> headword / display / kind / category (variant rows only)
         self.by_head: dict[str, list[str]] = defaultdict(list)
         self.by_syn: dict[str, set[str]] = defaultdict(set)
         self.keys_of: dict[str, set[str]] = defaultdict(set)
@@ -188,6 +197,9 @@ class GlossLinker:
             cid = e.concept_id if hasattr(e, "concept_id") else e["concept_id"]
             get = (lambda k, _e=e: getattr(_e, k, None)) if hasattr(e, "concept_id") else e.get
             self.known.add(cid)
+            if self.variants:
+                self._display[cid] = {"headword": get("headword"), "display": get("display"), "kind": get("kind"),
+                                      "category": get("category")}
             if get("kind") not in self.LINKABLE_KINDS:
                 continue
             hk = _key(get("headword"))
@@ -255,18 +267,46 @@ class GlossLinker:
         self.counts["new" if len(syn) == 0 else "ambiguous_synonym_new"] += 1
         return cid, "new"
 
+    def variant_of(self, cid: str, source: str) -> str:
+        """The variant concept of ``cid`` for clips of ``source`` (docs 15.36), else ``cid``. A variant id that is
+        already a vocabulary concept is never used (counted as ``variant_skipped_known``)."""
+        v = (self.variants.get(source) or {}).get(cid)
+        if not v:
+            return cid
+        if v in self.known:
+            self.counts["variant_skipped_known"] += 1
+            return cid
+        if v not in self.new:
+            base = self.new.get(cid) or self._display.get(cid) or {}
+            head = base.get("headword") or cid.split(".", 1)[-1]
+            self.new[v] = {"concept_id": v, "headword": head, "display": dict(base.get("display") or {"en": head}),
+                           "kind": base.get("kind") or "word", "category": base.get("category") or "other",
+                           "variants": [], "in_classifier": False, "indexable": True, "alias_of": cid,
+                           "review": {"status": "auto", "notes": [f"phase-2 variant form of {cid} in {source} "
+                                                                  "(variant-audit, docs 15.36)"]},
+                           "sources": [source]}
+        self.counts["variant_relinked"] += 1
+        self.counts[f"variant_relinked:{source}"] += 1
+        return v
+
     def link_clips(self, clips: list[Clip]) -> list[Clip]:
         out = []
         for c in clips:
             if c.concept_id:
-                out.append(c)
                 self.counts["adapter"] += 1
+                v = self.variant_of(c.concept_id, c.source) if self.variants else c.concept_id
+                out.append(c if v == c.concept_id else replace(c, concept_id=v,
+                                                               quality={**c.quality, "variant_of": c.concept_id}))
                 continue
             cid, how = self.link(c.raw_gloss, c.source)
             if cid is None:
                 continue
-            out.append(replace(c, concept_id=cid, variant_id=c.variant_id or f"{c.source}:{_key(c.raw_gloss)}",
-                               quality={**c.quality, "link": how}))
+            q = {**c.quality, "link": how}
+            v = self.variant_of(cid, c.source) if self.variants else cid
+            if v != cid:
+                q["variant_of"] = cid
+            out.append(replace(c, concept_id=v, variant_id=c.variant_id or f"{c.source}:{_key(c.raw_gloss)}",
+                               quality=q))
         return out
 
     def expand(self, concepts: Iterable[str]) -> set[str]:
@@ -449,7 +489,9 @@ def attach_all_sources(data, paths: IslPaths, vocab, profile: str, *, seed: int 
     data.extra_assign = {c.clip_id: assign[c.clip_id] for c in data.extra}
     data.dedup = dedup
     rep.links = dict(linker.counts) | {"new_concepts": len(linker.new)} | (
-        {"aliases": len(linker.alias_of)} if linker.alias_table else {})
+        {"aliases": len(linker.alias_of)} if linker.alias_table else {}) | (
+        {"variant_concepts": sum(1 for m in linker.variants.values() for v in m.values() if v in linker.new)}
+        if linker.variants else {})
     rep.dedup = {"unions": dict(dedup.reasons), "dropped_train_extra": dropped_extra,
                  "dropped_train_islrtc": dropped_isl,
                  "dropped_eval_duplicates": sum(1 for c in clips if assign.get(c.clip_id) in ("val", "test"))
@@ -518,13 +560,19 @@ def read_pretrain_list(work: Path) -> set[str] | None:
 LINK_SETTINGS = "link_settings.json"
 
 
-def link_settings(link_aliases: bool = False) -> dict:
+def link_settings(link_aliases: bool = False, variants: dict | None = None, variant_meta: dict | None = None) -> dict:
     """What the link step decides for a whole work folder (docs 15.34). ``link_aliases``: strip WSLP's "(N)"
-    numbering and use the twin alias table. Off: exactly the old linking."""
+    numbering and use the twin alias table. Off: exactly the old linking. ``variants`` / ``variant_meta``: the
+    relinks of a variant-links file and its file name and SHA-256 (``variant_audit.load_variant_links``, docs 15.36);
+    frozen into the settings, so later steps never re-read the audit file. No variants: no new key (as before)."""
     from app.isl.vocab.aliases import ALIAS_VERSION
 
     on = bool(link_aliases)
-    return {"version": 1, "strip_sign_numbers": on, "aliases": on, "alias_version": ALIAS_VERSION if on else None}
+    d = {"version": 1, "strip_sign_numbers": on, "aliases": on, "alias_version": ALIAS_VERSION if on else None}
+    if variants:
+        d["variants"] = {s: dict(sorted(m.items())) for s, m in sorted(variants.items()) if m}
+        d["variant_links"] = dict(variant_meta or {})
+    return d
 
 
 def linker_options(settings: dict | None) -> dict:
@@ -535,13 +583,16 @@ def linker_options(settings: dict | None) -> dict:
     from app.isl.vocab.aliases import TWIN_ALIASES
 
     s = settings or {}
-    if not s.get("aliases"):
-        al = None
-    elif "alias_of" in s:
-        al = dict(s.get("alias_of") or {})
-    else:
+    if "alias_of" in s and (s.get("aliases") or s.get("variants")):
+        al = dict(s.get("alias_of") or {})  # frozen by the link step (twins and / or variant pairs)
+    elif s.get("aliases"):
         al = TWIN_ALIASES
-    return {"strip_numbering": bool(s.get("strip_sign_numbers")), "aliases": al}
+    else:
+        al = None
+    out = {"strip_numbering": bool(s.get("strip_sign_numbers")), "aliases": al}
+    if s.get("variants"):  # docs 15.36: only when the link step froze variant relinks
+        out["variants"] = dict(s["variants"])
+    return out
 
 
 def read_link_settings(work: Path) -> dict:
@@ -559,9 +610,11 @@ def write_link_settings(work: Path, settings: dict, linker: GlossLinker | None =
     folder (training, index, fit-fusion, evaluate) links and scores the same way."""
     from app.isl.vocab.aliases import aliases_sha256
 
-    al = linker.alias_of if (linker is not None and settings.get("aliases")) else {}
+    al = linker.alias_of if (linker is not None and (settings.get("aliases") or settings.get("variants"))) else {}
     d = {**settings, "alias_of": al, "alias_sha256": aliases_sha256(al),
          "numbering_stripped": int(linker.counts.get("numbering_stripped", 0)) if linker is not None else 0}
+    if settings.get("variants"):  # docs 15.36: how many clips the frozen relinks moved
+        d["variant_relinked"] = int(linker.counts.get("variant_relinked", 0)) if linker is not None else 0
     f = Path(work) / LINK_SETTINGS
     f.parent.mkdir(parents=True, exist_ok=True)
     tmp = f.with_suffix(".json.tmp")
