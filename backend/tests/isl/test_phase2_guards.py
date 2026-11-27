@@ -490,36 +490,52 @@ def test_smoke_islrtc_cap_keeps_dictionary_clips_of_include_concepts(tmp_path):
 
 # --------------------------------------------------------------------------------------------- 9. retrains retrain
 
-STEPS_DONE = ("trim", "dedup", "vocab", "encoder", "classifier", "cv", "e1a", "pack")
+STEPS_DONE = ("trim", "dedup", "vocab", "splits", "link", "bench", "pretrain_dedup", "pretrain", "encoder", "oneshot",
+              "classifier", "cv", "e1a", "fingerspell", "index", "fusion", "trim_eval", "evaluate", "index_final",
+              "pack")  # every step of the driver, in order
 
 
 def _fake_py(tmp_path) -> tuple[Path, Path]:
-    """A stand-in for the venv python: logs its arguments and succeeds (guard, cli steps, the cv helper)."""
+    """A stand-in for the venv python: logs its arguments and succeeds (guard, cli steps, the cv helper); it fails
+    a train-classifier call while the file $FAKE_PY_FAIL exists."""
     log = tmp_path / "fake_py.log"
     py = tmp_path / "fake_py"
-    py.write_text('#!/usr/bin/env bash\necho "$*" >> "$FAKE_PY_LOG"\nexit 0\n')
+    py.write_text('#!/usr/bin/env bash\necho "$*" >> "$FAKE_PY_LOG"\n'
+                  'if [[ "$*" == *train-classifier* && -n "${FAKE_PY_FAIL:-}" && -f "$FAKE_PY_FAIL" ]]; then exit 1; fi\n'
+                  'exit 0\n')
     py.chmod(0o755)
     return py, log
 
 
-def _run_driver(tmp_path, *args, work_base=None, tag=None, isl_root=None, py=None):
+def _run_driver(tmp_path, *args, work_base=None, tag=None, isl_root=None, py=None, seed_base=None,
+                profile="commercial-safe", fail=None):
     proc = tmp_path / "proc_none"
     proc.mkdir(exist_ok=True)
     fake, flog = _fake_py(tmp_path)
     env = {**os.environ, "PY": str(py or fake), "FAKE_PY_LOG": str(flog), "SLR_ISL_DIR": str(isl_root),
            "SLR_ISL_PROC_ROOT": str(proc), "SLR_TORCH_THREADS": "1"}
-    for k in ("SLR_ISL_PARTIAL_DATA", "PHASE2_WORK_BASE", "PHASE2_TAG"):
+    for k in ("SLR_ISL_PARTIAL_DATA", "PHASE2_WORK_BASE", "PHASE2_TAG", "PHASE2_SEED_BASE", "FAKE_PY_FAIL"):
         env.pop(k, None)
     if work_base is not None:
         env["PHASE2_WORK_BASE"] = str(work_base)
     if tag is not None:
         env["PHASE2_TAG"] = tag
-    return subprocess.run(["bash", str(REPO / "scripts" / "phase2_train.sh"), "--profile", "commercial-safe", *args],
+    if seed_base is not None:  # never the real artifacts/isl in a test
+        env["PHASE2_SEED_BASE"] = str(seed_base)
+    if fail is not None:
+        env["FAKE_PY_FAIL"] = str(fail)
+    return subprocess.run(["bash", str(REPO / "scripts" / "phase2_train.sh"), "--profile", profile, *args],
                           capture_output=True, text=True, env=env, timeout=120)
 
 
+def _calls(tmp_path) -> list[str]:
+    f = tmp_path / "fake_py.log"
+    return f.read_text().splitlines() if f.exists() else []
+
+
 def _old_run(work: Path, stamps: Path) -> list[Path]:
-    """A finished run: every stamp, and the training state files of the classifier, cv folds, e1a, encoder."""
+    """A finished run: every stamp, the outputs later steps read, and the training state files of the classifier,
+    cv folds, e1a, encoder and oneshot (returned)."""
     stamps.mkdir(parents=True, exist_ok=True)
     for s in STEPS_DONE:
         (stamps / f"{s}.done").write_text("old\n")
@@ -529,6 +545,9 @@ def _old_run(work: Path, stamps: Path) -> list[Path]:
     for f in files:
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_bytes(b"finished state")
+    for name in ("vocabulary.jsonl", "pretrained_encoder.pt", "pretrain_clips.txt", "encoder.pt",
+                 "oneshot/fold0/encoder.pt", "classifier.pt", "cv/fold1/classifier.pt", "multisource.json"):
+        (work / name).write_bytes(b"old output")
     return files
 
 
@@ -597,10 +616,18 @@ def test_scratch_run_never_touches_the_real_runs_stamps(tmp_path):
     assert "pack: default" in r.stdout
     # a scratch run (own work base + tag) does not read, skip on or delete them
     scratch = tmp_path / "scratch"
-    r = _run_driver(tmp_path, "--from", "classifier", work_base=scratch, tag="abl1", isl_root=isl)
+    r = _run_driver(tmp_path, "--from", "classifier", work_base=scratch, tag="abl1", isl_root=isl,
+                    seed_base=tmp_path / "real_work_base")
+    assert r.returncode == 2 and "missing" in r.stderr  # nothing to seed the earlier steps from: fails fast
+    (tmp_path / "real_work_base").mkdir()
+    (tmp_path / "real_work_base" / "commercial-safe").symlink_to(real_work)
+    r = _run_driver(tmp_path, "--from", "classifier", work_base=scratch, tag="abl1", isl_root=isl,
+                    seed_base=tmp_path / "real_work_base")
     assert r.returncode == 0, r.stdout + r.stderr
     own = scratch / "commercial-safe" / "driver" / "phase2_commercial-safe_abl1.stamps"
-    assert (own / "trim.done").exists() and (own / "pack.done").exists()  # it ran trim: no real stamp was used
+    # the steps before --from are seeded from its own stamp folder, never skipped on the real stamps
+    assert "seeded from" in (own / "trim.done").read_text() and "seeded from" in (own / "encoder.done").read_text()
+    assert (own / "pack.done").exists() and "seeded" not in (own / "classifier.done").read_text()
     assert {p.name: p.read_text() for p in real.iterdir()} == before
     assert not (isl / "logs" / "phase2_commercial-safe.log").exists()  # nor its log
     assert (scratch / "commercial-safe" / "driver" / "phase2_commercial-safe_abl1.log").exists()
@@ -610,11 +637,143 @@ def test_scratch_run_never_touches_the_real_runs_stamps(tmp_path):
     r = _run_driver(tmp_path, "--dry-run", work_base=tmp_path / "other", isl_root=isl)
     assert f"stamps: {tmp_path / 'other' / 'commercial-safe' / 'driver'}" in r.stdout
     # a tag alone gets its own work folder; a tag on the real work folder is refused
-    r = _run_driver(tmp_path, "--dry-run", tag="abl2", isl_root=isl)
-    assert r.returncode == 0 and "artifacts/isl/runs/abl2/commercial-safe" in r.stdout
+    r = _run_driver(tmp_path, "--dry-run", tag="abl2", isl_root=isl)  # (refused: a fresh scratch run would run trim)
+    assert r.returncode == 2 and "artifacts/isl/runs/abl2/commercial-safe" in r.stdout
     r = _run_driver(tmp_path, "--tag", "abl3", "--dry-run", work_base=REPO / "artifacts" / "isl", isl_root=isl)
     assert r.returncode == 2 and "real work folder" in r.stderr
     assert _run_driver(tmp_path, "--tag", "../x", "--dry-run", isl_root=isl).returncode == 2
+
+
+def test_scratch_run_from_bench_never_rewrites_the_shared_data(tmp_path):
+    """A fresh scratch run --from bench seeds trim..link from the real work folder (outputs, never states) and never
+    runs trim / dedup / splits, which write the shared data/isl; without --from it is refused (docs 15.20)."""
+    isl = tmp_path / "isl"
+    seed = tmp_path / "seed"
+    real_files = _old_run(seed / "commercial-safe", tmp_path / "unused_stamps")
+    scratch = tmp_path / "scratch"
+    work = scratch / "commercial-safe"
+    r = _run_driver(tmp_path, "--from", "bench", "--dry-run", work_base=scratch, isl_root=isl, seed_base=seed)
+    assert r.returncode == 0, r.stdout + r.stderr
+    for s in ("trim", "dedup", "vocab", "splits", "link"):
+        assert f"would run {s}\n" not in r.stdout and f"would seed {s}" in r.stdout
+    assert "would run bench" in r.stdout and "would run pack" in r.stdout
+    assert f"would copy {seed / 'commercial-safe' / 'vocabulary.jsonl'}" in r.stdout
+    assert not work.exists() and not _calls(tmp_path)  # the dry run wrote and ran nothing
+    # the real thing: no data step reaches the cli, vocabulary.jsonl is copied, no state file is
+    r = _run_driver(tmp_path, "--from", "bench", work_base=scratch, isl_root=isl, seed_base=seed)
+    assert r.returncode == 0, r.stdout + r.stderr
+    cli = [c.split("app.isl.cli ", 1)[1].split()[0] for c in _calls(tmp_path) if "app.isl.cli " in c]
+    assert not {"trim", "dedup", "splits", "vocab", "link-sources"} & set(cli), cli
+    assert "bench" in cli and "build-pack" in cli
+    assert (work / "vocabulary.jsonl").read_bytes() == b"old output"
+    assert not list(work.rglob("*.state"))
+    assert all(f.exists() for f in real_files)  # the seed folder is only read
+    # a fresh scratch run without --from, or one that forces a data step, is refused; --allow-shared-data lets it
+    fresh = tmp_path / "fresh"
+    r = _run_driver(tmp_path, "--dry-run", work_base=fresh, isl_root=isl, seed_base=seed)
+    assert r.returncode == 2 and "shared data" in r.stderr
+    r = _run_driver(tmp_path, work_base=fresh, isl_root=isl, seed_base=seed)
+    assert r.returncode == 2 and not fresh.exists()  # refused before the data guard, nothing written
+    r = _run_driver(tmp_path, "--force", "splits", "--dry-run", work_base=scratch, isl_root=isl, seed_base=seed)
+    assert r.returncode == 2 and "splits" in r.stderr
+    r = _run_driver(tmp_path, "--only", "dedup", "--dry-run", work_base=scratch, isl_root=isl, seed_base=seed)
+    assert r.returncode == 2
+    r = _run_driver(tmp_path, "--force", "splits", "--allow-shared-data", "--dry-run", work_base=scratch,
+                    isl_root=isl, seed_base=seed)
+    assert r.returncode == 0 and "would run splits" in r.stdout
+    # the real run (no tag, default work folder) still runs its data steps
+    r = _run_driver(tmp_path, "--dry-run", isl_root=isl)
+    assert r.returncode == 0 and "would run trim" in r.stdout
+
+
+def test_failed_from_run_resumes_without_from(tmp_path):
+    """--from is applied at once: after a failure, a re-run WITHOUT --from resumes the failed step and runs every
+    later step, and does not retrain the finished earlier ones (docs 15.20)."""
+    isl = tmp_path / "isl"
+    work = tmp_path / "art" / "commercial-safe"
+    stamps = work / "driver" / "phase2_commercial-safe.stamps"
+    _old_run(work, stamps)
+    fail = tmp_path / "fail_now"
+    fail.write_text("1")
+    r = _run_driver(tmp_path, "--from", "encoder", work_base=tmp_path / "art", isl_root=isl, fail=fail)
+    assert r.returncode != 0
+    log = (work / "driver" / "phase2_commercial-safe.log").read_text()
+    assert "run again WITHOUT --from/--force" in log
+    assert (stamps / "encoder.done").read_text() != "old\n" and (stamps / "oneshot.done").exists()
+    for s in STEPS_DONE[STEPS_DONE.index("classifier"):]:  # every later stamp is gone already
+        assert not (stamps / f"{s}.done").exists(), s
+    enc = (stamps / "encoder.done").read_text()
+    # dry run of the plain re-run: encoder skipped, classifier..pack run
+    r = _run_driver(tmp_path, "--dry-run", work_base=tmp_path / "art", isl_root=isl)
+    assert "would skip encoder" in r.stdout and "would skip oneshot" in r.stdout
+    for s in STEPS_DONE[STEPS_DONE.index("classifier"):]:
+        assert f"would run {s}" in r.stdout, s
+    fail.unlink()
+    (tmp_path / "fake_py.log").unlink()
+    r = _run_driver(tmp_path, work_base=tmp_path / "art", isl_root=isl, fail=fail)
+    assert r.returncode == 0, r.stdout + r.stderr
+    calls = _calls(tmp_path)
+    assert not any(" train-encoder " in c or " train-oneshot " in c for c in calls)
+    assert any(" train-classifier " in c for c in calls) and any(" build-pack " in c for c in calls)
+    assert (stamps / "encoder.done").read_text() == enc
+    for s in STEPS_DONE[STEPS_DONE.index("classifier"):]:
+        assert (stamps / f"{s}.done").read_text() != "old\n", s
+
+
+def test_from_pretrain_forgets_the_pretrain_clip_list(tmp_path):
+    work = tmp_path / "art" / "commercial-safe"
+    _old_run(work, work / "driver" / "phase2_commercial-safe.stamps")
+    r = _run_driver(tmp_path, "--from", "pretrain", "--dry-run", work_base=tmp_path / "art", isl_root=tmp_path / "isl")
+    assert r.returncode == 0 and f"would remove {work / 'pretrain_clips.txt'}" in r.stdout
+
+
+def test_profile_both_passes_tag_and_dry_run_to_both_children(tmp_path):
+    seed = tmp_path / "seed"
+    for p in ("commercial-safe", "research"):
+        (seed / p).mkdir(parents=True)
+        (seed / p / "vocabulary.jsonl").write_text("{}\n")
+    r = _run_driver(tmp_path, "--tag", "t1", "--from", "bench", "--dry-run", isl_root=tmp_path / "isl",
+                    seed_base=seed, work_base=tmp_path / "scratch", profile="both")
+    assert r.returncode == 0, r.stdout + r.stderr
+    for p in ("commercial-safe", "research"):
+        assert f"dry run: profile={p} smoke=0 tag=t1 work={tmp_path / 'scratch' / p}" in r.stdout
+        assert f"stamps: {tmp_path / 'scratch' / p / 'driver' / f'phase2_{p}_t1.stamps'}" in r.stdout
+    assert r.stdout.count("would seed trim") == 2 and "would run trim\n" not in r.stdout
+    assert not (tmp_path / "scratch").exists() and not _calls(tmp_path)
+
+
+def test_option_values_must_not_be_empty(tmp_path):
+    isl = tmp_path / "isl"
+    for args in (("--tag", ""), ("--tag",), ("--from", ""), ("--only",), ("--force", ""), ("--tag", "--dry-run")):
+        r = _run_driver(tmp_path, *args, isl_root=isl)
+        assert r.returncode == 2 and "needs a value" in r.stderr, args
+    assert not _calls(tmp_path)
+
+
+def test_pretrain_signature_refuses_a_changed_clip_list(tmp_path):
+    from dataclasses import replace
+
+    from app.dataset.synthetic import make_sequence
+    from app.isl.data.sources import Clip
+    from app.isl.training.common import ISL_FEATURES
+    from app.isl.training.loop import StateMismatch
+    from app.isl.training.pretrain import PretrainConfig, pretrain_encoder
+
+    clips = []
+    for i in range(8):
+        p = tmp_path / f"s{i}.npz"
+        make_sequence(i % 4, signer=i, n_frames=30, fps=12.0).save(p)
+        clips.append(Clip(f"glosl/{i}", "glosl", "", None, None, None, p, group=f"g{i}"))
+    cfg = PretrainConfig(hidden=16, layers=1, emb_dim=16, batch=4, epochs=1, steps_per_epoch=2, val_batches=1)
+    out = tmp_path / "pre.pt"
+    assert pretrain_encoder(clips, out, ISL_FEATURES, cfg, profile="research", threads=1, smoke=True, fresh=True)[
+        "finished"]
+    assert pretrain_encoder(clips, out, ISL_FEATURES, cfg, profile="research", threads=1,
+                            smoke=True)["resumed_from"]["finished"]
+    # same number of clips, one of them another clip: the saved state is refused, not resumed on
+    other = clips[:-1] + [replace(clips[-1], clip_id="glosl/other")]
+    with pytest.raises(StateMismatch):
+        pretrain_encoder(other, out, ISL_FEATURES, cfg, profile="research", threads=1, smoke=True)
 
 
 def test_run_loop_refuses_a_finished_state_of_another_config(tmp_path):

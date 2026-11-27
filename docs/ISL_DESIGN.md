@@ -1773,7 +1773,7 @@ everything under `nice -n 10`, stops before any step if less than 10 GB of disk 
 | pack | `build-pack` | `artifacts/packs/isl` or `isl-research` (copies `eval/`, lists every source and licence) |
 
 Options: `--from STEP` and `--force S1,S2` (both also delete the training state of the steps they redo; 15.19),
-`--only STEP`, `--tag NAME` and `--dry-run` (15.19), `--threads 4` once the
+`--only STEP`, `--tag NAME` and `--dry-run` (15.19), `--allow-shared-data` (15.20), `--threads 4` once the
 machine is free, `--step-minutes M` (each training call stops after M minutes with its state saved and is re-run with
 `--resume` until done: exit code 75 means "stopped, continue later"). Full-setting sizes can be overridden with
 environment variables (`HIDDEN LAYERS EMB PRE_EPOCHS PRE_STEPS PRE_BATCH ENC_EPOCHS ENC_STEPS CLS_EPOCHS CLS_STEPS
@@ -3045,9 +3045,7 @@ overwrite or delete them. Its `pack` and `evaluate` steps also wrote into the sh
     `PHASE2_WORK_BASE` set to `artifacts/isl` is refused (exit 2), because it would share the real state files.
   * A non-default work folder sends `evaluate` and `build-pack` to `<work>/pack`, never to `artifacts/packs/<id>`.
   * Smoke runs without a tag are unchanged. With a tag they use `artifacts/isl/phase2-smoke/runs/<tag>/`.
-* Not changed: the data steps (`trim`, `dedup`, `vocab`, `splits`, `link`) of a full scratch run still write the
-  shared `data/isl/derived/` and `data/isl/splits/` (critic point 7). A scratch run should start after `link`
-  (`--from bench` or later) unless it means to refresh the shared data.
+* The data steps of a scratch run, and how `--from` and a failed run interact, were fixed after review: see 15.20.
 
 **Resume signatures (`training/loop.py` and the three trainers).** A stale state with any changed training option
 now raises `StateMismatch` instead of resuming. `LoopConfig.extra` now also holds:
@@ -3076,3 +3074,55 @@ Tests: `backend/tests/isl/test_phase2_guards.py` section 9. A dry run `--from cl
 state after a change to class power, source weights, ISLRTC oversampling, label smoothing, dropout, batch size,
 `use_extra`, `arc_weight`, validation size or the warm-start file. `test_trim_eval_e8.py` now reads the stamps of its
 `PHASE2_WORK_BASE` run from `<work>/driver/`.
+
+### 15.20 Driver: scratch runs never rewrite the shared data; `--from` is applied at once (review of 15.19, 27 Nov 2026)
+
+**Bug 1: scratch runs wrote the shared data.** 15.19 said "start a scratch run at `--from bench`". But `--from`
+only forgot steps from STEP on. Earlier steps without a stamp still ran, and a new scratch run has an empty stamp
+folder. So a scratch `--from bench` ran `trim`, `dedup` and `splits`, which rewrite `data/isl/derived/` and
+`data/isl/splits/`. The real run reads those files.
+
+**Fix.** A scratch run is a full run with a tag or its own `PHASE2_WORK_BASE` (smoke runs already have a private
+ISL root and are not affected).
+* `trim`, `dedup` and `splits` are refused in a scratch run (exit 2), before anything is written. This covers a
+  fresh run without `--from`, `--from trim`, `--force splits` and `--only dedup`. `--allow-shared-data` lifts the
+  refusal for someone who really means to refresh the shared data.
+* With `--from STEP`, the earlier steps that have no stamp are **seeded**, not run. The driver copies what later
+  steps read from the real work folder (`artifacts/isl/<profile>`, or `PHASE2_SEED_BASE/<profile>`):
+  `vocabulary.jsonl`, `pretrained_encoder.pt` and `pretrain_clips.txt`, `encoder.pt`, `oneshot/`, `classifier.pt`,
+  `cv/`, `e1a/`, `letters.pt`, `index/`, `fusion.json`, `trim_eval.json`, and the `link` reports. It never copies a
+  training state (`*.state`, `*.state.pt`, `*.tmp*`). A file already in the scratch work folder is kept. Then it
+  writes the stamp `seeded from <folder> (scratch run --from STEP)`.
+* A required file that is missing (`vocabulary.jsonl`, `pretrained_encoder.pt`, `encoder.pt`, `classifier.pt`, for
+  the steps being seeded) stops the run at once (exit 2). The other outputs are copied when present.
+* A seed folder marked PARTIAL DATA marks the scratch run too.
+* `link` writes only to the work folder (`multisource.json`, `sources.json`, `extra_concepts.jsonl`), so it is
+  allowed. I found no `variant_links.json` writer in the code.
+* `--dry-run` shows `would seed STEP` and `would copy FILE`, and exits 2 on a refusal, like a real run.
+* A refused run writes nothing: the stamp and log folders are made only after these checks.
+* The real run (no tag, default work folder) is unchanged: it runs its data steps as before.
+
+**Bug 2: `--from` was applied one step at a time.** Stamps and states were forgotten inside the loop, just before
+each step ran. After a failure, the advice was "run the same command again". With `--from` that forgot the finished
+steps again and retrained them (hours). Without `--from` it skipped the later steps on their OLD stamps, although
+earlier models had changed, and shipped a stale pack.
+
+**Fix.** The driver now plans first. It forgets STEP and every later step (and every `--force` step) in one pass,
+after the data guard and before the first step runs. After a failure, run again WITHOUT `--from` / `--force`: the
+failed step resumes from its state and every later step runs, and the finished earlier steps are skipped. The
+failure message now says exactly that (with `--only`, it says to run the same `--only` command again).
+
+**Smaller fixes.**
+* An option that needs a value refuses an empty or missing one (exit 2): `--tag ""`, `--tag` as the last
+  argument, `--from ""`, or `--tag --dry-run`. Before, `--tag ""` silently meant the real run.
+* `--from pretrain` / `--force pretrain` also delete `<work>/pretrain_clips.txt`. The trainer unions a new clip
+  list with an old one on `--resume`, so the recorded list (and its sha256 in the meta) would have included clips
+  the new pre-training never saw.
+* `--profile both` also passes `--allow-shared-data` to both children (it already passed `--tag` and `--dry-run`).
+
+Tests (`test_phase2_guards.py` section 9): a fresh scratch `--from bench` seeds trim..link and never calls `trim`,
+`dedup`, `splits`, `vocab` or `link-sources`, copies `vocabulary.jsonl` and no state file, and is refused without
+`--from` (nothing written) or with `--force splits` / `--only dedup`; a missing seed file fails fast; `--from encoder`
+failing at the classifier leaves classifier..pack unstamped, and a plain re-run runs classifier..pack and not the
+encoder; `--from pretrain` lists `pretrain_clips.txt`; `--profile both` passes the tag and the dry run to both
+profiles; empty option values are refused; pre-training refuses a finished state after one clip of the list changed.

@@ -22,7 +22,9 @@
 #  pretrain_dedup checks the OpenHands Sign Library chunks)
 # Options:
 #   --from STEP      re-run STEP and everything after it: their stamps AND training state files (*.state, incl.
-#                    cv/fold*/ and oneshot/fold*/) are removed, so a retrain really retrains (docs 15.19)
+#                    cv/fold*/ and oneshot/fold*/) are removed at once, before the first step runs, so a retrain
+#                    really retrains (docs 15.19, 15.20). After a failure, run again WITHOUT --from to resume.
+#                    In a scratch run, steps before STEP that have no stamp are seeded, not run (see --tag)
 #   --only STEP      run just this step (ignores its stamp; a training step resumes from its state file, and a
 #                    finished state returns the old weights: use --force STEP to retrain it)
 #   --force S1,S2    forget these steps' stamps and training state, then run normally (comma-separated list)
@@ -30,7 +32,12 @@
 #                    unless PHASE2_WORK_BASE is set), its own stamps / log / readiness file under <work>/driver/,
 #                    and its pack and eval report under <work>/pack (never artifacts/packs). Without a tag, a run
 #                    with PHASE2_WORK_BASE set also keeps its stamps under <work>/driver/, so it never reads, skips
-#                    on or deletes the real run's stamps (data/isl/logs/phase2_<profile>.stamps)
+#                    on or deletes the real run's stamps (data/isl/logs/phase2_<profile>.stamps).
+#                    A scratch run never rewrites the shared data/isl (trim, dedup, splits are refused, exit 2):
+#                    start it with --from bench (or later); the earlier steps are then seeded: their outputs
+#                    (vocabulary.jsonl, encoder.pt, ...; never *.state) are copied from the real work folder
+#                    (PHASE2_SEED_BASE/<profile>, default artifacts/isl/<profile>) and stamped "seeded" (docs 15.20)
+#   --allow-shared-data  let a scratch run run trim / dedup / splits anyway (rewrites data/isl for every run)
 #   --dry-run        print the work folder, the stamp folder, the files that would be removed and the steps that
 #                    would run, then exit without writing anything (no data guard, no training)
 #   --threads N      torch threads (default 2 while other jobs run; 4 when the machine is free)
@@ -46,7 +53,8 @@
 # smoke -> artifacts/isl/phase2-smoke/<profile>/ (work, pack/ inside it; never loaded by the app).
 # Logs: data/isl/logs/phase2_<profile>[_smoke].log for the real run (no tag, default work folder); otherwise
 # <work>/driver/phase2_<profile>[_smoke][_<tag>].log. Everything runs under nice -n 10.
-# Test hooks: SLR_ISL_DIR (data root), PHASE2_WORK_BASE (instead of artifacts/isl), SLR_ISL_PROC_ROOT (process table).
+# Test hooks: SLR_ISL_DIR (data root), PHASE2_WORK_BASE (instead of artifacts/isl), PHASE2_SEED_BASE (seed folder of
+# a scratch run, instead of artifacts/isl), SLR_ISL_PROC_ROOT (process table).
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -63,23 +71,27 @@ LIST=0
 ALLOW_PARTIAL=0
 CHECK_ONLY=0
 DRY_RUN=0
+ALLOW_SHARED=0
 RUN_TAG="${PHASE2_TAG:-}"
 STEPS=(trim dedup vocab splits link bench pretrain_dedup pretrain encoder oneshot classifier cv e1a fingerspell index fusion trim_eval evaluate index_final pack)
 
+# an option that takes a value refuses an empty or missing one (exit 2): `--tag ""` must not mean the real run
+need() { [[ -n "${2:-}" && "${2:-}" != --* ]] || { echo "$1 needs a value (see --help)" >&2; exit 2; }; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --profile) PROFILE="$2"; shift 2 ;;
+    --profile) need "$1" "${2:-}"; PROFILE="$2"; shift 2 ;;
     --smoke) SMOKE=1; shift ;;
-    --from) FROM="$2"; shift 2 ;;
-    --only) ONLY="$2"; shift 2 ;;
-    --force) FORCE="$2"; shift 2 ;;
-    --threads) THREADS="$2"; shift 2 ;;
-    --max-parts) MAX_PARTS="$2"; shift 2 ;;
-    --step-minutes) STEP_MIN="$2"; shift 2 ;;
+    --from) need "$1" "${2:-}"; FROM="$2"; shift 2 ;;
+    --only) need "$1" "${2:-}"; ONLY="$2"; shift 2 ;;
+    --force) need "$1" "${2:-}"; FORCE="$2"; shift 2 ;;
+    --threads) need "$1" "${2:-}"; THREADS="$2"; shift 2 ;;
+    --max-parts) need "$1" "${2:-}"; MAX_PARTS="$2"; shift 2 ;;
+    --step-minutes) need "$1" "${2:-}"; STEP_MIN="$2"; shift 2 ;;
     --list) LIST=1; shift ;;
     --allow-partial) ALLOW_PARTIAL=1; shift ;;
+    --allow-shared-data) ALLOW_SHARED=1; shift ;;
     --check-only) CHECK_ONLY=1; shift ;;
-    --tag) RUN_TAG="$2"; shift 2 ;;
+    --tag) need "$1" "${2:-}"; RUN_TAG="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) awk 'NR > 1 && /^set -uo/ {exit} NR > 1' "$0"; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
@@ -94,6 +106,7 @@ if [[ "$PROFILE" == "both" ]]; then
       ${FORCE:+--force "$FORCE"} --threads "$THREADS" --max-parts "$MAX_PARTS" --step-minutes "$STEP_MIN" \
       $([[ $ALLOW_PARTIAL == 1 ]] && echo --allow-partial) $([[ $CHECK_ONLY == 1 ]] && echo --check-only) \
       $([[ $LIST == 1 ]] && echo --list) ${RUN_TAG:+--tag "$RUN_TAG"} $([[ $DRY_RUN == 1 ]] && echo --dry-run) \
+      $([[ $ALLOW_SHARED == 1 ]] && echo --allow-shared-data) \
       || rc=$?
   done
   exit $rc
@@ -163,6 +176,13 @@ else
   LET="--epochs ${LETTER_EPOCHS:-40}"
   PDD=""
 fi
+# a scratch run: a full run with a tag or its own work folder (smoke runs have their own private ISL root). It must
+# not rewrite the shared data under data/isl (docs 15.20): the steps in SHARED_STEPS are refused there unless
+# --allow-shared-data, and with --from the steps before STEP are seeded from SEED_WORK instead of run.
+SCRATCH=0
+[[ $SMOKE == 0 && -n "$BASE" ]] && SCRATCH=1
+SEED_WORK="${PHASE2_SEED_BASE:-$DEFAULT_BASE}/$PROFILE"
+SHARED_STEPS=(trim dedup splits)  # write data/isl/derived and data/isl/splits, which every run reads
 # stamps / log: the real run (no tag and the default work folder; smoke: no tag) keeps the old place under
 # data/isl/logs, so the finished runs stay "done"; every other run keeps them in its own work folder (docs 15.19)
 if [[ -z "$RUN_TAG" && -z "$BASE" ]]; then
@@ -172,7 +192,6 @@ else
 fi
 STAMPS="$LOGDIR/phase2_${NAME}.stamps"
 LOG="$LOGDIR/phase2_${NAME}.log"
-[[ $DRY_RUN == 1 ]] || mkdir -p "$LOGDIR" "$STAMPS"
 
 VOCAB="$WORK/vocabulary.jsonl"
 COMMON="--profile $PROFILE --threads $THREADS --vocab $VOCAB $SM"
@@ -196,7 +215,9 @@ train() {
 state_files() {  # training state files of a step that exist (removed by --from / --force)
   local f x y
   case "$1" in
-    pretrain) f=("$WORK/pretrained_encoder.state.pt") ;;
+    # the clip list too: write_pretrain_list(resume=True) unions with an old list, so a retrain would record
+    # clips it never saw in its meta (provenance / sha256)
+    pretrain) f=("$WORK/pretrained_encoder.state.pt" "$WORK/pretrain_clips.txt") ;;
     encoder) f=("$WORK/encoder.pt.state") ;;
     oneshot) f=("$WORK"/oneshot/fold*/encoder.pt.state) ;;
     classifier) f=("$WORK/classifier.pt.state") ;;
@@ -219,7 +240,44 @@ forget() {  # forget a step (--from, --force): its stamp and its training state
   done
 }
 
-is_forced() { local x; for x in "${FORCE_STEPS[@]}"; do [[ "$x" == "$1" ]] && return 0; done; return 1; }
+in_list() { local x n="$1"; shift; for x in "$@"; do [[ "$x" == "$n" ]] && return 0; done; return 1; }
+
+step_outputs() {  # what a step leaves in the work folder for later steps (a leading ! = required); for seeding
+  case "$1" in
+    vocab) echo "!vocabulary.jsonl" ;;
+    link) echo "extra_concepts.jsonl sources.json multisource.json" ;;
+    pretrain_dedup) echo "pretrain_dedup.json" ;;
+    pretrain) echo "!pretrained_encoder.pt pretrain_clips.txt" ;;
+    encoder) echo "!encoder.pt" ;;
+    oneshot) echo "oneshot" ;;
+    classifier) echo "!classifier.pt" ;;
+    cv) echo "cv" ;;
+    e1a) echo "e1a" ;;
+    fingerspell) echo "letters.pt" ;;
+    index|index_final) echo "index" ;;
+    fusion) echo "fusion.json" ;;
+    trim_eval) echo "trim_eval.json" ;;
+  esac
+}
+
+seed_step() {  # scratch run, a step before --from: take its outputs from SEED_WORK (never its state), stamp it
+  local s="$1" o f
+  for o in $(step_outputs "$s"); do
+    f="${o#!}"
+    if [[ -e "$WORK/$f" ]]; then continue; fi
+    if [[ ! -e "$SEED_WORK/$f" ]]; then
+      [[ "$o" == !* ]] && { echo "seed $s: $SEED_WORK/$f is missing" >&2; return 2; }
+      continue
+    fi
+    if [[ $DRY_RUN == 1 ]]; then echo "would copy $SEED_WORK/$f"; continue; fi
+    # files only, never training state (*.state, *.state.pt, half-written *.tmp*)
+    (cd "$SEED_WORK" && find "$f" -type f ! -name '*.state' ! -name '*.state.pt' ! -name '*.tmp*' -print0 \
+       | xargs -0 -r cp -p --parents -t "$WORK") || return 1
+    log "  seed $s: copied $SEED_WORK/$f"
+  done
+  if [[ $DRY_RUN == 1 ]]; then echo "would seed $s"; return 0; fi
+  echo "$(date -u +%FT%TZ) seeded from $SEED_WORK (scratch run --from $FROM)" > "$STAMPS/$s.done"
+}
 
 run_step() {
   local s="$1"
@@ -277,30 +335,62 @@ if [[ $LIST == 1 ]]; then
   exit 0
 fi
 
-# ---- dry run: what --from / --force would remove and which steps would run (writes nothing) ----------------
+# ---- plan: what --from / --force forget, which steps are seeded, run or skipped ------------------------------
+# --from is applied eagerly: STEP and every later step are forgotten in one pass before the first step runs, so a
+# failed run is resumed by running again WITHOUT --from (re-running with --from would forget finished steps again)
+FORGET=("${FORCE_STEPS[@]}")
+SEED=()
+if [[ -n "$FROM" && -z "$ONLY" ]]; then
+  reached=0
+  for s in "${STEPS[@]}"; do
+    [[ "$s" == "$FROM" ]] && reached=1
+    if [[ $reached == 1 ]]; then in_list "$s" "${FORGET[@]}" || FORGET+=("$s"); continue; fi
+    # scratch run: an earlier step without a stamp is seeded from the real work folder, never run (docs 15.20)
+    if [[ $SCRATCH == 1 && ! -f "$STAMPS/$s.done" ]] && ! in_list "$s" "${FORGET[@]}"; then SEED+=("$s"); fi
+  done
+fi
+RUN=()
+for s in "${STEPS[@]}"; do
+  if [[ -n "$ONLY" ]]; then [[ "$s" == "$ONLY" ]] && RUN+=("$s"); continue; fi
+  in_list "$s" "${SEED[@]}" && continue
+  if in_list "$s" "${FORGET[@]}" || [[ ! -f "$STAMPS/$s.done" ]]; then RUN+=("$s"); fi
+done
+# (not for --check-only, which runs no step)
+if [[ $SCRATCH == 1 && $ALLOW_SHARED == 0 && $CHECK_ONLY == 0 ]]; then
+  for s in "${RUN[@]}"; do
+    if in_list "$s" "${SHARED_STEPS[@]}"; then
+      echo "scratch run: step $s would rewrite the shared data under $ISL_ROOT that the real run reads. Start after" >&2
+      echo "  splits (e.g. --from bench: earlier steps are seeded from $SEED_WORK), or pass --allow-shared-data." >&2
+      exit 2
+    fi
+  done
+fi
+[[ $CHECK_ONLY == 1 ]] && SEED=()
+for s in "${SEED[@]}"; do
+  for o in $(step_outputs "$s"); do
+    if [[ "$o" == !* && ! -e "$WORK/${o#!}" && ! -e "$SEED_WORK/${o#!}" ]]; then
+      echo "scratch run --from $FROM: step $s is seeded, but $SEED_WORK/${o#!} is missing (set PHASE2_SEED_BASE," >&2
+      echo "  or start from an earlier step)" >&2
+      exit 2
+    fi
+  done
+done
+
+# ---- dry run: what would be removed, seeded, run or skipped (writes nothing) --------------------------------
 if [[ $DRY_RUN == 1 ]]; then
   if [[ "$FROM" == "${STEPS[0]}" && -z "$ONLY" && -f "$WORK/partial_data.json" ]]; then
     echo "would remove $WORK/partial_data.json"
   fi
-  for s in "${FORCE_STEPS[@]}"; do forget "$s"; done
-  reached_from=0
-  [[ -z "$FROM" ]] && reached_from=1
+  for s in "${FORGET[@]}"; do forget "$s"; done
+  for s in "${SEED[@]}"; do seed_step "$s" || exit $?; done
   for s in "${STEPS[@]}"; do
-    [[ "$s" == "$FROM" ]] && reached_from=1
-    if [[ -n "$ONLY" && "$s" != "$ONLY" ]]; then continue; fi
-    redo=0
-    if [[ -z "$ONLY" && $reached_from == 1 && -n "$FROM" ]]; then
-      is_forced "$s" || forget "$s"
-      redo=1
-    fi
-    if [[ -z "$ONLY" && $redo == 0 && -f "$STAMPS/$s.done" ]] && ! is_forced "$s"; then
-      echo "would skip $s (done $(cat "$STAMPS/$s.done"))"
-    else
-      echo "would run $s"
-    fi
+    if in_list "$s" "${RUN[@]}"; then echo "would run $s"
+    elif [[ -z "$ONLY" ]] && ! in_list "$s" "${SEED[@]}"; then echo "would skip $s (done $(cat "$STAMPS/$s.done"))"; fi
   done
   exit 0
 fi
+
+mkdir -p "$LOGDIR" "$STAMPS"  # only now: a refused run (bad option, shared-data step, missing seed) writes nothing
 
 # ---- data guard: full runs never start silently on partial data -------------------------------------------
 [[ "$FROM" == "${STEPS[0]}" && -z "$ONLY" ]] && rm -f "$WORK/partial_data.json"  # rebuilt from scratch
@@ -327,21 +417,32 @@ free_gb=$(df -Pk "$REPO" | awk 'NR==2 {print int($4/1048576)}')
 if [[ "$free_gb" -lt 10 ]]; then log "only ${free_gb} GB free (< 10 GB floor): not starting"; exit 3; fi
 
 log "phase 2 driver: profile=$PROFILE smoke=$SMOKE tag=${RUN_TAG:--} allow_partial=$ALLOW_PARTIAL threads=$THREADS work=$WORK stamps=$STAMPS git=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
-for s in "${FORCE_STEPS[@]}"; do forget "$s"; done
-reached_from=0
-[[ -z "$FROM" ]] && reached_from=1
+if [[ ${#SEED[@]} -gt 0 ]]; then
+  for s in "${SEED[@]}"; do seed_step "$s" || { log "seeding $s FAILED"; exit 2; }; done
+  if [[ -f "$SEED_WORK/partial_data.json" && ! -f "$WORK/partial_data.json" ]]; then
+    cp -p "$SEED_WORK/partial_data.json" "$WORK/" && log "  seeded from a PARTIAL DATA work folder: this run is marked too"
+  fi
+fi
+for s in "${FORGET[@]}"; do forget "$s"; done  # eager: STEP and every later step at once (see the plan above)
 for s in "${STEPS[@]}"; do
-  [[ "$s" == "$FROM" ]] && reached_from=1
   if [[ -n "$ONLY" && "$s" != "$ONLY" ]]; then continue; fi
-  # --from: forget the stamp AND the training state, else train()'s --resume returns the old (finished) weights
-  if [[ -z "$ONLY" && $reached_from == 1 && -n "$FROM" ]] && ! is_forced "$s"; then forget "$s"; fi
   if [[ -z "$ONLY" && -f "$STAMPS/$s.done" ]]; then log "skip $s (done $(cat "$STAMPS/$s.done"))"; continue; fi
+  if [[ $SCRATCH == 1 && $ALLOW_SHARED == 0 ]] && in_list "$s" "${SHARED_STEPS[@]}"; then
+    log "step $s refused: a scratch run must not rewrite the shared data (--allow-shared-data)"; exit 2
+  fi
   free_gb=$(df -Pk "$REPO" | awk 'NR==2 {print int($4/1048576)}')
   if [[ "$free_gb" -lt 10 ]]; then log "only ${free_gb} GB free: stopping before $s"; exit 3; fi
   log "step $s ..."
   t0=$(date +%s)
   run_step "$s"; rc=$?
-  if [[ $rc -ne 0 ]]; then log "step $s FAILED (exit $rc); fix the cause and run the same command again (it resumes here)"; exit $rc; fi
+  if [[ $rc -ne 0 ]]; then
+    if [[ -n "$ONLY" ]]; then
+      log "step $s FAILED (exit $rc); fix the cause and run the same --only command again (it resumes from its state)"
+    else
+      log "step $s FAILED (exit $rc); fix the cause and run again WITHOUT --from/--force to resume here"
+    fi
+    exit $rc
+  fi
   echo "$(date -u +%FT%TZ) $(( $(date +%s) - t0 ))s" > "$STAMPS/$s.done"
   log "step $s done in $(( $(date +%s) - t0 )) s"
 done
