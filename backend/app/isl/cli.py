@@ -619,7 +619,8 @@ def cmd_train_classifier(paths: IslPaths, args) -> int:
     res = train_classifier(data, out, fcfg, _train_cfg(args, SMOKE_CLS), smoke=args.smoke,
                            threads=args.threads, progress=lambda f, m: _log(f"  classifier {m}"),
                            use_extra=args.all_sources, min_signers=args.min_signers, resume=args.resume,
-                           max_minutes=args.max_minutes, steps_per_epoch=args.batches)
+                           max_minutes=args.max_minutes, steps_per_epoch=args.batches,
+                           dictionary_group=bool(getattr(args, "dictionary_group", False)))
     _print(res)
     return 0 if res.get("finished", True) else EX_PARTIAL
 
@@ -633,9 +634,16 @@ def cmd_train_encoder(paths: IslPaths, args) -> int:
                         emb_dim=args.emb_dim or (128 if args.smoke else 256), p=args.p, k=args.k, smoke=args.smoke,
                         threads=args.threads, batches_per_epoch=args.batches or (20 if args.smoke else None),
                         progress=lambda f, m: _log(f"  encoder {m}"), init_from=_init_path(args, work),
-                        use_extra=args.all_sources, resume=args.resume, max_minutes=args.max_minutes)
+                        use_extra=args.all_sources, resume=args.resume, max_minutes=args.max_minutes,
+                        exclude_sources=_exclude_sources(args))
     _print(res)
     return 0 if res.get("finished", True) else EX_PARTIAL
+
+
+def _exclude_sources(args) -> tuple[str, ...]:
+    """``--exclude-sources wslp[,cislr]``: sources left out of encoder supervision (docs 15.32)."""
+    v = getattr(args, "exclude_sources", None) or ""
+    return tuple(sorted({x.strip() for x in v.split(",") if x.strip()}))
 
 
 def _init_path(args, work: Path) -> Path | None:
@@ -748,7 +756,8 @@ def cmd_train_oneshot(paths: IslPaths, args) -> int:
                             batches_per_epoch=args.batches or (20 if args.smoke else None),
                             progress=lambda f, m, _k=k: _log(f"  oneshot fold{_k} {m}"),
                             init_from=_init_path(args, work), use_extra=args.all_sources, resume=args.resume,
-                            max_minutes=args.max_minutes, version=f"isl-enc-1-oneshot{k}")
+                            max_minutes=args.max_minutes, version=f"isl-enc-1-oneshot{k}",
+                            exclude_sources=_exclude_sources(args))
         out[k] = {**res, "held_out": len(fd["held_out_concepts"]), "held_out_expanded": len(held)}
         if not res.get("finished", True):
             code = EX_PARTIAL
@@ -869,7 +878,7 @@ def cmd_bench(paths: IslPaths, args) -> int:
 
 def cmd_build_index(paths: IslPaths, args) -> int:
     from app.isl.models.encoder import EncoderPredictor
-    from app.isl.training.build_index import build_index
+    from app.isl.training.build_index import build_index, twin_sources_for
 
     profile, data, fcfg, work = _model_ctx(paths, args)
     # --all-include (the shipped index) indexes every reference, validation and test clips too, into
@@ -883,8 +892,12 @@ def cmd_build_index(paths: IslPaths, args) -> int:
     enc = EncoderPredictor(work / "encoder.pt")
     include = data.include_part("train") if not args.all_include else [c for c in data.include if c.concept_id]
     extra = [c for c in data.extra if args.all_include or data.extra_assign.get(c.clip_id) == "train"]
+    # --wslp-twins (docs 15.32): keep (default, as before), drop, or auto (drop when the encoder was trained
+    # without WSLP); index and index_final get the same choice from the same encoder
+    twins = twin_sources_for(getattr(args, "wslp_twins", None) or "keep", enc.meta)
     _print(build_index(enc, data.islrtc, include, out, profile, extra=extra or None,
-                       contains_eval=bool(args.all_include), split=str(data.split.get("name") or "")))
+                       contains_eval=bool(args.all_include), split=str(data.split.get("name") or ""),
+                       twin_sources=twins))
     return 0
 
 
@@ -1169,6 +1182,13 @@ def build_parser() -> argparse.ArgumentParser:
             spx.add_argument("--max-clips", type=int, default=0, help="use at most N unlabelled clips (0 = all)")
         if name == "train-oneshot":
             spx.add_argument("--folds", type=int, nargs="+", default=[0, 1])
+        if name == "train-classifier":
+            spx.add_argument("--dictionary-group", action="store_true",
+                             help="count ISLRTC, WSLP and CISLR as ONE signer group when choosing classes (WSLP is "
+                                  "a second view of the ISLRTC videos; docs 15.32). Default: the old grouping")
+        if name in ("train-encoder", "train-oneshot"):
+            spx.add_argument("--exclude-sources", default="",
+                             help="comma-separated sources left out of encoder supervision, e.g. wslp (docs 15.32)")
     lk = sub.add_parser("link-sources")
     _model_args(lk)
     pdd = sub.add_parser("pretrain-dedup")
@@ -1188,6 +1208,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp2 = sub.add_parser(name)
         _model_args(sp2)
         if name == "build-index":
+            sp2.add_argument("--wslp-twins", choices=["keep", "drop", "auto"], default="keep",
+                             help="WSLP rows of concepts that have an ISLRTC row: keep (default), drop, or auto (drop "
+                                  "when encoder.pt was trained without WSLP); docs 15.32")
             sp2.add_argument("--all-include", action="store_true",
                              help="every reference incl. validation / test clips (the shipped index): writes "
                                   "<work>/index_final unless --out; never <work>/index (docs 15.21)")

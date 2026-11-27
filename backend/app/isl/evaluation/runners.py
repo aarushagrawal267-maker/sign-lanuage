@@ -1000,7 +1000,8 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     from app.isl.evaluation.protocols import e6_latency
     from app.isl.models.encoder import EncoderPredictor
     from app.isl.training.pipeline import load_recognizer
-    from app.isl.training.train_encoder import encoder_training_clips
+    from app.isl.training.common import class_space_of, classifier_grouping_mismatch
+    from app.isl.training.train_encoder import encoder_excluded_sources, encoder_training_clips
 
     from app.isl.training.readiness import partial_data_flag, readiness_summary
 
@@ -1025,6 +1026,12 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     prot["E1b"] = e1_closed_set(rec, test_inc, f"E1b core words, closed set, INCLUDE test part of {split_name} ({lab}; "
                                 f"signer-independent: {si})", split_name, "primary", reference=reference)
     cv = sorted((work / "cv").glob("fold*/classifier.pt")) if (work / "cv").exists() else []
+    # class spaces (docs 15.32): a classifier chosen with another signer grouping (e.g. WSLP as its own signers)
+    # or an encoder trained with other sources has another class space; they are never pooled silently
+    cls_meta, enc_meta = getattr(rec.classifier, "meta", None), getattr(rec.encoder, "meta", None)
+    class_space = {"classifier": class_space_of(cls_meta) if cls_meta is not None else None,
+                   "encoder": class_space_of(enc_meta) if enc_meta is not None else None,
+                   "cv_folds_not_pooled": [], "oneshot_folds_other_sources": []}
     if cv:
         from app.isl.training.common import load_split
         from app.models.checkpoint import Predictor
@@ -1034,6 +1041,10 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
             pr = Predictor(p)
             sname = pr.meta.get("split")
             if not sname or sname == split_name:  # the main model is already E1b
+                continue
+            mis = classifier_grouping_mismatch(cls_meta, pr.meta) if cls_meta is not None else None
+            if mis:
+                class_space["cv_folds_not_pooled"].append({"fold": p.parent.name, **mis})
                 continue
             try:
                 sp = load_split(paths, sname) if paths is not None else None
@@ -1112,9 +1123,15 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
                 continue
             enc = EncoderPredictor(p)
             held = heldout_set(getattr(data, "linker", None), fd["held_out_concepts"])
+            # the fold encoder's own training list: with the sources it was trained without (docs 15.32)
+            xsrc = encoder_excluded_sources(enc.meta)
+            if class_space["encoder"] is not None and xsrc != class_space["encoder"]["excluded_sources"]:
+                class_space["oneshot_folds_other_sources"].append(
+                    {"fold": k, "excluded_sources": xsrc,
+                     "main_excluded_sources": class_space["encoder"]["excluded_sources"]})
             try:
                 folds.append(e2_oneshot_fold(enc, fd, data, getattr(data, "linker", None), fcfg, rec.fusion,
-                                             restricted, encoder_training_clips(data, held)))
+                                             restricted, encoder_training_clips(data, held, exclude_sources=xsrc)))
             except LeakageError as e:
                 folds.append({"fold": k, "run": False, "leakage": str(e)})
         pooled = e2_pool(folds)
@@ -1171,7 +1188,8 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
                                                                and index_guard["split_checked"]
                                                                and index_guard["train_clip_ids_checked"]),
                        **index_guard} if index_guard is not None
-                      else {"dir": None, "note": "no retrieval index"})}
+                      else {"dir": None, "note": "no retrieval index"}),
+            "class_space": class_space}
     if smoke:
         label = ("SMOKE RUN on partial data with tiny settings: proves the pipeline runs end to end. These numbers "
                  "are NOT the accuracy of the app.")
@@ -1471,6 +1489,17 @@ def markdown_report(doc: dict) -> str:
                  f"clips or their duplicates)" if pc.get("pretrain_clips") is not None else f"({pc.get('reason', '')})")]
     if pc.get("sign_library"):
         lines.append(f"* OpenHands Sign Library: {pc['sign_library']}")
+    cs = lg.get("class_space") or {}
+    if cs.get("classifier") or cs.get("encoder"):  # docs 15.32
+        lines.append(f"* class space: classifier signer grouping "
+                     f"{(cs.get('classifier') or {}).get('signer_grouping', '-')}, encoder trained without "
+                     f"{', '.join((cs.get('encoder') or {}).get('excluded_sources') or []) or 'no source'}")
+    for f in cs.get("cv_folds_not_pooled") or []:
+        lines.append(f"* cv {f['fold']} NOT pooled: its classes were chosen with signer grouping "
+                     f"{f['signer_grouping']}, the main classifier's with {f['main_signer_grouping']}")
+    for f in cs.get("oneshot_folds_other_sources") or []:
+        lines.append(f"* E2 fold {f['fold']} encoder was trained without {f['excluded_sources'] or 'no source'}, "
+                     f"the main encoder without {f['main_excluded_sources'] or 'no source'}")
     if lg.get("pretraining_excludes_eval_clips") is False:
         lines.append("* **LEAKAGE: pre-training saw evaluation clips; the numbers above are not clean.** Examples: "
                      + ", ".join(pc.get("overlap_examples") or []))

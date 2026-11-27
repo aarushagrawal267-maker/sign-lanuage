@@ -285,6 +285,8 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
         files["index/embeddings.f16.npy"] = _sha(tmp / "index" / "embeddings.f16.npy")
         index_info = {"built_from": src_index.name, "contains_eval": imeta.contains_eval,
                       "encoder_sha256": imeta.encoder_sha256 or None}
+        if imeta.row_filters:  # e.g. WSLP twins of ISLRTC rows left out (docs 15.32)
+            index_info["row_filters"] = imeta.row_filters
         if index_note:
             index_info["note"] = index_note
     # the results the app serves (/api/languages/<id>/results): the phase-2 ``evaluate --all`` report when it exists
@@ -321,10 +323,20 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
     write_spelling_lexicon(build_spelling_lexicon(Vocabulary.load(tmp / "vocabulary.jsonl").rows),
                            tmp / "spelling_lexicon.txt")
     enc_version = None
+    class_spaces = {}  # the components' class spaces when their meta records one (docs 15.32; older: none)
     if (work / "encoder.pt").exists():
         import torch
 
-        enc_version = torch.load(work / "encoder.pt", map_location="cpu", weights_only=False)["meta"]["encoder_version"]
+        enc_meta = torch.load(work / "encoder.pt", map_location="cpu", weights_only=False)["meta"]
+        enc_version = enc_meta["encoder_version"]
+        if enc_meta.get("class_space"):
+            class_spaces["encoder"] = enc_meta["class_space"]
+    if (work / "classifier.pt").exists():
+        import torch
+
+        cls_meta = torch.load(work / "classifier.pt", map_location="cpu", weights_only=False).get("meta") or {}
+        if cls_meta.get("class_space"):
+            class_spaces["classifier"] = cls_meta["class_space"]
     from app.isl.training.readiness import partial_data_flag
 
     base = json.loads((PACK_DIR / "pack.json").read_text())
@@ -350,6 +362,8 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
         man["components"]["index"] = {**man["components"]["index"], "encoder_version": enc_version}
     if index_info is not None:
         man["components"]["index"] = {**man["components"]["index"], **index_info}
+    for comp, cs in class_spaces.items():
+        man["components"][comp] = {**(man["components"].get(comp) or {}), "class_space": cs}
     (tmp / "pack.json").write_text(json.dumps(man, indent=1, ensure_ascii=False))
     shutil.rmtree(out, ignore_errors=True)
     tmp.replace(out)

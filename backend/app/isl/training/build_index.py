@@ -14,6 +14,9 @@ Two indexes per work folder (docs/ISL_DESIGN.md 15.21): ``work/index`` from the 
 (``--all-include``, ``contains_eval = True``), which only the shipped pack uses. Both record the SHA-256 of the
 encoder file they were embedded with, the split whose assignment chose the clips and a digest of those clip ids;
 every centroid row lists the clips it was built from (``clips``), so the leak guard sees every row (15.22).
+
+``twin_sources`` (docs 15.32): rows of these sources (research: WSLP, a second view of the ISLRTC videos) are left out
+for every concept that has an ISLRTC row, since they repeat that row. The count is recorded in ``row_filters``.
 """
 
 from __future__ import annotations
@@ -47,6 +50,40 @@ def index_training_clip_ids(data) -> list[str]:
     """The clip ids the ``index`` step (training parts only) would use with this data and split assignment; the
     leak guard compares their digest with ``train_clip_ids_sha256`` of the index (docs/ISL_DESIGN.md 15.22)."""
     return index_clip_ids(data.include_part("train"), data.extra_part("train"))
+
+
+WSLP_TWIN_MODES = ("keep", "drop", "auto")
+
+
+def twin_sources_for(mode: str, encoder_meta: dict | None) -> tuple[str, ...]:
+    """The sources whose ISLRTC twins ``build-index --wslp-twins MODE`` leaves out (docs 15.32). ``keep`` (default):
+    none, as before. ``drop``: WSLP. ``auto``: WSLP when the encoder was trained without WSLP
+    (``class_space.excluded_sources``), so an index of an older encoder is built exactly as before."""
+    from app.isl.training.common import class_space_of
+
+    if mode not in WSLP_TWIN_MODES:
+        raise ValueError(f"wslp twins mode must be one of {WSLP_TWIN_MODES}, not {mode!r}")
+    if mode == "drop" or (mode == "auto" and "wslp" in class_space_of(encoder_meta)["excluded_sources"]):
+        return ("wslp",)
+    return ()
+
+
+def drop_dictionary_twins(extra: list[Clip], dictionary_concepts: set[str],
+                          twin_sources: tuple[str, ...] | list[str]) -> tuple[list[Clip], dict]:
+    """``extra`` without the clips of ``twin_sources`` whose concept has a dictionary (ISLRTC) row, and a summary."""
+    ts = set(twin_sources or ())
+    if not ts:
+        return list(extra), {}
+    keep, dropped = [], Counter()
+    for c in extra:
+        if c.source in ts and c.concept_id in dictionary_concepts:
+            dropped[c.source] += 1
+        else:
+            keep.append(c)
+    kept = Counter(c.source for c in keep if c.source in ts)
+    return keep, {"sources": sorted(ts), "dropped": int(sum(dropped.values())), "dropped_per_source": dict(dropped),
+                  "kept_per_source": dict(kept),
+                  "rule": "clips of these sources whose concept has an ISLRTC row are not indexed (docs 15.32)"}
 
 
 def _extra_rows(enc: EncoderPredictor, clips: list[Clip], weights: dict, max_group_centroids: int,
@@ -109,11 +146,12 @@ def _extra_rows(enc: EncoderPredictor, clips: list[Clip], weights: dict, max_gro
 def build_index(enc: EncoderPredictor, islrtc: list[Clip], include: list[Clip], out_dir: Path, profile: str,
                 alt_weight: float = 0.95, centroid_weight: float = 1.0, extra: list[Clip] | None = None,
                 source_weights: dict | None = None, max_group_centroids: int = 3, contains_eval: bool = False,
-                split: str = "") -> dict:
+                split: str = "", twin_sources: tuple[str, ...] | list[str] = ()) -> dict:
     """``contains_eval``: the caller says whether ``include`` / ``extra`` hold any validation or test clip (True for
     ``--all-include``); it is written to the index meta and evaluation refuses such an index. ``split``: the name of
     the split whose assignment chose ``include`` / ``extra`` (recorded with a digest of their clip ids; an index
-    without it is refused for fitting and evaluation, docs 15.22)."""
+    without it is refused for fitting and evaluation, docs 15.22). ``twin_sources``: leave out these sources' clips
+    of concepts that have an ISLRTC row (docs 15.32); the clip digest still covers every given clip."""
     t0 = time.time()
     fcfg = enc.feature_config
     concepts = {c.concept_id for c in islrtc} | {c.concept_id for c in include}
@@ -146,11 +184,16 @@ def build_index(enc: EncoderPredictor, islrtc: list[Clip], include: list[Clip], 
         emb = np.concatenate([emb, np.stack(cents)]) if len(emb) else np.stack(cents)
         rows += crow
     n_extra = 0
+    row_filters: dict = {}
     if extra:
         from app.isl.training.multisource import INDEX_WEIGHTS
 
-        vecs, erows = _extra_rows(enc, [c for c in extra if c.concept_id], {**INDEX_WEIGHTS, **(source_weights or {})},
-                                  max_group_centroids)
+        given = [c for c in extra if c.concept_id]
+        if twin_sources:
+            dict_concepts = {r["concept_id"] for r in rows if r["source"] == "islrtc" and r["concept_id"]}
+            given, twins = drop_dictionary_twins(given, dict_concepts, twin_sources)
+            row_filters["wslp_twins" if set(twin_sources) == {"wslp"} else "dictionary_twins"] = twins
+        vecs, erows = _extra_rows(enc, given, {**INDEX_WEIGHTS, **(source_weights or {})}, max_group_centroids)
         if vecs:
             emb = np.concatenate([emb, np.stack(vecs)]) if len(emb) else np.stack(vecs)
             rows += erows
@@ -160,11 +203,13 @@ def build_index(enc: EncoderPredictor, islrtc: list[Clip], include: list[Clip], 
     enc_path = getattr(enc, "path", None)
     idx = EmbeddingIndex.build(emb, rows, enc.version, fcfg.to_dict(), profile, contains_eval=bool(contains_eval),
                                encoder_sha256=file_sha256(enc_path) if enc_path is not None else "", split=split or "",
-                               train_clip_ids_sha256=clip_ids_sha256(index_clip_ids(include, extra)))
+                               train_clip_ids_sha256=clip_ids_sha256(index_clip_ids(include, extra)),
+                               row_filters=row_filters)
     idx.save(out_dir)
     return {"rows": len(rows), "concepts": len(idx.concepts), "first_sign": sum(r["kind"] == "first_sign" for r in rows),
             "alt_end": sum(r["kind"] == "alt_end" for r in rows), "centroids": len(crow), "extra_rows": n_extra,
             "rows_per_source": dict(Counter(r["source"] for r in rows)),
             "contains_eval": idx.meta.contains_eval, "encoder_sha256": idx.meta.encoder_sha256,
             "split": idx.meta.split, "train_clip_ids_sha256": idx.meta.train_clip_ids_sha256,
+            "row_filters": idx.meta.row_filters,
             "seconds": round(time.time() - t0, 1), "dir": str(out_dir)}

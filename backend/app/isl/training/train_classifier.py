@@ -4,7 +4,8 @@ so ``Predictor`` loads it unchanged (class names = concept ids).
 
 Classes: INCLUDE concepts with at least ``min_clips`` training clips (as before) plus, with ``data.extra``
 (ISL500, WSLP, CISLR, Mendeley ...), every concept that has at least ``min_signers`` different signer groups and
-``min_clips`` clips across the training sources (ISLRTC counts as one signer). Batches are class-balanced
+``min_clips`` clips across the training sources (ISLRTC counts as one signer; with ``dictionary_group`` ISLRTC, WSLP
+and CISLR together count as one signer, docs/ISL_DESIGN.md 15.32). Batches are class-balanced
 (class drawn with probability ~ count ** ``class_power``; inside a class, clips by per-source weight); ISLRTC clips
 of the classes join training with random trim ends. Selection on the validation part (macro F1), then
 temperature scaling on validation. Runs in the resumable loop (``loop.py``).
@@ -24,7 +25,8 @@ from torch import nn
 from app.evaluation.metrics import confidence_curve, pick_threshold
 from app.features.spec import FeatureConfig
 from app.isl.models.calibration import fit_temperature
-from app.isl.training.common import IslData, LazyClipDataset, multi_signer_counts, set_threads
+from app.isl.training.common import (SIGNER_GROUPING_DICTIONARY, SIGNER_GROUPING_SOURCE, IslData, LazyClipDataset,
+                                     multi_signer_counts, set_threads)
 from app.isl.training.loop import (LoopConfig, atomic_save, balanced_batches, clips_digest, digest, run_loop,
                                    train_config_signature)
 from app.isl.training.multisource import SAMPLE_WEIGHTS
@@ -33,13 +35,17 @@ from app.models.networks import build_model
 from app.training.trainer import TrainConfig, set_seed
 
 
-def classifier_classes(data: IslData, min_clips: int = 2, min_signers: int = 2, use_extra: bool = True) -> list[str]:
+def classifier_classes(data: IslData, min_clips: int = 2, min_signers: int = 2, use_extra: bool = True,
+                       dictionary_group: bool = False) -> list[str]:
+    """``dictionary_group``: ISLRTC, WSLP and CISLR clips are one signer group (docs 15.32), so a concept seen only in
+    the dictionary and its second views (research: about 3,770 of 4,354 classes) is no class; it is served by
+    retrieval. Default False: the grouping before 15.32 (every WSLP / CISLR clip without a signer id is a group)."""
     train_inc = data.include_part("train")
     counts = Counter(c.concept_id for c in train_inc)
     classes = {c for c, n in counts.items() if n >= min_clips}
     if use_extra and data.extra:
         pool = train_inc + data.extra_part("train") + [c for c in data.islrtc if c.concept_id]
-        groups = multi_signer_counts(pool)
+        groups = multi_signer_counts(pool, dictionary_group)
         n = Counter(c.concept_id for c in pool)
         classes |= {c for c, g in groups.items() if len(g) >= min_signers and n[c] >= max(min_clips, 2)
                     and any(x.concept_id == c for x in data.extra_part("train"))}
@@ -50,11 +56,12 @@ def train_classifier(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainCo
                      islrtc_oversample: int = 4, smoke: bool = False, threads: int = 2, progress=None,
                      min_signers: int = 2, use_extra: bool = True, class_power: float = 0.5,
                      source_weights: dict | None = None, steps_per_epoch: int | None = None, resume: bool = False,
-                     max_minutes: float = 0.0, state_path: Path | None = None, cache_items: int = 12000) -> dict:
+                     max_minutes: float = 0.0, state_path: Path | None = None, cache_items: int = 12000,
+                     dictionary_group: bool = False) -> dict:
     set_threads(threads)
     set_seed(cfg.seed)
     t0 = time.time()
-    classes = classifier_classes(data, min_clips, min_signers, use_extra)
+    classes = classifier_classes(data, min_clips, min_signers, use_extra, dictionary_group)
     if len(classes) < 2:
         raise RuntimeError(f"not enough training data: {len(classes)} concepts with >= {min_clips} clips")
     label_of = {c: i for i, c in enumerate(classes)}
@@ -112,9 +119,15 @@ def train_classifier(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainCo
                                                zero_division=0))}
 
     src = Counter(c.source for c in clips)
+    # the class space, explicit (docs 15.32): a classifier trained with another signer grouping has other classes,
+    # and evaluation never pools it with this one (cv folds, E1a); older checkpoints have no field ("source")
+    class_space = {"signer_grouping": SIGNER_GROUPING_DICTIONARY if dictionary_group else SIGNER_GROUPING_SOURCE,
+                   "min_signers": min_signers, "min_clips": min_clips, "use_extra": use_extra,
+                   "n_classes": len(classes), "classes_sha256": digest(classes)}
     meta = {"architecture": cfg.architecture, "model_kwargs": cfg.model_kwargs(), "feature_config": fcfg.to_dict(),
             "class_names": classes, "language": "isl", "profile": data.profile, "split": data.split.get("name"),
             "split_label": data.split.get("label"), "train_config": asdict(cfg), "smoke": smoke,
+            "class_space": class_space,
             "data": {**data.summary(), "train_items": len(train_clips), "val_items": len(vx),
                      "islrtc_clips_of_classes": len(isl_same), "train_sources": dict(src),
                      "min_signers": min_signers, "class_power": class_power}}
@@ -134,7 +147,9 @@ def train_classifier(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainCo
                            "min_clips": min_clips, "min_signers": min_signers, "use_extra": use_extra,
                            "islrtc_oversample": islrtc_oversample, "class_power": class_power,
                            "source_weights": sw, "class_names": digest(classes),
-                           "data": clips_digest(clips, labels, weights), "val": clips_digest(val_clips)})
+                           "data": clips_digest(clips, labels, weights), "val": clips_digest(val_clips),
+                           # only when on, so a state of the default settings written before 15.32 still resumes
+                           **({"dictionary_group": True} if dictionary_group else {})})
     res = run_loop(model, batches, loss_fn, lc, state_path or Path(str(out) + ".state"), val_fn=val_fn,
                    select_key="val_macro_f1", save_best=save_best, fresh=not resume,
                    progress=(lambda m: progress(None, m)) if progress else None)
@@ -156,4 +171,5 @@ def train_classifier(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainCo
     return {"checkpoint": str(out), "classes": len(classes), "best_epoch": res.best_epoch,
             "val_top1": ck["meta"]["val_top1"], "val_top5": ck["meta"]["val_top5"], "temperature": T,
             "train_items": len(train_clips), "val_items": len(vx), "train_sources": dict(src),
-            "finished": res.finished, "step_seconds": res.step_seconds, "seconds": round(time.time() - t0, 1)}
+            "finished": res.finished, "step_seconds": res.step_seconds, "class_space": class_space,
+            "seconds": round(time.time() - t0, 1)}

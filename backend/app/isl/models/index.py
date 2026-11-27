@@ -5,14 +5,15 @@ Files in the index folder::
     embeddings.f16.npy   (N, D) float16, L2-normalised
     rows.jsonl           {"row", "variant_id", "concept_id", "source", "kind", "weight"}
     meta.json            {"encoder_version", "dim", "n", "created", "feature_config", "profile", "sha256",
-                          "contains_eval", "encoder_sha256", "split", "train_clip_ids_sha256"}
+                          "contains_eval", "encoder_sha256", "split", "train_clip_ids_sha256", "row_filters"}
 
 ``contains_eval`` says whether the index holds references of validation / test clips (``build-index --all-include``,
 the shipped ``index_final``); ``encoder_sha256`` is the SHA-256 of the encoder file the rows were embedded with
 (``ENCODER_VERSION`` is a constant, so it cannot tell two trainings apart). Index files written before these fields
 existed load with ``contains_eval = None`` (unknown) and ``encoder_sha256 = ""`` (docs/ISL_DESIGN.md 15.21).
 ``split`` and ``train_clip_ids_sha256`` say which split's training parts were indexed and which clips exactly; rows
-built from several clips (centroids) list them in ``clips`` (docs/ISL_DESIGN.md 15.22).
+built from several clips (centroids) list them in ``clips`` (docs/ISL_DESIGN.md 15.22). ``row_filters`` records rows
+left out on purpose, e.g. WSLP twins of ISLRTC rows (``{"wslp_twins": {"dropped": n, ...}}``, 15.32; ``{}`` = none).
 
 ~25k x 256 cosine scores are one small matrix product (a few ms on CPU), so no ANN library is needed.
 """
@@ -86,6 +87,9 @@ class IndexMeta:
     # given to the build ("" = unknown: an index written before docs 15.22; refused for fitting / evaluation)
     split: str = ""
     train_clip_ids_sha256: str = ""
+    # rows of the given clips left out on purpose (docs 15.32), e.g. {"wslp_twins": {"dropped": 4274, ...}}; the
+    # clip digest above still covers every given clip, so the leak guard compares like with like
+    row_filters: dict = field(default_factory=dict)
 
     def to_json(self) -> dict:
         return dict(self.__dict__)
@@ -121,13 +125,13 @@ class EmbeddingIndex:
     @classmethod
     def build(cls, emb: np.ndarray, rows: list[dict], encoder_version: str, feature_config: dict | None = None,
               profile: str = "", contains_eval: bool | None = None, encoder_sha256: str = "", split: str = "",
-              train_clip_ids_sha256: str = "") -> EmbeddingIndex:
+              train_clip_ids_sha256: str = "", row_filters: dict | None = None) -> EmbeddingIndex:
         rows = [{**r, "row": i} for i, r in enumerate(rows)]
         emb = np.asarray(emb, np.float32)
         meta = IndexMeta(encoder_version, int(emb.shape[1]) if emb.ndim == 2 and emb.size else 0, len(rows),
                          datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), feature_config or {}, profile,
                          contains_eval=contains_eval, encoder_sha256=encoder_sha256, split=split or "",
-                         train_clip_ids_sha256=train_clip_ids_sha256)
+                         train_clip_ids_sha256=train_clip_ids_sha256, row_filters=dict(row_filters or {}))
         if meta.dim == 0:
             raise ValueError("cannot build an empty index")
         return cls(emb, rows, meta)

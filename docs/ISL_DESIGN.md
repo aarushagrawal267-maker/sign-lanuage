@@ -3860,3 +3860,71 @@ the variable nothing changes. The dry run and the start line of the log name the
 Use `--dry-run` first to see what each command removes, seeds and runs.
 
 Test: `backend/tests/isl/test_phase2_guards.py::test_evaluate_step_passes_eval_compare_to`.
+
+### 15.32 WSLP is a second view of the ISLRTC dictionary, not a signer (QA plan 1.1, 27 Nov 2026)
+
+**Finding.** WSLP's labelled word clips are the ISLRTC dictionary videos again, re-encoded. A WSLP clip and its
+ISLRTC clip have the same timing and lie a median 0.062 shoulder widths apart (retakes by one signer: 0.163).
+The dedup step does not catch them (`data/dedup.py:83`). WSLP clips have no signer id, so each one counted as one
+more "signer". CISLR is the collection WSLP stands in for and is treated the same way.
+
+**Why it matters (critic 2).** The fix is justified by the class space and the encoder, not by E1b. Masking the
+research classifier to commercial-safe's classes moves E1b top-1 only from 0.592 to 0.606; most research errors are
+confusions inside the shared classes. E1b gains are expected from 1.3 and 1.4, not from this item.
+* **Class space.** A concept with one ISLRTC row and one WSLP twin had "2 signers" and became a classifier class.
+  That is about 3,770 of research's 4,354 classes: words the classifier saw from one signer only, in two views.
+  With one dictionary group the verifier measured 581 classes. The dictionary-only words are served by retrieval
+  (confirm-only under 15.25).
+* **Encoder.** Each WSLP twin made an "INCLUDE <-> ISLRTC <-> WSLP" positive pair that is really the same video. The
+  pair is almost free for the loss and teaches no signer invariance, and it takes P x K slots away from real
+  cross-signer pairs. The research encoder never learned INCLUDE <-> ISLRTC (true-pair cosine 0.368, the same as the
+  pretrained encoder).
+* **Index.** 4,274 of the 4,359 WSLP rows repeat an ISLRTC row of the same concept. They add hub rows and nothing new.
+
+**What changed.** Every change is opt-in. With no new flag, training, `build-index`, fit-fusion, evaluate and
+`build-pack` behave as in Batch 0.
+* `training/common.py`: `DICTIONARY_SOURCES = ("islrtc", "wslp", "cislr")`. `multi_signer_counts(clips,
+  dictionary_group=True)` counts all their clips as the one group `dictionary`. Default False: the old grouping.
+* Classifier: `classifier_classes(..., dictionary_group=)`, `train_classifier(..., dictionary_group=)` and
+  `train-classifier --dictionary-group`. WSLP clips still train the classes that remain.
+* Encoder: `encoder_training_clips(..., exclude_sources=)`, `train_encoder(..., exclude_sources=)` and
+  `--exclude-sources wslp` on `train-encoder` and `train-oneshot`. Excluded sources leave the training list, the
+  validation queries and the validation gallery.
+* Index: `build-index --wslp-twins keep|drop|auto` (default `keep`). `drop` leaves out every WSLP clip whose concept
+  has an ISLRTC row in the index. `auto` drops them only when `encoder.pt` was trained without WSLP, so the index of an
+  older encoder is built exactly as before. WSLP-only words keep their rows. `index/meta.json` has a new field
+  `row_filters` (`{}` when nothing was left out, else `{"wslp_twins": {"dropped": n, ...}}`). The training-clip
+  digest of 15.22 still covers every clip given to the build, so the leak guard compares like with like.
+
+**The class space is explicit in meta.** Old and new checkpoints are never mixed silently.
+* `classifier.pt` meta `class_space`: `signer_grouping` (`source` or `dictionary`), `min_signers`, `min_clips`,
+  `use_extra`, `n_classes`, `classes_sha256`. `encoder.pt` meta `class_space`: `excluded_sources`, `use_extra`,
+  `n_concepts`, `concepts_sha256`. A checkpoint without the field reads as `source` / no excluded source
+  (`common.class_space_of`).
+* Resume signature (15.19): `dictionary_group` and `exclude_sources` go into `LoopConfig.extra` when they are set.
+  A state of the default settings written before this change still resumes.
+* `evaluate --all`: a cv fold whose classifier used another signer grouping than the main classifier is not pooled
+  into the CV number. It is listed in `report.json` `leakage_guards.class_space.cv_folds_not_pooled` and in
+  `report.md`. E2 rebuilds each fold encoder's training list with that encoder's own excluded sources; a fold
+  trained with other sources than the main encoder is listed in `oneshot_folds_other_sources`.
+* `build-pack`: `pack.json` `components.classifier.class_space` and `components.encoder.class_space` when the
+  checkpoints record one, and `components.index.row_filters` when rows were left out.
+
+**Measured on the real research data** (read-only, current split): classifier classes 4,354 (old grouping) -> 581
+(dictionary group); index rows of WSLP 4,359 -> 85 (4,274 twins dropped); encoder training list 80,221 -> 75,862 clips
+and 12,439 -> 12,355 concepts (the 84 concepts only WSLP knows leave encoder supervision but keep their index rows).
+
+**Driver** (`scripts/phase2_train.sh`). New environment variables, research defaults on:
+* `CLS_DICTIONARY_GROUP=1|0`: `--dictionary-group` for classifier, cv and e1a. Research 1, commercial-safe 0.
+* `ENC_EXCLUDE_SOURCES=wslp`: `--exclude-sources` for encoder and oneshot. Research `wslp`, commercial-safe empty.
+* `INDEX_WSLP_TWINS=keep|drop|auto`: for index and index_final. Research `auto`, commercial-safe `keep`.
+Commercial-safe has no WSLP or CISLR, so it passes no new flag and nothing changes there. The dry run prints the three
+settings. The QA 0.6 research refresh (`--from index`) runs no training step, and with the current research encoder
+`auto` keeps every row, so its numbers are unchanged. The Batch 1 full run (`--from link`) gets all three.
+
+Tests: `backend/tests/isl/test_wslp_dictionary.py`. One WSLP clip plus one ISLRTC row give no class (ISL500 as a
+second signer still does); the grouping changes nothing without dictionary views; the encoder list drops WSLP only
+when asked; a toy encoder trained without WSLP records it, and its `auto` index has no WSLP twin rows, keeps the
+WSLP-only word and keeps the clip digest; `keep` indexes every WSLP clip; the classifier meta records the grouping
+and a dictionary-group state is refused without it; the driver passes the flags for research only and refuses a bad
+value.

@@ -8,7 +8,9 @@ sampler with replacement; within a concept, clips are drawn by per-source weight
 Phase 2 additions: ``init_from`` warm-starts the trunk from the self-supervised pre-training checkpoint
 (``pretrain.py``); ``data.extra`` (every other labelled source of the profile) joins the training set;
 ``exclude_concepts`` removes **every** clip of those concepts from the supervised losses, ISLRTC included (the
-held-out-concept one-shot protocol E2); training runs in the resumable loop (``loop.py``).
+held-out-concept one-shot protocol E2); ``exclude_sources`` removes whole sources from supervision (research: WSLP, a
+second view of the ISLRTC dictionary videos whose "pairs" with ISLRTC teach nothing, docs/ISL_DESIGN.md 15.32);
+training runs in the resumable loop (``loop.py``).
 
 Validation (model selection): retrieval recall@1 / @5 of held-out INCLUDE (+ signer-held-out extra) validation
 clips against a gallery of ISLRTC references plus a few training clips per concept and source.
@@ -30,7 +32,7 @@ from torch import nn
 from app.features.spec import FeatureConfig
 from app.isl.models.encoder import SignEncoder, load_encoder_weights
 from app.isl.models.losses import SubCenterArcFace, SupConLoss
-from app.isl.training.common import ClipDataset, IslData, LazyClipDataset, set_threads
+from app.isl.training.common import ClipDataset, IslData, LazyClipDataset, class_space_of, set_threads
 from app.isl.training.loop import (LoopConfig, atomic_save, clips_digest, digest, file_digest, pk_batches, run_loop,
                                    train_config_signature)
 from app.isl.training.multisource import SAMPLE_WEIGHTS
@@ -108,14 +110,22 @@ def _features_cache(clips, fcfg) -> tuple[np.ndarray, list]:
     return (np.stack(feats) if feats else np.zeros((0, fcfg.seq_len, fcfg.dim), np.float16)), kept
 
 
-def encoder_training_clips(data: IslData, exclude: set[str], use_extra: bool = True) -> list:
+def encoder_training_clips(data: IslData, exclude: set[str], use_extra: bool = True,
+                           exclude_sources: tuple[str, ...] | list[str] | set[str] = ()) -> list:
     """Supervised training clips: INCLUDE train + ISLRTC + (extra sources' train part), minus every clip of an
-    excluded concept (E2 held-out concepts never reach a supervised loss, ISLRTC included)."""
+    excluded concept (E2 held-out concepts never reach a supervised loss, ISLRTC included) and every clip of an
+    excluded source (``exclude_sources``, e.g. ``("wslp",)``, docs/ISL_DESIGN.md 15.32; default none)."""
+    xs = set(exclude_sources or ())
     clips = [c for c in data.include_part("train") if c.concept_id not in exclude]
     clips += [c for c in data.islrtc if c.concept_id and c.concept_id not in exclude]
     if use_extra:
         clips += [c for c in data.extra_part("train") if c.concept_id not in exclude]
-    return clips
+    return [c for c in clips if c.source not in xs] if xs else clips
+
+
+def encoder_excluded_sources(meta: dict | None) -> list[str]:
+    """The sources an encoder checkpoint was trained without (``[]`` for one written before 15.32)."""
+    return class_space_of(meta)["excluded_sources"]
 
 
 def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfig, *, emb_dim: int = 256,
@@ -124,12 +134,14 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
                   init_from: Path | None = None, use_extra: bool = True, source_weights: dict | None = None,
                   resume: bool = False, max_minutes: float = 0.0, state_path: Path | None = None,
                   max_val_queries: int = 1500, max_gallery: int = 8000, per_concept_gallery: int = 2,
-                  version: str = ENCODER_VERSION, cache_items: int = 12000) -> dict:
+                  version: str = ENCODER_VERSION, cache_items: int = 12000,
+                  exclude_sources: tuple[str, ...] | list[str] = ()) -> dict:
     set_threads(threads)
     set_seed(cfg.seed)
     t0 = time.time()
     excl = set(exclude_concepts or ())
-    train_clips = encoder_training_clips(data, excl, use_extra)
+    xsrc = sorted(set(exclude_sources or ()))
+    train_clips = encoder_training_clips(data, excl, use_extra, xsrc)
     concepts = sorted({c.concept_id for c in train_clips})
     label_of = {c: i for i, c in enumerate(concepts)}
     if len(train_clips) < 4 or len(concepts) < 2:
@@ -166,7 +178,7 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
 
     # validation: queries = held-out INCLUDE / extra clips; gallery = ISLRTC + a few training clips per concept
     rng = random.Random(cfg.seed)
-    vq = [c for c in data.labelled_part("val") if c.concept_id not in excl]
+    vq = [c for c in data.labelled_part("val") if c.concept_id not in excl and c.source not in xsrc]
     if len(vq) > max_val_queries:
         vq = rng.sample(vq, max_val_queries)
     gal = [c for c in data.islrtc if c.concept_id in label_of]
@@ -192,9 +204,13 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
     src_counts = defaultdict(int)
     for c in train_clips:
         src_counts[c.source] += 1
+    # the supervised class space, explicit (docs 15.32): encoders trained without a source (or on other concepts)
+    # are never mixed silently; E2 reads excluded_sources to rebuild the exact training list of a fold encoder
+    class_space = {"excluded_sources": xsrc, "use_extra": use_extra, "n_concepts": len(concepts),
+                   "concepts_sha256": digest(concepts)}
     meta = {"kind": "isl-encoder", "encoder_version": version, "model_kwargs": model_kwargs,
             "feature_config": fcfg.to_dict(), "profile": data.profile, "language": "isl", "smoke": smoke,
-            "train_config": asdict(cfg), "excluded_concepts": sorted(excl),
+            "train_config": asdict(cfg), "excluded_concepts": sorted(excl), "class_space": class_space,
             "pretraining": ({"init_from": init["path"], "loaded_tensors": init["loaded"], "skipped": init["skipped"],
                              **(init["meta"].get("pretraining") or {}),
                              "init_feature_config": init_fc, "init_feature_config_diff": init_fc_diff}
@@ -216,7 +232,9 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
                            "source_weights": sw, "excluded_concepts": digest(sorted(excl)),
                            "init_sha": file_digest(init_from), "data": clips_digest(train_clips, labels, weights),
                            "val": [max_val_queries, max_gallery, per_concept_gallery, clips_digest(vq),
-                                   clips_digest(gal)]})
+                                   clips_digest(gal)],
+                           # only when set, so a state of the default settings written before 15.32 still resumes
+                           **({"exclude_sources": xsrc} if xsrc else {})})
     res = run_loop(both, batches, loss_fn, lc, state_path or Path(str(out) + ".state"), val_fn=val_fn,
                    select_key="val_r1", save_best=save_best, fresh=not resume,
                    progress=(lambda m: progress(None, m)) if progress else None)
@@ -231,8 +249,9 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
             "train_sources": dict(src_counts), "best_epoch": res.best_epoch, "val_r1": best.get("val_r1"),
             "val_r5": best.get("val_r5"), "val_queries": len(vq), "finished": res.finished,
             "resumed_from": res.resumed_from, "step_seconds": res.step_seconds, "pretrained": bool(init),
+            "class_space": class_space,
             "seconds": round(time.time() - t0, 1)}
 
 
 __all__ = ["ENCODER_VERSION", "ClipDataset", "embed_items", "retrieval_metrics", "train_encoder",
-           "encoder_training_clips"]
+           "encoder_training_clips", "encoder_excluded_sources"]

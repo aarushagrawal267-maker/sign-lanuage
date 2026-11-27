@@ -27,6 +27,16 @@ log = logging.getLogger(__name__)
 ISL_FEATURES = FeatureConfig(seq_len=48, use_face=True, use_velocity=True, max_gap=5, canonical_hand=True,
                              hand_size_floor=0.1)
 
+# Sources that are views of ONE dictionary signer, not separate signers (docs/ISL_DESIGN.md 15.32): ISLRTC (the
+# dictionary videos); WSLP, verified to be a second view of the same ISLRTC videos (same timing, median 0.062
+# shoulder widths apart, against 0.163 for retakes by one signer); CISLR, the collection WSLP stands in for. When
+# signer groups are counted with ``dictionary_group``, all their clips are the one group ``dictionary``.
+DICTIONARY_SOURCES = ("islrtc", "wslp", "cislr")
+DICTIONARY_GROUP = "dictionary"
+# ``class_space.signer_grouping`` in checkpoint meta; a checkpoint without the field used "source" (before 15.32)
+SIGNER_GROUPING_SOURCE = "source"
+SIGNER_GROUPING_DICTIONARY = "dictionary"
+
 
 def slice_bf(bf: BodyFrame, a: int, b: int) -> BodyFrame:
     sl = slice(a, b)
@@ -365,10 +375,38 @@ class LazyClipDataset:
         return torch.from_numpy(np.stack(xs).astype(np.float32)), torch.tensor(ys, dtype=torch.long)
 
 
-def multi_signer_counts(clips: list[Clip]) -> dict[str, set[str]]:
-    """concept -> distinct signer groups (ISLRTC counts as one group)."""
+def signer_group_key(c: Clip, dictionary_group: bool = False) -> str:
+    """The signer group a clip counts for. Default (``dictionary_group=False``, the grouping before 15.32):
+    ``source:group``, and a clip without a group is its own group (so every WSLP / CISLR clip counted as one more
+    "signer"). ``dictionary_group=True``: every clip of a :data:`DICTIONARY_SOURCES` source is the one group
+    ``dictionary``."""
+    if dictionary_group and c.source in DICTIONARY_SOURCES:
+        return DICTIONARY_GROUP
+    return f"{c.source}:{c.group or c.clip_id}"
+
+
+def multi_signer_counts(clips: list[Clip], dictionary_group: bool = False) -> dict[str, set[str]]:
+    """concept -> distinct signer groups (ISLRTC counts as one group; with ``dictionary_group`` ISLRTC, WSLP and
+    CISLR together count as one group, docs/ISL_DESIGN.md 15.32)."""
     out: dict[str, set[str]] = defaultdict(set)
     for c in clips:
         if c.concept_id:
-            out[c.concept_id].add(f"{c.source}:{c.group or c.clip_id}")
+            out[c.concept_id].add(signer_group_key(c, dictionary_group))
     return out
+
+
+def class_space_of(meta: dict | None) -> dict:
+    """The class-space record of a classifier or encoder checkpoint meta (docs 15.32), with the pre-15.32 values for
+    a checkpoint that has none: ``signer_grouping = "source"`` and ``excluded_sources = []``. Two checkpoints whose
+    records differ were trained on different class spaces and are never pooled in one number."""
+    cs = dict((meta or {}).get("class_space") or {})
+    cs.setdefault("signer_grouping", SIGNER_GROUPING_SOURCE)
+    cs["excluded_sources"] = sorted(cs.get("excluded_sources") or [])
+    return cs
+
+
+def classifier_grouping_mismatch(main_meta: dict | None, other_meta: dict | None) -> dict | None:
+    """``None`` when two classifier checkpoints chose their classes with the same signer grouping, else what differs
+    (``{"signer_grouping", "main_signer_grouping"}``). Evaluation never pools such a pair (docs 15.32)."""
+    a, b = class_space_of(main_meta)["signer_grouping"], class_space_of(other_meta)["signer_grouping"]
+    return None if a == b else {"signer_grouping": b, "main_signer_grouping": a}

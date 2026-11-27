@@ -48,6 +48,11 @@
 #   --check-only     run the data guard and exit (0 = ready or allowed, 4 = refused)
 # Environment overrides for the full settings: PRE_EPOCHS PRE_STEPS PRE_BATCH HIDDEN LAYERS EMB ENC_EPOCHS
 # ENC_STEPS CLS_EPOCHS CLS_STEPS E1A_STEPS CV_FOLDS (empty = skip cv) ONESHOT_FOLDS ONESHOT_EPOCHS LETTER_EPOCHS.
+# WSLP is a second view of the ISLRTC dictionary (docs 15.32); defaults: research on, commercial-safe off (no WSLP):
+#   CLS_DICTIONARY_GROUP=1|0   classifier / cv / e1a count ISLRTC, WSLP and CISLR as ONE signer group (--dictionary-group)
+#   ENC_EXCLUDE_SOURCES=wslp   encoder / oneshot leave these sources out of supervision (--exclude-sources; "" = none)
+#   INDEX_WSLP_TWINS=auto      index / index_final: keep | drop | auto (drop WSLP rows of concepts with an ISLRTC row
+#                              when encoder.pt was trained without WSLP; an older encoder's index is built as before)
 # EVAL_COMPARE_TO=<report.json>: the evaluate step runs `evaluate --all --compare-to <report.json>` (E1b and E4 like
 # for like against that report, e.g. artifacts/isl/commercial-safe/eval/report.json; docs 15.27, 15.28, 15.31).
 # One profile per run (refused with --profile both); a missing file is refused before anything runs (exit 2).
@@ -188,6 +193,21 @@ else
   LET="--epochs ${LETTER_EPOCHS:-40}"
   PDD=""
 fi
+# WSLP / dictionary options (docs 15.32): research defaults on; commercial-safe has no WSLP and passes no new flag
+if [[ "$PROFILE" == "research" ]]; then
+  DG_DEFAULT=1; XS_DEFAULT="wslp"; TW_DEFAULT="auto"
+else
+  DG_DEFAULT=0; XS_DEFAULT=""; TW_DEFAULT="keep"
+fi
+DICT_GROUP="${CLS_DICTIONARY_GROUP:-$DG_DEFAULT}"
+ENC_XSRC="${ENC_EXCLUDE_SOURCES-$XS_DEFAULT}"
+WSLP_TWINS="${INDEX_WSLP_TWINS:-$TW_DEFAULT}"
+case "$DICT_GROUP" in 0|1) ;; *) echo "CLS_DICTIONARY_GROUP must be 0 or 1" >&2; exit 2 ;; esac
+case "$WSLP_TWINS" in keep|drop|auto) ;; *) echo "INDEX_WSLP_TWINS must be keep, drop or auto" >&2; exit 2 ;; esac
+[[ "$ENC_XSRC" =~ ^[a-z0-9_,]*$ ]] || { echo "ENC_EXCLUDE_SOURCES: comma-separated source names" >&2; exit 2; }
+DG_ARG=""; [[ $DICT_GROUP == 1 ]] && DG_ARG="--dictionary-group"
+XS_ARG=""; [[ -n "$ENC_XSRC" ]] && XS_ARG="--exclude-sources $ENC_XSRC"
+TW_ARG=""; [[ "$WSLP_TWINS" != keep ]] && TW_ARG="--wslp-twins $WSLP_TWINS"
 # a scratch run: a full run with a tag or its own work folder (smoke runs have their own private ISL root). It must
 # not rewrite the shared data under data/isl (docs 15.20): the steps in SHARED_STEPS are refused there unless
 # --allow-shared-data, and with --from the steps before STEP are seeded from SEED_WORK instead of run.
@@ -305,9 +325,9 @@ run_step() {
     bench) cli bench --threads "$THREADS" --steps $([[ $SMOKE == 1 ]] && echo 1 || echo 5) --hidden-sizes ${HIDDEN:-192} ;;
     pretrain_dedup) cli pretrain-dedup $COMMON --all-sources $CAP $PDD ;;  # Sign Library copies / eval-clip matches
     pretrain) train pretrain $COMMON $CAP $PRE ;;
-    encoder) train train-encoder $COMMON --all-sources $CAP $ENC --init auto ;;
-    oneshot) train train-oneshot $COMMON --all-sources $CAP $ONE --init auto ;;
-    classifier) train train-classifier $COMMON --all-sources $CAP $CLS ;;
+    encoder) train train-encoder $COMMON --all-sources $CAP $ENC --init auto $XS_ARG ;;
+    oneshot) train train-oneshot $COMMON --all-sources $CAP $ONE --init auto $XS_ARG ;;
+    classifier) train train-classifier $COMMON --all-sources $CAP $CLS $DG_ARG ;;
     cv)  # classifiers for the other folds of the primary split: E1b mean / spread and a signer-grouped interval
       local base
       base=$("$PY" -c "import json,sys; print(json.load(open(sys.argv[1])).get('primary_split',''))" \
@@ -315,17 +335,17 @@ run_step() {
       if [[ -z "$base" ]]; then log "  no splits_report.json: skipped"; return 0; fi
       for k in ${CV_FOLDS-$([[ $SMOKE == 1 ]] && echo 1 || echo 1 2 3 4)}; do
         mkdir -p "$WORK/cv/fold$k"
-        train train-classifier $COMMON --all-sources $CAP $CLS --split "$base-fold$k" --ckpt "$WORK/cv/fold$k/classifier.pt" || return $?
+        train train-classifier $COMMON --all-sources $CAP $CLS $DG_ARG --split "$base-fold$k" --ckpt "$WORK/cv/fold$k/classifier.pt" || return $?
       done ;;
     e1a)  # E1a needs its own model trained on the official (not signer-independent) INCLUDE split
       if [[ ! -f "${SROOT:-$REPO/data/isl}/splits/include-official.json" ]]; then log "  no official split: skipped"; return 0; fi
       mkdir -p "$WORK/e1a"
-      train train-classifier $COMMON $CAP $CLS --batches ${E1A_STEPS:-$([[ $SMOKE == 1 ]] && echo 6 || echo 120)} --split include-official --ckpt "$WORK/e1a/classifier.pt" ;;
+      train train-classifier $COMMON $CAP $CLS $DG_ARG --batches ${E1A_STEPS:-$([[ $SMOKE == 1 ]] && echo 6 || echo 120)} --split include-official --ckpt "$WORK/e1a/classifier.pt" ;;
     fingerspell) cli train-fingerspell --profile "$PROFILE" --threads "$THREADS" --vocab "$VOCAB" $SM $LET ;;
     # training parts only, into <work>/index: fit-fusion and evaluate read it and refuse anything else (docs 15.21).
     # A rebuilt index makes the later steps that used or must follow it stale: forget their stamps (docs 15.22),
     # so an older index_final (other data / row logic) is never shipped next to it
-    index) cli build-index $COMMON --all-sources $CAP --out "$WORK/index" \
+    index) cli build-index $COMMON --all-sources $CAP $TW_ARG --out "$WORK/index" \
         && rm -f "$STAMPS/fusion.done" "$STAMPS/evaluate.done" "$STAMPS/index_final.done" "$STAMPS/pack.done" ;;
     fusion) cli fit-fusion $COMMON --all-sources $CAP ;;
     trim_eval)  # E8: evaluate exactly the trimmer of the trim step (same learned-model choice) into the work folder
@@ -335,7 +355,7 @@ run_step() {
     evaluate) cli evaluate --all $COMMON --all-sources $CAP ${PACK_OUT:+--out "$PACK_OUT"} \
         ${COMPARE_TO:+--compare-to "$COMPARE_TO"} ;;
     # the shipped index: every reference (val / test too) into <work>/index_final, never over <work>/index
-    index_final) cli build-index $COMMON --all-sources $CAP --all-include --out "$WORK/index_final" ;;
+    index_final) cli build-index $COMMON --all-sources $CAP $TW_ARG --all-include --out "$WORK/index_final" ;;
     pack) cli build-pack $COMMON ${PACK_OUT:+--out "$PACK_OUT"} ;;
     *) log "unknown step $s"; return 2 ;;
   esac
@@ -347,6 +367,7 @@ if [[ $DRY_RUN == 1 ]]; then
   echo "log: $LOG"
   echo "pack: ${PACK_OUT:-default (artifacts/packs/<id>)}"
   [[ -n "$COMPARE_TO" ]] && echo "evaluate compares to: $COMPARE_TO"
+  echo "wslp/dictionary: classifier dictionary group=$DICT_GROUP, encoder excludes=${ENC_XSRC:--}, index wslp twins=$WSLP_TWINS"
 fi
 
 if [[ $LIST == 1 ]]; then
