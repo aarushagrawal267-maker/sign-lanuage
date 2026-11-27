@@ -4152,3 +4152,12 @@ prediction as correct and strict does not; `link-sources` reads only this work f
 after the file changes, ignores it with `none`, and refuses another profile's file; `variant-audit` end to end with
 tiny commercial-safe models scores ISL500 train clips only and refuses a commercial-safe run, a reference trained on
 ISL500 and an output in `data/isl/derived`; the pack gives a variant the word's Hindi; the driver's setting.
+
+**First look at the real data** (read-only, 27 Nov 2026, output in a scratch folder, not in any work folder; 20 train
+clips per word, 1 thread, 99 s). 191 of the 499 ISL500 words have a commercial-safe class. Top-5 agreement below 0.3:
+13 words; 8 relinked by the dictionary rule (clean-tidy, friend, gun, market, mean, monday, paint, she), 2 kept as
+signer shift (doctor, short), 3 kept as inconclusive (i, light, thief: no dictionary row). The QA count of "40 of 160"
+matches **top-1** agreement (37 of 191 below 0.3 here); `--top-k 1` gives that reading. The plan's examples mostly
+agree at top 5 (hot 0.50, lock 0.85, pink 0.45, child 0.35). The dictionary rule says "another form" for 36 of the 178
+words the classifier agrees on (20 %), so on its own it is noisy; it only ever narrows the classifier's candidates.
+Read the evidence before linking with the file. `--top-k` was added for this choice (default 5, as planned).

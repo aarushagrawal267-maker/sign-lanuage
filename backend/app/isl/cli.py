@@ -1136,7 +1136,7 @@ def cmd_variant_audit(paths: IslPaths, args) -> int:
                  "reverse_note": "every classifier also trains on INCLUDE train clips: a jointly trained model "
                                  "says 'no difference' easily, so its veto is weak evidence"}
     models = va.AuditModels(list(clf.class_names), va.model_scorer(clf, enc), dictionary, rev_names, rev_score, prov)
-    params = va.AuditParams(min_clips=args.min_clips, max_agreement=args.max_agreement,
+    params = va.AuditParams(min_clips=args.min_clips, max_agreement=args.max_agreement, top_k=args.top_k,
                             dict_rank_floor=args.dict_rank_floor, dict_rank_ratio=args.dict_rank_ratio,
                             dict_include_max_rank=args.dict_include_max_rank,
                             reverse_min_agreement=args.reverse_min_agreement, max_per_class=args.max_per_class,
@@ -1378,6 +1378,7 @@ def build_parser() -> argparse.ArgumentParser:
                           "classifier trained on that split)")
     vau.add_argument("--min-clips", type=int, default=20)
     vau.add_argument("--max-agreement", type=float, default=0.3)
+    vau.add_argument("--top-k", type=int, default=5, help="agreement = the word in the reference's top k (plan: 5)")
     vau.add_argument("--dict-rank-floor", type=int, default=10)
     vau.add_argument("--dict-rank-ratio", type=float, default=3.0)
     vau.add_argument("--dict-include-max-rank", type=int, default=20)

@@ -296,6 +296,7 @@ def test_cli_variant_audit_end_to_end_on_train_clips_only(world, tmp_path):
     root, common = world["root"], world["common"]
     args = [*root, "variant-audit", "--profile", "research", *common, "--reference-work", str(ref), "--min-clips", "3"]
     assert cli.main(args) == 0
+    assert cli.build_parser().parse_args([*args, "--top-k", "1"]).top_k == 1
     out = world["base"] / "research" / va.VARIANT_LINKS
     doc = json.loads(out.read_text())
     assert doc["kind"] == va.VARIANT_KIND and doc["profile"] == "research" and doc["part"] == "train"
