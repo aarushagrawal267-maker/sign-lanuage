@@ -11,12 +11,14 @@ from pathlib import Path
 
 import pytest
 
-from app.isl.evaluation.compare_packs import (DEFAULT_MARGINS, LEDGER, Side, compare, gate_status, mcnemar_exact,
-                                              paired_difference, unpaired_difference)
+from app.isl.evaluation.compare_packs import (DEFAULT_MARGINS, LEDGER, Side, compare, gate_status, isl500_val_check,
+                                              lower_bound_check, mcnemar_exact, paired_difference,
+                                              unpaired_difference)
 from tests.isl.test_eval_runners import phase2  # noqa: F401  (module fixture: a tiny trained research world)
 
 PRIMARY = "include-session-cv5-fold0"
 CV1 = "include-session-cv5-fold1"
+CV4 = "include-session-cv5-fold4"
 # after every file a test writes (a component newer than its report makes the report stale)
 CREATED = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
 
@@ -93,22 +95,49 @@ def _rec(hits: dict, groups=None, sources=None, parts=None) -> dict:
     return out
 
 
+def _fold_ids(split: str) -> list[str]:
+    return _ids(600, "include/v" if split == CV1 else f"include/f{split[-1]}_")
+
+
+def _splits(root: Path, fold4_selects_on_test: bool = True) -> Path:
+    """Split files of the synthetic world: the primary test is include/t*; fold 1 trains on it (disclosed, kept); fold
+    4's validation part IS the primary test (as in the real cv5 splits), so its classifier was selected on it."""
+    d = root / "splits"
+    if d.is_dir():
+        return d
+    d.mkdir(parents=True)
+    t = _ids(600, "include/t")
+
+    def write(name, assign):
+        (d / f"{name}.json").write_text(json.dumps({"name": name, "assign": assign}))
+
+    write(PRIMARY, {**{c: "test" for c in t}, **{c: "val" for c in _fold_ids(CV1)}})
+    write(CV1, {**{c: "test" for c in _fold_ids(CV1)}, **{c: "train" for c in t}})
+    write(CV4, {**{c: "test" for c in _fold_ids(CV4)},
+                **{c: ("val" if fold4_selects_on_test else "train") for c in t}})
+    return d
+
+
 def _work(root: Path, name: str, *, cv: float, e1b: float, lb: float, test_strict_prec: float = 0.95,
           e2_val: float = 0.1, e2_test: float = 0.1, seen: float = 0.4, isl500: float | None = None,
-          per_clip: bool = True) -> Path:
+          per_clip: bool = True, folds: dict | None = None) -> Path:
+    """``folds``: {split: top-1} of the CV folds besides the primary (default {CV1: cv})."""
     w = root / name
     (w / "eval").mkdir(parents=True)
-    test_ids, cv_ids = _ids(600, "include/t"), _ids(600, "include/v")
+    folds = {CV1: cv} if folds is None else folds
+    test_ids = _ids(600, "include/t")
     e2_ids = _ids(300, "include/o")
     e2h = {**_hits(e2_ids[:150], e2_val), **_hits(e2_ids[150:], e2_test)}
     isl_ids = _ids(600, "isl500/user005/x") if isl500 is not None else []
     e1c = {**_hits(isl_ids, isl500 or 0)}
-    e1b_h, cv_h, seen_h = _hits(test_ids, e1b), _hits(cv_ids, cv), _hits(test_ids, seen)
+    e1b_h, seen_h = _hits(test_ids, e1b), _hits(test_ids, seen)
+    cv_h = {f: _hits(_fold_ids(f), r) for f, r in folds.items()}
     pr = {"E1b": {"split": PRIMARY, "n": 600, "metrics": {"top1": e1b}, "clip_ids": test_ids,
                   "per_clip": {"hit1": "".join(str(e1b_h[c]) for c in test_ids)},
-                  "cv": {"pooled_top1": (e1b + cv) / 2, "pooled_n": 1200,
-                         "per_fold": [{"split": "E1b core words ...", "n": 600, "top1": e1b},
-                                      {"split": CV1, "n": 600, "top1": cv}]}},
+                  "cv": {"pooled_top1": (e1b + sum(folds.values())) / (1 + len(folds)),
+                         "pooled_n": 600 * (1 + len(folds)),
+                         "per_fold": [{"split": "E1b core words ...", "n": 600, "top1": e1b}]
+                         + [{"split": f, "n": 600, "top1": r} for f, r in folds.items()]}},
           "E1c": {"n": len(isl_ids), "metrics": {"top1": isl500}, "clip_ids": isl_ids,
                   "per_clip": {"hit1": "".join(str(e1c[c]) for c in isl_ids)}} if isl_ids else {"run": False},
           "E2_seen": {"n": 600, "metrics": {"top1": seen}},
@@ -119,7 +148,7 @@ def _work(root: Path, name: str, *, cv: float, e1b: float, lb: float, test_stric
     report = {"created": CREATED, "protocols": pr}
     (w / "eval" / "report.json").write_text(json.dumps(report))
     if per_clip:
-        pc = {"E1b": _rec(e1b_h), "E1b_cv": {CV1: _rec(cv_h)}, "E2_seen": _rec(seen_h),
+        pc = {"E1b": _rec(e1b_h), "E1b_cv": {f: _rec(h) for f, h in cv_h.items()}, "E2_seen": _rec(seen_h),
               "E2": _rec(e2h, parts=lambda c: "val" if int(c[-4:]) < 150 else "test"),
               "E3": _rec({**e1b_h, **e1c})}
         if isl_ids:
@@ -138,7 +167,7 @@ def test_selection_uses_validation_only_and_confirms_once(tmp_path):
     valgood = _work(tmp_path, "valgood", cv=0.75, e1b=0.50, lb=0.86, test_strict_prec=0.80)
     testgood = _work(tmp_path, "testgood", cv=0.55, e1b=0.90, lb=0.80)
     out = tmp_path / "cmp"
-    doc = compare(ref, {"valgood": valgood, "testgood": testgood}, out=out)
+    doc = compare(ref, {"valgood": valgood, "testgood": testgood}, splits_dir=_splits(tmp_path), out=out)
     c = doc["candidates"]
     # the candidate with the better TEST numbers is rejected on validation and its test numbers are never looked at
     assert doc["selected"] == "valgood"
@@ -161,7 +190,7 @@ def test_selection_uses_validation_only_and_confirms_once(tmp_path):
     assert len(led) == 1 and json.loads(led[0])["candidate"] == "valgood"
     assert (out / "compare.json").exists() and "Confirmation (test, once)" in (out / "compare.md").read_text()
     # a second look from the same folder is reported
-    doc2 = compare(ref, {"valgood": valgood, "testgood": testgood}, out=out)
+    doc2 = compare(ref, {"valgood": valgood, "testgood": testgood}, splits_dir=_splits(tmp_path), out=out)
     cf2 = doc2["candidates"]["valgood"]["confirmation"]
     assert cf2["test_looks_before"] == 1 and "no longer a single confirmation" in cf2["warning"]
     assert len((out / LEDGER).read_text().splitlines()) == 2
@@ -171,7 +200,7 @@ def test_select_only_never_looks_at_test(tmp_path):
     ref = _work(tmp_path, "ref", cv=0.70, e1b=0.70, lb=0.84)
     cand = _work(tmp_path, "cand", cv=0.71, e1b=0.70, lb=0.85)
     out = tmp_path / "cmp"
-    doc = compare(ref, {"cand": cand}, out=out, select_only=True)
+    doc = compare(ref, {"cand": cand}, splits_dir=_splits(tmp_path), out=out, select_only=True)
     assert doc["selected"] == "cand" and "confirmation" not in doc["candidates"]["cand"]
     assert "test not looked at" in doc["candidates"]["cand"]["verdict"] and not (out / LEDGER).exists()
 
@@ -179,12 +208,12 @@ def test_select_only_never_looks_at_test(tmp_path):
 def test_confirmed_candidate_ships_and_no_candidate_falls_back(tmp_path):
     ref = _work(tmp_path, "ref", cv=0.70, e1b=0.70, lb=0.84)
     good = _work(tmp_path, "good", cv=0.74, e1b=0.74, lb=0.86, seen=0.45, e2_val=0.12, e2_test=0.12)
-    doc = compare(ref, {"good": good}, out=tmp_path / "c1")
+    doc = compare(ref, {"good": good}, splits_dir=_splits(tmp_path), out=tmp_path / "c1")
     cf = doc["candidates"]["good"]["confirmation"]
     assert cf["gates"] == {"a": "pass", "b": "pass", "c": "pass", "d": "not_applicable"} and cf["ship"] is True
     assert doc["candidates"]["good"]["stale"] == [] and "confirmed on test: ship" in doc["verdict"]
     bad = _work(tmp_path, "bad", cv=0.50, e1b=0.74, lb=0.86)
-    doc = compare(ref, {"bad": bad}, out=tmp_path / "c2")
+    doc = compare(ref, {"bad": bad}, splits_dir=_splits(tmp_path), out=tmp_path / "c2")
     assert doc["selected"] is None and "commercial-safe's encoder and classifier" in doc["verdict"]
     assert not (tmp_path / "c2" / LEDGER).exists()
 
@@ -193,16 +222,16 @@ def test_isl500_gate_against_the_baseline(tmp_path):
     ref = _work(tmp_path, "ref", cv=0.70, e1b=0.70, lb=0.84)
     base = _work(tmp_path, "base", cv=0.60, e1b=0.60, lb=0.80, isl500=0.88)
     worse = _work(tmp_path, "worse", cv=0.74, e1b=0.74, lb=0.86, seen=0.45, e2_val=0.12, e2_test=0.12, isl500=0.80)
-    doc = compare(ref, {"worse": worse}, baseline=base, out=tmp_path / "c")
+    doc = compare(ref, {"worse": worse}, baseline=base, splits_dir=_splits(tmp_path), out=tmp_path / "c")
     cf = doc["candidates"]["worse"]["confirmation"]
-    d = [x for x in cf["checks"] if x["gate"] == "d"]
+    d = [x for x in cf["checks"] if x["gate"] == "d" and x["role"] == "gate"]
     assert {x["check"] for x in d} == {"ISL500 test top-1 (classifier alone)", "ISL500 test top-1 (fused)"}
     assert all(x["status"] == "fail" and x["paired"] for x in d) and cf["ship"] is False
     # ISL500 groups are its users (2 test signers): no group interval, said so
     assert d[0]["group_interval"] is None and d[0]["n_groups"] == 1
     # a candidate without ISL500 clips: gate (d) does not apply
     plain = _work(tmp_path, "plain", cv=0.74, e1b=0.74, lb=0.86, seen=0.45, e2_val=0.12, e2_test=0.12)
-    doc = compare(ref, {"plain": plain}, baseline=base, out=tmp_path / "c2")
+    doc = compare(ref, {"plain": plain}, baseline=base, splits_dir=_splits(tmp_path), out=tmp_path / "c2")
     assert doc["candidates"]["plain"]["confirmation"]["gates"]["d"] == "not_applicable"
 
 
@@ -210,7 +239,7 @@ def test_unpaired_fallback_and_stale_inputs(tmp_path):
     ref = _work(tmp_path, "ref", cv=0.70, e1b=0.70, lb=0.84, per_clip=False)
     cand = _work(tmp_path, "cand", cv=0.74, e1b=0.74, lb=0.86, per_clip=False)
     # E1b still pairs on report.json's clip ids and hit bits; E2_seen falls back to the two rates
-    doc = compare(ref, {"cand": cand}, out=tmp_path / "c1")
+    doc = compare(ref, {"cand": cand}, splits_dir=_splits(tmp_path), out=tmp_path / "c1")
     ch = {x["check"]: x for x in doc["candidates"]["cand"]["confirmation"]["checks"]}
     assert ch["E1b top-1 on the common test clips"]["paired"] is True
     assert ch["E2_seen top-1 (INCLUDE test -> ISLRTC rows)"]["paired"] is False
@@ -227,10 +256,19 @@ def test_unpaired_fallback_and_stale_inputs(tmp_path):
     (good / "eval" / "report.json").write_text(json.dumps(rep))
     (good / "encoder.pt").write_bytes(b"not the encoder the report measured")
     (good / "eval" / "per_clip.json").write_text(json.dumps(pc))
-    doc = compare(ref, {"good": good}, out=tmp_path / "c2")
+    doc = compare(ref, {"good": good}, splits_dir=_splits(tmp_path), out=tmp_path / "c2")
     e = doc["candidates"]["good"]
-    assert e["stale"] == ["report.json measured another encoder.pt"] and e["confirmation"]["ship"] is False
-    assert any("STALE" in n for n in e["notes"])
+    # a stale candidate is not selected: no confirmation, no ledger line (its test numbers are of another model)
+    assert e["stale"] == ["report.json measured another encoder.pt"] and not e["selection"]["eligible"]
+    assert doc["selected"] is None and "confirmation" not in e and "stale inputs" in e["verdict"]
+    assert not (tmp_path / "c2" / LEDGER).exists() and any("STALE" in n for n in e["notes"])
+    # a stale reference: selection runs, but stage 2 does not (no test look, no ledger line)
+    doc = compare(good, {"cand": cand}, splits_dir=_splits(tmp_path), out=tmp_path / "c3")
+    assert doc["selected"] == "cand" and "confirmation" not in doc["candidates"]["cand"]
+    assert "reference is stale" in doc["verdict"] and not (tmp_path / "c3" / LEDGER).exists()
+    # a stale ISL500 baseline blocks stage 2 too
+    doc = compare(ref, {"cand": cand}, baseline=good, splits_dir=_splits(tmp_path), out=tmp_path / "c4")
+    assert "ISL500 baseline is stale" in doc["verdict"] and not (tmp_path / "c4" / LEDGER).exists()
     # a component newer than its report is stale too
     rep["created"] = "2020-01-01T00:00:00Z"
     (good / "eval" / "report.json").write_text(json.dumps(rep))
@@ -258,6 +296,171 @@ def test_cli_compare_packs(tmp_path, capsys):
     assert main(["compare-packs", "--reference", str(ref), "--candidate", "nope", "--out", str(out)]) == 2
     assert main(["compare-packs", "--reference", str(ref), "--out", str(out)]) == 2
     assert main(["compare-packs", "--reference", str(tmp_path / "missing"), "--candidate", f"c={cand}"]) == 2
+
+
+# --------------------------------------------------------------------------------------------- review fixes (15.45)
+
+def test_a_fold_selected_on_the_primary_test_never_serves_selection(tmp_path):
+    folds = {CV1: 0.70, CV4: 0.70}
+    ref = _work(tmp_path, "ref", cv=0.70, e1b=0.70, lb=0.84, folds=folds)
+    # the candidate is much better on fold 4 only: the fold whose classifier was early-stopped on the E1b test
+    cand = _work(tmp_path, "cand", cv=0.70, e1b=0.70, lb=0.85, folds={CV1: 0.70, CV4: 0.95})
+    doc = compare(ref, {"cand": cand}, splits_dir=_splits(tmp_path), out=tmp_path / "c", select_only=True)
+    chk = next(x for x in doc["candidates"]["cand"]["selection"]["checks"] if x["check"].startswith("CV out-of-fold"))
+    assert chk["folds"] == [CV1] and chk["common"] == 600 and chk["delta"] == 0
+    sk = chk["folds_skipped"]
+    assert [r["split"] for r in sk] == [CV4] and sk[0]["selected_on_primary_test_clips"] == 600
+    assert "early-stopped on the E1b test" in sk[0]["reason"] and CV4 in chk["note"]
+    # fold 1 trained on E1b test clips: kept (training data, not selection) and disclosed
+    assert chk["folds_disclosed"][0]["split"] == CV1 and chk["folds_disclosed"][0]["trained_on_primary_test_clips"] == 600
+    # one signer group in two folds is one cluster: 6 real groups, not 6 per fold
+    assert chk["n_groups"] == 6
+    # only behind the explicit option, recorded
+    doc = compare(ref, {"cand": cand}, splits_dir=_splits(tmp_path), out=tmp_path / "c2", select_only=True,
+                  allow_test_selected_folds=True)
+    chk = next(x for x in doc["candidates"]["cand"]["selection"]["checks"] if x["check"].startswith("CV out-of-fold"))
+    assert chk["folds"] == [CV1, CV4] and chk["allow_test_selected_folds"] and chk["delta"] > 0
+    assert doc["options"]["allow_test_selected_folds"] is True
+    assert "USED although selected" in chk["folds_disclosed"][1]["note"]
+    # without split files nothing can be verified: no fold serves selection (fail closed)
+    doc = compare(ref, {"cand": cand}, out=tmp_path / "c3", select_only=True)
+    chk = next(x for x in doc["candidates"]["cand"]["selection"]["checks"] if x["check"].startswith("CV out-of-fold"))
+    assert chk["status"] == "not_available" and "cannot verify" in chk["reason"] and chk["folds"] == []
+
+
+def _probe(work: Path, hits: dict, *, same=None, protocol="mixed"):
+    (work / "eval" / "encoder_probe.json").write_text(json.dumps({
+        "hits": {f"include|{k}": v for k, v in hits.items()}, "profile": "research", "split": PRIMARY,
+        "per_signer": 300, "same_sets_as_training": same, "trained_val": {"val_protocol": protocol}}))
+
+
+def test_probe_of_an_encoder_selected_on_its_queries_is_information(tmp_path):
+    q = _ids(800, "include/q")
+    ref = _work(tmp_path, "ref", cv=0.70, e1b=0.70, lb=0.84)
+    cand = _work(tmp_path, "cand", cv=0.71, e1b=0.70, lb=0.85, e2_val=0.02)
+    _probe(ref, _hits(q, 0.5))
+    _probe(cand, _hits(q, 0.6), same=True, protocol="dictionary")
+    doc = compare(ref, {"cand": cand}, splits_dir=_splits(tmp_path), out=tmp_path / "c", select_only=True)
+    sel = doc["candidates"]["cand"]["selection"]
+    pr = next(x for x in sel["checks"] if x["check"].startswith("encoder probe"))
+    assert pr["role"] == "info" and pr["status"] == "pass" and "same_sets_as_training" in pr["note"]
+    assert pr["val_protocol"] == {"cand": "dictionary", "ref": "mixed"}
+    # gate (b) is carried by E2 one-shot on validation-part queries (here much worse): rejected
+    assert sel["gates"]["b"] == "fail" and doc["selected"] is None
+    # both encoders selected otherwise (the old mixed protocol on other sets): the probe gates
+    _probe(cand, _hits(q, 0.6), same=False, protocol="mixed")
+    doc = compare(ref, {"cand": cand}, splits_dir=_splits(tmp_path), out=tmp_path / "c2", select_only=True)
+    pr = next(x for x in doc["candidates"]["cand"]["selection"]["checks"] if x["check"].startswith("encoder probe"))
+    assert pr["role"] == "gate" and pr["selected_on_probe_queries"] is None
+    # a probe that does not say how its encoder was selected cannot gate
+    (cand / "eval" / "encoder_probe.json").write_text(json.dumps({"hits": {f"include|{k}": 1 for k in q}}))
+    doc = compare(ref, {"cand": cand}, splits_dir=_splits(tmp_path), out=tmp_path / "c3", select_only=True)
+    pr = next(x for x in doc["candidates"]["cand"]["selection"]["checks"] if x["check"].startswith("encoder probe"))
+    assert pr["role"] == "info" and "does not record" in pr["note"]
+
+
+def test_isl500_clips_without_a_baseline_cannot_ship(tmp_path):
+    ref = _work(tmp_path, "ref", cv=0.70, e1b=0.70, lb=0.84)
+    cand = _work(tmp_path, "cand", cv=0.74, e1b=0.74, lb=0.86, seen=0.45, e2_val=0.12, e2_test=0.12, isl500=0.9)
+    doc = compare(ref, {"cand": cand}, splits_dir=_splits(tmp_path), out=tmp_path / "c")
+    e = doc["candidates"]["cand"]
+    d = next(x for x in e["selection"]["checks"] if x["gate"] == "d")
+    assert d["status"] == "not_available" and "--isl500-baseline" in d["reason"]
+    # selected, but no test look: it could not ship anyway
+    assert doc["selected"] == "cand" and "confirmation" not in e and "--isl500-baseline" in e["verdict"]
+    assert not (tmp_path / "c" / LEDGER).exists()
+    # explicitly without the gate: recorded, confirmed, gate (d) not applicable
+    doc = compare(ref, {"cand": cand}, splits_dir=_splits(tmp_path), out=tmp_path / "c2", no_isl500_gate=True)
+    cf = doc["candidates"]["cand"]["confirmation"]
+    assert doc["options"]["no_isl500_gate"] is True and cf["gates"]["d"] == "not_applicable"
+    assert all("--no-isl500-gate" in x["reason"] for x in cf["checks"] if x["gate"] == "d" and x["role"] == "gate")
+
+
+def test_isl500_validation_needs_the_same_signer_split():
+    ref = Side("a", Path("/nonexistent-a"))
+    base = Side("b", Path("/nonexistent-b"))
+    data = {"extra_sources": {"isl500": {"val": 900}}}
+    ref._cls_meta = {"val_by_source": {"isl500": {"top1": 0.9, "n": 900}}, "data": data, "train_config": {"seed": 0}}
+    base._cls_meta = {"val_by_source": {"isl500": {"top1": 0.9, "n": 900}}, "data": {**data, "signer_split": "v2"},
+                      "train_config": {"seed": 0}}
+    r = isl500_val_check(ref, base, DEFAULT_MARGINS)
+    assert r["status"] == "not_available" and "signer_split v1 vs v2" in r["reason"]
+    base._cls_meta["data"] = data
+    r = isl500_val_check(ref, base, DEFAULT_MARGINS)
+    assert r["status"] != "not_available" and r["same_validation_set"]["signer_split"] == "v1"
+    base._cls_meta.pop("data")
+    assert "cannot verify" in isl500_val_check(ref, base, DEFAULT_MARGINS)["reason"]
+
+
+def test_lower_bound_gate_reads_how_each_side_was_calibrated(tmp_path):
+    ref = Side("ref", _work(tmp_path, "ref", cv=0.70, e1b=0.70, lb=0.84))
+    cw = _work(tmp_path, "cand", cv=0.70, e1b=0.70, lb=0.86)
+    fu = json.loads((cw / "fusion.json").read_text())
+    fu["certification"]["calibration_sets"] = {"clips": 2566, "folds_used": [1, 2, 3], "fold_classifiers": {
+        "1": {"selected_on_primary_test_clips": 0}, "4": {"selected_on_primary_test_clips": 856}}}
+    (cw / "fusion.json").write_text(json.dumps(fu))
+    r = lower_bound_check(Side("cand", cw), ref, DEFAULT_MARGINS)
+    assert r["status"] == "pass" and "not like for like" in r["note"]
+    assert r["calibration"]["cand"]["kind"] == "out-of-fold" and r["calibration"]["ref"]["kind"] == "validation"
+    # a fold classifier selected on the E1b test among the folds used: the bound is not a validation number
+    fu["certification"]["calibration_sets"]["folds_used"] = [1, 2, 3, 4]
+    (cw / "fusion.json").write_text(json.dumps(fu))
+    r = lower_bound_check(Side("cand", cw), ref, DEFAULT_MARGINS)
+    assert r["status"] == "not_available" and "selected on the E1b test" in r["reason"]
+
+
+def test_one_look_per_folder_and_the_fallback_after_a_failed_confirmation(tmp_path):
+    ref = _work(tmp_path, "ref", cv=0.70, e1b=0.70, lb=0.84)
+    first = _work(tmp_path, "first", cv=0.75, e1b=0.50, lb=0.86, e2_val=0.12)
+    second = _work(tmp_path, "second", cv=0.74, e1b=0.74, lb=0.86, seen=0.45, e2_val=0.12, e2_test=0.12)
+    out = tmp_path / "cmp"
+    doc = compare(ref, {"first": first, "second": second}, splits_dir=_splits(tmp_path), out=out)
+    v = doc["candidates"]["first"]["verdict"]
+    assert doc["selected"] == "first" and "NOT confirmed" in v
+    assert "commercial-safe's encoder and classifier" in v and "selection on test" in v
+    led = json.loads((out / LEDGER).read_text().splitlines()[0])
+    assert [r["candidate"] for r in led["ranking"]] == ["first", "second"] and led["ship"] is False
+    # confirming the next-ranked candidate from the same folder is refused: no test look, no ledger line
+    doc = compare(ref, {"second": second}, splits_dir=_splits(tmp_path), out=out)
+    assert "confirmation" not in doc["candidates"]["second"] and "--force-second-look" in doc["verdict"]
+    assert len((out / LEDGER).read_text().splitlines()) == 1
+    # forced: it runs, is recorded and flagged as selection on test
+    doc = compare(ref, {"second": second}, splits_dir=_splits(tmp_path), out=out, force_second_look=True)
+    cf = doc["candidates"]["second"]["confirmation"]
+    assert "selection on test" in cf["warning"] and doc["options"]["force_second_look"] is True
+    assert json.loads((out / LEDGER).read_text().splitlines()[1])["force_second_look"] is True
+
+
+def test_plan_floors_are_information_and_ranking_counts_gates(tmp_path):
+    ref = _work(tmp_path, "ref", cv=0.70, e1b=0.70, lb=0.84)
+    good = _work(tmp_path, "good", cv=0.74, e1b=0.74, lb=0.86, seen=0.45, e2_val=0.12, e2_test=0.12)
+    doc = compare(ref, {"good": good}, splits_dir=_splits(tmp_path), out=tmp_path / "c")
+    fl = {x["check"]: x for x in doc["candidates"]["good"]["confirmation"]["checks"] if "plan floor" in x["check"]}
+    assert fl["E1b top-1 (common clips) >= plan floor 0.722"]["status"] == "pass"
+    assert fl["E2_seen top-1 >= plan floor 0.386"]["status"] == "pass"
+    assert all(x["role"] == "info" for x in fl.values())
+    assert doc["ranking"][0]["key"][0] == 4  # gates passed or not applicable, not raw checks
+    assert doc["plan_floors"]["E2"] == 0.06
+
+
+def test_a_recorded_fusion_or_index_file_is_checked(tmp_path):
+    from app.packs.isl import ProfileMismatch, _file_sha256, check_component_profiles
+
+    fu, emb = tmp_path / "fusion.json", tmp_path / "embeddings.f16.npy"
+    fu.write_text("{}")
+    emb.write_bytes(b"rows")
+    rec = {"fusion": {"profile": "commercial-safe", "sha256": _file_sha256(fu)},
+           "index": {"profile": "commercial-safe", "sha256": _file_sha256(emb)}}
+    prof = {"fusion": "commercial-safe", "index": "commercial-safe"}
+    assert set(check_component_profiles(_manifest("research", rec), prof, {"fusion": fu, "index": emb})) == {
+        "fusion", "index"}
+    fu.write_text('{"swapped": true}')
+    with pytest.raises(ProfileMismatch, match="another fusion file"):
+        check_component_profiles(_manifest("research", rec), prof, {"fusion": fu, "index": emb})
+    fu.write_text("{}")
+    emb.write_bytes(b"other rows")
+    with pytest.raises(ProfileMismatch, match="another index file"):
+        check_component_profiles(_manifest("research", rec), prof, {"fusion": fu, "index": emb})
 
 
 # --------------------------------------------------------------------------------------------- evaluate --per-clip

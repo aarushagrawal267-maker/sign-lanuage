@@ -1254,7 +1254,9 @@ def cmd_compare_packs(paths: IslPaths, args) -> int:
     if any(v < 0 for v in margins.values()):
         return refuse("margins must be >= 0")
     doc = compare(ref, cands, baseline=base, out=out, splits_dir=paths.splits, margins={**DEFAULT_MARGINS, **margins},
-                  select_only=args.select_only, boot=args.boot, seed=args.seed)
+                  select_only=args.select_only, boot=args.boot, seed=args.seed,
+                  allow_test_selected_folds=args.allow_test_selected_folds, no_isl500_gate=args.no_isl500_gate,
+                  force_second_look=args.force_second_look)
     _print({"out": str(out / "compare.json"), "selected": doc["selected"], "verdict": doc["verdict"],
             "candidates": {n: {"verdict": e.get("verdict"), "selection": e["selection"]["gates"],
                                "test": (e.get("confirmation") or {}).get("gates")}
@@ -1787,7 +1789,8 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--candidate", action="append",
                     help="NAME=WORK_DIR, repeatable (e.g. research=artifacts/isl/research)")
     cp.add_argument("--isl500-baseline", dest="isl500_baseline",
-                    help="work folder whose ISL500 numbers gate (d) must not fall below (e.g. the current research)")
+                    help="work folder whose ISL500 numbers gate (d) must not fall below: a COPY of the pre-retrain "
+                         "research work folder (the running chain overwrites artifacts/isl/research)")
     cp.add_argument("--out", help="output folder (default <artifacts>/isl/compare)")
     cp.add_argument("--margin-top1", type=float, default=None, help="non-inferiority margin, top-1 gates (0.02)")
     cp.add_argument("--margin-oneshot", type=float, default=None, help="margin, E2 one-shot (0.01)")
@@ -1796,6 +1799,15 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--select-only", action="store_true", help="selection on validation only; test not looked at")
     cp.add_argument("--boot", type=int, default=2000, help="signer-group bootstrap resamples")
     cp.add_argument("--seed", type=int, default=0)
+    cp.add_argument("--allow-test-selected-folds", action="store_true",
+                    help="selection may use a CV fold whose classifier was early-stopped on the E1b test (fold 4 of 5; "
+                         "skipped by default, docs 15.45); recorded")
+    cp.add_argument("--no-isl500-gate", action="store_true",
+                    help="no --isl500-baseline on purpose: gate (d) not checked (recorded); without it a candidate with "
+                         "ISL500 clips cannot ship and is not confirmed")
+    cp.add_argument("--force-second-look", action="store_true",
+                    help="confirm on test a candidate other than the one this --out folder's ledger already looked at "
+                         "(selection on test; recorded)")
     pdd = sub.add_parser("pretrain-dedup")
     _model_args(pdd)
     pdd.add_argument("--max-chunks", type=int, default=0, help="smoke: check at most N Sign Library chunks")

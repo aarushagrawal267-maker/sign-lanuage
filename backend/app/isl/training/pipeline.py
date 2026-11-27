@@ -386,7 +386,8 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
             shutil.rmtree(tmp, ignore_errors=True)
             raise ValueError(f"refusing to build a {prof.name} pack with components of another data profile: {bad} "
                              "(only a commercial-safe component in a research pack is licence-compatible)")
-        fname = {"classifier": "classifier.pt", "encoder": "encoder.pt", "fusion": "fusion.json"}
+        fname = {"classifier": "classifier.pt", "encoder": "encoder.pt", "fusion": "fusion.json",
+                 "index": "index/embeddings.f16.npy"}  # the app checks each recorded SHA-256 (docs 15.45)
         for k, v in other.items():
             mixed[k] = {"profile": v, **({"sha256": files[fname[k]]} if fname.get(k) in files else {}),
                         "reason": f"licence-compatible: every source the {v} profile reads is allowed in {prof.name}; "

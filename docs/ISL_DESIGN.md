@@ -4711,12 +4711,15 @@ loaded: the app raised `ProfileMismatch` for any component of another data profi
 
 **`cli compare-packs`** (`backend/app/isl/evaluation/compare_packs.py`). Read-only on the work folders.
 `--reference` is the commercial-safe work folder (default `artifacts/isl/commercial-safe`). `--candidate NAME=WORK`
-is repeatable. `--isl500-baseline WORK` is the folder gate (d) must not fall below (the current research run).
+is repeatable. `--isl500-baseline WORK` is the folder gate (d) must not fall below: a copy of the research work folder
+made before the retrain (the running chain overwrites `artifacts/isl/research`).
 Output: `<out>/compare.json` and `compare.md` (default `artifacts/isl/compare`), with a verdict per candidate.
 
 Two stages, never mixed:
-1. **Selection on validation and out-of-fold numbers only.** No test clip of the primary split is read.
-   * (a) CV out-of-fold top-1 on the folds other than the primary one (their test parts are not E1b's test clips).
+1. **Selection on validation and out-of-fold numbers only.** No test clip of the primary split is read, and no
+   fold classifier that was selected on it is used (15.45).
+   * (a) CV out-of-fold top-1 on the folds other than the primary one. Their test parts are not E1b's test clips.
+     Fold 4 is skipped: its validation part is the E1b test, so its classifier was selected on the test (15.45).
      The classifier's INCLUDE validation top-1 is shown as information only: it is the early-stopping set.
    * (b) The encoder probe (`<work>/eval/encoder_probe.json`, INCLUDE validation -> ISLRTC rows, docs 15.41), paired on
      the common INCLUDE queries. And E2 one-shot on the held-out-concept queries of the validation part.
@@ -4733,8 +4736,10 @@ Two stages, never mixed:
      rule (E3) is at least the validation lower bound. Fewer than 30 test accepts: inconclusive.
    * (d) ISL500 test top-1, classifier alone (E1c) and fused (E3), no worse than the baseline.
    * Ship only when every test gate is pass or not applicable, and no input is stale.
-   * The other candidates' test numbers are never looked at. If no candidate passes selection, the verdict is the
-     plan's fallback: the research pack ships commercial-safe's encoder and classifier.
+   * compare-packs never uses another candidate's test numbers. But `evaluate --all` still writes them (report.json,
+     report.md, the driver log, the pack's results.json). So do not pick a candidate from report.md. If no candidate
+     passes selection, the verdict is the plan's fallback: the research pack ships commercial-safe's encoder and
+     classifier.
 
 **Statistics of one check.** Paired on the clip ids both systems measured: McNemar's exact test on the discordant
 clips, and the paired difference with a clip-level Agresti-Min interval (never zero-width). With at least 5 signer
@@ -4798,3 +4803,84 @@ tiny trained world: `--per-clip` is opt-in and matches the report (E2 parts are 
 allowance: the rule, the manifest record, the SHA-256 check, and a research pack with a commercial-safe encoder that
 the app refuses by default and loads with `--allow-profile-mix`; a commercial-safe pack with research components is
 refused at build time.
+
+### 15.45 Selection gate review fixes: no test-selected fold, no self-selected probe, no wasted test look (review of 15.44, 27 Nov 2026)
+
+**Fold 4 leaked the test into selection.** Gate (a) pooled every CV fold but the primary one. In the real cv5 splits,
+fold 4's validation part is exactly the 856 E1b test clips. Its classifier was early-stopped and temperature-fitted on
+the E1b test, so its out-of-fold number is a test number. Now each fold's split file is read (`<data>/isl/splits`).
+* A fold whose validation part holds primary test clips is skipped. It is listed in the check's `folds_skipped` with
+  the overlap count. `--allow-test-selected-folds` uses it anyway, recorded in `options` and in the check.
+* A fold whose test part holds primary test clips is always skipped.
+* A fold or primary split file that cannot be read is skipped too: what cannot be checked does not select.
+* Training on E1b test clips (folds 1-3) is kept and disclosed in `folds_disclosed`. Their scored clips are not E1b
+  test clips; only the training data overlaps.
+* The confirmation stage still pools every fold (it is the test stage).
+
+**Gate (b): a probe on an encoder's own selection queries does not gate.** The research encoder chooses its epoch on
+the dictionary protocol (15.40), that is on the probe's INCLUDE validation queries. Its probe number is optimistic,
+the reference's is not. The probe check is now information when either probe says `same_sets_as_training: true`, or
+its `trained_val.val_protocol` is `dictionary`, or it does not say. E2 one-shot on the validation-part queries carries
+gate (b): those concepts are held out of every encoder's training and selection. A missing probe is information too.
+
+**A stale input never uses the test look.**
+* A stale candidate is not eligible ("stale inputs: re-run evaluate --all"). Its test numbers are of another model.
+* A stale reference or ISL500 baseline stops before stage 2: no confirmation, no ledger line. The verdict says why.
+* The ship condition also checks the baseline.
+
+**Gate (d) needs a baseline.** A candidate with ISL500 clips (classifier data, validation numbers, E1c or E3 records)
+and no `--isl500-baseline` is "not available" at selection and on test. It cannot ship, and stage 2 does not run (the
+look would be wasted). "Not applicable" stays for a candidate without ISL500 clips, or with `--no-isl500-gate`
+(recorded).
+
+**Gate (d) at selection needs the same validation clips.** Equal clip counts are not enough. Both classifiers' data
+meta must agree on the signer split version, the ISL500 validation count and the seed. A classifier meta without a
+data block cannot be checked: "not available".
+
+**Gate (c) reads how each fusion.json was calibrated** (`certification.calibration_sets`). A different kind
+(out-of-fold vs validation) or fold set is noted as "not like for like": the bound on fewer clips is looser. When a
+fold classifier the certification used was selected on the E1b test (`selected_on_primary_test_clips` > 0, or
+`--oof-allow-test-selected`), the check is "not available": that bound is not a validation number.
+
+**One look per folder.**
+* The ledger entry now holds the ranking, `ship` and `force_second_look`.
+* When the ledger already holds a look at another candidate (or other component files of the same one), no
+  confirmation runs. Confirming the next-ranked candidate after a failed look is selection on test (critic 9).
+  `--force-second-look` runs it anyway, recorded, and the warning says "selection on test".
+* A failed confirmation's verdict names the plan's fallback (research pack with commercial-safe's encoder and
+  classifier, plus research index rows) and says not to confirm the next candidate.
+* A new `--out` folder starts a new ledger. Keep one `--out` folder per decision.
+
+**Signer groups across folds.** The CV checks now bootstrap over the real signer group. Before, a fold prefix made one
+INCLUDE pseudo-signer count as a separate cluster in each fold. That could switch the bootstrap on with only 4 real
+groups.
+
+**The plan's absolute floors** (E1b 0.722, CV pooled 0.717, E2_seen 0.386, E2 one-shot 0.06, ISL500 classifier 0.886,
+ISL500 fused 0.6133) are information rows next to the paired checks in the confirmation. The paired non-inferiority
+checks carry the gates. The mapping: each floor is commercial-safe's (or current research's) test number minus a
+margin; the paired check compares on the same clips with that margin (top-1 0.02, one-shot 0.01, ISL500 0.01). For E2
+one-shot the implied floor is about 0.058 rather than 0.06.
+
+**Ranking counts gates, not checks.** Selection ranks on the number of gates (a)-(d) that pass or do not apply, then
+the CV difference, then the gate (b) difference. A side with an extra check available gains nothing from it.
+
+**Profile allowance binds every recorded file.** The app now also checks the recorded SHA-256 of `fusion.json` and of
+the index (`index/embeddings.f16.npy`), and build-pack records the index's SHA-256. A swapped recorded file is refused.
+
+**Per-clip records on a resume.** `ISL_EVAL_PER_CLIP=1` only works when the evaluate step runs. On a driver resume
+`evaluate.done` skips it, so no `per_clip.json` appears and every check falls back to unpaired. Delete the
+evaluate stamp (`data/isl/logs/phase2_<name>.stamps/evaluate.done` for the real run, `<work>/driver/phase2_<name>.stamps/`
+for a tagged or scratch run), or run `cli evaluate --all --per-clip` by hand, to get it.
+
+New CLI options: `compare-packs --allow-test-selected-folds`, `--no-isl500-gate`, `--force-second-look`. Without them
+the defaults are the safe ones above. Nothing else changes: fit-fusion, evaluate, index and build-pack behave as before
+without new flags; the profile allowance change affects only packs that record `mixed_profiles`.
+
+Tests (`backend/tests/isl/test_compare_packs.py`): fold 4 with the primary test as its validation part is skipped and
+listed, used only with the option, and nothing selects without split files; one signer in two folds is one cluster; a
+probe with `same_sets_as_training` or the dictionary protocol is information and E2 one-shot carries gate (b); stale
+candidate, reference and baseline write no ledger line; ISL500 clips without a baseline cannot ship and get no test
+look, `--no-isl500-gate` is recorded; ISL500 validation needs the same signer split; gate (c) notes unlike calibration
+and refuses a test-selected fold classifier; a second candidate from the same folder is refused, forced it is flagged;
+the failed verdict names the fallback; floors are information rows; ranking counts gates; a swapped recorded
+`fusion.json` or index file is refused.

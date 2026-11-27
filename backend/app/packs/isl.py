@@ -252,9 +252,11 @@ class IslPack:
         if speller is not None and pr["letters"]:  # the trained letter model (not the user's own alphabet)
             profiles["letters"] = (getattr(speller.model, "meta", None) or {}).get("profile")
         # a recorded, licence-compatible exception is accepted (docs 15.44); anything else raises as before
-        mixed = check_component_profiles(self.manifest, profiles, {"classifier": paths["classifier"],
-                                                                   "encoder": paths["encoder"],
-                                                                   "letters": paths["letters"]})
+        # every file an allowance can be recorded for is checked against its SHA-256 (docs 15.45)
+        mixed = check_component_profiles(self.manifest, profiles, {
+            "classifier": paths["classifier"], "encoder": paths["encoder"], "letters": paths["letters"],
+            "fusion": paths["fusion"],
+            "index": None if paths["index"] is None else paths["index"] / "embeddings.f16.npy"})
         rec = IslRecognizer(self.manifest.id, self.feature_config, vocab, lexicon=self.lexicon(), classifier=classifier,
                             encoder=encoder, index=index, speller=speller, fusion=fusion, my_signs=self.my_signs(),
                             profile=prof)

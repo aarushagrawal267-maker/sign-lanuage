@@ -5,18 +5,27 @@ retrained run). The reference is the commercial-safe work folder. Two stages, ne
 
 1. **Selection on validation / out-of-fold data only.** For every candidate, the four gates are checked on numbers
    that no test clip touched:
-   (a) CV out-of-fold top-1 on the folds other than the primary one (their test parts are not E1b's test clips);
-   (b) the encoder probe (INCLUDE validation -> ISLRTC dictionary, paired on the common queries) and E2 one-shot on
-   the held-out-concept queries of the validation part;
-   (c) the certified worst-source strict lower bound of ``fusion.json`` (fitted on validation or out-of-fold clips);
-   (d) ISL500 validation top-1 against the ISL500 baseline (same validation clips only).
-   A candidate with a failed selection gate is rejected. Among the rest, one is selected by a fixed rule (most
-   passed selection checks, then the CV difference, then the probe difference).
+   (a) CV out-of-fold top-1 on the folds other than the primary one whose classifier was not selected on the primary
+   test: a fold whose split file puts primary (E1b) test clips in its validation part early-stopped on the E1b test
+   (fold 4 of 5) and is skipped, listed in ``folds_skipped`` (``allow_test_selected_folds`` uses it, recorded); a
+   fold whose split file cannot be read is skipped too (fail closed);
+   (b) E2 one-shot on the held-out-concept queries of the validation part, and the encoder probe (INCLUDE validation
+   -> ISLRTC dictionary, paired on the common queries) as a gate only when neither encoder chose its epoch on those
+   queries (otherwise information);
+   (c) the certified worst-source strict lower bound of ``fusion.json`` (fitted on validation or out-of-fold clips;
+   not available when a fold classifier it used was selected on the E1b test);
+   (d) ISL500 validation top-1 against the ISL500 baseline (same signer split, seed and clip count only). A candidate
+   with ISL500 clips and no baseline is "not available" (blocks shipping) unless ``no_isl500_gate``.
+   A candidate with a failed selection gate, or stale inputs, is rejected. Among the rest, one is selected by a fixed
+   rule (most selection gates passed, then the CV difference, then the gate (b) difference).
 2. **One confirmation on test**, for the selected candidate only: (a) E1b on the common test clips (and CV pooled),
    (b) E2_seen and E2 one-shot (test-part queries), (c) the strict certificate holds on test for every major source,
-   (d) ISL500 test top-1 (classifier alone and fused) is no worse than the baseline's. The other candidates' test
-   numbers are not looked at. Every confirmation is logged in ``<out>/test_looks.jsonl``; a second look from the same
-   folder is reported, because it is no longer a single confirmation.
+   (d) ISL500 test top-1 (classifier alone and fused) is no worse than the baseline's. compare-packs never uses the
+   other candidates' test numbers (``evaluate --all`` still writes them: do not pick a candidate from report.md).
+   No confirmation runs (and nothing is logged) when the reference or the baseline is stale, when gate (d) has no
+   baseline, or when this folder's ledger already holds a look at another candidate (``force_second_look``). Every
+   confirmation is logged in ``<out>/test_looks.jsonl`` with the ranking; a second look is reported, because it is
+   no longer a single confirmation.
 
 Paired checks: both systems on the same clip ids. McNemar's exact test on the discordant clips; the paired difference
 with a clip-level (Agresti-Min) interval and, with at least ``MIN_INTERVAL_GROUPS`` signer groups, a bootstrap over signer groups
@@ -46,6 +55,11 @@ SEVERITY = {"fail": 0, "inconclusive": 1, "not_available": 2, "pass": 3, "not_ap
 MIN_CONFIRM_ACCEPTS = 30  # gate (c) on test: fewer strict accepts of a source cannot confirm its certificate
 LEDGER = "test_looks.jsonl"
 COMPONENTS = ("classifier.pt", "encoder.pt", "fusion.json", "index/meta.json")
+# the QA plan's absolute floors (commercial-safe's test numbers minus their margins): shown as information next to
+# the paired checks, which carry the gates (docs 15.45)
+PLAN_FLOORS = {"E1b": 0.722, "cv_pooled": 0.717, "E2_seen": 0.386, "E2": 0.06, "isl500_E1c": 0.886,
+               "isl500_E3": 0.6133}
+NO_BASELINE = "give --isl500-baseline (a copy of the pre-retrain research work folder)"
 
 
 # --------------------------------------------------------------------------------------------- statistics
@@ -338,15 +352,87 @@ def _cv_folds(side: Side) -> dict[str, dict]:
     return out
 
 
+def fold_selection_screen(folds: list[str], primaries: list[str | None], splits_dir: Path | None,
+                          allow_test_selected: bool = False) -> tuple[list[str], list[dict]]:
+    """Which CV folds may serve selection (docs 15.45). A fold whose split file puts primary (E1b) test clips in its
+    validation part early-stopped and temperature-fitted its classifier on the E1b test (``grouped_kfold``: fold 4 of
+    5 validates on fold 0's test), so its out-of-fold number is a test number: skipped unless
+    ``allow_test_selected``. A fold or primary split file that cannot be read cannot be verified: skipped (fail
+    closed). Returns (folds kept, one dict per fold skipped or kept with an overlap). Training on E1b test clips is
+    recorded, not skipped: the fold's scored clips (its test part) are still not E1b test clips."""
+    test: set[str] = set()
+    missing_primary = []
+    for pname in sorted({p for p in primaries if p}):
+        d = _json(Path(splits_dir) / f"{pname}.json") if splits_dir else None
+        if not d or not isinstance(d.get("assign"), dict):
+            missing_primary.append(pname)
+            continue
+        test |= {i for i, part in d["assign"].items() if part == "test"}
+    keep, rows = [], []
+    for f in folds:
+        if not splits_dir or missing_primary or not primaries or not any(primaries):
+            why = ("no splits folder given" if not splits_dir else
+                   f"primary split file {missing_primary or primaries} not readable")
+            rows.append({"split": f, "skipped": True, "reason": f"cannot verify what its classifier was selected on "
+                                                                f"({why})"})
+            continue
+        d = _json(Path(splits_dir) / f"{f}.json")
+        if not d or not isinstance(d.get("assign"), dict):
+            rows.append({"split": f, "skipped": True,
+                         "reason": f"cannot verify what its classifier was selected on (no {f}.json)"})
+            continue
+        va = sum(1 for i, part in d["assign"].items() if part == "val" and i in test)
+        tr = sum(1 for i, part in d["assign"].items() if part == "train" and i in test)
+        te = sum(1 for i, part in d["assign"].items() if part == "test" and i in test)
+        if te:  # its scored clips are E1b test clips: never a selection number
+            rows.append({"split": f, "skipped": True, "test_part_primary_test_clips": te,
+                         "reason": f"its test part holds {te} primary (E1b) test clips"})
+            continue
+        if va and not allow_test_selected:
+            rows.append({"split": f, "skipped": True, "selected_on_primary_test_clips": va,
+                         "trained_on_primary_test_clips": tr,
+                         "reason": f"its validation part holds {va} primary (E1b) test clips: its classifier was "
+                                   "early-stopped on the E1b test (--allow-test-selected-folds uses it anyway)"})
+            continue
+        keep.append(f)
+        if va or tr:
+            rows.append({"split": f, "skipped": False, "selected_on_primary_test_clips": va,
+                         "trained_on_primary_test_clips": tr,
+                         "note": ("USED although selected on the E1b test (--allow-test-selected-folds)" if va else
+                                  "trained on E1b test clips (training data, not selection): disclosed")})
+    return keep, rows
+
+
+def _probe_selection(p: dict) -> str | None:
+    """Why an encoder probe cannot gate selection: its encoder chose its epoch on the probe's own queries (docs
+    15.45). None when it did not (the old "mixed" protocol on other sets)."""
+    tv = p.get("trained_val")
+    if p.get("same_sets_as_training") is True:
+        return "its encoder was selected on these very query and gallery sets (same_sets_as_training)"
+    if not isinstance(tv, dict) or not tv.get("val_protocol"):
+        return "the probe does not record how its encoder was selected (trained_val.val_protocol)"
+    if tv.get("val_protocol") == "dictionary":
+        return "its encoder chose its epoch on the dictionary protocol, i.e. on these INCLUDE validation queries"
+    return None
+
+
 def selection_checks(cand: Side, ref: Side, base: Side | None, m: dict, opts: dict) -> list[dict]:
-    """Validation / out-of-fold checks only (no test clip of the primary split)."""
+    """Validation / out-of-fold checks only (no test clip of the primary split, and no fold classifier selected on
+    it unless ``opts["allow_test_selected_folds"]``)."""
     out = []
-    # (a) CV out-of-fold, folds other than the primary one
+    name_a = "CV out-of-fold top-1 (folds other than the primary)"
+    # (a) CV out-of-fold, folds other than the primary one, and not selected on the primary test
     cf, rf = _cv_folds(cand), _cv_folds(ref)
-    common = sorted(set(cf) & set(rf))
+    both = sorted(set(cf) & set(rf))
+    common, screen = fold_selection_screen(both, [cand.protocol("E1b").get("split"), ref.protocol("E1b").get("split")],
+                                           opts.get("splits_dir"), opts.get("allow_test_selected_folds", False))
+    skipped = [r for r in screen if r.get("skipped")]
+    extra = {"folds_skipped": skipped, "folds_disclosed": [r for r in screen if not r.get("skipped")],
+             "allow_test_selected_folds": bool(opts.get("allow_test_selected_folds"))}
     if not common:
-        out.append(_check("a", "CV out-of-fold top-1 (folds other than the primary)", "validation",
-                          _na("no common CV fold besides the primary split in both reports")))
+        why = ("no common CV fold besides the primary split in both reports" if not both else
+               "every common CV fold was skipped: " + "; ".join(f"{r['split']}: {r['reason']}" for r in skipped))
+        out.append(_check("a", name_a, "validation", _na(why), folds=[], **extra))
     else:
         ch, rh, groups, paired = {}, {}, {}, True
         for s in common:
@@ -356,7 +442,8 @@ def selection_checks(cand: Side, ref: Side, base: Side | None, m: dict, opts: di
                 break
             ch.update(a[0])
             rh.update(b[0])
-            groups.update({k: f"{s}:{v}" for k, v in {**b[1], **a[1]}.items()})
+            # the real signer group: one signer in two folds is one cluster (docs 15.45)
+            groups.update({**b[1], **a[1]})
         cn = sum(cf[s]["n"] for s in common)
         rn = sum(rf[s]["n"] for s in common)
         crate = sum(cf[s]["n"] * cf[s]["top1"] for s in common) / cn
@@ -366,8 +453,10 @@ def selection_checks(cand: Side, ref: Side, base: Side | None, m: dict, opts: di
         else:
             res = unpaired_difference((crate, cn), (rrate, rn), m["top1"],
                                       "each side on its own classes' clips of these folds")
-        out.append(_check("a", "CV out-of-fold top-1 (folds other than the primary)", "validation", res,
-                          folds=common))
+        if skipped:
+            res["note"] = ((res.get("note") + "; ") if res.get("note") else "") + "folds skipped: " + ", ".join(
+                f"{r['split']} ({r['reason']})" for r in skipped)
+        out.append(_check("a", name_a, "validation", res, folds=common, **extra))
     # (a, info) classifier INCLUDE validation top-1: the early-stopping set, so optimistic for both
     cm, rm = cand.cls_meta or {}, ref.cls_meta or {}
     ci = (cm.get("val_by_source") or {}).get("include")
@@ -376,23 +465,7 @@ def selection_checks(cand: Side, ref: Side, base: Side | None, m: dict, opts: di
         res = unpaired_difference((ci["top1"], ci["n"]), (ri["top1"], ri["n"]), m["top1"],
                                   "the classifiers were early-stopped on these clips")
         out.append(_check("a", "classifier INCLUDE validation top-1", "validation", res, role="info"))
-    # (b) encoder probe: INCLUDE validation -> ISLRTC dictionary, query by query
-    if cand.probe and ref.probe and cand.probe.get("hits") and ref.probe.get("hits"):
-        def inc(p):
-            h = {k.split("|", 1)[1]: int(v) for k, v in p["hits"].items() if k.split("|", 1)[0] == "include"}
-            return h, {k: clip_source_group(k, cand.include_groups)[1] or "?" for k in h}
-
-        c_, r_ = inc(cand.probe), inc(ref.probe)
-        res = paired_difference(c_[0], r_[0], {**r_[1], **c_[1]}, m["top1"], opts["boot"], opts["seed"])
-        diff = [k for k in ("profile", "split", "per_signer", "data_seed") if cand.probe.get(k) != ref.probe.get(k)]
-        if diff:
-            res["note"] = "the probes differ in " + ", ".join(diff) + " (paired on the common INCLUDE queries)"
-        out.append(_check("b", "encoder probe INCLUDE val -> ISLRTC r1", "validation", res))
-    else:
-        out.append(_check("b", "encoder probe INCLUDE val -> ISLRTC r1", "validation",
-                          _na("no current encoder_probe.json with per-query hits in both work folders (run "
-                              "encoder-probe --out <work>/eval/encoder_probe.json)")))
-    # (b) E2 one-shot: held-out-concept queries of the validation part
+    # (b) E2 one-shot: held-out-concept queries of the validation part (no encoder selected on these concepts)
     c_, r_ = cand.hits("E2", part="val"), ref.hits("E2", part="val")
     if c_ is not None and r_ is not None:
         res = paired_difference(c_[0], r_[0], {**r_[1], **c_[1]}, m["oneshot"], opts["boot"], opts["seed"])
@@ -400,10 +473,41 @@ def selection_checks(cand: Side, ref: Side, base: Side | None, m: dict, opts: di
     else:
         out.append(_check("b", "E2 one-shot top-1, validation-part queries", "validation",
                           _na("no E2 per-clip records with parts (evaluate --all --per-clip) in both")))
+    # (b) encoder probe: INCLUDE validation -> ISLRTC dictionary, query by query. A gate only when neither encoder
+    # chose its epoch on these queries; otherwise the paired difference is optimistic for that side: information
+    name_b = "encoder probe INCLUDE val -> ISLRTC r1"
+    if cand.probe and ref.probe and cand.probe.get("hits") and ref.probe.get("hits"):
+        def inc(p):
+            h = {k.split("|", 1)[1]: int(v) for k, v in p["hits"].items() if k.split("|", 1)[0] == "include"}
+            return h, {k: clip_source_group(k, cand.include_groups)[1] or "?" for k in h}
+
+        c_, r_ = inc(cand.probe), inc(ref.probe)
+        res = paired_difference(c_[0], r_[0], {**r_[1], **c_[1]}, m["top1"], opts["boot"], opts["seed"])
+        notes = []
+        diff = [k for k in ("profile", "split", "per_signer", "data_seed") if cand.probe.get(k) != ref.probe.get(k)]
+        if diff:
+            notes.append("the probes differ in " + ", ".join(diff) + " (paired on the common INCLUDE queries)")
+        sel = {n: w for n, w in (("candidate", _probe_selection(cand.probe)), ("reference", _probe_selection(ref.probe)))
+               if w}
+        role = "gate"
+        if sel:
+            role = "info"
+            notes.append("information only, not a gate: " + "; ".join(f"{n}: {w}" for n, w in sel.items())
+                         + ". E2 one-shot on validation-part queries carries gate (b)")
+        res["note"] = "; ".join(notes) or None
+        out.append(_check("b", name_b, "validation", res, role=role,
+                          selected_on_probe_queries=sel or None,
+                          val_protocol={"cand": (cand.probe.get("trained_val") or {}).get("val_protocol"),
+                                        "ref": (ref.probe.get("trained_val") or {}).get("val_protocol")}))
+    else:
+        out.append(_check("b", name_b, "validation",
+                          _na("no current encoder_probe.json with per-query hits in both work folders (run "
+                              "encoder-probe --out <work>/eval/encoder_probe.json)"), role="info"))
     # (c) certified worst-source strict lower bound (fitted on validation / out-of-fold clips)
     out.append(_check("c", "strict worst-source lower bound (fusion.json)", "validation", lower_bound_check(cand, ref, m)))
     # (d) ISL500 validation top-1 against the baseline (same validation clips only)
-    out.append(_check("d", "ISL500 validation top-1 (classifier)", "validation", isl500_val_check(cand, base, m)))
+    out.append(_check("d", "ISL500 validation top-1 (classifier)", "validation",
+                      isl500_val_check(cand, base, m, opts.get("no_isl500_gate", False))))
     return out
 
 
@@ -412,33 +516,114 @@ def _strict_lb(side: Side) -> tuple[float | None, str | None, dict]:
     return a.get("precision_lower_bound"), a.get("worst_source"), a
 
 
+def _calibration(side: Side) -> dict:
+    """How a fusion.json was certified: kind (``out-of-fold`` with its folds, or ``validation``), clips, and the fold
+    classifiers it used that were selected on the E1b test (docs 15.43, 15.45)."""
+    cert = (side.fusion or {}).get("certification") or {}
+    cs = cert.get("calibration_sets")
+    if not isinstance(cs, dict) or not cs:
+        return {"kind": "validation", "clips": cert.get("calibration_clips"), "folds": None, "test_selected": []}
+    used = [str(f) for f in cs.get("folds_used") or []]
+    fc = cs.get("fold_classifiers") or {}
+    sel = sorted(str(f) for f, r in fc.items()
+                 if (not used or str(f) in used) and isinstance(r, dict) and (r.get("selected_on_primary_test_clips")
+                                                                             or 0) > 0)
+    if cs.get("allow_test_selected") and not sel and used:
+        sel = ["(allow_test_selected)"]
+    return {"kind": "out-of-fold", "clips": cs.get("clips") or cert.get("calibration_clips"), "folds": used,
+            "test_selected": sel}
+
+
 def lower_bound_check(cand: Side, ref: Side, m: dict) -> dict:
     c_lb, c_ws, ca = _strict_lb(cand)
     r_lb, r_ws, _ = _strict_lb(ref)
     if c_lb is None or r_lb is None:
         return _na("a fusion.json without a strict precision_lower_bound (refit with the 15.25 code)")
-    cal = lambda s: ((s.fusion or {}).get("certification") or {}).get("calibration_clips")  # noqa: E731
+    cc, rc = _calibration(cand), _calibration(ref)
+    cal = {"cand": cc, "ref": rc}
+    bad = {n: c["test_selected"] for n, c in (("candidate", cc), ("reference", rc)) if c["test_selected"]}
+    if bad:
+        return {**_na("a fusion.json certified with fold classifiers selected on the E1b test ("
+                      + "; ".join(f"{n}: folds {v}" for n, v in bad.items())
+                      + "): its lower bound is not a validation number; refit without --oof-allow-test-selected"),
+                "calibration": cal}
+    notes = ["each number is already a 95 % lower bound (worst major source, design-effect adjusted)"]
+    if (cc["kind"], cc["folds"]) != (rc["kind"], rc["folds"]):
+        notes.append(f"not like for like: calibrated on {cc['kind']} {cc['folds'] or ''} ({cc['clips']} clips) vs "
+                     f"{rc['kind']} {rc['folds'] or ''} ({rc['clips']} clips); the bound on fewer clips is looser")
     return {"cand": c_lb, "ref": r_lb, "delta": round(c_lb - r_lb, 4), "cand_worst_source": c_ws,
             "ref_worst_source": r_ws, "cand_rule": ca.get("rule"), "margin": m["lower_bound"],
-            "calibration_clips": {"cand": cal(cand), "ref": cal(ref)},
-            "status": "pass" if c_lb >= r_lb - m["lower_bound"] else "fail",
-            "note": "each number is already a 95 % lower bound (worst major source, design-effect adjusted)"}
+            "calibration_clips": {"cand": cc["clips"], "ref": rc["clips"]}, "calibration": cal,
+            "status": "pass" if c_lb >= r_lb - m["lower_bound"] else "fail", "note": "; ".join(notes)}
 
 
-def isl500_val_check(cand: Side, base: Side | None, m: dict) -> dict:
+def has_isl500(side: Side) -> bool:
+    """Does this work folder have ISL500 clips (its classifier's data, validation numbers, or E1c / E3 records)?"""
+    cm = side.cls_meta or {}
+    if (cm.get("val_by_source") or {}).get("isl500") or ((cm.get("data") or {}).get("extra_sources") or {}).get("isl500"):
+        return True
+    for key in ("E1c", "E3"):
+        h = side.hits(key, source="isl500")
+        if h is not None and h[0]:
+            return True
+        if _isl500_rate(side, key)[1]:
+            return True
+    return False
+
+
+def _no_baseline(cand: Side, no_gate: bool) -> dict:
+    if no_gate:
+        return {"status": "not_applicable", "reason": "--no-isl500-gate given (recorded): gate (d) not checked"}
+    if has_isl500(cand):
+        return _na(f"the candidate has ISL500 clips and no ISL500 baseline: {NO_BASELINE}")
+    return {"status": "not_applicable", "reason": "the candidate has no ISL500 clips"}
+
+
+def isl500_val_signature(side: Side) -> dict | None:
+    """What fixes a classifier's ISL500 validation clips: the signer split version, the data seed and the ISL500
+    validation count its data meta records. None when the meta records no data block (cannot verify)."""
+    cm = side.cls_meta or {}
+    d = cm.get("data")
+    if not isinstance(d, dict):
+        return None
+    return {"signer_split": d.get("signer_split") or "v1",
+            "isl500_val": ((d.get("extra_sources") or {}).get("isl500") or {}).get("val"),
+            "seed": (cm.get("train_config") or {}).get("seed")}
+
+
+def isl500_val_check(cand: Side, base: Side | None, m: dict, no_gate: bool = False) -> dict:
     if base is None:
-        return {"status": "not_applicable", "reason": "no --isl500-baseline given"}
+        return _no_baseline(cand, no_gate)
     c = ((cand.cls_meta or {}).get("val_by_source") or {}).get("isl500")
     b = ((base.cls_meta or {}).get("val_by_source") or {}).get("isl500")
     if not c:
         return {"status": "not_applicable", "reason": "the candidate's classifier has no ISL500 validation clips"}
     if not b:
         return _na("the baseline classifier records no ISL500 validation top-1 (val_by_source)")
-    if c["n"] != b["n"]:
-        return _na(f"different ISL500 validation sets (n {c['n']} vs {b['n']}; signer split v2 moves 2 signers to "
+    cs, bs = isl500_val_signature(cand), isl500_val_signature(base)
+    if cs is None or bs is None:
+        return _na("cannot verify that both used the same ISL500 validation clips (no data block in a classifier's "
+                   "meta): only the test check can compare them")
+    cs_n, bs_n = {**cs, "n": c["n"]}, {**bs, "n": b["n"]}
+    diff = [f"{k} {cs_n[k]} vs {bs_n[k]}" for k in cs_n if cs_n[k] != bs_n[k]]
+    if diff:
+        return _na(f"different ISL500 validation sets ({', '.join(diff)}; signer split v2 moves 2 signers to "
                    "validation): only the test check can compare them")
-    return unpaired_difference((c["top1"], c["n"]), (b["top1"], b["n"]), m["isl500"],
-                               "the classifiers were early-stopped on these clips")
+    res = unpaired_difference((c["top1"], c["n"]), (b["top1"], b["n"]), m["isl500"],
+                              "the classifiers were early-stopped on these clips")
+    res["same_validation_set"] = cs
+    return res
+
+
+def _floor(gate: str, label: str, key: str, res: dict) -> dict:
+    """Information row: the candidate's value against the QA plan's absolute floor (docs 15.45). The paired check
+    next to it carries the gate."""
+    v, f = res.get("cand"), PLAN_FLOORS[key]
+    r = ({"status": "not_available", "reason": "no candidate value"} if v is None else
+         {"status": "pass" if v >= f else "fail", "cand": v, "floor": f,
+          "note": f"information: the QA plan's absolute floor {f} (commercial-safe's test number minus its margin); "
+                  "the paired check carries the gate"})
+    return _check(gate, f"{label} >= plan floor {f}", "test", r, role="info")
 
 
 def confirmation_checks(cand: Side, ref: Side, base: Side | None, m: dict, opts: dict) -> list[dict]:
@@ -455,12 +640,14 @@ def confirmation_checks(cand: Side, ref: Side, base: Side | None, m: dict, opts:
                                   ((re_.get("metrics") or {}).get("top1"), re_.get("n")), m["top1"], opts,
                                   "each side on its own class set")
         out.append(_check("a", "E1b top-1 on the common test clips", "test", res))
+        out.append(_floor("a", "E1b top-1 (common clips)", "E1b", res))
     lf = ce.get("like_for_like") or {}
     if lf:
         out.append(_check("a", "E1b like for like (evaluate --compare-to)", "test",
                           {"status": "pass", "like_for_like": lf,
                            "note": "information: scores masked to the reference's classes"}, role="info"))
-    # (a) CV pooled over every fold (the primary fold included: this is the test stage)
+    # (a) CV pooled over every fold (the primary fold included, and a fold selected on the primary test too: this is
+    # the test stage)
     ccv, rcv = ce.get("cv") or {}, re_.get("cv") or {}
     folds = sorted(set(_cv_folds(cand)) & set(_cv_folds(ref)))
     ch, rh, groups, paired = {}, {}, {}, bool(c_ and r_)
@@ -471,36 +658,39 @@ def confirmation_checks(cand: Side, ref: Side, base: Side | None, m: dict, opts:
             break
         ch.update(a[0])
         rh.update(b[0])
-        groups.update({k: f"{s}:{v}" for k, v in {**b[1], **a[1]}.items()})
+        groups.update({**b[1], **a[1]})  # the real signer group across folds (docs 15.45)
     if paired and folds:
         ch.update(c_[0])
         rh.update(r_[0])
-        groups.update({k: f"primary:{v}" for k, v in {**r_[1], **c_[1]}.items()})
+        groups.update({**r_[1], **c_[1]})
         res = paired_difference(ch, rh, groups, m["top1"], opts["boot"], opts["seed"])
     else:
         res = unpaired_difference((ccv.get("pooled_top1"), ccv.get("pooled_n")),
                                   (rcv.get("pooled_top1"), rcv.get("pooled_n")), m["top1"],
                                   "each side on its own classes' clips")
     out.append(_check("a", "CV pooled top-1 (every fold)", "test", res))
+    out.append(_floor("a", "CV pooled top-1", "cv_pooled", res))
     # (b) E2_seen and E2 one-shot (test-part queries)
     c_, r_ = cand.hits("E2_seen"), ref.hits("E2_seen")
     cs, rs = cand.protocol("E2_seen"), ref.protocol("E2_seen")
     res = _paired_or_unpaired(c_, r_, ((cs.get("metrics") or {}).get("top1"), cs.get("n")),
                               ((rs.get("metrics") or {}).get("top1"), rs.get("n")), m["top1"], opts)
     out.append(_check("b", "E2_seen top-1 (INCLUDE test -> ISLRTC rows)", "test", res))
+    out.append(_floor("b", "E2_seen top-1", "E2_seen", res))
     c_, r_ = cand.hits("E2", part="test"), ref.hits("E2", part="test")
     c2, r2 = cand.protocol("E2"), ref.protocol("E2")
     res = _paired_or_unpaired(c_, r_, ((c2.get("metrics") or {}).get("top1"), c2.get("n")),
                               ((r2.get("metrics") or {}).get("top1"), r2.get("n")), m["oneshot"], opts,
                               "validation and test queries pooled (no parts recorded)")
     out.append(_check("b", "E2 one-shot top-1, test-part queries", "test", res))
+    out.append(_floor("b", "E2 one-shot top-1", "E2", res))
     # (c) the strict certificate holds on test, per major source
     out.append(_check("c", "strict certificate holds on test (every major source)", "test", certificate_check(cand, ref)))
     # (d) ISL500 test top-1 against the baseline: classifier alone (E1c) and fused (E3)
     for key, label in (("E1c", "classifier alone"), ("E3", "fused")):
         name = f"ISL500 test top-1 ({label})"
         if base is None:
-            out.append(_check("d", name, "test", {"status": "not_applicable", "reason": "no --isl500-baseline given"}))
+            out.append(_check("d", name, "test", _no_baseline(cand, opts.get("no_isl500_gate", False))))
             continue
         c_, b_ = cand.hits(key, source="isl500"), base.hits(key, source="isl500")
         if c_ is not None and not c_[0]:
@@ -513,7 +703,9 @@ def confirmation_checks(cand: Side, ref: Side, base: Side | None, m: dict, opts:
             out.append(_check("d", name, "test", {"status": "not_applicable",
                                                   "reason": "the candidate reports no ISL500 test clips"}))
             continue
-        out.append(_check("d", name, "test", _paired_or_unpaired(c_, b_, crate, brate, m["isl500"], opts)))
+        res = _paired_or_unpaired(c_, b_, crate, brate, m["isl500"], opts)
+        out.append(_check("d", name, "test", res))
+        out.append(_floor("d", f"ISL500 test top-1 ({label})", f"isl500_{key}", res))
     return out
 
 
@@ -569,26 +761,56 @@ def gate_status(checks: list[dict]) -> dict[str, str]:
 
 # --------------------------------------------------------------------------------------------- driver
 
+FALLBACK = ("ship the research pack with commercial-safe's encoder and classifier (plus research index rows for "
+            "extra vocabulary), per the QA plan")
+
+
+def _ledger(led: Path) -> list[dict]:
+    if not led.exists():
+        return []
+    out = []
+    for x in led.read_text().splitlines():
+        try:
+            out.append(json.loads(x)) if x.strip() else None
+        except ValueError:
+            out.append({"unreadable": x[:80]})
+    return out
+
+
 def compare(reference: Path, candidates: dict[str, Path], *, baseline: Path | None = None, out: Path,
             splits_dir: Path | None = None, margins: dict | None = None, select_only: bool = False,
-            boot: int = 2000, seed: int = 0) -> dict:
+            boot: int = 2000, seed: int = 0, allow_test_selected_folds: bool = False, no_isl500_gate: bool = False,
+            force_second_look: bool = False) -> dict:
     """Selection on validation for every candidate, then one confirmation on test for the selected one. Writes
-    ``<out>/compare.json`` and ``compare.md``; returns the document."""
+    ``<out>/compare.json`` and ``compare.md``; returns the document.
+
+    ``splits_dir`` is needed to verify which CV folds may serve selection (without it no fold does). Opt-ins, each
+    recorded in ``options``: ``allow_test_selected_folds`` (use a fold whose classifier was early-stopped on the E1b
+    test), ``no_isl500_gate`` (gate (d) not checked when no baseline is given), ``force_second_look`` (confirm a
+    candidate other than the one this folder's ledger already looked at)."""
     m = {**DEFAULT_MARGINS, **(margins or {})}
-    opts = {"boot": boot, "seed": seed}
+    opts = {"boot": boot, "seed": seed, "splits_dir": splits_dir, "allow_test_selected_folds": allow_test_selected_folds,
+            "no_isl500_gate": no_isl500_gate}
     groups = include_signer_groups(splits_dir)
     ref = Side("reference", reference, groups)
     base = Side("isl500-baseline", baseline, groups) if baseline else None
     sides = {n: Side(n, p, groups) for n, p in candidates.items()}
     doc: dict = {"schema": SCHEMA, "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                 "reference": {"work": str(ref.work), "notes": ref.notes, "components": ref.components},
-                 "isl500_baseline": None if base is None else {"work": str(base.work), "notes": base.notes},
-                 "margins": m, "bootstrap": opts, "gates": GATES,
-                 "rule": {"selection": "validation / out-of-fold checks only; a failed selection gate rejects the "
-                                       "candidate; among the others: most passed selection checks, then the CV "
-                                       "difference, then the probe difference",
+                 "reference": {"work": str(ref.work), "notes": ref.notes, "components": ref.components,
+                               "stale": ref.stale},
+                 "isl500_baseline": None if base is None else {"work": str(base.work), "notes": base.notes,
+                                                               "stale": base.stale},
+                 "margins": m, "bootstrap": {"boot": boot, "seed": seed}, "gates": GATES, "plan_floors": PLAN_FLOORS,
+                 "options": {"splits_dir": None if splits_dir is None else str(splits_dir),
+                             "allow_test_selected_folds": allow_test_selected_folds,
+                             "no_isl500_gate": no_isl500_gate, "force_second_look": force_second_look,
+                             "select_only": select_only},
+                 "rule": {"selection": "validation / out-of-fold checks only (CV folds whose classifier was selected "
+                                       "on the E1b test are skipped); a failed selection gate or stale inputs reject "
+                                       "the candidate; among the others: most selection gates passed (or not "
+                                       "applicable), then the CV difference, then the gate (b) difference",
                           "confirmation": "the selected candidate only, once on test; ship when every test gate is "
-                                          "pass (or not applicable)",
+                                          "pass (or not applicable) and no input is stale",
                           "check": "pass: interval lower end >= -margin; fail: upper end < -margin; else "
                                    "inconclusive. Paired: McNemar exact + clip-level interval, and a signer-group "
                                    "bootstrap with >= %d groups (the wider interval counts)" % MIN_INTERVAL_GROUPS},
@@ -597,7 +819,7 @@ def compare(reference: Path, candidates: dict[str, Path], *, baseline: Path | No
     for name, s in sides.items():
         sel = selection_checks(s, ref, base, m, opts)
         gs = gate_status(sel)
-        eligible = "fail" not in gs.values()
+        eligible = "fail" not in gs.values() and not s.stale
         entry = {"work": str(s.work), "notes": s.notes, "stale": s.stale, "components": s.components,
                  "selection": {"checks": sel, "gates": gs, "eligible": eligible}}
         doc["candidates"][name] = entry
@@ -606,8 +828,9 @@ def compare(reference: Path, candidates: dict[str, Path], *, baseline: Path | No
                 v = next((c.get("delta") for c in ch if c["gate"] == g and c["role"] == "gate"
                           and c.get("delta") is not None), None)
                 return v if v is not None else -1.0
-            npass = sum(1 for c in sel if c["role"] == "gate" and c["status"] == "pass")
-            ranked.append(((npass, delta("a"), delta("b")), name))
+            # rank on gates, not on raw check counts (a side with more checks available gains nothing)
+            ngates = sum(1 for st in gs.values() if st in ("pass", "not_applicable"))
+            ranked.append(((ngates, delta("a"), delta("b")), name))
     ranked.sort(key=lambda t: t[0], reverse=True)
     selected = ranked[0][1] if ranked else None
     doc["selected"] = selected
@@ -616,35 +839,66 @@ def compare(reference: Path, candidates: dict[str, Path], *, baseline: Path | No
     out.mkdir(parents=True, exist_ok=True)
     for name, e in doc["candidates"].items():
         if name != selected:
-            e["verdict"] = ("rejected on validation: " + ", ".join(f"gate ({g}) {st}" for g, st in
-                                                                     e["selection"]["gates"].items() if st == "fail")
-                            if not e["selection"]["eligible"] else "eligible on validation, not selected; test not "
-                                                                    "looked at")
+            if e["stale"]:
+                e["verdict"] = "rejected: stale inputs (" + "; ".join(e["stale"]) + "): re-run evaluate --all"
+            elif not e["selection"]["eligible"]:
+                e["verdict"] = "rejected on validation: " + ", ".join(
+                    f"gate ({g}) {st}" for g, st in e["selection"]["gates"].items() if st == "fail")
+            else:
+                e["verdict"] = "eligible on validation, not selected; test not looked at"
+    led = out / LEDGER
+    before = _ledger(led)
     if selected is None:
-        doc["verdict"] = ("no candidate passes selection: ship the research pack with commercial-safe's encoder and "
-                          "classifier (plus research index rows for extra vocabulary), per the QA plan")
+        doc["verdict"] = "no candidate passes selection: " + FALLBACK
     elif select_only:
         doc["candidates"][selected]["verdict"] = "selected on validation; test not looked at (--select-only)"
         doc["verdict"] = f"{selected} selected on validation; confirm on test before shipping"
     else:
         s = sides[selected]
-        led = out / LEDGER
-        before = [json.loads(x) for x in led.read_text().splitlines() if x.strip()] if led.exists() else []
-        tc = confirmation_checks(s, ref, base, m, opts)
-        tg = gate_status(tc)
-        ship = all(v in ("pass", "not_applicable") for v in tg.values()) and not s.stale and not ref.stale
-        with led.open("a") as f:
-            f.write(json.dumps({"time": doc["created"], "candidate": selected, "work": str(s.work),
-                                "components": s.components, "gates": tg}) + "\n")
+        # a confirmation that cannot ship, or a look at another candidate, would spend the test set: none runs
+        blockers = []
+        if ref.stale:
+            blockers.append("the reference is stale (" + "; ".join(ref.stale) + "): re-run evaluate --all there")
+        if base is not None and base.stale:
+            blockers.append("the ISL500 baseline is stale (" + "; ".join(base.stale) + ")")
+        if base is None and not no_isl500_gate and has_isl500(s):
+            blockers.append(f"gate (d) has no baseline: {NO_BASELINE} (or --no-isl500-gate, recorded)")
+        first = next((x for x in before if x.get("candidate")), None)
+        if first is not None and (first.get("candidate") != selected or first.get("components") != s.components) \
+                and not force_second_look:
+            blockers.append(f"this folder's ledger already holds a test look at {first.get('candidate')!r} "
+                            f"({first.get('time')}); confirming another candidate (or other component files) on "
+                            "test is selection on test (--force-second-look, recorded)")
         e = doc["candidates"][selected]
-        e["confirmation"] = {"checks": tc, "gates": tg, "ship": ship, "test_looks_before": len(before),
-                             "warning": (f"the test set was looked at {len(before)} time(s) before from {out}: this "
-                                         "is no longer a single confirmation" if before else None)}
-        failed = [f"({g}) {st}" for g, st in tg.items() if st not in ("pass", "not_applicable")]
-        e["verdict"] = ("selected on validation and confirmed on test: ship" if ship else
-                        "selected on validation, NOT confirmed on test: do not ship ("
-                        + (", ".join(failed) if failed else "stale inputs") + ")")
-        doc["verdict"] = f"{selected}: {e['verdict']}"
+        if blockers:
+            e["verdict"] = "selected on validation; NOT looked at on test: " + "; ".join(blockers)
+            doc["verdict"] = f"{selected}: {e['verdict']}"
+        else:
+            tc = confirmation_checks(s, ref, base, m, opts)
+            tg = gate_status(tc)
+            stale = s.stale or ref.stale or (base.stale if base is not None else [])
+            ship = all(v in ("pass", "not_applicable") for v in tg.values()) and not stale
+            other = [x.get("candidate") for x in before if x.get("candidate") and x.get("candidate") != selected]
+            with led.open("a") as f:
+                f.write(json.dumps({"time": doc["created"], "candidate": selected, "work": str(s.work),
+                                    "components": s.components, "gates": tg, "ship": ship,
+                                    "ranking": doc["ranking"], "force_second_look": force_second_look}) + "\n")
+            warn = None
+            if before:
+                warn = (f"the test set was looked at {len(before)} time(s) before from {out}: this is no longer a "
+                        "single confirmation")
+                if other:
+                    warn += f"; earlier looks were at other candidates {sorted(set(other))}: this is selection on test"
+            e["confirmation"] = {"checks": tc, "gates": tg, "ship": ship, "test_looks_before": len(before),
+                                 "warning": warn}
+            failed = [f"({g}) {st}" for g, st in tg.items() if st not in ("pass", "not_applicable")]
+            if ship:
+                e["verdict"] = "selected on validation and confirmed on test: ship"
+            else:
+                e["verdict"] = ("selected on validation, NOT confirmed on test: do not ship ("
+                                + (", ".join(failed) if failed else "stale inputs") + "). Fallback: " + FALLBACK
+                                + ". Do not confirm the next-ranked candidate on test: that is selection on test")
+            doc["verdict"] = f"{selected}: {e['verdict']}"
     (out / "compare.json").write_text(json.dumps(doc, indent=1, default=str))
     (out / "compare.md").write_text(markdown(doc))
     return doc
@@ -679,16 +933,22 @@ def markdown(doc: dict) -> str:
     lines = ["# ISL pack selection (compare-packs)", "",
              f"Created {doc['created']}. Reference: `{doc['reference']['work']}`. "
              + (f"ISL500 baseline: `{doc['isl500_baseline']['work']}`." if doc.get("isl500_baseline") else
-                "No ISL500 baseline: gate (d) not applicable."), "",
+                "No ISL500 baseline given."), "",
              f"**Verdict: {doc['verdict']}**", "",
              f"Margins (non-inferiority): top-1 {m['top1']}, one-shot {m['oneshot']}, ISL500 {m['isl500']}, "
              f"lower bound {m['lower_bound']}. {doc['rule']['check']}.", "",
              "Selection uses validation and out-of-fold numbers only; only the selected candidate is looked at on "
-             "test, once.", ""]
+             "test, once. compare-packs never uses another candidate's test numbers; evaluate --all still writes "
+             "them, so do not pick a candidate from report.md.", "",
+             "Options: " + ", ".join(f"{k} {v}" for k, v in (doc.get("options") or {}).items()), "",
+             "Ranking (gates passed or not applicable, CV difference, gate (b) difference): "
+             + (", ".join(f"{r['candidate']} {r['key']}" for r in doc.get("ranking") or []) or "none"), ""]
     for g, t in doc["gates"].items():
         lines.append(f"* gate ({g}): {t}")
     for n in doc["reference"].get("notes") or []:
         lines.append(f"* reference: {n}")
+    for n in (doc.get("isl500_baseline") or {}).get("notes") or []:
+        lines.append(f"* ISL500 baseline: {n}")
     for name, e in doc["candidates"].items():
         lines += ["", f"## {name}", "", f"`{e['work']}`", "", f"**{e.get('verdict')}**", ""]
         lines += [f"* {n}" for n in e.get("notes") or []]
@@ -707,4 +967,5 @@ def markdown(doc: dict) -> str:
 
 __all__ = ["compare", "paired_difference", "unpaired_difference", "mcnemar_exact", "group_bootstrap_diff",
            "selection_checks", "confirmation_checks", "certificate_check", "gate_status", "Side", "DEFAULT_MARGINS",
-           "include_signer_groups", "clip_source_group", "LEDGER"]
+           "include_signer_groups", "clip_source_group", "LEDGER", "PLAN_FLOORS", "fold_selection_screen",
+           "lower_bound_check", "isl500_val_check", "has_isl500"]
