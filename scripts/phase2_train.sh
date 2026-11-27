@@ -254,7 +254,8 @@ step_outputs() {  # what a step leaves in the work folder for later steps (a lea
     cv) echo "cv" ;;
     e1a) echo "e1a" ;;
     fingerspell) echo "letters.pt" ;;
-    index|index_final) echo "index" ;;
+    index) echo "index" ;;
+    index_final) echo "index_final" ;;
     fusion) echo "fusion.json" ;;
     trim_eval) echo "trim_eval.json" ;;
   esac
@@ -309,14 +310,16 @@ run_step() {
       mkdir -p "$WORK/e1a"
       train train-classifier $COMMON $CAP $CLS --batches ${E1A_STEPS:-$([[ $SMOKE == 1 ]] && echo 6 || echo 120)} --split include-official --ckpt "$WORK/e1a/classifier.pt" ;;
     fingerspell) cli train-fingerspell --profile "$PROFILE" --threads "$THREADS" --vocab "$VOCAB" $SM $LET ;;
-    index) cli build-index $COMMON --all-sources $CAP ;;  # training parts only: evaluation stays clean
+    # training parts only, into <work>/index: fit-fusion and evaluate read it and refuse anything else (docs 15.21)
+    index) cli build-index $COMMON --all-sources $CAP --out "$WORK/index" ;;
     fusion) cli fit-fusion $COMMON --all-sources $CAP ;;
     trim_eval)  # E8: evaluate exactly the trimmer of the trim step (same learned-model choice) into the work folder
       # a new trim-eval makes an older report / pack stale: forget their stamps so they are rebuilt from it
       cli trim-eval --learned-model auto --out "$WORK/trim_eval.json" $([[ $SMOKE == 1 ]] && echo "--n ${SMOKE_TRIM_EVAL_N:-60}") \
         && rm -f "$STAMPS/evaluate.done" "$STAMPS/pack.done" ;;
     evaluate) cli evaluate --all $COMMON --all-sources $CAP ${PACK_OUT:+--out "$PACK_OUT"} ;;
-    index_final) cli build-index $COMMON --all-sources $CAP --all-include ;;  # the shipped index: every reference
+    # the shipped index: every reference (val / test too) into <work>/index_final, never over <work>/index
+    index_final) cli build-index $COMMON --all-sources $CAP --all-include --out "$WORK/index_final" ;;
     pack) cli build-pack $COMMON ${PACK_OUT:+--out "$PACK_OUT"} ;;
     *) log "unknown step $s"; return 2 ;;
   esac

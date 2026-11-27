@@ -187,7 +187,9 @@ class IslPack:
         index = None
         if encoder is not None and pr["index"]:
             want = (self.manifest.components.get("index") or {}).get("encoder_version") or encoder.version
-            index = EmbeddingIndex.load(paths["index"], expect_encoder_version=want)
+            # the index of a pack may contain evaluation clips (index_final): fine for the app; but it must have been
+            # embedded with this very encoder file when it records one (docs 15.21)
+            index = EmbeddingIndex.load(paths["index"], expect_encoder_version=want, encoder_path=paths["encoder"])
             if index.meta.encoder_version != encoder.version:
                 raise ProfileMismatch(f"index encoder {index.meta.encoder_version!r} != encoder {encoder.version!r}")
         speller = self._speller(vocab, paths, pr, Speller)

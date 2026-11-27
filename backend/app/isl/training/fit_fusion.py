@@ -30,11 +30,24 @@ def collect_evidence(rec, clips: list[Clip], use_my_signs: bool = False) -> tupl
     return inputs, truths, used
 
 
+def check_index_for_fitting(rec, clips: list[Clip]) -> dict | None:
+    """Leak guard (docs 15.21): the retrieval index ``rec`` uses must be the training-only one of this very encoder
+    file and hold no row of these clips; ``LeakageError`` otherwise. None when ``rec`` has no index."""
+    idx = getattr(rec, "index", None)
+    if idx is None:
+        return None
+    enc = getattr(rec, "encoder", None)
+    return idx.check_for_evaluation(getattr(enc, "path", None), eval_clip_ids=[c.clip_id for c in clips])
+
+
 def fit_fusion(rec, val_clips: list[Clip], profile: str, version: str = "fusion-1") -> tuple[FusionParams, dict]:
     t0 = time.time()
+    guard = check_index_for_fitting(rec, val_clips)  # before any work: an eval-including index is refused
     inputs, truths, used = collect_evidence(rec, val_clips)
     base = FusionParams(profile=profile, version=version)
     rep: dict = {"val_queries": len(inputs)}
+    if guard is not None:
+        rep["index_guard"] = guard
     if not inputs:
         return base, {**rep, "note": "no validation clips: default (uncalibrated) fusion parameters"}
     if inputs[0].cls_logp is not None:

@@ -8,6 +8,11 @@ Phase 2 (``extra``): every other labelled reference of the profile (ISL500, WSLP
 per-source row weight (``multisource.INDEX_WEIGHTS``): sources with several clips of a concept give one centroid
 per (concept, source) plus up to ``max_group_centroids`` per-signer centroids (different signers' forms stay
 separate rows); sources with one clip per concept give one row per clip (``kind = "clip"``).
+
+Two indexes per work folder (docs/ISL_DESIGN.md 15.21): ``work/index`` from the training parts only
+(``contains_eval = False``), which fit-fusion and evaluation use, and ``work/index_final`` from every reference
+(``--all-include``, ``contains_eval = True``), which only the shipped pack uses. Both record the SHA-256 of the
+encoder file they were embedded with.
 """
 
 from __future__ import annotations
@@ -21,7 +26,7 @@ import numpy as np
 from app.features.build import featurize
 from app.isl.data.sources import Clip
 from app.isl.models.encoder import EncoderPredictor
-from app.isl.models.index import EmbeddingIndex
+from app.isl.models.index import EmbeddingIndex, file_sha256
 from app.isl.training.common import ClipDataset, Item, items_for, slice_bf
 
 
@@ -90,7 +95,9 @@ def _extra_rows(enc: EncoderPredictor, clips: list[Clip], weights: dict, max_gro
 
 def build_index(enc: EncoderPredictor, islrtc: list[Clip], include: list[Clip], out_dir: Path, profile: str,
                 alt_weight: float = 0.95, centroid_weight: float = 1.0, extra: list[Clip] | None = None,
-                source_weights: dict | None = None, max_group_centroids: int = 3) -> dict:
+                source_weights: dict | None = None, max_group_centroids: int = 3, contains_eval: bool = False) -> dict:
+    """``contains_eval``: the caller says whether ``include`` / ``extra`` hold any validation or test clip (True for
+    ``--all-include``); it is written to the index meta and evaluation refuses such an index."""
     t0 = time.time()
     fcfg = enc.feature_config
     concepts = {c.concept_id for c in islrtc} | {c.concept_id for c in include}
@@ -134,9 +141,12 @@ def build_index(enc: EncoderPredictor, islrtc: list[Clip], include: list[Clip], 
             n_extra = len(erows)
     if not rows:
         raise RuntimeError("nothing to index")
-    idx = EmbeddingIndex.build(emb, rows, enc.version, fcfg.to_dict(), profile)
+    enc_path = getattr(enc, "path", None)
+    idx = EmbeddingIndex.build(emb, rows, enc.version, fcfg.to_dict(), profile, contains_eval=bool(contains_eval),
+                               encoder_sha256=file_sha256(enc_path) if enc_path is not None else "")
     idx.save(out_dir)
     return {"rows": len(rows), "concepts": len(idx.concepts), "first_sign": sum(r["kind"] == "first_sign" for r in rows),
             "alt_end": sum(r["kind"] == "alt_end" for r in rows), "centroids": len(crow), "extra_rows": n_extra,
             "rows_per_source": dict(Counter(r["source"] for r in rows)),
+            "contains_eval": idx.meta.contains_eval, "encoder_sha256": idx.meta.encoder_sha256,
             "seconds": round(time.time() - t0, 1), "dir": str(out_dir)}

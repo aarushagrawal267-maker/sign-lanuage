@@ -872,11 +872,19 @@ def cmd_build_index(paths: IslPaths, args) -> int:
     from app.isl.training.build_index import build_index
 
     profile, data, fcfg, work = _model_ctx(paths, args)
+    # --all-include (the shipped index) indexes every reference, validation and test clips too, into
+    # <work>/index_final; otherwise only training parts into <work>/index, the one fit-fusion and evaluation read
+    # (docs 15.21). The evaluation index is never overwritten with evaluation clips.
+    out = Path(args.out) if getattr(args, "out", None) else work / ("index_final" if args.all_include else "index")
+    if args.all_include and out.resolve() == (work / "index").resolve():
+        print(f"build-index --all-include must not write {out}: that is the training-only index fit-fusion and "
+              "evaluation read (use the default <work>/index_final)", file=sys.stderr)
+        return 2
     enc = EncoderPredictor(work / "encoder.pt")
     include = data.include_part("train") if not args.all_include else [c for c in data.include if c.concept_id]
-    # --all-include (final pack) indexes every reference; otherwise only training parts (evaluation stays clean)
     extra = [c for c in data.extra if args.all_include or data.extra_assign.get(c.clip_id) == "train"]
-    _print(build_index(enc, data.islrtc, include, work / "index", profile, extra=extra or None))
+    _print(build_index(enc, data.islrtc, include, out, profile, extra=extra or None,
+                       contains_eval=bool(args.all_include)))
     return 0
 
 
@@ -1078,7 +1086,8 @@ def _model_args(sp, train: bool = False) -> None:
     sp.add_argument("--seed", type=int, default=0)
     sp.add_argument("--max-islrtc", type=int, default=0, help="use at most N ISLRTC clips (0 = all)")
     sp.add_argument("--smoke", action="store_true", help="tiny settings; results are labelled as a smoke run")
-    sp.add_argument("--out", help="build-pack / smoke: pack output folder")
+    sp.add_argument("--out", help="build-pack / smoke: pack output folder; build-index: index folder (default "
+                                  "<work>/index, or <work>/index_final with --all-include)")
     if train:
         for k, t in (("epochs", int), ("hidden", int), ("layers", int), ("batch-size", int), ("lr", float),
                      ("patience", int)):
@@ -1172,7 +1181,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp2 = sub.add_parser(name)
         _model_args(sp2)
         if name == "build-index":
-            sp2.add_argument("--all-include", action="store_true", help="centroids from every INCLUDE clip (final pack)")
+            sp2.add_argument("--all-include", action="store_true",
+                             help="every reference incl. validation / test clips (the shipped index): writes "
+                                  "<work>/index_final unless --out; never <work>/index (docs 15.21)")
         if name == "evaluate":
             sp2.add_argument("--part", default="test", choices=["val", "test"])
             sp2.add_argument("--all", action="store_true",
@@ -1197,10 +1208,19 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+EX_LEAKAGE = 6  # a leak guard refused the command (docs 15.21): e.g. fit-fusion / evaluate on an eval-including index
+
+
 def main(argv: list[str] | None = None) -> int:
+    from app.isl.models.index import LeakageError
+
     args = build_parser().parse_args(argv)
     paths = isl_paths(args.root)
-    return COMMANDS[args.cmd](paths, args)
+    try:
+        return COMMANDS[args.cmd](paths, args)
+    except LeakageError as e:
+        print(f"refused by the leak guard: {e}", file=sys.stderr)
+        return EX_LEAKAGE
 
 
 if __name__ == "__main__":

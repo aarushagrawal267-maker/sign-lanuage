@@ -1,8 +1,9 @@
 """ISL build pipeline glue used by ``python -m app.isl.cli``: work folders, component loading, evaluation and
 ``build-pack`` (docs/ISL_DESIGN.md section 11).
 
-Work folder per profile: ``<artifacts>/isl/<profile>/`` (classifier.pt, encoder.pt, index/, fusion.json,
-results.json, letters.pt). ``build-pack`` copies them with the vocabulary, the Hindi lexicon (when present) and
+Work folder per profile: ``<artifacts>/isl/<profile>/`` (classifier.pt, encoder.pt, index/ (training parts only:
+fit-fusion and evaluation), index_final/ (every reference: the shipped pack's index), fusion.json, results.json,
+letters.pt). ``build-pack`` copies them with the vocabulary, the Hindi lexicon (when present) and
 a spelling lexicon into ``<artifacts>/packs/<pack id>/`` - ``isl`` for commercial-safe, ``isl-research`` for
 research - which the app loads in place of the tracked ``models/packs/isl`` (vocabulary only).
 """
@@ -44,8 +45,14 @@ def pack_dir(profile: str) -> Path:
 
 
 def load_recognizer(work: Path, fcfg: FeatureConfig, vocab_path: Path | None = None, profile: str = "commercial-safe",
-                    fusion: FusionParams | None = None, with_index: bool = True):
-    """An ``IslRecognizer`` over the components present in a work folder (no My signs)."""
+                    fusion: FusionParams | None = None, with_index: bool = True, for_app: bool = False):
+    """An ``IslRecognizer`` over the components present in a work folder (no My signs).
+
+    Default (fit-fusion, evaluation, every measuring caller): the index is ``<work>/index`` and must pass the leak
+    guard (``EmbeddingIndex.check_for_evaluation``): built from training parts only (``contains_eval`` False, not
+    unknown) with this very ``encoder.pt`` (SHA-256), else ``LeakageError``. ``for_app=True`` (a recogniser that is
+    used, not measured): ``<work>/index_final`` when it exists (every reference, validation and test clips too),
+    else ``<work>/index``; only the encoder SHA-256 is checked (``IndexEncoderMismatch``). docs 15.21."""
     from app.isl.models.encoder import EncoderPredictor
     from app.isl.models.index import EmbeddingIndex
     from app.isl.recognizer import IslRecognizer
@@ -56,8 +63,15 @@ def load_recognizer(work: Path, fcfg: FeatureConfig, vocab_path: Path | None = N
     clf = Predictor(work / "classifier.pt") if (work / "classifier.pt").exists() else None
     enc = EncoderPredictor(work / "encoder.pt") if (work / "encoder.pt").exists() else None
     idx = None
-    if with_index and enc is not None and (work / "index" / "meta.json").exists():
-        idx = EmbeddingIndex.load(work / "index", expect_encoder_version=enc.version)
+    folder = work / "index"
+    if for_app and (work / "index_final" / "meta.json").exists():
+        folder = work / "index_final"
+    if with_index and enc is not None and (folder / "meta.json").exists():
+        if for_app:
+            idx = EmbeddingIndex.load(folder, expect_encoder_version=enc.version, encoder_path=enc.path)
+        else:  # the leak guard checks the encoder SHA-256 itself (LeakageError, also for an index that records none)
+            idx = EmbeddingIndex.load(folder, expect_encoder_version=enc.version)
+            idx.check_for_evaluation(enc.path, where=str(folder))
     if fusion is None:
         fusion = FusionParams.load(work / "fusion.json") if (work / "fusion.json").exists() else FusionParams(profile=profile)
     return IslRecognizer("isl", fcfg, vocab, classifier=clf, encoder=enc, index=idx, fusion=fusion, profile=profile)
@@ -68,8 +82,11 @@ def evaluate(work: Path, data, fcfg: FeatureConfig, smoke: bool, part: str = "te
     from app.isl.evaluation.report import markdown_table, write_results
     from app.isl.training.fit_fusion import collect_evidence
 
+    from app.isl.training.fit_fusion import check_index_for_fitting
+
     rec = load_recognizer(work, fcfg, vocab_path, profile=data.profile)
     clips = data.include_part(part)
+    check_index_for_fitting(rec, clips)  # no index row of a clip being measured (docs 15.21)
     inputs, truths, used = collect_evidence(rec, clips)
     si = data.split.get("signer_independent")
     lab = data.split.get("label") or data.split.get("name")
@@ -190,9 +207,21 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
         if (work / name).exists():
             shutil.copy2(work / name, tmp / name)
             files[name] = _sha(tmp / name)
-    if (work / "index" / "meta.json").exists():
-        shutil.copytree(work / "index", tmp / "index")
+    # the shipped index: <work>/index_final (every reference, validation and test clips too: fine for the app, which
+    # is not measured with it), else the training-only <work>/index. Never one embedded with another encoder file.
+    index_info = None
+    src_index = next((work / n for n in ("index_final", "index") if (work / n / "meta.json").exists()), None)
+    if src_index is not None:
+        from app.isl.models.index import EmbeddingIndex, IndexMeta
+
+        imeta = IndexMeta.from_json(json.loads((src_index / "meta.json").read_text()))
+        if imeta.encoder_sha256 and (work / "encoder.pt").exists() and imeta.encoder_sha256 != _sha(work / "encoder.pt"):
+            # same message and type as the app's loader would raise
+            EmbeddingIndex.load(src_index, encoder_path=work / "encoder.pt")
+        shutil.copytree(src_index, tmp / "index")
         files["index/embeddings.f16.npy"] = _sha(tmp / "index" / "embeddings.f16.npy")
+        index_info = {"built_from": src_index.name, "contains_eval": imeta.contains_eval,
+                      "encoder_sha256": imeta.encoder_sha256 or None}
     # the results the app serves (/api/languages/<id>/results): the phase-2 ``evaluate --all`` report when it exists
     # (same top-level fields: label, smoke, partial_data, protocols), never a phase-1 ``results.json`` left in a
     # reused work folder by an older run; the phase-1 ``evaluate`` results only when there is no phase-2 report
@@ -254,6 +283,8 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
     if enc_version:
         man["components"]["encoder"] = {**man["components"]["encoder"], "version": enc_version}
         man["components"]["index"] = {**man["components"]["index"], "encoder_version": enc_version}
+    if index_info is not None:
+        man["components"]["index"] = {**man["components"]["index"], **index_info}
     (tmp / "pack.json").write_text(json.dumps(man, indent=1, ensure_ascii=False))
     shutil.rmtree(out, ignore_errors=True)
     tmp.replace(out)

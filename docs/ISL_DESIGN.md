@@ -925,7 +925,8 @@ index/embeddings.f16.npy   (N, 256) float16, L2-normalised; N ≈ 2 rows × ~12k
 index/rows.jsonl           {"row": 0, "variant_id": "islrtc:P/Pencil", "concept_id": "isl.pencil", "source": "islrtc",
                             "kind": "first_sign|alt_end|centroid", "weight": 1.0}
 index/meta.json            {"encoder_version": "isl-enc-1", "dim": 256, "n": 24311, "created": "...",
-                            "feature_config": {...}, "profile": "commercial-safe", "sha256": "..."}
+                            "feature_config": {...}, "profile": "commercial-safe", "sha256": "...",
+                            "contains_eval": true, "encoder_sha256": "..."}   (last two: 15.21)
 ```
 
 ```python
@@ -1766,10 +1767,10 @@ everything under `nice -n 10`, stops before any step if less than 10 GB of disk 
 | cv | `train-classifier --split <primary>-fold{1..4} --ckpt <work>/cv/fold<k>/classifier.pt` | E1b mean / spread over folds and a signer-grouped interval pooled over every fold's held-out signers (one fold holds out a single pseudo-signer, so one fold alone cannot give a signer-level interval); `CV_FOLDS=""` skips it |
 | e1a | `train-classifier --split include-official --ckpt <work>/e1a/classifier.pt` | the model E1a needs (official split) |
 | fingerspell | `train-fingerspell` | letter model from every letter source + leave-one-signer-out E5 |
-| index | `build-index --all-sources` | index over training references only (keeps evaluation clean) |
+| index | `build-index --all-sources --out <work>/index` | index over training references only (keeps evaluation clean; 15.21) |
 | fusion | `fit-fusion --all-sources` | fusion weights and thresholds on validation; always writes strict / balanced / lenient |
 | evaluate | `evaluate --all --all-sources` | E1a-E8 -> `<work>/eval/report.json` + `report.md` and `artifacts/packs/<pack>/eval/` |
-| index_final | `build-index --all-sources --all-include` | the shipped index: every reference of every source |
+| index_final | `build-index --all-sources --all-include --out <work>/index_final` | the shipped index: every reference of every source, in its own folder (15.21) |
 | pack | `build-pack` | `artifacts/packs/isl` or `isl-research` (copies `eval/`, lists every source and licence) |
 
 Options: `--from STEP` and `--force S1,S2` (both also delete the training state of the steps they redo; 15.19),
@@ -3126,3 +3127,63 @@ Tests (`test_phase2_guards.py` section 9): a fresh scratch `--from bench` seeds 
 failing at the classifier leaves classifier..pack unstamped, and a plain re-run runs classifier..pack and not the
 encoder; `--from pretrain` lists `pretrain_clips.txt`; `--profile both` passes the tag and the dry run to both
 profiles; empty option values are refused; pre-training refuses a finished state after one clip of the list changed.
+
+### 15.21 A separate final index, and a leak guard on the index (Model QA fix 0.2 / RC8, 27 Nov 2026)
+
+**Bug.** The driver's `index` step built a training-only index in `<work>/index`. Fit-fusion and evaluate read it.
+But the later `index_final` step (`build-index --all-include`) wrote to the same folder. It holds every reference,
+validation and test clips too. So after a full run, `<work>/index` was the eval-including index. Any later fit-fusion
+or evaluate (`--from fusion`, `--only evaluate`, the planned re-runs) would have measured on clips that were in the
+index. Both real work folders were in this state (their `index/meta.json` has the `index_final` time).
+
+**Fix: two folders.**
+* `build-index` writes to `<work>/index` (training parts only). With `--all-include` it writes to
+  `<work>/index_final`. `--out` picks another folder. `--all-include --out <work>/index` is refused (exit 2).
+* The driver passes the folders explicitly: `index` → `--out <work>/index`, `index_final` →
+  `--all-include --out <work>/index_final`. A scratch run seeds `index/` and `index_final/` separately.
+* `build-pack` ships `<work>/index_final` as the pack's `index/`. Without it (an older work folder), it ships
+  `<work>/index`. The app may use the eval-including index: the app is not measured with it.
+  `pack.json` `components.index` now says `built_from`, `contains_eval` and `encoder_sha256`.
+
+**Two new fields in `index/meta.json`.**
+* `contains_eval`: `true` for an `--all-include` build, `false` for a training-only build. An index file written
+  before this change has no field and loads as `None` (unknown).
+* `encoder_sha256`: the SHA-256 of the encoder file the rows were embedded with. `ENCODER_VERSION` is a constant
+  (`isl-enc-1`), so it cannot tell a retrained encoder from the old one. Older files load with `""`.
+
+**The leak guard** (`EmbeddingIndex.check_for_evaluation`, raises `LeakageError`). It runs in `load_recognizer`
+(the default mode, used by fit-fusion and every evaluation), at the start of `fit_fusion`, in phase-1 `evaluate`
+and in `evaluate --all`. It refuses:
+* an index with `contains_eval` true;
+* an index with `contains_eval` unknown. **Rule: an old index is never used to fit or evaluate, wherever it lives.**
+  A folder name cannot prove it is clean: the old `index_final` step wrote exactly to `<work>/index`. The fix is
+  cheap: rebuild it with the `index` step (72 s commercial-safe, 280 s research);
+* an index whose `encoder_sha256` differs from the `encoder.pt` in use, or that records none;
+* an index with a row whose clip id is one of the clips being fitted or measured (a direct check on the rows that
+  carry a clip id: ISLRTC rows and single-clip rows of other sources).
+`evaluate --all` writes the check's result to `report.json` `leakage_guards.index`. `LeakageError` is now one class
+(`app.isl.models.index`); `app.isl.evaluation.runners.LeakageError` is the same class. The CLI turns it into a
+one-line message and exit code 6 (`EX_LEAKAGE`), so the driver log says "step fusion FAILED (exit 6)".
+
+**The app.** `EmbeddingIndex.load(..., encoder_path=...)` compares the SHA-256 when the index records one and raises
+`IndexEncoderMismatch` (a kind of `IndexVersionMismatch`). The pack loader (`app/packs/isl.py`) and
+`load_recognizer(..., for_app=True)` pass the encoder file. `for_app=True` reads `<work>/index_final` when it exists.
+`build-pack` refuses an index embedded with another encoder file. Packs built before this change have no SHA in
+their index and load as before. The ASL path is unchanged.
+
+**Other.** `EmbeddingIndex.save` writes into `<folder>.tmp` and then swaps it in. A killed build no longer leaves
+new embeddings next to an old `meta.json`.
+
+**Re-runs (0.6).** `--force index,fusion,trim_eval,evaluate,index_final,pack` now does the right thing. `index`
+runs first and rebuilds `<work>/index` from the training parts. Fusion and evaluate read it. `index_final` writes
+its own folder, and `pack` ships it. Until that re-run, fit-fusion and evaluate on the real work folders are
+refused (exit 6), because their `<work>/index` is an old, eval-including index. `--from fusion` alone is refused
+for the same reason: start at `--from index` or force `index` too.
+
+Tests (`test_index_leak_guard.py`): an old-format index loads (fields unknown) but is refused for evaluation;
+fit-fusion refuses an index with `contains_eval` and one with another encoder SHA; `load_recognizer` refuses the old
+driver's layout (final index in `<work>/index`), an old-format index and a retrained `encoder.pt`, and gives the app
+`index_final`; the pack ships `index_final`, falls back to `index`, and refuses a stale one; an old pack loads in the
+app loader; `build-index --all-include` writes `index_final` and never `index`; `fit-fusion` on the eval-including
+index exits 6 and writes no `fusion.json`; the driver passes `--out` for both index steps and the 0.6 re-run order
+is index, fusion, trim_eval, evaluate, index_final, pack.

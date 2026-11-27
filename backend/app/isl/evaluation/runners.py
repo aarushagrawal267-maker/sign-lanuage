@@ -22,7 +22,8 @@ E8   trim quality (``cli trim-eval`` report of the run's trimmer, version-checke
 
 Leakage guards: E1 refuses a classifier trained on another split; E2 refuses an encoder whose excluded
 concepts do not cover the (synonym-expanded) held-out set; queries in a duplicate group of any training clip
-(same video hash, same landmark file, landmark near-duplicate) are dropped and counted.
+(same video hash, same landmark file, landmark near-duplicate) are dropped and counted; the retrieval index must be
+the training-only ``work/index`` of this very encoder file (never ``index_final``; docs 15.21).
 """
 
 from __future__ import annotations
@@ -41,15 +42,12 @@ from app.isl.evaluation.report import (PARTIAL_DATA_LABEL, format_interval, git_
                                        interval_fields, interval_reason)
 from app.isl.models.calibration import classifier_alone_decisions, fit_thresholds, summarize
 from app.isl.models.fusion import POLICIES, USER_PREFIX, FusionInputs, FusionParams, decide, fuse
+from app.isl.models.index import LeakageError  # noqa: F401  (one class for every leak guard; re-exported here)
 from app.isl.training.common import engine_crops
 
 E1_POLICY = "balanced"  # E1's summary columns: the sliding mode at the app's default policy (all in "policies")
 DECISION_KEYS = ("top1", "top5", "coverage", "accepted_precision", "not_sure_rate", "wrong_accept_rate",
                  "suggest_rate", "suggest_top5_hit")
-
-
-class LeakageError(RuntimeError):
-    """An evaluation would use data the model was trained on."""
 
 
 # --------------------------------------------------------------------------------------------- helpers
@@ -632,11 +630,15 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     partial = partial_data_flag(work) if partial_data is None else bool(partial_data)
     pre_guard = pretraining_guard(work, data)
     split_name = data.split.get("name")
-    rec = load_recognizer(work, fcfg, vocab_path, profile=profile)
+    rec = load_recognizer(work, fcfg, vocab_path, profile=profile)  # refuses an eval-including / stale index
     prot: dict = {}
     si = data.split.get("signer_independent")
     lab = data.split.get("label") or split_name
     test_inc = data.include_part("test")
+    from app.isl.training.fit_fusion import check_index_for_fitting
+
+    # no index row of a clip that is measured (test) or that fitted the thresholds (val); docs 15.21
+    index_guard = check_index_for_fitting(rec, test_inc + data.extra_part("test") + data.labelled_part("val"))
     # E1b / E1c / E3 on the primary split's test part
     log("E1b")
     prot["E1b"] = e1_closed_set(rec, test_inc, f"E1b core words, closed set, INCLUDE test part of {split_name} ({lab}; "
@@ -780,7 +782,9 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     leak = {"split": split_name, "classifier_split_checked": True,
             "classifier_refused": cls_why, "dedup": getattr(data, "multisource", {}).get("dedup"),
             "links": getattr(data, "multisource", {}).get("links"),
-            "pretraining_excludes_eval_clips": pre_guard.get("excludes_eval_clips"), "pretraining_check": pre_guard}
+            "pretraining_excludes_eval_clips": pre_guard.get("excludes_eval_clips"), "pretraining_check": pre_guard,
+            "index": ({"dir": "index", "training_parts_only": True, **index_guard} if index_guard is not None
+                      else {"dir": None, "note": "no retrieval index"})}
     if smoke:
         label = ("SMOKE RUN on partial data with tiny settings: proves the pipeline runs end to end. These numbers "
                  "are NOT the accuracy of the app.")
