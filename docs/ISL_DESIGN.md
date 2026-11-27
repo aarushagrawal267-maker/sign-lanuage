@@ -101,7 +101,7 @@ All sources (INCLUDE, ISLRTC, CISLR, iSign poses, user takes) are converted to `
 
 **ADR-ISL-5: Hindi through a reviewed lexicon file, not live machine translation.** Every concept has a Hindi entry with source and review status, generated offline and reviewed by people. The UI shows the review status. No Hindi is ever invented at runtime.
 
-**ADR-ISL-6: Data profiles.** `commercial-safe` and `research` are explicit, recorded in every checkpoint and every results file, and shown in the UI.
+**ADR-ISL-6: Data profiles.** `commercial-safe` and `research` are explicit, recorded in every checkpoint and every results file, and shown in the UI. Components of different profiles are never mixed, with one recorded exception: a commercial-safe component in a research pack built with `--allow-profile-mix` (15.44).
 
 ### 3.2 Component diagram (C4 container level)
 
@@ -3857,7 +3857,8 @@ the variable nothing changes. The dry run and the start line of the log name the
    `EVAL_COMPARE_TO=artifacts/isl/commercial-safe/eval/report.json scripts/phase2_train.sh --profile research --tag fallback-csenc --from index --threads 4`.
    The other inputs (vocabulary, classifier, cv, oneshot, letters, link outputs) are seeded from
    `artifacts/isl/research`. E2 one-shot still uses the research one-shot encoders. Its pack is for measuring only:
-   the app refuses a pack whose encoder records another data profile (`ProfileMismatch`, ADR-ISL-6).
+   the app refuses a pack whose encoder records another data profile (`ProfileMismatch`, ADR-ISL-6), unless
+   the pack is built with `--allow-profile-mix` (15.44).
 
 Use `--dry-run` first to see what each command removes, seeds and runs.
 
@@ -4698,3 +4699,102 @@ split that is not a cv split, a missing cv classifier and a leaking fold, all be
 succeeds with `oof_calibration` in its output and the provenance in fusion.json; the selection note follows the folds
 used; clips of a word the fold classifier lacks are dropped; the driver passes `--oof-folds`, refuses an empty
 `CV_FOLDS` and warns on a fusion stamp of the other setting; an explicit `--init` is checked or warned.
+
+### 15.44 Selection gates: choose on validation, confirm once on test; a recorded profile allowance (QA plan "Final model choice logic", critic 9, 27 Nov 2026)
+
+**The problem.** The QA plan ships the retrained research pack only if four gates pass against commercial-safe. If
+one fails, it picks "the best component per role, chosen on those gates". Those gates were test numbers (E1b, E2_seen,
+E3). Choosing among up to 6 combinations on test makes the shipped pack's test numbers optimistic (critic 9). The
+gates were also point comparisons. Gate (a) at parity (0.722 vs 0.723) is a coin flip: one clip-level standard error
+is about 0.016. And the fallback pack (research classifier, commercial-safe encoder) could be measured but never
+loaded: the app raised `ProfileMismatch` for any component of another data profile.
+
+**`cli compare-packs`** (`backend/app/isl/evaluation/compare_packs.py`). Read-only on the work folders.
+`--reference` is the commercial-safe work folder (default `artifacts/isl/commercial-safe`). `--candidate NAME=WORK`
+is repeatable. `--isl500-baseline WORK` is the folder gate (d) must not fall below (the current research run).
+Output: `<out>/compare.json` and `compare.md` (default `artifacts/isl/compare`), with a verdict per candidate.
+
+Two stages, never mixed:
+1. **Selection on validation and out-of-fold numbers only.** No test clip of the primary split is read.
+   * (a) CV out-of-fold top-1 on the folds other than the primary one (their test parts are not E1b's test clips).
+     The classifier's INCLUDE validation top-1 is shown as information only: it is the early-stopping set.
+   * (b) The encoder probe (`<work>/eval/encoder_probe.json`, INCLUDE validation -> ISLRTC rows, docs 15.41), paired on
+     the common INCLUDE queries. And E2 one-shot on the held-out-concept queries of the validation part.
+   * (c) The strict worst-source lower bound in `fusion.json` (fitted on validation or out-of-fold clips). Each side
+     is already a 95 % lower bound, so this is a plain comparison.
+   * (d) ISL500 validation top-1 against the baseline, only when both used the same validation clips. Signer split v2
+     moves 2 signers into validation, so a v1 baseline is "not available" here; the test check still applies.
+   * A failed selection gate rejects the candidate. Among the others one is selected by a fixed rule: most passed
+     selection checks, then the CV difference, then the probe difference.
+2. **One confirmation on test, for the selected candidate only.**
+   * (a) E1b top-1 on the common test clips (strict labels), and CV pooled over every fold.
+   * (b) E2_seen top-1, and E2 one-shot on the test-part queries.
+   * (c) The strict certificate holds on test: for every major source, the test precision of the strict threshold
+     rule (E3) is at least the validation lower bound. Fewer than 30 test accepts: inconclusive.
+   * (d) ISL500 test top-1, classifier alone (E1c) and fused (E3), no worse than the baseline.
+   * Ship only when every test gate is pass or not applicable, and no input is stale.
+   * The other candidates' test numbers are never looked at. If no candidate passes selection, the verdict is the
+     plan's fallback: the research pack ships commercial-safe's encoder and classifier.
+
+**Statistics of one check.** Paired on the clip ids both systems measured: McNemar's exact test on the discordant
+clips, and the paired difference with a clip-level Agresti-Min interval (never zero-width). With at least 5 signer
+groups there is also a bootstrap over signer groups; the wider interval counts. Pass: the lower end is at least
+`-margin` (non-inferiority). Fail: the upper end is below `-margin`. Otherwise inconclusive, which does not ship.
+Margins are fixed before looking and recorded: top-1 0.02 (about one clip standard error at n 800; also the plan's
+E2_seen margin), E2 one-shot 0.01, ISL500 0.01, lower bound 0. Change them with `--margin-*`, before the first look.
+
+**Honest limits.**
+* E1b has 4 INCLUDE signer groups and ISL500 test has 2 users. A signer-level interval needs 5, so those checks rest
+  on the clip-level interval, which treats clips of one signer as independent. That interval is optimistic. The
+  report gives every group's difference (`per_group`, `groups_worse`) so a pass carried by one signer is visible.
+* Without per-clip records a check falls back to an unpaired comparison of the two rates (said so). That interval is
+  wider than a paired one on the same clips, and it is not like for like when the clip sets differ. E1b and E1c can
+  always be paired: report.json has their clip ids and hit bits (15.27). Their signer groups then come from
+  `splits/include_groups.json` (pseudo-signer, the INCLUDE adapter's group) and from the ISL500 user in the clip id.
+* A side is **stale** when report.json measured another `encoder.pt` (index SHA-256) or a classifier, encoder or
+  fusion file is newer than the report. A stale candidate or reference never ships. An encoder probe of another
+  encoder file is not used.
+* Every confirmation is appended to `<out>/test_looks.jsonl` (candidate, component SHA-256s, gates). A second look
+  from the same folder is reported: it is no longer a single confirmation. Only this folder is tracked.
+* `--select-only` stops after selection and writes nothing to the ledger.
+
+**Per-clip records for paired tests (opt-in).** `evaluate --all --per-clip`, or `ISL_EVAL_PER_CLIP=1` in the
+environment (so a driver run can ask for them without a driver change), also writes `<work>/eval/per_clip.json`. It
+holds every clip's hit@1, signer group and source for E1b, every CV fold, E1c, E3, E2_seen and E2 one-shot. E2 also
+records each query's part (val or test); that split is what lets gate (b) select on validation queries. The file names
+the report it belongs to (`report_created`); compare-packs ignores a file of another run. report.json then has
+`per_clip_file`. Without the flag report.json and every other output are unchanged. The driver was not changed (it
+was running); set `ISL_EVAL_PER_CLIP=1` for the evaluate step of the next run.
+
+**A recorded, licence-compatible profile allowance.** ADR-ISL-6 still refuses mixed profiles, with one exception.
+* `profiles.component_profile_allowed(component, pack)`: the same profile, or a component whose every source the
+  pack's profile may also read, and never a non-commercial component in a commercial pack. Today that is exactly: a
+  commercial-safe component in a research pack. Never the reverse.
+* `build-pack --allow-profile-mix` records each such component in `pack.json` `mixed_profiles.<component>`: its
+  profile, the file's SHA-256 and the reason. An incompatible component (a research one in a commercial-safe pack) is
+  refused at build time. Without the flag nothing changes: the pack builds, build-pack prints a note, and the app
+  refuses it.
+* The app (`app/packs/isl.py` `check_component_profiles`) loads a component of another profile only when it is
+  compatible AND recorded with that profile AND, when a SHA-256 is recorded, the file matches. The recogniser info
+  shows `mixed_profiles`. A research pack's licence list already covers commercial-safe's sources, a subset.
+* The QA 0.6 fallback pack (research classifier + commercial-safe encoder) can now be shipped, if compare-packs
+  selects and confirms it: `build-pack --profile research --allow-profile-mix --out <pack folder>` on that work folder.
+
+**Commands** (after the runs; each from the repo root, read-only on the work folders):
+1. Probes for gate (b) selection, one per work folder (the commercial-safe one is the bar):
+   `python -m app.isl.cli encoder-probe --encoder artifacts/isl/commercial-safe/encoder.pt --out artifacts/isl/commercial-safe/eval/encoder_probe.json`
+   and the same for each candidate.
+2. Selection only, to see the ranking: `python -m app.isl.cli compare-packs --candidate research=artifacts/isl/research --candidate fallback=artifacts/isl/runs/fallback-csenc/research --isl500-baseline <current research copy> --select-only`.
+3. Then once, without `--select-only`, for the confirmation.
+
+Tests: `backend/tests/isl/test_compare_packs.py`. McNemar values; paired verdicts (equal, worse, better, a small
+sample that cannot pass, 4 groups without a group interval); a group bootstrap wider than the clip interval when groups
+disagree; the unpaired fallback. On synthetic work folders: a candidate that is better on test but worse on
+validation is rejected and its test numbers are never computed; the selected one is confirmed once, paired, on
+test-part queries only, and the ledger counts a second look; `--select-only` writes no ledger; a candidate that passes
+everything ships, and with no eligible candidate the verdict is the fallback; gate (d) fails a regression against the
+baseline and does not apply without ISL500 clips; stale reports and a per-clip file of another run; the CLI. On the
+tiny trained world: `--per-clip` is opt-in and matches the report (E2 parts are the real val / test parts). Profile
+allowance: the rule, the manifest record, the SHA-256 check, and a research pack with a commercial-safe encoder that
+the app refuses by default and loads with `--allow-profile-mix`; a commercial-safe pack with research components is
+refused at build time.

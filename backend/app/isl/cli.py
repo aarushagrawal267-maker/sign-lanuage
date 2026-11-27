@@ -58,6 +58,8 @@ training ones --resume / --max-minutes (exit code 75 = stopped with state saved,
   encoder-probe --encoder PATH [--out FILE] [--bar FILE|R1]
                          any encoder.pt on the dictionary validation protocol (per-source recall@1/@5 against the
                          ISLRTC rows; read-only, writes only --out); --bar warns below a previous probe's INCLUDE r1
+  compare-packs --candidate NAME=WORK [--reference WORK] [--isl500-baseline WORK]
+                         which research pack to ship: select on validation, confirm once on test (docs 15.44)
   train-fingerspell      letter model from every letter source (+ leave-one-group-out E5)
   evaluate --all         E1a/E1b/E1c/E2/E3/E4/E5/E6/E7/E8 -> <work>/eval and <pack>/eval report.json + report.md
   bench                  CPU seconds per training step for the model sizes (for the time budget)
@@ -1189,6 +1191,14 @@ def cmd_evaluate(paths: IslPaths, args) -> int:
         print("evaluate --compare-to needs --all (the like-for-like rows are part of the full evaluation)",
               file=sys.stderr)
         return 2
+    # per-clip records for compare-packs (docs 15.44): --per-clip, or ISL_EVAL_PER_CLIP=1 from the environment (so a
+    # driver run can ask for them without a driver change); opt-in, report.json is unchanged without them
+    import os
+
+    per_clip = bool(getattr(args, "per_clip", False)) or os.environ.get("ISL_EVAL_PER_CLIP", "") == "1"
+    if getattr(args, "per_clip", False) and not getattr(args, "all", False):
+        print("evaluate --per-clip needs --all", file=sys.stderr)
+        return 2
     profile, data, fcfg, work = _model_ctx(paths, args)
     if getattr(args, "all", False):
         from app.isl.evaluation.runners import evaluate_all
@@ -1197,13 +1207,58 @@ def cmd_evaluate(paths: IslPaths, args) -> int:
         outs = [Path(args.out) / "eval"] if args.out else [pack_dir(profile) / "eval"]
         doc = evaluate_all(work, data, fcfg, profile=profile, smoke=args.smoke, vocab_path=_vocab_path(args),
                            paths=paths, out_dirs=outs, progress=lambda m: _log(f"  evaluate {m}"),
-                           compare_to=Path(args.compare_to) if getattr(args, "compare_to", None) else None)
+                           compare_to=Path(args.compare_to) if getattr(args, "compare_to", None) else None,
+                           per_clip=per_clip)
         _print({"report": [str(work / "eval" / "report.json")] + [str(o / "report.json") for o in outs],
                 **{k: {"n": v.get("n"), "metrics": v.get("metrics"), "run": v.get("run", True)}
                    for k, v in doc["protocols"].items()}})
         return 0
     doc = evaluate(work, data, fcfg, smoke=args.smoke, part=args.part, vocab_path=_vocab_path(args))
     _print({k: {"n": v.get("n"), "metrics": v.get("metrics")} for k, v in doc["protocols"].items()})
+    return 0
+
+
+def cmd_compare_packs(paths: IslPaths, args) -> int:
+    """Which research pack to ship (QA plan "Final model choice logic", critic 9; docs 15.44): selection on
+    validation / out-of-fold numbers, then one confirmation on test for the selected candidate. Read-only on the work
+    folders; writes ``<out>/compare.json``, ``compare.md`` and appends ``<out>/test_looks.jsonl``."""
+    from app.core.config import get_settings
+    from app.isl.evaluation.compare_packs import DEFAULT_MARGINS, compare
+
+    def refuse(msg: str) -> int:
+        print(f"compare-packs: {msg}", file=sys.stderr)
+        return 2
+
+    cands: dict[str, Path] = {}
+    for c in args.candidate or []:
+        name, sep, d = c.partition("=")
+        if not sep or not name or not d:
+            return refuse(f"--candidate {c!r}: use NAME=WORK_DIR")
+        if name in cands:
+            return refuse(f"--candidate {name} given twice")
+        if not Path(d).is_dir():
+            return refuse(f"--candidate {name}: {d} is not a folder")
+        cands[name] = Path(d)
+    if not cands:
+        return refuse("give at least one --candidate NAME=WORK_DIR")
+    ref = Path(args.reference) if args.reference else get_settings().artifacts_dir / "isl" / "commercial-safe"
+    if not (ref / "eval" / "report.json").is_file():
+        return refuse(f"--reference {ref}: no eval/report.json (run evaluate --all there first)")
+    base = Path(args.isl500_baseline) if args.isl500_baseline else None
+    if base is not None and not base.is_dir():
+        return refuse(f"--isl500-baseline {base} is not a folder")
+    out = Path(args.out) if args.out else get_settings().artifacts_dir / "isl" / "compare"
+    margins = {k: v for k, v in (("top1", args.margin_top1), ("oneshot", args.margin_oneshot),
+                                 ("isl500", args.margin_isl500), ("lower_bound", args.margin_lower_bound))
+               if v is not None}
+    if any(v < 0 for v in margins.values()):
+        return refuse("margins must be >= 0")
+    doc = compare(ref, cands, baseline=base, out=out, splits_dir=paths.splits, margins={**DEFAULT_MARGINS, **margins},
+                  select_only=args.select_only, boot=args.boot, seed=args.seed)
+    _print({"out": str(out / "compare.json"), "selected": doc["selected"], "verdict": doc["verdict"],
+            "candidates": {n: {"verdict": e.get("verdict"), "selection": e["selection"]["gates"],
+                               "test": (e.get("confirmation") or {}).get("gates")}
+                           for n, e in doc["candidates"].items()}})
     return 0
 
 
@@ -1237,7 +1292,7 @@ def cmd_build_pack(paths: IslPaths, args) -> int:
 
     profile = get_profile(args.profile or "commercial-safe").name
     _print(build_pack(workdir(profile), profile, ISL_FEATURES, Path(args.out) if args.out else None, smoke=args.smoke,
-                      vocab_path=_vocab_path(args)))
+                      vocab_path=_vocab_path(args), allow_profile_mix=getattr(args, "allow_profile_mix", False)))
     return 0
 
 
@@ -1548,6 +1603,7 @@ COMMANDS = {
     "link-sources": cmd_link_sources, "pretrain": cmd_pretrain, "train-oneshot": cmd_train_oneshot,
     "train-fingerspell": cmd_train_fingerspell, "bench": cmd_bench, "readiness": cmd_readiness,
     "pretrain-dedup": cmd_pretrain_dedup, "variant-audit": cmd_variant_audit, "encoder-probe": cmd_encoder_probe,
+    "compare-packs": cmd_compare_packs,
 }
 
 
@@ -1726,6 +1782,20 @@ def build_parser() -> argparse.ArgumentParser:
     ep.add_argument("--bar", help="a probe JSON (its include_r1) or a number: warn when INCLUDE r1 is below it")
     ep.add_argument("--bar-margin", type=float, default=0.02,
                     help="bar.clears = INCLUDE r1 >= bar + this (default 0.02, about one clip standard error)")
+    cp = sub.add_parser("compare-packs")
+    cp.add_argument("--reference", help="reference work folder (default <artifacts>/isl/commercial-safe)")
+    cp.add_argument("--candidate", action="append",
+                    help="NAME=WORK_DIR, repeatable (e.g. research=artifacts/isl/research)")
+    cp.add_argument("--isl500-baseline", dest="isl500_baseline",
+                    help="work folder whose ISL500 numbers gate (d) must not fall below (e.g. the current research)")
+    cp.add_argument("--out", help="output folder (default <artifacts>/isl/compare)")
+    cp.add_argument("--margin-top1", type=float, default=None, help="non-inferiority margin, top-1 gates (0.02)")
+    cp.add_argument("--margin-oneshot", type=float, default=None, help="margin, E2 one-shot (0.01)")
+    cp.add_argument("--margin-isl500", type=float, default=None, help="margin, ISL500 gate (d) (0.01)")
+    cp.add_argument("--margin-lower-bound", type=float, default=None, help="margin, strict lower bound gate (c) (0)")
+    cp.add_argument("--select-only", action="store_true", help="selection on validation only; test not looked at")
+    cp.add_argument("--boot", type=int, default=2000, help="signer-group bootstrap resamples")
+    cp.add_argument("--seed", type=int, default=0)
     pdd = sub.add_parser("pretrain-dedup")
     _model_args(pdd)
     pdd.add_argument("--max-chunks", type=int, default=0, help="smoke: check at most N Sign Library chunks")
@@ -1765,6 +1835,11 @@ def build_parser() -> argparse.ArgumentParser:
             sp2.add_argument("--oof-allow-test-selected", action="store_true",
                              help="also use a fold whose classifier was early-stopped on primary (E1b) test clips "
                                   "(its validation part holds them; fold 4 of 5). Default: skipped (docs 15.43)")
+        if name == "build-pack":
+            sp2.add_argument("--allow-profile-mix", dest="allow_profile_mix", action="store_true",
+                             help="record a licence-compatible component of another data profile (a commercial-safe "
+                                  "encoder / classifier in a research pack, never the reverse) in pack.json "
+                                  "mixed_profiles, so the app loads it (docs 15.44); default: off (the app refuses)")
         if name == "evaluate":
             sp2.add_argument("--part", default="test", choices=["val", "test"])
             sp2.add_argument("--all", action="store_true",
@@ -1774,6 +1849,10 @@ def build_parser() -> argparse.ArgumentParser:
                                   "report.json); E1b also reports top-1/top-5 on its class set and on the clips both "
                                   "evaluated; E4 compares the INCLUDE-only user-sign false-accept rate (docs 15.27, "
                                   "15.28)")
+            sp2.add_argument("--per-clip", dest="per_clip", action="store_true",
+                             help="needs --all: also <work>/eval/per_clip.json (every clip's hit@1, signer group and "
+                                  "source for E1b, CV folds, E1c, E3, E2_seen, E2), which compare-packs pairs on; "
+                                  "env ISL_EVAL_PER_CLIP=1 does the same (docs 15.44)")
     hi = sub.add_parser("hindi")
     hi.add_argument("--translate", action="store_true", help="run IndicTrans2 on CPU for concepts not in the cache")
     hi.add_argument("--limit", type=int, default=0, help="translate at most N new inputs (0 = all)")

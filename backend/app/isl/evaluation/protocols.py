@@ -42,8 +42,9 @@ def e1_classifier(inputs: list[FusionInputs], truths: list[str], clips: list[Cli
             **interval_fields({"top1": (hit.tolist(), groups), "top5": (top5.astype(float).tolist(), groups)})}
 
 
-def e2_retrieval(rec, clips: list[Clip], label: str) -> dict | None:
-    """INCLUDE clips (another signer group) queried against the ISLRTC dictionary rows only."""
+def e2_retrieval(rec, clips: list[Clip], label: str, records: dict | None = None) -> dict | None:
+    """INCLUDE clips (another signer group) queried against the ISLRTC dictionary rows only. ``records``: when a dict,
+    it is filled with the per-clip record of the queries (``runners.clip_record``; docs 15.44)."""
     from app.features.build import FeatureError, build_features
 
     if rec.index is None or rec.encoder is None:
@@ -56,7 +57,7 @@ def e2_retrieval(rec, clips: list[Clip], label: str) -> dict | None:
     cpos = {c: i for i, c in enumerate(isl_concepts)}
     rc = np.array([cpos.get(r["concept_id"], -1) for r in idx.rows])
     hits: dict[int, list[float]] = {1: [], 5: [], 10: []}
-    groups = []
+    groups, used = [], []
     for c in clips:
         if c.concept_id not in cpos:
             continue
@@ -72,6 +73,11 @@ def e2_retrieval(rec, clips: list[Clip], label: str) -> dict | None:
         for k in hits:
             hits[k].append(float(c.concept_id in ranked[:k]))
         groups.append(c.group)
+        used.append(c)
+    if records is not None and used:
+        from app.isl.evaluation.runners import clip_record
+
+        records.update(clip_record(used, hits[1]))
     return {"label": label, "n": len(groups), "n_groups": len(set(groups)), "gallery_concepts": len(isl_concepts),
             "metrics": {f"top{k}": (float(np.mean(v)) if v else None) for k, v in hits.items()},
             **interval_fields({"top1": (hits[1], groups)})}

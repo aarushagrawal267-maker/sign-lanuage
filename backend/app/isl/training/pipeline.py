@@ -251,7 +251,12 @@ def check_letters_profile(path: Path, profile: str) -> None:
 
 
 def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None = None, smoke: bool = False,
-               vocab_path: Path | None = None) -> dict:
+               vocab_path: Path | None = None, allow_profile_mix: bool = False) -> dict:
+    """Assemble the pack folder from a work folder. ``allow_profile_mix`` (opt-in, docs/ISL_DESIGN.md 15.44): a
+    component built under another data profile that is licence-compatible with this one (a commercial-safe encoder
+    or classifier in a research pack, never the reverse) is recorded in ``pack.json`` ``mixed_profiles``, which is
+    what lets the app load it; an incompatible one is refused. Without it nothing changes: such a pack builds as
+    before and the app refuses it (``ProfileMismatch``)."""
     from app.isl.fingerspell.lexicon import build_spelling_lexicon, write_spelling_lexicon
     from app.packs.vocabulary import Vocabulary
 
@@ -366,6 +371,29 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
             shutil.rmtree(tmp, ignore_errors=True)
             raise ValueError(f"{work / 'fusion.json'} was fitted on another class space ({', '.join(bad)}) than the "
                              "components of this pack: run fit-fusion (and evaluate) again before build-pack")
+    # components built under another data profile (docs 15.44): recorded only on request and only when compatible
+    comp_prof = {"classifier": cls_meta.get("profile") if (work / "classifier.pt").exists() else None,
+                 "encoder": enc_meta.get("profile") if (work / "encoder.pt").exists() else None,
+                 "index": imeta.profile if src_index is not None else None,
+                 "fusion": FusionParams.load(work / "fusion.json").profile if (work / "fusion.json").exists() else None}
+    other = {k: v for k, v in comp_prof.items() if v and v != prof.name}
+    mixed = {}
+    if other and allow_profile_mix:
+        from app.isl.profiles import component_profile_allowed
+
+        bad = {k: v for k, v in other.items() if not component_profile_allowed(v, prof.name)}
+        if bad:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise ValueError(f"refusing to build a {prof.name} pack with components of another data profile: {bad} "
+                             "(only a commercial-safe component in a research pack is licence-compatible)")
+        fname = {"classifier": "classifier.pt", "encoder": "encoder.pt", "fusion": "fusion.json"}
+        for k, v in other.items():
+            mixed[k] = {"profile": v, **({"sha256": files[fname[k]]} if fname.get(k) in files else {}),
+                        "reason": f"licence-compatible: every source the {v} profile reads is allowed in {prof.name}; "
+                                  "recorded by build-pack --allow-profile-mix (docs/ISL_DESIGN.md 15.44)"}
+    elif other:
+        print(f"build-pack: components of another data profile {other}: the app will refuse this pack "
+              "(ProfileMismatch) unless it is built with --allow-profile-mix (docs 15.44)", file=sys.stderr)
     from app.isl.training.readiness import partial_data_flag
 
     base = json.loads((PACK_DIR / "pack.json").read_text())
@@ -400,6 +428,8 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
     vl = variant_links_summary(read_link_settings(work))
     if vl:
         man["variant_links"] = vl
+    if mixed:
+        man["mixed_profiles"] = mixed
     (tmp / "pack.json").write_text(json.dumps(man, indent=1, ensure_ascii=False))
     shutil.rmtree(out, ignore_errors=True)
     tmp.replace(out)

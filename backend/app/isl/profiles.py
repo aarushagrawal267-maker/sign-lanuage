@@ -84,3 +84,22 @@ def get_profile(name: str | DataProfile | None = None) -> DataProfile:
         return PROFILES[name]
     except KeyError:
         raise ValueError(f"unknown data profile {name!r}; choose one of {sorted(PROFILES)}") from None
+
+
+def component_profile_allowed(component: str | None, pack: str | None) -> bool:
+    """May a component built under data profile ``component`` serve in a pack of profile ``pack``? Yes for the same
+    profile. Otherwise only when it is licence-compatible: every source the component's profile may read is also one
+    the pack's profile may read, and a commercial pack never takes a non-commercial component. Today that allows a
+    commercial-safe component in a research pack, never the reverse (docs/ISL_DESIGN.md 15.44). Unknown profiles:
+    no. The app still needs the allowance recorded in the pack manifest (``mixed_profiles``) to load such a pack."""
+    if not component or not pack:
+        return False
+    if component == pack:
+        return True
+    try:
+        c, p = get_profile(component), get_profile(pack)
+    except ValueError:
+        return False
+    if p.commercial and not c.commercial:
+        return False
+    return set(c.all_sources()) <= set(p.all_sources())

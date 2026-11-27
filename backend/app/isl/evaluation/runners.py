@@ -178,6 +178,20 @@ def _bits(x) -> str:
     return "".join("1" if v else "0" for v in np.asarray(x, bool))
 
 
+PER_CLIP_FILE = "per_clip.json"  # evaluate --all --per-clip (docs 15.44): what compare-packs pairs on
+
+
+def clip_record(clips, hit1, parts: list[str] | None = None) -> dict:
+    """One protocol's per-clip record for ``per_clip.json``: clip ids, hit@1 bits, signer group and source of each
+    clip (and the part, val or test, when the protocol mixes them). Paired gates need all four (docs 15.44)."""
+    out = {"clip_ids": [c.clip_id for c in clips], "hit1": _bits(np.asarray(hit1, float) > 0.5),
+           "groups": [getattr(c, "group", None) or c.clip_id for c in clips],
+           "sources": [getattr(c, "source", None) for c in clips]}
+    if parts is not None:
+        out["parts"] = list(parts)
+    return out
+
+
 def _parse_utc(stamp) -> float | None:
     """A report's ``created`` (``%Y-%m-%dT%H:%M:%SZ``, UTC) as epoch seconds, or None."""
     import calendar
@@ -499,7 +513,7 @@ def e1_closed_set(rec, clips, label: str, split_name: str, kind: str, reference:
             "interval_note": None if interval_reason(hit.tolist(), groups) is None else
             f"{interval_reason(hit.tolist(), groups)} in this test part: a signer-level interval needs more held-out "
             "signers (the cross-validation folds pool them)",
-            "_hits": hit.tolist(), "_groups": groups,
+            "_hits": hit.tolist(), "_groups": groups, "_per_clip": clip_record(used, hit),
             "per_category_top1": {k: round(float(np.mean(v)), 4) for k, v in sorted(per_cat.items())}, **record}
 
 
@@ -595,6 +609,7 @@ def e3_fused(rec, clips, label: str, alias_of: dict | None = None, variant_of: d
             "metrics": _metrics_from(block), **block, "risk_coverage": curve,
             "aurc": float(np.mean([c["risk"] for c in curve])),
             "top1_by_source": {k: {"n": len(v), "top1": float(np.mean(v))} for k, v in sorted(by_src.items())},
+            "_per_clip": clip_record(used, ok),
             **({"alias_labels": e3_alias_rates(results, truths, rec.fusion, alias_of, closed)} if alias_of else {}),
             **({"word_labels": word} if word is not None else {})}
 
@@ -651,6 +666,7 @@ def e2_oneshot_fold(enc, fold: dict, data, linker, fcfg, base_params: FusionPara
     inc_eval = data.include_part("val") + data.include_part("test")
     queries = [c for c in inc_eval if c.concept_id in set(fold["held_out_concepts"]) and c.concept_id in gal_concepts]
     queries, dropped = drop_trained_duplicates(queries, train_clips_of_encoder, getattr(data, "dedup", None))
+    test_ids = {c.clip_id for c in data.include_part("test")}  # per-clip records name each query's part (15.44)
     calib = [c for c in data.include_part("val") if c.concept_id not in held and c.concept_id in gal_concepts]
     seen = [c for c in data.include_part("test") if c.concept_id not in held and c.concept_id in gal_concepts]
 
@@ -703,7 +719,8 @@ def e2_oneshot_fold(enc, fold: dict, data, linker, fcfg, base_params: FusionPara
                      "gallery_concepts": len(ids) if ids is not None else len(gal_concepts),
                      "metrics": _metrics_from(block, {f"top{k}": float(np.mean(v)) for k, v in hits.items()}),
                      **interval_fields({f"top{k}": (v, groups) for k, v in hits.items()}),
-                     "_hits": hits, "_groups": groups, "_block": block}
+                     "_hits": hits, "_groups": groups, "_block": block,
+                     "_per_clip": clip_record(qu, hits[1], ["test" if c.clip_id in test_ids else "val" for c in qu])}
     si, st, su = run(seen)
     if si:
         res = [fuse(i, params) for i in si]
@@ -754,9 +771,14 @@ def e2_pool(folds: list[dict]) -> dict:
                      "metrics": {f"top{k}": float(np.mean(v)) for k, v in hits.items()} | pol["balanced"],
                      **interval_fields({f"top{k}": (v, groups) for k, v in hits.items()}),
                      "policies": pol}
+        recs = [p["_per_clip"] for p in parts if p.get("_per_clip")]
+        if recs and len(recs) == len(parts):  # per-clip records of every fold, pooled (popped before writing)
+            out[name]["_per_clip"] = {k: ("".join(r[k] for r in recs) if k == "hit1" else
+                                          sum((list(r[k]) for r in recs), []))
+                                      for k in recs[0]}
     for f in folds:
         for name in ("full", "restricted"):
-            for k in ("_hits", "_groups", "_block"):
+            for k in ("_hits", "_groups", "_block", "_per_clip"):
                 f.get(name, {}).pop(k, None)
     return out
 
@@ -1166,8 +1188,12 @@ def variant_links_summary(link: dict | None) -> dict | None:
 
 def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_path: Path | None = None,
                  paths=None, out_dirs: list[Path] | None = None, e4_ks=E4_KS, latency_n: int = 20,
-                 progress=None, partial_data: bool | None = None, compare_to: Path | None = None) -> dict:
+                 progress=None, partial_data: bool | None = None, compare_to: Path | None = None,
+                 per_clip: bool = False) -> dict:
     """Run every protocol whose components exist in ``work`` and write ``eval/report.json`` + ``report.md``.
+    ``per_clip`` (opt-in, docs 15.44): also ``eval/per_clip.json`` with every clip's hit@1, signer group and source
+    for E1b, the CV folds, E1c, E3, E2_seen and E2 one-shot (what ``compare-packs`` pairs on); report.json then
+    names it in ``per_clip_file``. Off: report.json is unchanged.
     ``compare_to``: another evaluation report.json (e.g. the commercial-safe pack's); E1b then also reports top-1 /
     top-5 on that report's class set and on the clips both evaluated (``E1b.like_for_like``, docs 15.27), and E4
     compares the INCLUDE-only user-sign false-accept rate with the reference's (``E4.like_for_like``, docs 15.28)."""
@@ -1188,6 +1214,8 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     split_name = data.split.get("name")
     rec = load_recognizer(work, fcfg, vocab_path, profile=profile)  # refuses an eval-including / stale index
     prot: dict = {}
+    cv_records: dict = {}
+    e2_records: dict = {}
     si = data.split.get("signer_independent")
     lab = data.split.get("label") or split_name
     test_inc = data.include_part("test")
@@ -1243,6 +1271,7 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
             r2 = load_recognizer(work, fcfg, vocab_path, profile=profile)
             r2.classifier = pr
             folds.append(e1_closed_set(r2, fold_test, sname, sname, "cv"))
+        cv_records = {f["label"]: f.get("_per_clip") for f in folds if f.get("run") and f.get("_per_clip")}
         runs = [f for f in [prot["E1b"], *folds] if f.get("run")]
         tops = [f["metrics"]["top1"] for f in runs]
         if len(runs) > 1:
@@ -1331,6 +1360,10 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
             except LeakageError as e:
                 folds.append({"fold": k, "run": False, "leakage": str(e)})
         pooled = e2_pool(folds)
+        for name in ("full", "restricted"):  # never into report.json
+            r_ = (pooled.get(name) or {}).pop("_per_clip", None)
+            if name == "full" and r_:
+                e2_records = r_
         full = pooled.get("full", {})
         seen_gal = pre_guard.get("islrtc_clips_seen_unlabelled")
         prot["E2"] = {"label": "E2 open vocabulary, one-shot: concepts held out of ALL supervised training (synonyms "
@@ -1358,8 +1391,9 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
                       "oneshot_concepts.json; the seen-class retrieval number is in E2_seen"}
     from app.isl.evaluation.protocols import e2_retrieval
 
+    e2s_records: dict | None = {} if per_clip else None
     e2s = e2_retrieval(rec, test_inc, "E2_seen: INCLUDE test clips vs ISLRTC rows only; SEEN classes (the encoder "
-                       "trained on these concepts' other clips) - not the open-vocabulary number")
+                       "trained on these concepts' other clips) - not the open-vocabulary number", records=e2s_records)
     if e2s:
         prot["E2_seen"] = e2s
     log("E4")
@@ -1373,8 +1407,20 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     prot["E7"] = e7_asl_regression(REPO_ROOT)
     if paths is not None:
         prot["E8"] = e8_trim(paths, get_settings().artifacts_dir, work)
+    pc_doc = None
+    if per_clip:
+        pc = {k: prot[k].get("_per_clip") for k in ("E1b", "E1c", "E3") if (prot.get(k) or {}).get("_per_clip")}
+        if cv_records:
+            pc["E1b_cv"] = cv_records
+        if e2_records:
+            pc["E2"] = e2_records
+        if e2s_records:
+            pc["E2_seen"] = e2s_records
+        pc_doc = {"schema": 1, "split": split_name, "profile": profile, "protocols": pc,
+                  "note": "hit1: one 0/1 per clip in clip_ids order; groups: signer group; E2 parts: val / test "
+                          "(compare-packs selects on val, confirms on test; docs 15.44)"}
     for v in prot.values():
-        for k in ("_hits", "_groups"):
+        for k in ("_hits", "_groups", "_per_clip"):
             v.pop(k, None)
     leak = {"split": split_name, "classifier_split_checked": True,
             "classifier_refused": cls_why, "dedup": getattr(data, "multisource", {}).get("dedup"),
@@ -1406,6 +1452,13 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     ep = encoder_probe_summary(work)
     if ep is not None:  # only when the driver ran encoder-probe (ENC_BAR, docs 15.41): no new key otherwise
         doc["encoder_probe"] = ep
+    if pc_doc is not None:  # opt-in (docs 15.44): the per-clip file belongs to this very report
+        pc_doc["report_created"] = doc["created"]
+        doc["per_clip_file"] = PER_CLIP_FILE
+        (work / "eval").mkdir(parents=True, exist_ok=True)
+        (work / "eval" / PER_CLIP_FILE).write_text(json.dumps(pc_doc, ensure_ascii=False, default=float))
+    # without --per-clip an older per_clip.json is left alone: compare-packs ignores one whose report_created is not
+    # this report's
     md = markdown_report(doc)
     for d in [work / "eval", *(out_dirs or [])]:
         d.mkdir(parents=True, exist_ok=True)

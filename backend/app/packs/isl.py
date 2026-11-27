@@ -28,6 +28,51 @@ class ProfileMismatch(ValueError):
     pass
 
 
+MIX_HINT = ("a commercial-safe component may serve in a research pack only when the pack records it: rebuild with "
+            "'python -m app.isl.cli build-pack --profile research --allow-profile-mix' (docs/ISL_DESIGN.md 15.44)")
+
+
+def _file_sha256(p: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with Path(p).open("rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def check_component_profiles(manifest: PackManifest, profiles: dict[str, str | None],
+                             files: dict[str, Path | None] | None = None) -> dict[str, dict]:
+    """ADR-ISL-6, never mix data profiles, with one explicit exception (docs/ISL_DESIGN.md 15.44): a component built
+    under another profile is accepted only when (1) it is licence-compatible with the pack's profile
+    (``profiles.component_profile_allowed``: a commercial-safe component in a research pack, never the reverse) and
+    (2) the pack manifest records it in ``mixed_profiles.<component>`` with that profile (and, when recorded, the
+    file's SHA-256). Returns the accepted records; raises ``ProfileMismatch`` otherwise."""
+    from app.isl.profiles import component_profile_allowed
+
+    prof = manifest.profile
+    declared = getattr(manifest, "mixed_profiles", None) or {}
+    accepted, refused = {}, {}
+    for k, v in profiles.items():
+        if not v or v == prof or k == "pack":
+            continue
+        rec = declared.get(k) if isinstance(declared, dict) else None
+        if not component_profile_allowed(v, prof):
+            refused[k] = f"{v} (never allowed in a {prof} pack)"
+        elif not isinstance(rec, dict) or rec.get("profile") != v:
+            refused[k] = f"{v} (licence-compatible, but not recorded in the pack manifest)"
+        elif rec.get("sha256") and (files or {}).get(k) is not None and Path(files[k]).is_file() \
+                and _file_sha256(files[k]) != rec["sha256"]:
+            refused[k] = f"{v} (the manifest's allowance was recorded for another {k} file)"
+        else:
+            accepted[k] = {"profile": v, **{x: rec[x] for x in ("sha256", "reason") if x in rec}}
+    if refused:
+        hint = f"; {MIX_HINT}" if any("not recorded" in r for r in refused.values()) else ""
+        raise ProfileMismatch(f"components built with another data profile than the pack ({prof}): {refused}{hint}")
+    return accepted
+
+
 class IslPack:
     def __init__(self, manifest: PackManifest, folder: Path):
         self.manifest = manifest
@@ -206,9 +251,10 @@ class IslPack:
             profiles["fusion"] = fusion.profile
         if speller is not None and pr["letters"]:  # the trained letter model (not the user's own alphabet)
             profiles["letters"] = (getattr(speller.model, "meta", None) or {}).get("profile")
-        bad = {k: v for k, v in profiles.items() if v and v != prof}
-        if bad:
-            raise ProfileMismatch(f"components built with another data profile than the pack ({prof}): {bad}")
+        # a recorded, licence-compatible exception is accepted (docs 15.44); anything else raises as before
+        mixed = check_component_profiles(self.manifest, profiles, {"classifier": paths["classifier"],
+                                                                   "encoder": paths["encoder"],
+                                                                   "letters": paths["letters"]})
         rec = IslRecognizer(self.manifest.id, self.feature_config, vocab, lexicon=self.lexicon(), classifier=classifier,
                             encoder=encoder, index=index, speller=speller, fusion=fusion, my_signs=self.my_signs(),
                             profile=prof)
@@ -229,6 +275,8 @@ class IslPack:
                                           "certification": {pol: fusion.certification_info(pol)
                                                             for pol in ("strict", "balanced", "lenient")}}},
                 "is_synthetic": False}
+        if mixed:
+            info["mixed_profiles"] = mixed
         return rec, info
 
     def alphabet(self):
