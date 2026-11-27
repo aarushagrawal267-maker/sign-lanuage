@@ -3828,3 +3828,35 @@ and focus, no delay for the first word, the card while spelling) and the new `fr
 (a fake socket hello: the strict precision in the settings and on the model card, confirm-only and ungated lines, the
 continuous toggle shown only with sliding rows and sending `mode: "sliding"`). The e2e step of 15.29 in
 `frontend/e2e/a11y.spec.ts` now ran (system Chrome, `scripts/e2e_env.sh`) and passed.
+
+### 15.31 Batch 0 final check: the driver can compare like for like (QA plan 0.6, 27 Nov 2026)
+
+**Problem.** E1b and E4 like for like (15.27, 15.28) need `evaluate --all --compare-to <report.json>`. The driver's
+evaluate step never passed it. So the QA 0.6 refresh of research, and the fallback run, would have written reports
+without the rows that compare them with commercial-safe (critic point 4: user-sign false accepts no worse than
+commercial-safe). Getting them would have meant a second evaluate run (about 1.3 h).
+
+**Fix** (`scripts/phase2_train.sh`). The environment variable `EVAL_COMPARE_TO=<report.json>` makes the evaluate step
+run with `--compare-to <absolute path>`. The driver refuses a missing file before anything runs (exit 2). It also
+refuses `--profile both`: commercial-safe would compare with its own report, which its evaluate then replaces. Without
+the variable nothing changes. The dry run and the start line of the log name the report.
+
+**QA 0.6 commands** (no training; each one from the repo root, one at a time):
+1. Commercial-safe first, so its report has clip ids and class ids:
+   `scripts/phase2_train.sh --profile commercial-safe --from index --threads 4`
+   (index train-only, fusion, trim_eval, evaluate, index_final, pack).
+2. Research, compared with the new commercial-safe report:
+   `EVAL_COMPARE_TO=artifacts/isl/commercial-safe/eval/report.json scripts/phase2_train.sh --profile research --from index --threads 4`
+3. Fallback (research classifier, commercial-safe encoder) in a scratch run. Its stamps, log and pack stay under
+   `artifacts/isl/runs/fallback-csenc/research/` and never touch `data/isl/logs` or `artifacts/packs`. Put the
+   encoder in first; seeding never overwrites a file that is already there:
+   `mkdir -p artifacts/isl/runs/fallback-csenc/research && cp -p artifacts/isl/commercial-safe/encoder.pt artifacts/isl/runs/fallback-csenc/research/`
+   then
+   `EVAL_COMPARE_TO=artifacts/isl/commercial-safe/eval/report.json scripts/phase2_train.sh --profile research --tag fallback-csenc --from index --threads 4`.
+   The other inputs (vocabulary, classifier, cv, oneshot, letters, link outputs) are seeded from
+   `artifacts/isl/research`. E2 one-shot still uses the research one-shot encoders. Its pack is for measuring only:
+   the app refuses a pack whose encoder records another data profile (`ProfileMismatch`, ADR-ISL-6).
+
+Use `--dry-run` first to see what each command removes, seeds and runs.
+
+Test: `backend/tests/isl/test_phase2_guards.py::test_evaluate_step_passes_eval_compare_to`.

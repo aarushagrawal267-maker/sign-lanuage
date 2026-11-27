@@ -510,14 +510,17 @@ def _fake_py(tmp_path) -> tuple[Path, Path]:
 
 
 def _run_driver(tmp_path, *args, work_base=None, tag=None, isl_root=None, py=None, seed_base=None,
-                profile="commercial-safe", fail=None):
+                profile="commercial-safe", fail=None, compare_to=None):
     proc = tmp_path / "proc_none"
     proc.mkdir(exist_ok=True)
     fake, flog = _fake_py(tmp_path)
     env = {**os.environ, "PY": str(py or fake), "FAKE_PY_LOG": str(flog), "SLR_ISL_DIR": str(isl_root),
            "SLR_ISL_PROC_ROOT": str(proc), "SLR_TORCH_THREADS": "1"}
-    for k in ("SLR_ISL_PARTIAL_DATA", "PHASE2_WORK_BASE", "PHASE2_TAG", "PHASE2_SEED_BASE", "FAKE_PY_FAIL"):
+    for k in ("SLR_ISL_PARTIAL_DATA", "PHASE2_WORK_BASE", "PHASE2_TAG", "PHASE2_SEED_BASE", "FAKE_PY_FAIL",
+              "EVAL_COMPARE_TO"):
         env.pop(k, None)
+    if compare_to is not None:
+        env["EVAL_COMPARE_TO"] = str(compare_to)
     if work_base is not None:
         env["PHASE2_WORK_BASE"] = str(work_base)
     if tag is not None:
@@ -604,6 +607,33 @@ def test_driver_force_takes_a_comma_separated_list(tmp_path):
     assert bad.returncode == 2 and "nope" in bad.stderr
     assert _run_driver(tmp_path, "--from", "classifer", "--dry-run", work_base=tmp_path / "art",
                        isl_root=isl).returncode == 2  # a typo is refused, not "run everything"
+
+
+def test_evaluate_step_passes_eval_compare_to(tmp_path):
+    """EVAL_COMPARE_TO reaches `evaluate --all --compare-to` as an absolute path (QA 0.6: the research refresh is
+    compared like for like with the refit commercial-safe report, docs 15.31); a missing file, or --profile both,
+    is refused before anything runs."""
+    isl = tmp_path / "isl"
+    ref = tmp_path / "ref" / "report.json"
+    ref.parent.mkdir()
+    ref.write_text("{}")
+    r = _run_driver(tmp_path, "--only", "evaluate", work_base=tmp_path / "art", isl_root=isl, profile="research",
+                    compare_to=ref)
+    assert r.returncode == 0, r.stdout + r.stderr
+    ev = [c for c in _calls(tmp_path) if " evaluate " in f" {c} "]
+    assert len(ev) == 1 and f"--compare-to {ref}" in ev[0] and "--all" in ev[0], ev
+    dry = _run_driver(tmp_path, "--from", "index", "--dry-run", work_base=tmp_path / "art", isl_root=isl,
+                      profile="research", compare_to=ref)
+    assert dry.returncode == 0 and f"evaluate compares to: {ref}" in dry.stdout, dry.stdout + dry.stderr
+    (tmp_path / "fake_py.log").unlink()
+    bad = _run_driver(tmp_path, "--only", "evaluate", work_base=tmp_path / "art", isl_root=isl, profile="research",
+                      compare_to=tmp_path / "nope.json")
+    assert bad.returncode == 2 and "EVAL_COMPARE_TO" in bad.stderr and not _calls(tmp_path)
+    both = _run_driver(tmp_path, "--dry-run", work_base=tmp_path / "art", isl_root=isl, profile="both",
+                       compare_to=ref)
+    assert both.returncode == 2 and "one profile" in both.stderr
+    plain = _run_driver(tmp_path, "--only", "evaluate", work_base=tmp_path / "art", isl_root=isl, profile="research")
+    assert plain.returncode == 0 and not any("--compare-to" in c for c in _calls(tmp_path))
 
 
 def test_scratch_run_never_touches_the_real_runs_stamps(tmp_path):

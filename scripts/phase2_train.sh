@@ -48,6 +48,9 @@
 #   --check-only     run the data guard and exit (0 = ready or allowed, 4 = refused)
 # Environment overrides for the full settings: PRE_EPOCHS PRE_STEPS PRE_BATCH HIDDEN LAYERS EMB ENC_EPOCHS
 # ENC_STEPS CLS_EPOCHS CLS_STEPS E1A_STEPS CV_FOLDS (empty = skip cv) ONESHOT_FOLDS ONESHOT_EPOCHS LETTER_EPOCHS.
+# EVAL_COMPARE_TO=<report.json>: the evaluate step runs `evaluate --all --compare-to <report.json>` (E1b and E4 like
+# for like against that report, e.g. artifacts/isl/commercial-safe/eval/report.json; docs 15.27, 15.28, 15.31).
+# One profile per run (refused with --profile both); a missing file is refused before anything runs (exit 2).
 #
 # Outputs: full -> artifacts/isl/<profile>/ (work) and artifacts/packs/<isl|isl-research>/ (pack the app loads);
 # smoke -> artifacts/isl/phase2-smoke/<profile>/ (work, pack/ inside it; never loaded by the app).
@@ -98,6 +101,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "$PROFILE" == "both" && -n "${EVAL_COMPARE_TO:-}" ]]; then
+  # commercial-safe would be compared with its own report, which its evaluate step then replaces (docs 15.31)
+  echo "EVAL_COMPARE_TO needs one profile per run (not --profile both): run the two profiles separately" >&2; exit 2
+fi
 if [[ "$PROFILE" == "both" ]]; then
   args=("$@")
   rc=0
@@ -122,6 +129,11 @@ if [[ -n "$FORCE" ]]; then
 fi
 if [[ -n "$RUN_TAG" && ! "$RUN_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "--tag / PHASE2_TAG: letters, digits, '.', '_' and '-' only" >&2; exit 2
+fi
+COMPARE_TO=""  # absolute now: the steps run from backend/
+if [[ -n "${EVAL_COMPARE_TO:-}" ]]; then
+  COMPARE_TO="$(realpath -m -- "$EVAL_COMPARE_TO")"
+  [[ -f "$COMPARE_TO" ]] || { echo "EVAL_COMPARE_TO: $COMPARE_TO is not a file (a report.json of evaluate --all)" >&2; exit 2; }
 fi
 
 NAME="$PROFILE$([[ $SMOKE == 1 ]] && echo _smoke)${RUN_TAG:+_$RUN_TAG}"
@@ -320,7 +332,8 @@ run_step() {
       # a new trim-eval makes an older report / pack stale: forget their stamps so they are rebuilt from it
       cli trim-eval --learned-model auto --out "$WORK/trim_eval.json" $([[ $SMOKE == 1 ]] && echo "--n ${SMOKE_TRIM_EVAL_N:-60}") \
         && rm -f "$STAMPS/evaluate.done" "$STAMPS/pack.done" ;;
-    evaluate) cli evaluate --all $COMMON --all-sources $CAP ${PACK_OUT:+--out "$PACK_OUT"} ;;
+    evaluate) cli evaluate --all $COMMON --all-sources $CAP ${PACK_OUT:+--out "$PACK_OUT"} \
+        ${COMPARE_TO:+--compare-to "$COMPARE_TO"} ;;
     # the shipped index: every reference (val / test too) into <work>/index_final, never over <work>/index
     index_final) cli build-index $COMMON --all-sources $CAP --all-include --out "$WORK/index_final" ;;
     pack) cli build-pack $COMMON ${PACK_OUT:+--out "$PACK_OUT"} ;;
@@ -333,6 +346,7 @@ if [[ $DRY_RUN == 1 ]]; then
   echo "stamps: $STAMPS"
   echo "log: $LOG"
   echo "pack: ${PACK_OUT:-default (artifacts/packs/<id>)}"
+  [[ -n "$COMPARE_TO" ]] && echo "evaluate compares to: $COMPARE_TO"
 fi
 
 if [[ $LIST == 1 ]]; then
@@ -422,7 +436,7 @@ mkdir -p "$WORK"
 free_gb=$(df -Pk "$REPO" | awk 'NR==2 {print int($4/1048576)}')
 if [[ "$free_gb" -lt 10 ]]; then log "only ${free_gb} GB free (< 10 GB floor): not starting"; exit 3; fi
 
-log "phase 2 driver: profile=$PROFILE smoke=$SMOKE tag=${RUN_TAG:--} allow_partial=$ALLOW_PARTIAL threads=$THREADS work=$WORK stamps=$STAMPS git=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+log "phase 2 driver: profile=$PROFILE smoke=$SMOKE tag=${RUN_TAG:--} allow_partial=$ALLOW_PARTIAL threads=$THREADS work=$WORK stamps=$STAMPS${COMPARE_TO:+ compare_to=$COMPARE_TO} git=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
 if [[ ${#SEED[@]} -gt 0 ]]; then
   for s in "${SEED[@]}"; do seed_step "$s" || { log "seeding $s FAILED"; exit 2; }; done
   if [[ -f "$SEED_WORK/partial_data.json" && ! -f "$WORK/partial_data.json" ]]; then
