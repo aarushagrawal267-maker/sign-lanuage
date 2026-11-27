@@ -194,6 +194,28 @@ def test_segment_mode_reports_the_threshold_the_pack_uses():
     assert eng.threshold == 0.1  # sliding mode's own decision reads cfg.threshold
 
 
+def test_threshold_source_says_which_number_is_used():
+    """Review of 15e2aec (docs 15.28): spell mode never accepts on a threshold (spelling always asks), so the engine
+    keeps its earlier value there and says it is unused; describe() names the source for packs only (ASL unchanged)."""
+    from app.isl.models.fusion import FusionParams
+
+    rec = FakeRecognizer("accept")
+    rec.fusion = FusionParams(accept={"strict": 0.93, "balanced": 0.8, "lenient": 0.6})
+    eng = RecognitionEngine(None, recognizer=rec, config=EngineConfig(threshold=0.1, policy="strict"))
+    assert eng.describe()["threshold_source"] == "pack_fused_accept"
+    eng.configure(EngineConfig(mode="spell", threshold=0.4, policy="strict"))
+    assert eng.threshold == 0.4 and eng.describe()["threshold_source"] == "unused"  # the value before 15.27
+    eng.configure(EngineConfig(mode="spell", policy="strict"))
+    assert eng.threshold == 0.93 and eng.threshold_source == "unused"
+    rec.classifier = object()
+    eng.configure(EngineConfig(mode="sliding", threshold=0.1))
+    assert eng.threshold_source == "config"
+    eng.configure(EngineConfig(mode="sliding"))
+    assert eng.threshold_source == "pack_fused_accept" and eng.threshold == 0.8  # no classifier threshold
+    rec.classifier_threshold = 0.55
+    assert eng.threshold_source == "classifier" and eng.threshold == 0.55
+
+
 class _SlidingRecognizer(FakeRecognizer):
     """A pack classifier whose two classes are missing from the vocabulary (vocabulary index -1 for both)."""
 

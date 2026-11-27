@@ -334,3 +334,29 @@ def test_theta_is_recomputed_when_the_takes_are_reembedded_for_a_new_encoder(tmp
     assert abs(rec._user_theta(f"mysign:{sign.sign_id}") - max(t2, rec.fusion.user_theta_floor, rec.fusion.s_min)) < 1e-6
     rec.user_embedder = tight
     assert abs(rec._user_theta(f"mysign:{sign.sign_id}") - t1) < 1e-6
+
+
+def test_recomputed_theta_uses_the_packs_enrolment_c_min(tmp_path):
+    """Review of 15e2aec (docs 15.28): the re-embedded theta used the hard-coded c_min 0.5, while enrolment uses the
+    pack's ``fusion.enrol['c_min']``. A pack with another c_min must get the same rule for both."""
+    from app.isl.mysigns.store import _pairwise_mean, theta_from_embeddings
+    from app.isl.recognizer import IslRecognizer
+    from app.packs.vocabulary import Vocabulary
+
+    st = MySignsStore(tmp_path, "isl")
+    emb = _emb()
+    sign = st.add("Poha", _takes(3), embedder=emb).sign
+    z = emb.embed_raws(st.takes(sign.sign_id))
+    cons = _pairwise_mean(z)
+    assert st.user_theta(sign.sign_id, emb) is not None  # the default 0.5
+    strict = min(cons + 0.01, 1.0 + 1e-6)  # a pack whose enrolment would have refused these takes
+    assert st.user_theta(sign.sign_id, emb, c_min=strict) is None
+    loose = st.user_theta(sign.sign_id, emb, c_min=-1.0)
+    assert loose is not None and abs(loose - theta_from_embeddings(z, c_min=-1.0)) < 1e-6
+    assert st.user_theta(sign.sign_id, emb) is not None  # cached per c_min: the strict result did not stick
+    rec = IslRecognizer("isl", FCFG, Vocabulary.from_class_names(["isl.x"]), my_signs=st)
+    rec.user_embedder = emb
+    key = f"mysign:{sign.sign_id}"
+    assert rec._user_theta(key) < 1.0
+    rec.fusion = rec.fusion.with_(enrol={**rec.fusion.enrol, "c_min": strict})
+    assert rec._user_theta(key) == 1.0  # the pack's own c_min: never auto-accepted, as enrolment would refuse

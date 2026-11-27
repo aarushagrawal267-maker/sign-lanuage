@@ -221,6 +221,69 @@ describe("Hindi interface", () => {
   });
 });
 
+describe("E4 user-sign false accepts (review of 15e2aec, docs 15.27 / 15.28)", () => {
+  // a confirm-only pack: the app's own rate is 0 by construction, the threshold-rule rate is the regression
+  const k3 = {
+    n: 2808, n_groups: 12, top1_without_enrolment: 0.874, top1_with_enrolment: 0.918, gain: 0.044,
+    interval_with: [0.9, 0.93] as [number, number], interval_with_reason: null, n_other_words: 2700,
+    user_sign_false_accept_rate: 0.0, user_sign_false_accepts: 0, interval_false_accept: [0, 0] as [number, number],
+    interval_false_accept_reason: null, user_sign_false_accept_rate_threshold_rule: 0.0148,
+    user_sign_false_accepts_threshold_rule: 40, interval_false_accept_threshold_rule: [0.009, 0.021] as [number, number],
+    enrolments: 60, enrolment_refused: 2,
+  };
+  const withE4 = (opts: { includeRuns?: boolean } = {}) => {
+    const r = phase2();
+    const include: Protocol = opts.includeRuns === false
+      ? { run: false, reason: "no test signer has enough repeated takes (needs >= 2 words with >= 4 takes each)", n: 0 }
+      : { run: true, n: 89, n_groups: 6, metrics: { top1_with_enrolment_k3: 0.6, gain_k3: 0.04, user_sign_false_accept_rate_k3: 0.0,
+          user_sign_false_accept_rate_threshold_rule_k3: 0.0148 }, by_k: { k3 } };
+    r.protocols!.E4 = {
+      ...include, label: "My signs few-shot", population: "INCLUDE test signers only (comparable across profiles)",
+      all_sources: { run: true, population: "INCLUDE + other sources", n: 2808, n_groups: 12, by_k: { k3: { ...k3, user_sign_false_accept_rate_threshold_rule: 0.031 } } },
+      like_for_like: { run: true, reference: { profile: "commercial-safe" }, k: "k3", this_rate: 0.0148, reference_rate: 0.0, pass: false,
+        notes: ["the reference report has no threshold-rule rate (written before docs 15.27): compared with its user_sign_false_accept_rate"] },
+    };
+    return r;
+  };
+
+  it("shows the threshold-rule false-accept rate next to the auto rate, with its interval", () => {
+    wrap(withE4());
+    const e4 = card("E4");
+    const inc = within(e4).getByRole("table", { name: /INCLUDE test signers only/ });
+    expect(within(inc).getByRole("columnheader", { name: /shown without asking/ })).toBeInTheDocument();
+    expect(within(inc).getByRole("columnheader", { name: /would win/ })).toBeInTheDocument();
+    const row = inc.querySelector('tr[data-k="k3"]') as HTMLElement;
+    expect(row).toHaveTextContent("0.0%"); // auto: 0 by construction under confirm-only
+    expect(row).toHaveTextContent("1.5%"); // threshold rule: the precision regression critic 4 found
+    expect(row).toHaveTextContent("(40 / 2,700)");
+    expect(row).toHaveTextContent("0.9%–2.1% (12 groups)");
+    expect(e4).toHaveTextContent("Enrolments refused (recordings too different): 2 of 60");
+    // the headline metric has its own label and interval in the metric table
+    const mt = within(e4).getByRole("table", { name: "E4 metrics with 95% intervals" });
+    expect(mt).toHaveTextContent("Other words a user sign would win (put first, before the confirm tap) (k = 3)");
+    expect(mt).toHaveTextContent("0.9%–2.1% (12 groups)");
+  });
+
+  it("shows the all-sources population as not comparable, and the like-for-like result", () => {
+    wrap(withE4());
+    const e4 = card("E4");
+    const all = within(e4).getByRole("table", { name: /not comparable across packs/ });
+    expect(all).toHaveTextContent("3.1%");
+    const lf = within(e4).getByTestId("e4-like-for-like");
+    expect(lf).toHaveTextContent("worse than the reference");
+    expect(lf).toHaveTextContent("this pack 1.5% · reference 0.0%");
+    expect(e4).toHaveTextContent("User-sign false accepts against commercial-safe");
+  });
+
+  it("shows the all-sources population when the INCLUDE-only headline could not run", () => {
+    wrap(withE4({ includeRuns: false }));
+    expect(row("E4")).toHaveTextContent("not measured");
+    const e4 = card("E4");
+    expect(e4).toHaveTextContent("no test signer has enough repeated takes");
+    expect(within(e4).getByRole("table", { name: /not comparable across packs/ })).toHaveTextContent("3.1%");
+  });
+});
+
 describe("E8 trim check and data-guard warnings (review of d5b488e / 0b54985)", () => {
   const withChecks = (status: "ok" | "mismatch") => {
     const r = phase2();

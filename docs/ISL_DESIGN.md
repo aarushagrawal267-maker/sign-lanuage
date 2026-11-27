@@ -3645,3 +3645,70 @@ and a pre-15.27 report; the measuring recogniser sees the extra concepts), `test
 `test_phase2_guards.py` (the sign-test rule and its p-values), `test_mysigns.py` (an encoder change changes theta,
 and the recogniser uses it) and `test_engine_recognizer.py` (segment mode reports the pack's threshold; two classes
 with vocabulary index -1 commit as two words; the classifier thresholds are computed once per pair).
+
+### 15.28 Protocol fixes review: false accepts in the app, a like-for-like E4 check, the pack's enrolment rule (review of 15.27, 27 Nov 2026)
+
+**Problems found by the code review of 15.27.**
+* The app's evaluation page showed only the E4 "auto" false-accept rate. Under a confirm-only policy that rate is 0
+  by design, and every current pack is confirm-only. So the page would show 0.0 % and hide the research regression
+  (0.0148). The new threshold-rule headline metric had no label and no interval. `E4.all_sources` was never shown.
+* Section 15.27 said "INCLUDE-only false accept <= commercial-safe's", but nothing computed it.
+* The recomputed theta used the default c_min 0.5. The app's enrolment uses the pack's `fusion.enrol["c_min"]`. With
+  another c_min, a sign accepted at enrolment could get no theta later, or the other way round. E4 did the same.
+* E4 kept a word as enrolled even when its takes failed the store's consistency rule. The app refuses that
+  enrolment ("Your recordings look different"), so the word is never a user sign there.
+* `choose_user_mode` ran the sign test pooled over all validation sources. On research, ISL500 is about 94 % of those
+  takes, so neutral could win on ISL500 while INCLUDE got worse.
+* For a pre-15.27 reference, class ids came from the `classifier.pt` next to the report, with no check that this
+  checkpoint made the report. A reference with no split was accepted silently.
+* `cli evaluate --compare-to` without `--all` was silently ignored.
+* In spell mode the engine reported the fused accept threshold, but spelling never accepts on a threshold.
+
+**What changed.**
+1. **Evaluation page.** The E4 card has both false-accept columns next to each other, with counts and intervals:
+   "shown without asking" (the app's own rate) and "a user sign would win" (the threshold rule). A note says why the
+   first one is 0 under confirm-only. The INCLUDE-only table is labelled as the one to compare packs on.
+   `all_sources` has its own table, labelled "not comparable across packs". If the INCLUDE-only entry did not run,
+   the card still shows its reason and the all-sources table. The headline metric
+   `user_sign_false_accept_rate_threshold_rule_k3` has a label (English and Hindi) and its interval.
+2. **E4 like for like.** With `evaluate --all --compare-to <report.json>`, `E4.like_for_like` holds the reference's
+   and this pack's threshold-rule false-accept rate (INCLUDE only, k = 3) and `pass` = this <= reference. A
+   reference from before 15.27 has no threshold-rule rate; its `user_sign_false_accept_rate` is used and a note says
+   so. report.md prints PASS or FAIL. It does not block a pack yet.
+3. **The pack's enrolment rule.** `MySignsStore.user_theta(sign_id, embedder, c_min=..., theta_margin=...)`
+   computes theta from the cached vectors with the given setting and caches it per (sign, c_min, theta_margin).
+   The recogniser passes `fusion.enrol["c_min"]`. E4 uses the same c_min.
+4. **Refused enrolments in E4.** For k >= 2, a word whose takes fail the consistency rule is not enrolled. All its
+   takes are then tested as a word the signer did not enrol (false-accept rows). A signer with no accepted
+   enrolment is skipped. Each k reports `enrolments` and `enrolment_refused`; E4 has `enrolment` and `enrol_c_min`.
+   The clip-for-clip test now enrols with `MySignsStore.add`, so the app's refusals are mirrored, for k = 3 and 5.
+5. **Sign test per source.** `my_signs.sign_test.by_source` has n, b, c and both one-sided p values for each source
+   of the enrolled validation takes, and for INCLUDE against the rest. Neutral is now chosen only when (a) the
+   pooled one-sided sign test gives p < 0.05, (b) the threshold-rule false-accept rate rises by at most 0.01, and
+   (c) penalty is not better on INCLUDE takes alone (one-sided sign test of penalty over neutral, p < 0.05). E4 keeps
+   the source of each enrolled take (`_with_src`, with `keep_hits`).
+6. **Reference checks.** When the class ids come from the `classifier.pt` next to a reference report: a checkpoint
+   trained on another split is not used (a note says so); a checkpoint newer than the report's `created` time
+   (more than 60 s) gets a WARNING note. A reference report with no split gets a note that the split could not be
+   verified.
+7. **CLI.** `evaluate --compare-to` without `--all` exits with code 2 and says it needs `--all`.
+8. **Engine threshold source.** Segment mode with a pack still reports the fused accept threshold. Spell mode keeps
+   the value it had before 15.27 (`EngineConfig.threshold`, else the fused accept). `describe()` for a pack now has
+   `threshold_source`: `pack_fused_accept`, `unused` (spell mode), `config`, `classifier` or `model`. The ASL
+   `describe()` output is unchanged. The live page has no threshold control for packs, so nothing is greyed out.
+
+**Backward compatibility.** Old reports and fusion.json files load as before. A fusion.json without `enrol` uses
+c_min 0.5. A reference report without E4, or with E4 not run, gives `like_for_like.run = false` with a reason.
+Reports before 15.27 render on the evaluation page with the old generic E4 table title.
+
+**Effect.** E4 numbers can change slightly where enrolments are refused (those takes move to the false-accept rows).
+Fit-fusion may keep `penalty` where 15.27 picked `neutral`, if INCLUDE gets worse. Re-run fit-fusion and evaluate
+(QA 0.6) for the new numbers.
+
+Tests: `test_eval_runners.py` (evaluate_all runs the INCLUDE-only E4 with repeated INCLUDE takes and compares with a
+reference report; like-for-like with a pre-15.27 report; refused enrolments, also refused by `MySignsStore.add`;
+real paired E4 hit lists feed an unpatched `choose_user_mode` with per-source counts; penalty stays when INCLUDE gets
+worse; a rebuilt pack's checkpoint is flagged; `--compare-to` without `--all`; clip-for-clip for k = 3 and 5),
+`test_mysigns.py` (a non-default c_min in the store and the recogniser), `test_engine_recognizer.py`
+(`threshold_source` and the spell-mode value) and `LanguageEvaluation.test.tsx` (an auto rate of 0 next to a
+threshold-rule rate above 0, the all-sources table, the like-for-like line, and an INCLUDE entry that did not run).

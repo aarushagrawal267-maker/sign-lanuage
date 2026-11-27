@@ -434,31 +434,32 @@ def test_e3_and_e4_are_refused_with_a_classifier_from_another_split(phase2, tmp_
     assert "REFUSED" in (work / "eval" / "report.md").read_text()
 
 
-def _repeat_takes(root: Path, users: int = 3, takes: int = 5) -> list[Clip]:
+def _repeat_takes(root: Path, users: int = 3, takes: int = 5, source: str = "isl500", seed: int = 7000) -> list[Clip]:
     """Held-out signers with ``takes`` repeated takes of every CORE word (the app enrols 3 to 5)."""
-    d = root / "e4_takes"
+    d = root / f"e4_takes_{source}_{seed}"
     d.mkdir(parents=True, exist_ok=True)
     out = []
     for ci, w in enumerate(CORE):
         for u in range(users):
             for t in range(takes):
                 raw = make_sequence(ci, signer=300 + u, n_frames=40, fps=12.0, n_classes=6,
-                                    rng=np.random.default_rng(7000 + 100 * ci + 10 * u + t))
+                                    rng=np.random.default_rng(seed + 100 * ci + 10 * u + t))
                 p = d / f"{w}_{u}_{t}.npz"
                 raw.save(p)
-                out.append(Clip(f"e4/user{u}/{w}_{t}", "isl500", w, f"isl.{w}", None, None, p, group=f"e4-user{u}",
-                                quality={"n_frames": 40}))
+                out.append(Clip(f"e4/{source}/user{u}/{w}_{t}", source, w, f"isl.{w}", None, None, p,
+                                group=f"e4-{source}-user{u}", quality={"n_frames": 40}))
     return out
 
 
 @pytest.mark.parametrize("gated", [True, False])
-def test_e4_matches_the_recognizer_clip_for_clip(phase2, tmp_path, gated):
+@pytest.mark.parametrize("k", [3, 5])
+def test_e4_matches_the_recognizer_clip_for_clip(phase2, tmp_path, gated, k):
     """QA plan 0.5 (docs 15.27): E4 takes the app's decisions. Every E4 test take, enrolled into a real MySignsStore
     with the same takes, gets the same decision and the same top word from ``IslRecognizer.recognize`` (crop
     agreement on the override, confirm-only demotion, a user sign on top without the override is a suggestion)."""
     from app.isl.evaluation.runners import e4_my_signs
     from app.isl.models.fusion import USER_PREFIX
-    from app.isl.mysigns.store import MySign, MySignsStore
+    from app.isl.mysigns.store import MySignsStore
     from app.isl.training.common import ISL_FEATURES, engine_crops
     from app.isl.training.pipeline import load_recognizer
 
@@ -469,11 +470,13 @@ def test_e4_matches_the_recognizer_clip_for_clip(phase2, tmp_path, gated):
     rec.fusion = rec.fusion.with_(user_margin=-1.0, user_bonus=3.0)
     if not gated:  # in-code parameters: no certification gate, so the override can really accept
         rec.fusion = rec.fusion.with_(certification=None)
-    clips = _repeat_takes(tmp_path)
+    clips = _repeat_takes(tmp_path, takes=k + 1 if k == 5 else 5)
     by_id = {c.clip_id: c for c in clips}
     trace: list = []
-    res = e4_my_signs(rec, clips, ks=(3,), trace=trace)
-    assert res["run"] and res["ks"] == [3] and trace and res["by_k"]["k3"]["n"] > 0
+    res = e4_my_signs(rec, clips, ks=(k,), trace=trace)
+    kk = f"k{k}"
+    assert res["run"] and res["ks"] == [k] and trace and res["by_k"][kk]["n"] > 0
+    c_min = float(rec.fusion.enrol.get("c_min", 0.5))
     stores: dict = {}
     seen = {"decisions": set(), "user_top": 0}
     for i, t in enumerate(trace):
@@ -481,10 +484,14 @@ def test_e4_matches_the_recognizer_clip_for_clip(phase2, tmp_path, gated):
         if key not in stores:  # one store per (k, signer): the words that signer enrolled, with those takes
             st = MySignsStore(tmp_path / f"store{i}", "isl")
             names = {}
-            for word, ids in sorted(t["enrolment"].items()):
-                s = st.save_sign(MySign(sign_id=f"00000000-0000-0000-0000-{len(names):012d}", pack="isl",
-                                        concept_id=None, text_en=word), [by_id[x].load() for x in ids])
-                names[f"{USER_PREFIX}{s.sign_id}"] = f"{USER_PREFIX}{word}"
+            # the app's enrolment (MySignsStore.add with the pack's c_min) accepts exactly the words E4 enrolled
+            # and refuses the ones E4 refused (docs 15.28)
+            for word, ids in sorted({**t["enrolment"], **t["refused"]}.items()):
+                r = st.add(word, [by_id[x].load() for x in ids], embedder=rec.user_embedder, c_min=c_min,
+                           s_min=rec.fusion.s_min)
+                assert r.accepted == (word in t["enrolment"]), (word, r.message)
+                if r.accepted:
+                    names[f"{USER_PREFIX}{r.sign.sign_id}"] = f"{USER_PREFIX}{word}"
             stores[key] = (st, names)
         st, names = stores[key]
         rec.my_signs = st
@@ -497,8 +504,8 @@ def test_e4_matches_the_recognizer_clip_for_clip(phase2, tmp_path, gated):
     assert seen["user_top"] > 0  # the user-sign rules were exercised
     if gated:  # the phase-2 world's fusion.json is a pack record: confirm-only policies never accept
         assert rec.fusion.gated and (rec.fusion.policy_rule("balanced") == "certified" or "accept" not in seen["decisions"])
-        k3 = res["by_k"]["k3"]
-        assert k3["user_sign_false_accept_rate_threshold_rule"] >= k3["user_sign_false_accept_rate"]
+        kr = res["by_k"][kk]
+        assert kr["user_sign_false_accept_rate_threshold_rule"] >= kr["user_sign_false_accept_rate"]
     else:
         assert "accept" in seen["decisions"]
 
@@ -616,3 +623,209 @@ def test_e1b_like_for_like_against_a_reference_report(phase2, tmp_path):
     lf = e1_closed_set(rec, test, "E1b", split, "primary", reference=ref)["like_for_like"]
     assert lf["run"] and lf["reference_classes"]["top1"] == own["metrics"]["top1"]  # same classes: nothing masked
     assert lf["common_clips"]["run"] is False
+
+
+# --------------------------------------------------------------------------------------------- review of 15e2aec
+
+class _WithIncludeTakes:
+    """``data`` whose INCLUDE test part also has held-out signers with repeated takes (the toy world has one take
+    per INCLUDE word, so the INCLUDE-only E4 headline never ran in evaluate_all)."""
+
+    def __init__(self, data, extra):
+        self._d, self._x = data, extra
+
+    def __getattr__(self, k):
+        return getattr(self._d, k)
+
+    def include_part(self, part):
+        base = self._d.include_part(part)
+        return base + self._x if part == "test" else base
+
+
+def test_evaluate_all_runs_the_include_only_e4_and_compares_false_accepts(phase2, tmp_path):
+    """Critic 4 (docs 15.27 / 15.28): the INCLUDE-only E4 headline runs when INCLUDE test signers have repeated
+    takes; both false-accept rates are headline metrics; with --compare-to, E4.like_for_like compares the
+    threshold-rule rate with the reference's and report.md prints PASS / FAIL."""
+    import shutil
+
+    from app.isl.evaluation.runners import evaluate_all
+    from app.isl.training.common import ISL_FEATURES
+
+    w, data = phase2["world"], phase2["data"]
+    work = tmp_path / "work"
+    shutil.copytree(phase2["work"], work, ignore=shutil.ignore_patterns("eval", "oneshot"))
+    inc = _repeat_takes(tmp_path, users=3, takes=5, source="include", seed=9000)
+    ref = tmp_path / "ref" / "eval" / "report.json"
+    ref.parent.mkdir(parents=True)
+    ref.write_text(json.dumps({"profile": "commercial-safe", "protocols": {"E4": {
+        "run": True, "population": "INCLUDE test signers only", "by_k": {"k3": {
+            "n_other_words": 100, "user_sign_false_accept_rate": 0.0,
+            "user_sign_false_accept_rate_threshold_rule": 0.0}}}}}))
+    doc = evaluate_all(work, _WithIncludeTakes(data, inc), ISL_FEATURES, profile="research", smoke=True,
+                       vocab_path=w["vocab"], paths=w["paths"], out_dirs=[], e4_ks=(3,), latency_n=1, compare_to=ref)
+    e4 = doc["protocols"]["E4"]
+    assert e4["run"] is True and "INCLUDE" in e4["population"], e4.get("reason")
+    assert {"user_sign_false_accept_rate_k3", "user_sign_false_accept_rate_threshold_rule_k3"} <= set(e4["metrics"])
+    assert e4["by_k"]["k3"]["n"] > 0 and e4["all_sources"]["run"]
+    lf = e4["like_for_like"]
+    this = e4["by_k"]["k3"]["user_sign_false_accept_rate_threshold_rule"]
+    assert lf["run"] and lf["reference_rate"] == 0.0 and lf["this_rate"] == this and lf["pass"] == (this <= 0.0)
+    md = (work / "eval" / "report.md").read_text()
+    assert "E4 like for like against commercial-safe" in md and ("**PASS**" in md or "**FAIL**" in md)
+
+
+def test_e4_like_for_like_with_a_report_from_before_15_27(tmp_path):
+    from app.isl.evaluation.runners import _e4_like_for_like_lines, e4_like_for_like
+
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({"profile": "commercial-safe", "protocols": {"E4": {"run": True, "by_k": {
+        "k3": {"n_other_words": 89, "user_sign_false_accept_rate": 0.0}}}}}))
+    own = {"run": True, "by_k": {"k3": {"n_other_words": 2700, "user_sign_false_accept_rate": 0.0,
+                                        "user_sign_false_accept_rate_threshold_rule": 0.0148}}}
+    lf = e4_like_for_like(own, old)
+    assert lf["run"] and lf["pass"] is False and lf["reference_rate"] == 0.0 and lf["this_rate"] == 0.0148
+    assert any("before docs 15.27" in n and "user_sign_false_accept_rate" in n for n in lf["notes"])
+    assert any("population" in n for n in lf["notes"])
+    assert any("**FAIL**" in x for x in _e4_like_for_like_lines(lf))
+    # nothing to compare
+    assert e4_like_for_like({"run": False, "reason": "no repeated takes"}, old)["run"] is False
+    old.write_text(json.dumps({"protocols": {"E4": {"run": False, "reason": "refused"}}}))
+    assert "no E4 k3" in e4_like_for_like(own, old)["reason"]
+
+
+def test_e4_refuses_enrolments_the_store_would_refuse(phase2, tmp_path):
+    """Review of 15e2aec (docs 15.28): with the pack's enrol.c_min, a word whose takes are not consistent is not a
+    user sign (MySignsStore.add refuses it). E4 counts it and tests its takes as a word that was not enrolled."""
+    from app.isl.evaluation.runners import e4_my_signs
+    from app.isl.mysigns.store import MySignsStore
+    from app.isl.training.common import ISL_FEATURES
+    from app.isl.training.pipeline import load_recognizer
+
+    w, work = phase2["world"], phase2["work"]
+    rec = load_recognizer(work, ISL_FEATURES, w["vocab"], profile="research")
+    clips = _repeat_takes(tmp_path)
+    by_id = {c.clip_id: c for c in clips}
+    ok = e4_my_signs(rec, clips, ks=(3,))
+    assert ok["run"] and ok["enrol_c_min"] == float(rec.fusion.enrol.get("c_min", 0.5))
+    assert ok["enrolment"]["k3"]["enrolments"] > 0
+    strict = rec.fusion.with_(enrol={**rec.fusion.enrol, "c_min": 1.01})  # no takes are that consistent
+    trace: list = []
+    res = e4_my_signs(rec, clips, ks=(3,), params=strict, trace=trace)
+    assert res["run"] is False and "refused" in res["reason"]
+    assert res["enrolment"]["k3"]["refused"] == res["enrolment"]["k3"]["enrolments"] == ok["enrolment"]["k3"]["enrolments"]
+    # the app refuses the same takes with the same rule
+    st = MySignsStore(tmp_path / "st", "isl")
+    probe: list = []
+    e4_my_signs(rec, clips, ks=(3,), trace=probe)
+    word, ids = next(iter(probe[0]["enrolment"].items()))
+    r = st.add(word, [by_id[x].load() for x in ids], embedder=rec.user_embedder, c_min=1.01)
+    assert not r.accepted and "look different" in r.message
+
+
+def test_e4_paired_hits_feed_the_sign_test_unpatched(phase2, tmp_path):
+    """Review of 15e2aec: choose_user_mode's sign test pairs E4's per-take hit lists of penalty and neutral. Real E4
+    runs (shared cache, keep_hits) give lists of equal length over the same takes in the same order, and the choice
+    records b / c / p per source (INCLUDE vs the rest, docs 15.28)."""
+    from app.isl.evaluation.runners import e4_my_signs
+    from app.isl.training.common import ISL_FEATURES
+    from app.isl.training.fit_fusion import choose_user_mode
+    from app.isl.training.pipeline import load_recognizer
+
+    w, work = phase2["world"], phase2["work"]
+    rec = load_recognizer(work, ISL_FEATURES, w["vocab"], profile="research")
+    clips = (_repeat_takes(tmp_path, users=5) + _repeat_takes(tmp_path, users=5, source="include", seed=9000))
+    cache: dict = {}
+    runs, traces = {}, {}
+    for m in ("penalty", "neutral"):
+        traces[m] = []
+        runs[m] = e4_my_signs(rec, clips, ks=(3,), params=rec.fusion.with_(user_cls_mode=m), cache=cache,
+                              keep_hits=True, trace=traces[m])
+    hp, hn = runs["penalty"]["by_k"]["k3"], runs["neutral"]["by_k"]["k3"]
+    assert len(hp["_with"]) == len(hn["_with"]) == hp["n"] >= 30
+    order = {m: [t["clip_id"] for t in traces[m] if t["enrolled"]] for m in traces}
+    assert order["penalty"] == order["neutral"] and len(order["penalty"]) == hp["n"]
+    assert hp["_with_src"] == hn["_with_src"] and set(hp["_with_src"]) == {"include", "isl500"}
+    p, rep = choose_user_mode(rec, clips, rec.fusion, ks=(3,))
+    assert rep["chosen"] == p.user_cls_mode and rep["k"] == 3
+    bs = rep["sign_test"]["by_source"]
+    assert set(bs) == {"include", "isl500", "not_include"}
+    assert bs["include"]["n"] + bs["not_include"]["n"] == hp["n"]
+    assert (bs["include"]["neutral_only_correct"] + bs["not_include"]["neutral_only_correct"]
+            == rep["sign_test"]["neutral_only_correct"])
+
+
+def test_user_mode_is_not_neutral_when_include_gets_worse(monkeypatch):
+    """docs 15.28: the pooled sign test can be won on ISL500 (~94 % of research validation takes) while INCLUDE,
+    the population packs are compared on, gets worse. Then penalty stays."""
+    from pathlib import Path
+
+    import app.isl.evaluation.runners as runners
+    from app.isl.models.fusion import FusionParams
+    from app.isl.training import fit_fusion as ff
+
+    def fake(inc_lost):
+        n_isl, n_inc = 400, 60
+        src = ["isl500"] * n_isl + ["include"] * n_inc
+        pen = [0.0] * 100 + [1.0] * (n_isl - 100) + [1.0] * n_inc
+        neu = [1.0] * n_isl + [0.0] * inc_lost + [1.0] * (n_inc - inc_lost)  # +100 on ISL500, -inc_lost on INCLUDE
+
+        def e4(rec, clips, ks, params, cache, **kw):
+            h = neu if params.user_cls_mode == "neutral" else pen
+            return {"run": True, "by_k": {"k3": {"n": len(h), "n_groups": 6, "top1_with_enrolment": sum(h) / len(h),
+                                                 "gain": 0.1, "user_sign_false_accept_rate": 0.0,
+                                                 "user_sign_false_accept_rate_threshold_rule": 0.0,
+                                                 "n_other_words": 50, "_with": h, "_with_src": src}}}
+        return e4
+
+    val = [Clip(f"v/{g}/{w}/{t}", "isl500", w, f"isl.{w}", None, None, Path("/x"), group=g)
+           for g in ("u1", "u2") for w in ("a", "b") for t in range(4)]
+    monkeypatch.setattr(runners, "e4_my_signs", fake(10))  # INCLUDE: 0 won, 10 lost -> p = 1/1024
+    p, rep = ff.choose_user_mode(None, val, FusionParams())
+    assert rep["sign_test"]["p_one_sided"] < 0.05  # the pooled test alone would pick neutral
+    assert p.user_cls_mode == "penalty" and "include" in rep["reason"]
+    inc = rep["sign_test"]["by_source"]["include"]
+    assert (inc["neutral_only_correct"], inc["penalty_only_correct"]) == (0, 10) and inc["p_penalty_better"] < 0.05
+    monkeypatch.setattr(runners, "e4_my_signs", fake(2))  # 2 lost of 60: p = 0.25, not significant -> neutral
+    p, rep = ff.choose_user_mode(None, val, FusionParams())
+    assert p.user_cls_mode == "neutral"
+
+
+def test_reference_class_ids_from_a_rebuilt_pack_are_flagged(phase2, tmp_path):
+    """Review of 15e2aec (docs 15.28): a pre-15.27 reference report takes its class ids from the classifier.pt next
+    to it. A checkpoint from another split is not used; a checkpoint newer than the report gets a warning; a
+    reference with no split says the split could not be verified."""
+    import shutil
+
+    import torch
+
+    from app.isl.evaluation.runners import load_e1_reference
+
+    work = phase2["work"]
+    rp = tmp_path / "pack" / "eval" / "report.json"
+    rp.parent.mkdir(parents=True)
+    ck = rp.parent.parent / "classifier.pt"
+    shutil.copy2(work / "classifier.pt", ck)
+    split = torch.load(ck, map_location="cpu", weights_only=False)["meta"]["split"]
+    old = {"profile": "commercial-safe", "created": "2020-01-01T00:00:00Z", "leakage_guards": {"split": split},
+           "protocols": {"E1b": {"n": 5, "metrics": {"top1": 0.7}}}}
+    rp.write_text(json.dumps(old))
+    ref = load_e1_reference(rp)
+    assert ref["class_ids"] and any(n.startswith("WARNING") and "newer than the report" in n for n in ref["notes"])
+    old["created"] = "2999-01-01T00:00:00Z"
+    rp.write_text(json.dumps(old))
+    assert not any(n.startswith("WARNING") for n in load_e1_reference(rp)["notes"])
+    old["leakage_guards"]["split"] = "another-split"
+    rp.write_text(json.dumps(old))
+    ref = load_e1_reference(rp)
+    assert ref["class_ids"] is None and any("NOT read" in n and "another-split" in n for n in ref["notes"])
+    del old["leakage_guards"]
+    rp.write_text(json.dumps(old))
+    ref = load_e1_reference(rp)
+    assert any("records no split" in n for n in ref["notes"]) and ref["class_ids"]
+
+
+def test_cli_compare_to_needs_all(tmp_path, capsys):
+    from app.isl import cli
+
+    assert cli.main(["--root", str(tmp_path), "evaluate", "--compare-to", str(tmp_path / "r.json")]) == 2
+    assert "--compare-to needs --all" in capsys.readouterr().err

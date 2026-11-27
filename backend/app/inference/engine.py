@@ -149,11 +149,33 @@ class RecognitionEngine:
         self.spell_last_t = -1e18
 
     @property
+    def threshold_source(self) -> str:
+        """Where :attr:`threshold` comes from, and whether anything decides with it (docs/ISL_DESIGN.md 15.28):
+        ``pack_fused_accept`` (segment mode with a pack: the recogniser's fused accept for the policy; cfg.threshold
+        is not used), ``unused`` (spell mode with a pack: spelling always asks, the number is informational),
+        ``config`` (cfg.threshold), ``classifier`` (sliding mode with a pack: the classifier's own threshold) or
+        ``model`` (an ASL / classifier-only model)."""
+        if self.predictor is None and self.recognizer is not None:
+            if self.cfg.mode == "segment":
+                return "pack_fused_accept"
+            if self.cfg.mode == "spell":
+                return "unused"
+            if self.cfg.threshold is not None:
+                return "config"
+            per_pol = getattr(self.recognizer, "classifier_threshold_for", None)
+            if (per_pol(self.cfg.policy) if callable(per_pol) else None) is not None or \
+                    getattr(self.recognizer, "classifier_threshold", None) is not None:
+                return "classifier"
+            return "pack_fused_accept"
+        return "config" if self.cfg.threshold is not None else "model"
+
+    @property
     def threshold(self) -> float:
-        if self.predictor is None and self.recognizer is not None and self.cfg.mode != "sliding":
-            # segment (and spell) mode with a language pack: the recogniser decides with the pack's fused accept
-            # threshold for the policy and never reads cfg.threshold, so report that one (docs/ISL_DESIGN.md 15.27);
-            # before, a cfg.threshold was echoed although nothing used it
+        if self.predictor is None and self.recognizer is not None and self.cfg.mode == "segment":
+            # segment mode with a language pack: the recogniser decides with the pack's fused accept threshold for
+            # the policy and never reads cfg.threshold, so report that one (docs/ISL_DESIGN.md 15.27); before, a
+            # cfg.threshold was echoed although nothing used it. Spell mode keeps the earlier value (cfg.threshold,
+            # else the fused accept): spelling never accepts on a threshold, threshold_source says "unused" (15.28)
             acc = getattr(getattr(self.recognizer, "fusion", None), "accept", None)
             if isinstance(acc, dict) and self.cfg.policy in acc:
                 return float(acc[self.cfg.policy])
@@ -587,6 +609,8 @@ class RecognitionEngine:
             for k in RECOGNIZER_FIELDS:
                 cfg.pop(k, None)
         out = {"config": cfg, "threshold": self.threshold}
+        if self.recognizer is not None:  # language packs only (the ASL output is unchanged): is the number used?
+            out["threshold_source"] = self.threshold_source
         info = getattr(self.recognizer, "certification_info", None) if self.recognizer is not None else None
         if callable(info):  # language packs only: what the UI shows next to words (docs/ISL_DESIGN.md 15.25)
             out["certification"] = info(self.cfg.policy, self.cfg.mode)

@@ -178,6 +178,16 @@ def _bits(x) -> str:
     return "".join("1" if v else "0" for v in np.asarray(x, bool))
 
 
+def _parse_utc(stamp) -> float | None:
+    """A report's ``created`` (``%Y-%m-%dT%H:%M:%SZ``, UTC) as epoch seconds, or None."""
+    import calendar
+
+    try:
+        return float(calendar.timegm(time.strptime(str(stamp), "%Y-%m-%dT%H:%M:%SZ")))
+    except (TypeError, ValueError):
+        return None
+
+
 def load_e1_reference(path: Path) -> dict:
     """The E1b of another evaluation report (``--compare-to``, docs 15.27): its split, evaluated clip ids, per-clip
     top-1 / top-5 hits and the classifier's class ids. Reports written before 15.27 have none of these: the class
@@ -191,14 +201,33 @@ def load_e1_reference(path: Path) -> dict:
            "top1": (e1.get("metrics") or {}).get("top1"), "top5": (e1.get("metrics") or {}).get("top5"),
            "clip_ids": e1.get("clip_ids"), "hit1": (e1.get("per_clip") or {}).get("hit1"),
            "hit5": (e1.get("per_clip") or {}).get("hit5"), "class_ids": e1.get("class_ids"), "notes": []}
+    if not ref["split"]:
+        ref["notes"].append("the reference report records no split: it could not be verified that it was evaluated "
+                            "on the same split")
     if not ref["class_ids"]:
         ck = path.parent.parent / "classifier.pt"
         if ck.exists():
             import torch
 
             meta = (torch.load(ck, map_location="cpu", weights_only=False) or {}).get("meta") or {}
-            ref["class_ids"] = list(meta.get("class_names") or []) or None
-            ref["notes"].append(f"class ids read from {ck} (the report has none: written before docs 15.27)")
+            ck_split = meta.get("split")
+            if ref["split"] and ck_split and ck_split != ref["split"]:
+                # not the checkpoint that produced the report: its classes would mask the wrong rows (docs 15.28)
+                ref["notes"].append(f"class ids NOT read from {ck}: it was trained on split {ck_split!r}, the report "
+                                    f"was evaluated on {ref['split']!r} (the pack was rebuilt after the report)")
+            else:
+                ref["class_ids"] = list(meta.get("class_names") or []) or None
+                ref["notes"].append(f"class ids read from {ck} (the report has none: written before docs 15.27)")
+                created = _parse_utc(doc.get("created"))
+                if created is None:
+                    ref["notes"].append(f"WARNING: the report has no creation time, so {ck} could not be checked "
+                                        "against it (it may be a newer checkpoint with other classes)")
+                elif ck.stat().st_mtime > created + 60:
+                    ref["notes"].append(f"WARNING: {ck} is newer than the report ({doc.get('created')}): it may not "
+                                        "be the checkpoint that produced it, so the masked rows may use the wrong "
+                                        "class set")
+                if not ck_split:
+                    ref["notes"].append(f"{ck} records no split: its class set could not be checked")
         else:
             ref["notes"].append("the report has no class ids and there is no classifier.pt next to it")
     if not ref["clip_ids"]:
@@ -630,13 +659,20 @@ def e4_my_signs(rec, clips, ks=E4_KS, seed: int = 0, max_groups: int = 40, param
     the app accepts by itself (0 under a confirm-only policy), ``user_sign_false_accept_rate_threshold_rule`` = the
     same rules without the certification gate (the user sign the app would put first and ask to confirm; with an
     ungated ``params`` both are equal). ``trace``: a list that gets one dict per test take (tests).
-    ``keep_hits``: keep the per-take hit lists (``_with``, ``_fa``, ``_fa_threshold``) for paired comparisons."""
+    ``keep_hits``: keep the per-take hit lists (``_with``, ``_fa``, ``_fa_threshold``) and the enrolled takes'
+    sources (``_with_src``) for paired comparisons.
+
+    Enrolment uses the pack's own consistency rule (``fusion.enrol['c_min']``, as the app's enrolment). A word whose
+    k >= 2 takes fail it is refused, as ``MySignsStore.add`` refuses it ("Your recordings look different"): it is not
+    a user sign, so all its takes are tested as a word the signer did not enrol, and ``enrolment_refused`` counts it
+    (docs 15.28). A signer with no accepted enrolment is skipped."""
     from app.isl.models.encoder import FeatureStatsEmbedder
     from app.isl.mysigns.store import theta_from_embeddings
     from app.isl.recognizer import user_sign_decision
 
     fp = params or rec.fusion
     ungated = fp.with_(certification=None) if fp.gated else None
+    c_min = float((getattr(fp, "enrol", None) or {}).get("c_min", 0.5))  # the app's enrolment rule (docs 15.28)
     is_ov = getattr(rec, "is_open_vocabulary", None)
     has_global = bool(getattr(rec, "has_global_model", True))
 
@@ -657,8 +693,10 @@ def e4_my_signs(rec, clips, ks=E4_KS, seed: int = 0, max_groups: int = 40, param
         return cache[c.clip_id]
 
     out = {}
+    enrolment = {}
     for k in ks:
-        rows = {"base": [], "with": [], "fa": [], "fa_thr": [], "g_hit": [], "g_fa": [], "acc_ok": []}
+        rows = {"base": [], "with": [], "fa": [], "fa_thr": [], "g_hit": [], "g_fa": [], "acc_ok": [], "src": []}
+        n_enrol = n_refused = 0
         for g in groups:
             words = {w: v for w, v in by[g].items() if len(v) >= k + 1}
             if len(words) < 2:
@@ -667,6 +705,8 @@ def e4_my_signs(rec, clips, ks=E4_KS, seed: int = 0, max_groups: int = 40, param
             rng.shuffle(names)
             enrolled = set(names[: max(1, len(names) // 2)])
             signs = {}
+            refused = 0
+            refused_takes = {}
             try:
                 for w in sorted(enrolled):  # a set: its order (string hashing) changed per process
                     takes = list(words[w])
@@ -674,12 +714,21 @@ def e4_my_signs(rec, clips, ks=E4_KS, seed: int = 0, max_groups: int = 40, param
                     # the whole take (crop 0), as MySignsStore.user_index embeds a recorded take
                     E = np.stack([ev(t)[1][0] for t in takes[:k]]).astype(np.float32)
                     E /= np.maximum(np.linalg.norm(E, axis=1, keepdims=True), 1e-8)
-                    th = theta_from_embeddings(E)  # the store's rule (None: < 2 takes or inconsistent)
+                    # the store's rule (None: < 2 takes or inconsistent), with the pack's enrolment c_min
+                    th = theta_from_embeddings(E, c_min=c_min)
+                    if th is None and k >= 2:  # MySignsStore.add refuses this enrolment: not a user sign
+                        refused += 1
+                        refused_takes[w] = [t.clip_id for t in takes[:k]]
+                        continue
                     theta = max(th if th is not None else 1.0, fp.user_theta_floor, fp.s_min)
                     signs[w] = (E, theta, takes[k:], [t.clip_id for t in takes[:k]])
-                tests = [(t, w, True) for w in enrolled for t in signs[w][2]]
-                tests += [(t, w, False) for w in names if w not in enrolled for t in words[w]]
+                tests = [(t, w, True) for w in sorted(signs) for t in signs[w][2]]
+                tests += [(t, w, False) for w in names if w not in signs for t in words[w]]
             except (FeatureError, OSError, ValueError):
+                continue
+            n_enrol += len(signs) + refused
+            n_refused += refused
+            if not signs:  # every enrolment of this signer refused: no user sign to measure
                 continue
             order = sorted(signs)
             uid = [f"{USER_PREFIX}{w}" for w in order]
@@ -706,17 +755,20 @@ def e4_my_signs(rec, clips, ks=E4_KS, seed: int = 0, max_groups: int = 40, param
                 pred = top.removeprefix(USER_PREFIX)
                 if trace is not None:
                     trace.append({"k": k, "group": g, "clip_id": t.clip_id, "word": w, "enrolled": is_enrolled,
-                                  "enrolment": {x: signs[x][3] for x in order}, "decision": dec, "reason": why,
+                                  "enrolment": {x: signs[x][3] for x in order}, "refused": refused_takes,
+                                  "decision": dec, "reason": why,
                                   "top": top, "decision_threshold_rule": dec_thr})
                 if is_enrolled:
                     rows["base"].append(float(bool(base.keys) and base.keys[0] == w))
                     rows["with"].append(float(pred == w))
                     rows["acc_ok"].append(float(pred == w and dec == "accept"))
                     rows["g_hit"].append(g)
+                    rows["src"].append(getattr(t, "source", None) or "")
                 else:
                     rows["fa"].append(float(top.startswith(USER_PREFIX) and dec == "accept"))
                     rows["fa_thr"].append(float(top.startswith(USER_PREFIX) and dec_thr == "accept"))
                     rows["g_fa"].append(g)
+        enrolment[f"k{k}"] = {"enrolments": n_enrol, "refused": n_refused}
         if rows["with"]:
             out[f"k{k}"] = {"n": len(rows["with"]), "n_groups": len(set(rows["g_hit"])),
                             "top1_without_enrolment": float(np.mean(rows["base"])),
@@ -733,19 +785,26 @@ def e4_my_signs(rec, clips, ks=E4_KS, seed: int = 0, max_groups: int = 40, param
                             "user_sign_false_accepts_threshold_rule": int(sum(rows["fa_thr"])),
                             "interval_false_accept": grouped_bootstrap(rows["fa"], rows["g_fa"]),
                             "interval_false_accept_threshold_rule": grouped_bootstrap(rows["fa_thr"], rows["g_fa"]),
-                            "interval_false_accept_reason": interval_reason(rows["fa"], rows["g_fa"])}
+                            "interval_false_accept_reason": interval_reason(rows["fa"], rows["g_fa"]),
+                            "enrolments": n_enrol, "enrolment_refused": n_refused, "enrol_c_min": c_min}
             if keep_hits:
-                out[f"k{k}"].update(_with=rows["with"], _fa=rows["fa"], _fa_threshold=rows["fa_thr"])
+                out[f"k{k}"].update(_with=rows["with"], _fa=rows["fa"], _fa_threshold=rows["fa_thr"],
+                                    _with_src=rows["src"])
     label = ("My signs few-shot: a held-out signer enrols k takes (3 to 5, as the app) of half of their words; "
              "tested on their other takes (gain over no enrolment) and on the words they did not enrol (false "
              "accepts of user signs). The app's own decision rule (docs 15.27). Groups are INCLUDE sessions / "
              "estimated signers, or other sources' signer ids, not verified identities.")
     if not out:
-        return {"label": label, "run": False, "reason": "no test signer has enough repeated takes "
-                f"(needs >= 2 words with >= {min(ks) + 1} takes each)", "n": 0, "ks": list(ks)}
+        n_ref = sum(v["refused"] for v in enrolment.values())
+        why = (f"every enrolment was refused by the store's consistency rule (c_min {c_min}; {n_ref} refused)"
+               if n_ref and n_ref == sum(v["enrolments"] for v in enrolment.values()) else
+               f"no test signer has enough repeated takes (needs >= 2 words with >= {min(ks) + 1} takes each)")
+        return {"label": label, "run": False, "reason": why, "n": 0, "ks": list(ks), "enrolment": enrolment,
+                "enrol_c_min": c_min}
     best = out.get("k3") or next(iter(out.values()))
     return {"label": label, "run": True, "n": best["n"], "n_groups": best["n_groups"], "ks": list(ks),
             "policy": policy, "rule": fp.policy_rule(policy), "user_cls_mode": fp.user_cls_mode,
+            "enrolment": enrolment, "enrol_c_min": c_min,
             "metrics": {"top1_with_enrolment_k3": best["top1_with_enrolment"], "gain_k3": best["gain"],
                         "user_sign_false_accept_rate_k3": best["user_sign_false_accept_rate"],
                         "user_sign_false_accept_rate_threshold_rule_k3":
@@ -768,6 +827,45 @@ def e4_populations(rec, include_test, extra_test, ks=E4_KS) -> dict:
     allp["population"] = "INCLUDE test signers + other sources' held-out signers"
     inc["all_sources"] = allp
     return inc
+
+
+def e4_like_for_like(e4: dict, ref_path: Path, k: str = "k3") -> dict:
+    """Critic 4 (docs 15.28): this pack's user-sign false-accept rate (threshold rule, INCLUDE test signers only,
+    k = 3) against the reference report's. ``pass`` = this <= reference. A reference written before docs 15.27 has
+    no threshold-rule rate: its ``user_sign_false_accept_rate`` is used and a note says so. Recorded, not (yet) a
+    gate that blocks a pack."""
+    ref_path = Path(ref_path)
+    out = {"reference": {"path": str(ref_path)}, "k": k, "metric": "user_sign_false_accept_rate_threshold_rule",
+           "rule": "this pack's user-sign false-accept rate (threshold rule) <= the reference's, INCLUDE test "
+                   "signers only", "notes": []}
+    try:
+        doc = json.loads(ref_path.read_text())
+    except (OSError, ValueError) as e:
+        return {**out, "run": False, "reason": f"cannot read the reference report: {e}"}
+    r4 = (doc.get("protocols") or {}).get("E4") or {}
+    out["reference"].update(profile=doc.get("profile"), population=r4.get("population"))
+    rk = (r4.get("by_k") or {}).get(k) if r4.get("run") else None
+    if not rk:
+        return {**out, "run": False, "reason": f"the reference report has no E4 {k} result"
+                + (f" ({r4.get('reason')})" if r4.get("reason") else "")}
+    ref_v = rk.get("user_sign_false_accept_rate_threshold_rule")
+    if ref_v is None:
+        ref_v = rk.get("user_sign_false_accept_rate")
+        out["notes"].append("the reference report has no threshold-rule rate (written before docs 15.27): compared "
+                            "with its user_sign_false_accept_rate")
+    if not r4.get("population"):
+        out["notes"].append("the reference report does not record its E4 population (written before docs 15.27); "
+                            "a commercial-safe report is INCLUDE only, other profiles may have pooled other sources")
+    own = (e4.get("by_k") or {}).get(k) if e4.get("run") else None
+    if not own:
+        return {**out, "run": False, "reason": f"this report has no INCLUDE-only E4 {k} result"
+                + (f" ({e4.get('reason')})" if e4.get("reason") else "")}
+    this_v = own.get("user_sign_false_accept_rate_threshold_rule")
+    if ref_v is None or this_v is None:
+        return {**out, "run": False, "reason": "a false-accept rate is missing (no other-word takes)"}
+    return {**out, "run": True, "reference_rate": float(ref_v), "this_rate": float(this_v),
+            "reference_n_other_words": rk.get("n_other_words"), "this_n_other_words": own.get("n_other_words"),
+            "pass": bool(this_v <= ref_v)}
 
 
 # --------------------------------------------------------------------------------------------- pre-training guard
@@ -896,7 +994,8 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
                  progress=None, partial_data: bool | None = None, compare_to: Path | None = None) -> dict:
     """Run every protocol whose components exist in ``work`` and write ``eval/report.json`` + ``report.md``.
     ``compare_to``: another evaluation report.json (e.g. the commercial-safe pack's); E1b then also reports top-1 /
-    top-5 on that report's class set and on the clips both evaluated (``E1b.like_for_like``, docs 15.27)."""
+    top-5 on that report's class set and on the clips both evaluated (``E1b.like_for_like``, docs 15.27), and E4
+    compares the INCLUDE-only user-sign false-accept rate with the reference's (``E4.like_for_like``, docs 15.28)."""
     from app.core.config import REPO_ROOT, get_settings
     from app.isl.evaluation.protocols import e6_latency
     from app.isl.models.encoder import EncoderPredictor
@@ -1053,6 +1152,8 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     log("E4")
     prot["E4"] = (refused_entry("My signs few-shot (uses the word classifier)", cls_why) if cls_why else
                   e4_populations(rec, test_inc, extra_test, ks=e4_ks))
+    if compare_to and not cls_why:  # critic 4: user-sign false accepts no worse than the reference pack's
+        prot["E4"]["like_for_like"] = e4_like_for_like(prot["E4"], Path(compare_to))
     prot["E5"] = e5_from_letters(work / "letters.pt")
     log("E6")
     prot["E6"] = e6_latency(rec, test_inc + extra_test, n=latency_n)
@@ -1260,7 +1361,7 @@ def _e4_lines(e4: dict) -> list[str]:
     pops = [("INCLUDE only", e4)] + ([("all sources", e4["all_sources"])] if isinstance(e4.get("all_sources"), dict)
                                      and e4["all_sources"].get("run") else [])
     if not any(p.get("run") for _, p in pops):
-        return []
+        return _e4_like_for_like_lines(e4.get("like_for_like"))
     lines = ["", f"## E4 My signs (user-sign classifier term: {e4.get('user_cls_mode', 'penalty')}, policy "
              f"{e4.get('policy', 'balanced')}: {e4.get('rule', '-')})", "",
              "False accept = a user sign accepted on a word the signer did not enrol (lower is better). 'auto' = what "
@@ -1281,7 +1382,29 @@ def _e4_lines(e4: dict) -> list[str]:
                          f"{_fmt(v['top1_with_enrolment'])} | "
                          f"{format_interval(v.get('interval_with'), v.get('n_groups'), v.get('interval_with_reason'))} | "
                          f"{_fmt(v['gain'])} |")
-    return lines
+    refused = [(name, k, v) for name, p in pops if p.get("run") for k, v in p["by_k"].items()
+               if v.get("enrolment_refused")]
+    if refused:
+        lines += ["", "Enrolments refused by the store's consistency rule (c_min "
+                  f"{refused[0][2].get('enrol_c_min')}; those words were tested as not enrolled): "
+                  + "; ".join(f"{name} {k}: {v['enrolment_refused']} of {v.get('enrolments')}"
+                              for name, k, v in refused)]
+    return lines + _e4_like_for_like_lines(e4.get("like_for_like"))
+
+
+def _e4_like_for_like_lines(lf: dict | None) -> list[str]:
+    if not lf:
+        return []
+    r = lf.get("reference") or {}
+    head = (f"E4 like for like against {r.get('profile') or '-'} ({r.get('path')}), user-sign false-accept rate "
+            f"(threshold rule, INCLUDE only, {lf.get('k')}):")
+    if not lf.get("run"):
+        return ["", head, f"* not compared: {lf.get('reason')}"]
+    return ["", head,
+            f"* **{'PASS' if lf.get('pass') else 'FAIL'}**: this pack {_fmt(lf.get('this_rate'))} (other-word takes "
+            f"{lf.get('this_n_other_words', '-')}) vs reference {_fmt(lf.get('reference_rate'))} (other-word takes "
+            f"{lf.get('reference_n_other_words', '-')}); rule: {lf.get('rule')}",
+            *[f"* note: {n}" for n in lf.get("notes") or []]]
 
 
 def markdown_report(doc: dict) -> str:

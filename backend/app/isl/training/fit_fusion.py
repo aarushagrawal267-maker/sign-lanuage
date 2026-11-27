@@ -504,6 +504,24 @@ MAX_FA_INCREASE = 0.01  # "neutral" may not raise the user-sign false-accept rat
 # >= 2 more correct takes), which on research validation (4,689 takes, +84 correct, 0 lost) kept "penalty" and with
 # 30 takes let +3 of 30 through.
 SIGN_TEST_ALPHA = 0.05
+# The pooled test is dominated by the largest source (ISL500 is ~94 % of research validation takes), so the INCLUDE
+# takes, the population packs are compared on, are also tested on their own (docs 15.28): "neutral" is refused when
+# penalty beats it on INCLUDE by a one-sided sign test at p < SIGN_TEST_ALPHA.
+GUARD_SOURCE = "include"
+
+
+def _paired_by_source(hp: np.ndarray, hn: np.ndarray, src) -> dict:
+    """b / c / one-sided p per source of the enrolled takes (``_with_src``), plus INCLUDE vs the rest."""
+    src = np.asarray([str(x or "unknown") for x in src])
+    out = {}
+    groups = {x: src == x for x in sorted(set(src.tolist()))}
+    if GUARD_SOURCE in groups and len(groups) > 1:
+        groups[f"not_{GUARD_SOURCE}"] = src != GUARD_SOURCE
+    for name, sel in groups.items():
+        b, c = int((hn & ~hp & sel).sum()), int((hp & ~hn & sel).sum())
+        out[name] = {"n": int(sel.sum()), "neutral_only_correct": b, "penalty_only_correct": c,
+                     "p_one_sided": sign_test_p(b, c), "p_penalty_better": sign_test_p(c, b)}
+    return out
 
 
 def sign_test_p(b: int, c: int) -> float:
@@ -587,15 +605,34 @@ def choose_user_mode(rec, val_clips: list[Clip], params: FusionParams, ks=(3, 5)
     b, c = int((hn & ~hp).sum()), int((hp & ~hn).sum())
     p_val = sign_test_p(b, c)
     clear_gain = p_val < SIGN_TEST_ALPHA
-    choose = "neutral" if clear_gain and fa_up <= MAX_FA_INCREASE else "penalty"
+    st = {"neutral_only_correct": b, "penalty_only_correct": c, "p_one_sided": p_val, "alpha": SIGN_TEST_ALPHA,
+          "population": "every enrolled validation take, pooled over sources"}
+    # per source (docs 15.28): the pooled test can be won on one big source while INCLUDE gets worse
+    src = res["penalty"]["by_k"][f"k{k_used}"].get("_with_src")
+    src_n = res["neutral"]["by_k"][f"k{k_used}"].get("_with_src")
+    inc_worse = False
+    if src is not None and len(src) == len(hp) and (src_n is None or list(src_n) == list(src)):
+        st["by_source"] = _paired_by_source(hp, hn, src)
+        g = st["by_source"].get(GUARD_SOURCE)
+        inc_worse = bool(g and g["p_penalty_better"] < SIGN_TEST_ALPHA)
+    else:
+        st["by_source_reason"] = "no per-take sources from E4"
+    choose = "neutral" if clear_gain and fa_up <= MAX_FA_INCREASE and not inc_worse else "penalty"
+    if choose == "neutral":
+        why = "neutral raises enrolled-word top-1 (sign test) without more user-sign false accepts"
+    elif not clear_gain:
+        why = (f"neutral's top-1 gain ({gain:+.3f}; {b} takes won, {c} lost) is within noise "
+               f"(one-sided sign test p = {p_val:.3g}, need < {SIGN_TEST_ALPHA})")
+    elif fa_up > MAX_FA_INCREASE:
+        why = f"neutral raised user-sign false accepts by {fa_up:+.4f} (> {MAX_FA_INCREASE})"
+    else:
+        g = st["by_source"][GUARD_SOURCE]
+        why = (f"neutral wins pooled but is worse on {GUARD_SOURCE} takes ({g['neutral_only_correct']} won, "
+               f"{g['penalty_only_correct']} lost; one-sided p = {g['p_penalty_better']:.3g} < {SIGN_TEST_ALPHA})")
     rep.update(chosen=choose, k=k_used, top1_gain_neutral=round(gain, 4), false_accept_increase_neutral=round(fa_up, 4),
-               extra_correct_neutral=b - c, sign_test={"neutral_only_correct": b, "penalty_only_correct": c,
-                                                       "p_one_sided": p_val, "alpha": SIGN_TEST_ALPHA},
-               rule=f"neutral when the one-sided paired sign test gives p < {SIGN_TEST_ALPHA} and the user-sign "
-                    f"false-accept rate (threshold rule) rises by <= {MAX_FA_INCREASE}",
-               reason=("neutral raises enrolled-word top-1 (sign test) without more user-sign false accepts"
-                       if choose == "neutral" else
-                       (f"neutral's top-1 gain ({gain:+.3f}; {b} takes won, {c} lost) is within noise "
-                        f"(one-sided sign test p = {p_val:.3g}, need < {SIGN_TEST_ALPHA})" if not clear_gain
-                        else f"neutral raised user-sign false accepts by {fa_up:+.4f} (> {MAX_FA_INCREASE})")))
+               extra_correct_neutral=b - c, sign_test=st,
+               rule=f"neutral when the one-sided paired sign test (pooled) gives p < {SIGN_TEST_ALPHA}, the user-sign "
+                    f"false-accept rate (threshold rule) rises by <= {MAX_FA_INCREASE}, and penalty is not better "
+                    f"on {GUARD_SOURCE} takes alone (one-sided sign test, p < {SIGN_TEST_ALPHA})",
+               reason=why)
     return params.with_(user_cls_mode=choose), rep

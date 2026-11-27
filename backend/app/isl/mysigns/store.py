@@ -379,17 +379,28 @@ class MySignsStore:
                     disk_rows.write_text(json.dumps(keys))
                 except OSError:
                     pass
-            thetas = {sid: theta_from_embeddings(np.stack([cached[k] for k in ks])) for sid, ks in sign_keys.items()}
-            self._cache = {"key": key, "index": idx, "thetas": thetas, "ekey": ekey}
+            # each sign's vectors under THIS embedder; thetas are computed from them on demand, per enrolment
+            # setting (user_theta), so a pack's own enrol.c_min is applied, not a hard-coded 0.5 (docs 15.28)
+            vecs = {sid: np.stack([cached[k] for k in ks]) for sid, ks in sign_keys.items()}
+            self._cache = {"key": key, "index": idx, "vecs": vecs, "thetas": {}, "ekey": ekey}
             return idx
 
-    def user_theta(self, sign_id: str, embedder) -> float | None:
-        """The sign's acceptance cosine for ``embedder``'s vectors (recomputed by :meth:`user_index`); ``None`` when
-        it has fewer than 2 usable takes or they are not consistent under this embedder (never auto-accepted)."""
+    def user_theta(self, sign_id: str, embedder, *, c_min: float = 0.5,
+                   theta_margin: float = 0.05) -> float | None:
+        """The sign's acceptance cosine for ``embedder``'s vectors (``theta_from_embeddings`` of the takes that
+        :meth:`user_index` embedded); ``None`` when it has fewer than 2 usable takes or they are not consistent under
+        this embedder (never auto-accepted). ``c_min`` / ``theta_margin``: the pack's enrolment settings, the ones
+        :meth:`add` used (``fusion.enrol``); results are cached per (sign, c_min, theta_margin)."""
         if self.user_index(embedder) is None:
             return None
         with self._lock:
-            return (self._cache.get("thetas") or {}).get(sign_id)
+            memo = self._cache.setdefault("thetas", {})
+            mk = (sign_id, float(c_min), float(theta_margin))
+            if mk not in memo:
+                z = (self._cache.get("vecs") or {}).get(sign_id)
+                memo[mk] = (None if z is None else
+                            theta_from_embeddings(z, c_min=float(c_min), theta_margin=float(theta_margin)))
+            return memo[mk]
 
     # -------------------------------------------------------------- enrolment
     def add(self, text_en: str, takes: list[RawSequence], *, embedder=None, text_hi: str | None = None,

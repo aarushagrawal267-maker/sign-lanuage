@@ -346,8 +346,8 @@ class IslRecognizer:
         p = self.fusion
         sid = key.removeprefix(USER_PREFIX)
         fn = getattr(self.my_signs, "user_theta", None) if self.my_signs is not None else None
-        if callable(fn):
-            th = fn(sid, self.user_embedder)
+        if callable(fn):  # with the pack's enrolment consistency rule, as at enrolment (docs 15.28)
+            th = fn(sid, self.user_embedder, c_min=float((p.enrol or {}).get("c_min", 0.5)))
         else:
             sign = self.my_signs.get(sid) if self.my_signs else None
             th = sign.theta if sign else None

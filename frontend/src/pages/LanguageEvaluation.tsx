@@ -29,7 +29,20 @@ type E2Fold = { fold: number; run?: boolean; reason?: string; leakage?: string; 
 type ByK = {
   n?: number; n_groups?: number; top1_without_enrolment?: number; top1_with_enrolment?: number; gain?: number;
   interval_with?: Interval; interval_with_reason?: string | null; n_other_words?: number;
-  user_sign_false_accept_rate?: number; interval_false_accept?: Interval; interval_false_accept_reason?: string | null;
+  user_sign_false_accept_rate?: number | null; interval_false_accept?: Interval; interval_false_accept_reason?: string | null;
+  user_sign_false_accepts?: number;
+  /** docs 15.27: the same rule without the certification gate (the user sign put first and asked to confirm). Under a
+   * confirm-only policy the app's own rate above is 0 by construction; this one is the number to compare packs on. */
+  user_sign_false_accept_rate_threshold_rule?: number | null; user_sign_false_accepts_threshold_rule?: number;
+  interval_false_accept_threshold_rule?: Interval;
+  enrolments?: number; enrolment_refused?: number;
+};
+/** E4 on one population (the headline is INCLUDE test signers only; ``all_sources`` adds other sources). */
+type E4Population = { run?: boolean; reason?: string; population?: string; n?: number; n_groups?: number | null; by_k?: Record<string, ByK> };
+/** E4 against a reference report (docs 15.28): INCLUDE-only threshold-rule false-accept rate, this <= reference. */
+type E4LikeForLike = {
+  run?: boolean; reason?: string; reference?: { path?: string; profile?: string | null }; k?: string;
+  this_rate?: number; reference_rate?: number; pass?: boolean; notes?: string[];
 };
 type TrimEval = {
   synthetic?: { n?: number; within_300ms?: number; median_abs_err_ms?: number; late_frac?: number; early_frac?: number };
@@ -48,7 +61,8 @@ export type Protocol = IntervalBlock & {
   top1_by_source?: Record<string, { n?: number; top1?: number }>;
   restricted_gallery?: (IntervalBlock & { n?: number; n_groups?: number }) | null;
   folds?: E2Fold[]; pretraining_saw_gallery_unlabelled?: boolean | null;
-  user_cls_mode?: string; by_k?: Record<string, ByK>;
+  user_cls_mode?: string; by_k?: Record<string, ByK>; population?: string;
+  all_sources?: E4Population; like_for_like?: E4LikeForLike;
   data?: { examples?: number; letters?: number; signers?: number; words?: number; per_source?: Record<string, number> } | null;
   load_average?: number; stages_p50_ms?: Record<string, number>;
   sha256?: string; unchanged_in_git?: boolean;
@@ -93,6 +107,7 @@ const METRICS: Record<string, StringKey> = {
   suggest_rate: "eval.m.suggest_rate", suggest_top5_hit: "eval.m.suggest_top5_hit", p50_ms: "eval.m.p50_ms", p95_ms: "eval.m.p95_ms",
   passed: "eval.m.passed", trims: "eval.m.trims", low_confidence_frac: "eval.m.low_confidence_frac", cap_frac: "eval.m.cap_frac",
   top1_with_enrolment: "eval.m.top1_with_enrolment", gain: "eval.m.gain", user_sign_false_accept_rate: "eval.m.user_sign_false_accept_rate",
+  user_sign_false_accept_rate_threshold_rule: "eval.m.user_sign_false_accept_rate_threshold_rule",
 };
 
 export type Status = "measured" | "not_run" | "refused" | "missing";
@@ -150,13 +165,15 @@ function BlockInterval({ block, k, fallback }: { block: IntervalBlock; k: string
   return <IntervalText ci={b.intervals?.[k]} groups={b.interval_groups?.[k]} reason={b.interval_reasons?.[k]} fmt={(v) => value(k, v)} />;
 }
 
-/** E4's headline metrics carry no intervals; its per-k rows do (top1_with_enrolment_k3 -> by_k.k3.interval_with). */
-function e4Interval(p: Protocol, key: string): IntervalBlock | undefined {
-  const m = /^(top1_with_enrolment|user_sign_false_accept_rate)_k(\d+)$/.exec(key);
+/** E4's headline metrics carry no intervals; its per-k rows do (top1_with_enrolment_k3 -> by_k.k3.interval_with,
+ * user_sign_false_accept_rate_threshold_rule_k3 -> by_k.k3.interval_false_accept_threshold_rule). */
+export function e4Interval(p: Protocol, key: string): IntervalBlock | undefined {
+  const m = /^(top1_with_enrolment|user_sign_false_accept_rate(?:_threshold_rule)?)_k(\d+)$/.exec(key);
   const r = m ? p.by_k?.[`k${m[2]}`] : undefined;
   if (!m || !r) return undefined;
   const fa = m[1] !== "top1_with_enrolment";
-  const ci = fa ? r.interval_false_accept : r.interval_with;
+  const thr = m[1].endsWith("_threshold_rule");
+  const ci = !fa ? r.interval_with : thr ? r.interval_false_accept_threshold_rule : r.interval_false_accept;
   const why = fa ? r.interval_false_accept_reason : r.interval_with_reason;
   return { intervals: { [key]: ci ?? null }, interval_reasons: why ? { [key]: why } : {}, interval_groups: r.n_groups !== undefined ? { [key]: r.n_groups } : {} };
 }
@@ -354,45 +371,104 @@ function E3Details({ p }: { p: Protocol }) {
   );
 }
 
-function E4Details({ p }: { p: Protocol }) {
-  const { t, value } = useFmt();
-  const rows = Object.entries(p.by_k ?? {});
+/** One false-accept cell: rate, "count / other-word takes", interval or its reason. */
+function FaCell({ rate, count, n, ci, groups, reason }: { rate?: number | null; count?: number; n?: number; ci?: Interval; groups?: number; reason?: string | null }) {
+  const { value } = useFmt();
   return (
-    <>
-      {p.user_cls_mode && <div className="mt-3"><Kv k={t("eval.userMode")} v={<En>{p.user_cls_mode}</En>} /></div>}
-      {rows.length > 0 && (
-        <Section title={t("eval.byKTitle")}>
-          <ScrollRegion label={t("eval.byKTitle")} className="overflow-x-auto">
-            <table className="w-full min-w-[720px] text-left text-sm">
-              <caption className="sr-only">{t("eval.byKTitle")}</caption>
+    <td className={`${td} font-semibold`}>
+      {value("rate", rate)}
+      {n !== undefined && <span className="font-normal text-fg-3"> ({count !== undefined ? `${num(count)} / ` : ""}{num(n)})</span>}
+      <div className="text-[11px] font-normal"><IntervalText ci={ci} groups={groups} reason={reason} fmt={(x) => value("rate", x)} /></div>
+    </td>
+  );
+}
+
+/** The by-k table of one E4 population. The false-accept columns come first: they are a precision number (critic 4,
+ * docs 15.27). "Shown without asking" is 0 by design under a confirm-only policy, so the threshold-rule column is
+ * always next to it. */
+function E4ByK({ title, pop, named = true }: { title: string; pop: E4Population; named?: boolean }) {
+  const { t, value } = useFmt();
+  const rows = Object.entries(pop.by_k ?? {});
+  const refused = rows.filter(([, v]) => v.enrolment_refused);
+  return (
+    <Section title={title}>
+      {pop.run === false ? (
+        <p className="text-sm text-fg-2"><span className="font-medium">{t("eval.reason")}</span> <En>{pop.reason ?? "—"}</En></p>
+      ) : (
+        <>
+          <ScrollRegion label={title} className="overflow-x-auto">
+            <table className="w-full min-w-[880px] text-left text-sm">
+              <caption className="sr-only">{named ? `${t("eval.byKTitle")} · ${title}` : title}</caption>
               <thead className="text-xs text-fg-3">
                 <tr>
                   <th scope="col" className={th}>{t("eval.k")}</th>
                   <th scope="col" className={th}>{t("eval.n")}</th>
                   <th scope="col" className={th}>{t("eval.colGroups")}</th>
+                  <th scope="col" className={th}>{t("eval.m.user_sign_false_accept_rate")}</th>
+                  <th scope="col" className={th}>{t("eval.m.user_sign_false_accept_rate_threshold_rule")}</th>
                   <th scope="col" className={th}>{t("eval.without")}</th>
                   <th scope="col" className={th}>{t("eval.m.top1_with_enrolment")}</th>
                   <th scope="col" className={th}>{t("eval.m.gain")}</th>
-                  <th scope="col" className={th}>{t("eval.m.user_sign_false_accept_rate")}</th>
                 </tr>
               </thead>
               <tbody className="font-mono text-[13px] tabular">
                 {rows.map(([k, v]) => (
-                  <tr key={k} className="border-t border-ink-700/60 align-top">
+                  <tr key={k} className="border-t border-ink-700/60 align-top" data-k={k}>
                     <th scope="row" className={`${td} font-sans font-normal`}>{k.replace(/^k/, "")}</th>
                     <td className={td}>{num(v.n)}</td>
                     <td className={td}>{v.n_groups ?? "—"}</td>
+                    <FaCell rate={v.user_sign_false_accept_rate} count={v.user_sign_false_accepts} n={v.n_other_words}
+                      ci={v.interval_false_accept} groups={v.n_groups} reason={v.interval_false_accept_reason} />
+                    <FaCell rate={v.user_sign_false_accept_rate_threshold_rule} count={v.user_sign_false_accepts_threshold_rule}
+                      n={v.n_other_words} ci={v.interval_false_accept_threshold_rule} groups={v.n_groups} reason={v.interval_false_accept_reason} />
                     <td className={td}>{pct(v.top1_without_enrolment)}</td>
                     <td className={td}>{pct(v.top1_with_enrolment)}<div className="text-[11px]"><IntervalText ci={v.interval_with} groups={v.n_groups} reason={v.interval_with_reason} fmt={(x) => value("top1", x)} /></div></td>
                     <td className={td}>{pct(v.gain)}</td>
-                    <td className={td}>{pct(v.user_sign_false_accept_rate)}{v.n_other_words !== undefined && <span className="text-fg-3"> / {num(v.n_other_words)}</span>}<div className="text-[11px]"><IntervalText ci={v.interval_false_accept} groups={v.n_groups} reason={v.interval_false_accept_reason} fmt={(x) => value("top1", x)} /></div></td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </ScrollRegion>
-        </Section>
+          {refused.map(([k, v]) => (
+            <p key={k} className="mt-1 text-xs text-fg-3">k = {k.replace(/^k/, "")}: {t("eval.e4Refused", { n: num(v.enrolment_refused), total: num(v.enrolments) })}</p>
+          ))}
+        </>
       )}
+    </Section>
+  );
+}
+
+function E4LikeForLikeLine({ lf }: { lf: E4LikeForLike }) {
+  const { t, value } = useFmt();
+  const head = t("eval.e4Lfl", { profile: lf.reference?.profile ?? "—" });
+  return (
+    <Section title={head}>
+      {lf.run ? (
+        <p className={`text-sm ${lf.pass ? "text-fg-2" : "text-danger"}`} data-testid="e4-like-for-like">
+          <Badge tone={lf.pass ? "good" : "danger"}>{lf.pass ? t("eval.e4LflPass") : t("eval.e4LflFail")}</Badge>{" "}
+          {t("eval.e4LflValues", { this: value("rate", lf.this_rate), ref: value("rate", lf.reference_rate) })}
+        </p>
+      ) : (
+        <p className="text-sm text-fg-2"><span className="font-medium">{t("eval.reason")}</span> <En>{lf.reason ?? "—"}</En></p>
+      )}
+      {(lf.notes ?? []).map((n) => <p key={n} className="mt-1 text-xs text-fg-3"><En>{n}</En></p>)}
+    </Section>
+  );
+}
+
+function E4Details({ p }: { p: Protocol }) {
+  const { t } = useT();
+  const all = p.all_sources;
+  return (
+    <>
+      {p.user_cls_mode && <div className="mt-3"><Kv k={t("eval.userMode")} v={<En>{p.user_cls_mode}</En>} /></div>}
+      <p className="mt-3 text-xs text-fg-3">{t("eval.e4FaNote")}</p>
+      {/* reports before docs 15.27 have no population: their headline may pool every source */}
+      {(p.run !== false || all) && (p.population
+        ? <E4ByK title={t("eval.e4PopInclude")} pop={p} />
+        : <E4ByK title={t("eval.byKTitle")} pop={p} named={false} />)}
+      {all && (all.run || all.reason) && <E4ByK title={t("eval.e4PopAll")} pop={all} />}
+      {p.like_for_like && <E4LikeForLikeLine lf={p.like_for_like} />}
     </>
   );
 }
@@ -483,9 +559,13 @@ function ProtocolCard({ id, p }: { id: string; p: Protocol }) {
       title={<span className="flex flex-wrap items-center gap-1.5">{title} <Badge>{id}</Badge> <StatusBadge s={s} /></span>}
       subtitle={p.label ? <En>{p.label}</En> : undefined}>
       {s !== "measured" ? (
-        <p className={`text-sm ${s === "refused" ? "text-danger" : "text-fg-2"}`}>
-          <span className="font-medium">{t("eval.reason")}</span> <En>{reasonOf(p) ?? "—"}</En>
-        </p>
+        <>
+          <p className={`text-sm ${s === "refused" ? "text-danger" : "text-fg-2"}`}>
+            <span className="font-medium">{t("eval.reason")}</span> <En>{reasonOf(p) ?? "—"}</En>
+          </p>
+          {/* E4's INCLUDE-only headline may not run while its all-sources population did (docs 15.27) */}
+          {id === "E4" && s === "not_run" && (p.all_sources?.run || p.like_for_like) && <E4Details p={p} />}
+        </>
       ) : (
         <>
           <MetricTable caption={t("eval.metricsCaption", { id })} block={p} fallback={(k) => intervalFallback(id, p, k)} />

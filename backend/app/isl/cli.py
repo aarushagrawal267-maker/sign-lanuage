@@ -905,6 +905,11 @@ def cmd_fit_fusion(paths: IslPaths, args) -> int:
 def cmd_evaluate(paths: IslPaths, args) -> int:
     from app.isl.training.pipeline import evaluate
 
+    if getattr(args, "compare_to", None) and not getattr(args, "all", False):
+        # before, it was silently ignored without --all: no like-for-like block (docs 15.28)
+        print("evaluate --compare-to needs --all (the like-for-like rows are part of the full evaluation)",
+              file=sys.stderr)
+        return 2
     profile, data, fcfg, work = _model_ctx(paths, args)
     if getattr(args, "all", False):
         from app.isl.evaluation.runners import evaluate_all
@@ -1191,9 +1196,10 @@ def build_parser() -> argparse.ArgumentParser:
             sp2.add_argument("--all", action="store_true",
                              help="every protocol (E1a-E8) -> <work>/eval and <pack>/eval report.json + report.md")
             sp2.add_argument("--compare-to", dest="compare_to", default=None,
-                             help="with --all: another report.json (e.g. artifacts/isl/commercial-safe/eval/"
+                             help="needs --all: another report.json (e.g. artifacts/isl/commercial-safe/eval/"
                                   "report.json); E1b also reports top-1/top-5 on its class set and on the clips both "
-                                  "evaluated (docs 15.27)")
+                                  "evaluated; E4 compares the INCLUDE-only user-sign false-accept rate (docs 15.27, "
+                                  "15.28)")
     hi = sub.add_parser("hindi")
     hi.add_argument("--translate", action="store_true", help="run IndicTrans2 on CPU for concepts not in the cache")
     hi.add_argument("--limit", type=int, default=0, help="translate at most N new inputs (0 = all)")
