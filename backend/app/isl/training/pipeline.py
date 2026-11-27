@@ -393,6 +393,13 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
         man["components"]["index"] = {**man["components"]["index"], **index_info}
     for comp, cs in class_spaces.items():
         man["components"][comp] = {**(man["components"].get(comp) or {}), "class_space": cs}
+    # the variant-audit file whose relinks trained this pack (docs 15.36-37): shipped numbers trace back to it
+    from app.isl.evaluation.runners import variant_links_summary
+    from app.isl.training.multisource import read_link_settings
+
+    vl = variant_links_summary(read_link_settings(work))
+    if vl:
+        man["variant_links"] = vl
     (tmp / "pack.json").write_text(json.dumps(man, indent=1, ensure_ascii=False))
     shutil.rmtree(out, ignore_errors=True)
     tmp.replace(out)

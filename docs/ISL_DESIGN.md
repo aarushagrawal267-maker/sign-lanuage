@@ -4082,6 +4082,8 @@ stale; the driver's start line).
 
 ### 15.36 Variant forms instead of forced merges: the variant audit (QA plan 1.3, critics 7 and 13, 27 Nov 2026)
 
+*15.37 changed parts of this section: the dictionary rule, the file names, the split check, the gates and the driver's seeding. Read 15.37 with it.*
+
 **Finding.** ISL500 and INCLUDE sometimes sign one word in two different ways. The QA review found 40 of 160 linked
 classes with cross-dataset agreement below 0.3 (for example short, tight~clothes, hot, child, pink, lock). The linker
 gives both forms one concept id. So the encoder is pulled to put two different signs together, and the classifier has
@@ -4161,3 +4163,71 @@ matches **top-1** agreement (37 of 191 below 0.3 here); `--top-k 1` gives that r
 agree at top 5 (hot 0.50, lock 0.85, pink 0.45, child 0.35). The dictionary rule says "another form" for 36 of the 178
 words the classifier agrees on (20 %), so on its own it is noisy; it only ever narrows the classifier's candidates.
 Read the evidence before linking with the file. `--top-k` was added for this choice (default 5, as planned).
+
+### 15.37 Variant audit review fixes: a calibrated dictionary rule, a proposal file, word labels (review of 15.36, 27 Nov 2026)
+
+**Dictionary rule, calibrated on signer shift.** The rule of 15.36 compared the ISL500 rank with the INCLUDE rank.
+The commercial-safe encoder was trained on those INCLUDE train clips, so the INCLUDE rank is in-sample: on the real
+sample its 25th, 50th and 75th percentiles were all 1. The rule then reduced to "ISL500 rank above 10", and it fired on
+20 % of the words the classifier agrees on. Now the yardstick is the ISL500 rank of the words the classifier agrees
+on (same form, new signers, same encoder). A low-agreement word is `different_form` only when its ISL500 rank is
+above the 95th percentile of that spread (`--dict-calib-percentile`, and above `--dict-rank-floor`). The INCLUDE rank
+is only a sanity check that the row exists and is reachable (`--dict-include-max-rank`). `--dict-rank-ratio` is gone.
+* The summary has `dictionary_calibration`: the number of agreeing words, the threshold, the 50/80/90/95th
+  percentiles, and the false-alarm rate on agreeing words (leave-one-out: each word against the threshold of the
+  others).
+* `dictionary_rule_usable` is false with fewer than 20 agreeing words (`--dict-calib-min-words`; then every verdict
+  is inconclusive) or a false-alarm rate above 0.10 (`--dict-max-false-alarm`). `link-sources` refuses such a file
+  with relinks (exit 2) unless `--accept-noisy`; that is recorded (`accepted_noisy`).
+* The audit version is now `isl-variant-audit-2`. The link step refuses a version-1 file.
+* The INCLUDE centroid is embedded with the encoder only (no classifier pass).
+
+**Real data, read-only** (27 Nov 2026, 20 train clips per word, 1 thread, 85 s per run, output in a scratch folder).
+Top-5: 13 low-agreement words, 4 relinked (mean 278, monday 211, paint 1502, she 731). Threshold 130 (178 agreeing
+words, p80 12, p90 41), false alarms 9 of 178 (0.051), usable. gun 22, market 27, friend 47 and clean-tidy 101 are
+now kept as signer shift. Top-1: 37 low-agreement words, 8 relinked (clean-tidy, mean, monday, paint, she, spring,
+tight~clothes, ugly). Threshold 90 (154 agreeing words), false alarms 0.058, usable.
+**Open: the orchestrator picks `--top-k` for the Batch 1 run and records it here.** The plan's count (40 of 160) and
+its examples fit top-1; with the calibrated rule, `--top-k 1` is a defensible reading.
+
+**A proposal, not an accepted file.** `variant-audit` now writes `<work>/variant_audit.json`. The link step never
+reads it. A person reads the evidence and approves it by copying it to `<work>/variant_links.json`, or names it with
+`link-sources --variant-links FILE`. `auto` reads only `variant_links.json`. A file whose `work` is another folder
+(for example a copy) is ignored in `auto` mode with a log line; a file named explicitly is allowed. `link-sources`
+prints the relink count, the false-alarm rate and the evidence scope.
+
+**Split check.** The audit records `isl500_split`: the seed, the split parameters (`multisource.SIGNER_SPLIT`) and
+the sorted ISL500 train signer groups with their SHA-256. `link-sources` recomputes the current ISL500 train groups.
+When an audited group is no longer train (for example QA plan 1.6 moves ISL500 signers to val), it refuses the file
+(exit 2). `--allow-split-change` links anyway and records `split_check.override` and the moved groups. A file without
+the record is refused too. Re-run the audit after any split change.
+
+**Evidence scope.** The audit records `parts_used` (ISL500 `train`; INCLUDE `train` for the dictionary, plus the
+reverse check's part, `val` by default). `link_settings.json` keeps it in `variant_links`. The evaluate report
+(`aliases.variant_links`, and a "Variant links" paragraph in report.md) and the pack manifest (`variant_links`) carry
+the file, its SHA-256, the relinks, the moved clip count and `parts_used`. The report warns when validation clips
+were evidence, when a noisy rule was accepted, and when the split check was overridden.
+
+**Word labels; the gates.** Strict labels count an INCLUDE clip predicted as `isl.<word>~isl500` as wrong, and an
+ISL500 test clip predicted as `isl.<word>` as wrong too, although the app shows the same word. That biases gates (a)
+and (d) against a variant run. Word labels collapse only the variant concepts to their word (from the frozen
+`variants`); twins such as female / woman-female stay strict (critic 12). E1b, E1c and E3 report `word_labels` next
+to strict and alias labels, and E1b like-for-like has `common_clips_word_labels`. In a run with variant links, **gate
+(a) uses the word-label common-clip number (or the masked `reference_classes_common_clips` number, which masks the
+variant column), and gate (d) uses the ISL500 row of `word_labels.top1_by_source` in E1c (classifier) and E3
+(fused)**. Without variants word labels equal
+strict labels and nothing new is written.
+
+**Driver.** `variant_links.json` is no longer a link output for seeding, so a scratch run never gets the real
+folder's audit; a scratch `--from link` links without variants. `--only link` is refused (exit 2) when the file's
+state differs from the variant state frozen in the folder's `link_settings.json`: the later steps would keep stamps
+on models trained with the old labels. Use `--from link`. `VARIANT_ACCEPT_NOISY=1` and `VARIANT_ALLOW_SPLIT_CHANGE=1`
+pass the two overrides to the link step.
+
+Tests (`backend/tests/isl/test_variant_audit.py`): the calibrated rule keeps a low-agreement word whose ISL500 rank
+is inside the agreeing words' spread although its in-sample INCLUDE rank is 1, and relinks one far above it; a noisy
+or uncalibrated rule; refusal of a noisy, old-version or unchecked-split file; a split change between audit and link
+is refused and the override is recorded; `auto` ignores a file of another work folder and never reads the proposal;
+word labels count a variant as its word while a twin stays wrong, also on common clips; the report and the pack
+carry the audit and warn on validation evidence; the driver refuses `--only link` on a changed state and does not
+seed the audit file.

@@ -237,10 +237,12 @@ def load_e1_reference(path: Path) -> dict:
 
 
 def e1_like_for_like(P: np.ndarray, y: np.ndarray, ids: list[str], used, hit: np.ndarray, top5: np.ndarray,
-                     split_name: str, ref: dict) -> dict:
+                     split_name: str, ref: dict, word_hits: tuple[np.ndarray, np.ndarray] | None = None) -> dict:
     """E1b against a reference report (docs 15.27): top-1 / top-5 of THIS classifier restricted to the reference's
     class set (scores of other classes masked, only clips whose word is a reference class) and to the clip ids both
-    reports evaluated, with the reference's own numbers on the same clips. No alias scoring: strict labels only."""
+    reports evaluated, with the reference's own numbers on the same clips. No alias scoring: strict labels only.
+    ``word_hits``: (top-1, top-5) per clip on word labels (variant concepts counted as their word, docs 15.37); the
+    common-clip row is then also given on word labels (``common_clips_word_labels``)."""
     out = {"reference": {k: ref.get(k) for k in ("path", "profile", "split", "n", "top1", "top5")},
            "notes": list(ref.get("notes") or []), "rule": "strict labels; masked = the reference's classes only"}
     if ref.get("split") and ref["split"] != split_name:
@@ -285,6 +287,19 @@ def e1_like_for_like(P: np.ndarray, y: np.ndarray, ids: list[str], used, hit: np
             r5 = np.array([h5[i] == "1" for i in ref_idx], bool)
             row["reference_top5"] = float(r5.mean()) if len(r5) else None
         out["common_clips"] = row
+        if word_hits is not None:
+            w1, w5 = (np.asarray(x, float) for x in word_hits)
+            roww = {**rates(common, w1, w5), "rule": WORD_RULE}
+            if len(h1) == len(rid):
+                own_w = w1[common] > 0.5
+                r1 = np.array([h1[i] == "1" for i in ref_idx], bool)
+                roww["reference_top1"] = float(r1.mean()) if len(r1) else None
+                roww["discordant_top1"] = {"only_this": int((own_w & ~r1).sum()),
+                                           "only_reference": int((~own_w & r1).sum())}
+            if len(h5) == len(rid):
+                r5 = np.array([h5[i] == "1" for i in ref_idx], bool)
+                roww["reference_top5"] = float(r5.mean()) if len(r5) else None
+            out["common_clips_word_labels"] = roww
         if m_hit is not None:
             sel = common & in_ref
             row2 = rates(sel, m_hit, m_top5)
@@ -305,18 +320,36 @@ ALIAS_RULE = ("alias labels: a prediction of another member of the clip's alias 
               "headline and certification uses STRICT labels (docs 15.34, critic 12)")
 
 
-def e1_alias_rates(P: np.ndarray, y: np.ndarray, ids: list[str], alias_of: dict, hit: np.ndarray,
-                   top5: np.ndarray) -> dict:
-    """E1 top-1 / top-5 on alias labels (docs 15.34): the crop-mean probabilities ``P`` (n, classes) summed over each
-    alias group, then ranked by group. Strict numbers of the same clips next to them."""
+WORD_RULE = ("word labels: a prediction of a variant concept (isl.<word>~isl500, docs 15.36) counts as its word; "
+             "twins and every other alias stay strict. The variant is the same word and the same output, so these "
+             "are the like-for-like numbers for the gates of a variant run (docs 15.37)")
+
+
+def variant_word_map(link: dict | None) -> dict[str, str]:
+    """variant concept -> its word, from the link step's frozen ``variants`` (docs 15.36); empty without variants."""
+    return {str(v): str(w) for m in ((link or {}).get("variants") or {}).values() for w, v in (m or {}).items()}
+
+
+def group_hits(P: np.ndarray, y: np.ndarray, ids: list[str], alias_of: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Per clip top-1 / top-5 hits after summing ``P`` over the groups of ``alias_of`` and ranking groups."""
     from app.isl.vocab.aliases import alias_root, sum_by_alias
 
     roots, Pr = sum_by_alias(P, ids, alias_of)
     rpos = {r: i for i, r in enumerate(roots)}
     ry = np.array([rpos[alias_root(ids[t], alias_of)] for t in y], int)
     order = np.argsort(-np.asarray(Pr), axis=1, kind="stable")
-    h1 = order[:, 0] == ry
-    h5 = (order[:, :5] == ry[:, None]).any(1)
+    return order[:, 0] == ry, (order[:, :5] == ry[:, None]).any(1)
+
+
+def e1_alias_rates(P: np.ndarray, y: np.ndarray, ids: list[str], alias_of: dict, hit: np.ndarray,
+                   top5: np.ndarray, rule: str = ALIAS_RULE) -> dict:
+    """E1 top-1 / top-5 on alias labels (docs 15.34): the crop-mean probabilities ``P`` (n, classes) summed over each
+    alias group, then ranked by group. Strict numbers of the same clips next to them. With ``alias_of`` = the
+    variant pairs only (:func:`variant_word_map`) and ``rule`` = ``WORD_RULE``: word labels (docs 15.37)."""
+    from app.isl.vocab.aliases import alias_root, sum_by_alias
+
+    roots, _ = sum_by_alias(P, ids, alias_of)
+    h1, h5 = group_hits(P, y, ids, alias_of)
     strict1 = np.asarray(hit) > 0.5
     # per group: how many clips of that group change (docs 15.35), so a reader sees where the alias gain comes from
     yroot = [alias_root(ids[t], alias_of) for t in y]
@@ -326,13 +359,14 @@ def e1_alias_rates(P: np.ndarray, y: np.ndarray, ids: list[str], alias_of: dict,
         if m.any():
             by_group[g] = {"n": int(m.sum()), "top1_only_alias": int((h1 & ~strict1 & m).sum()),
                            "top1_only_strict": int((~h1 & strict1 & m).sum())}
-    return {"rule": ALIAS_RULE, "n": int(len(y)), "top1": float(h1.mean()), "top5": float(h5.mean()),
+    return {"rule": rule, "n": int(len(y)), "top1": float(h1.mean()), "top5": float(h5.mean()),
             "top1_strict": float(strict1.mean()), "top5_strict": float(np.mean(top5)),
             "top1_only_alias": int((h1 & ~strict1).sum()), "top1_only_strict": int((~h1 & strict1).sum()),
             "groups_among_classes": int(len(ids) - len(roots)), "by_group": by_group}
 
 
-def e3_alias_rates(results, truths: list[str], params: FusionParams, alias_of: dict, closed_set=None) -> dict:
+def e3_alias_rates(results, truths: list[str], params: FusionParams, alias_of: dict, closed_set=None,
+                   rule: str = ALIAS_RULE) -> dict:
     """E3 on alias labels (docs 15.34): the shown word counts as correct when it is in the clip's alias group. The
     decisions are the app's (``params``; with ``params.aliases`` the groups were already summed by ``fuse``)."""
     from app.isl.vocab.aliases import alias_root
@@ -346,7 +380,7 @@ def e3_alias_rates(results, truths: list[str], params: FusionParams, alias_of: d
     h5 = np.array([t in {root(k) for k in r.keys[:5]} for r, t in zip(results, rt)], bool)
     s5 = np.array([t in r.keys[:5] for r, t in zip(results, truths)], bool)
     n = len(results)
-    out = {"rule": ALIAS_RULE, "n": n, "top1": _rate(h1), "top5": _rate(h5), "top1_strict": _rate(s1),
+    out = {"rule": rule, "n": n, "top1": _rate(h1), "top5": _rate(h5), "top1_strict": _rate(s1),
            "top5_strict": _rate(s5),
            "fusion_sums_groups": bool(getattr(params, "aliases", None)), "policies": {}}
     for pol in POLICIES:
@@ -359,7 +393,7 @@ def e3_alias_rates(results, truths: list[str], params: FusionParams, alias_of: d
 
 
 def e1_closed_set(rec, clips, label: str, split_name: str, kind: str, reference: dict | None = None,
-                  alias_of: dict | None = None) -> dict:
+                  alias_of: dict | None = None, variant_of: dict | None = None) -> dict:
     """Classifier alone on ``clips``. Decision columns: the classifier-alone rule of the app's sliding mode, with the
     classifier's own validation temperature and threshold, NOT the fused thresholds of ``fusion.json`` (another
     probability scale: the commercial-safe report of 2026-11-26 compared raw classifier probabilities with the fused
@@ -367,7 +401,8 @@ def e1_closed_set(rec, clips, label: str, split_name: str, kind: str, reference:
     app's default policy (``E1_POLICY``, balanced): fitted per policy by fit-fusion when the pack has it for this
     classifier, else the checkpoint's single threshold (``classifier_policy_thresholds``, docs 15.17). Every policy's
     numbers are in ``policies``. ``alias_of``: also the alias-label top-1 / top-5 in ``alias_labels`` (docs 15.34;
-    the strict numbers stay the metrics)."""
+    the strict numbers stay the metrics). ``variant_of``: variant concept -> word (docs 15.37); also the word-label
+    numbers in ``word_labels`` (and on the common clips of ``like_for_like``)."""
     from sklearn.metrics import f1_score
 
     from app.inference.engine import EngineConfig
@@ -425,10 +460,15 @@ def e1_closed_set(rec, clips, label: str, split_name: str, kind: str, reference:
         record["per_clip"] = {"hit1": _bits(hit > 0.5), "hit5": _bits(top5 > 0.5)}
     if kind == "primary":
         record["class_ids"] = ids
+    word_hits = group_hits(P, y, ids, variant_of) if variant_of else None
     if reference is not None:
-        record["like_for_like"] = e1_like_for_like(P, y, ids, used, hit, top5, split_name, reference)
+        record["like_for_like"] = e1_like_for_like(P, y, ids, used, hit, top5, split_name, reference,
+                                                   word_hits=word_hits)
     if alias_of:
         record["alias_labels"] = e1_alias_rates(P, y, ids, alias_of, hit, top5)
+    if variant_of:
+        record["word_labels"] = e1_alias_rates(P, y, ids, variant_of, hit, top5, rule=WORD_RULE)
+        record["word_labels"]["top1_by_source"] = _top1_by_source(used, word_hits[0], hit > 0.5)
     per_cat = defaultdict(list)
     for c, h in zip(used, hit):
         per_cat[c.category or "other"].append(h)
@@ -499,7 +539,16 @@ def _e1_sliding_replay(rec, clips, thresholds: dict, kind: str) -> dict | None:
     return out
 
 
-def e3_fused(rec, clips, label: str, alias_of: dict | None = None) -> dict:
+def _top1_by_source(used, word_hit, strict_hit) -> dict:
+    """Per source: n, word-label top-1 and strict top-1 (gate (d) reads the ISL500 row, docs 15.37)."""
+    by: dict[str, list] = defaultdict(list)
+    for c, w, h in zip(used, word_hit, strict_hit):
+        by[getattr(c, "source", None) or "?"].append((float(w), float(h)))
+    return {k: {"n": len(v), "top1": float(np.mean([a for a, _ in v])), "top1_strict": float(np.mean([b for _, b in v]))}
+            for k, v in sorted(by.items())}
+
+
+def e3_fused(rec, clips, label: str, alias_of: dict | None = None, variant_of: dict | None = None) -> dict:
     from app.isl.training.fit_fusion import collect_evidence
 
     inputs, truths, used = collect_evidence(rec, clips)
@@ -526,6 +575,12 @@ def e3_fused(rec, clips, label: str, alias_of: dict | None = None) -> dict:
     by_src = defaultdict(list)
     for c, h in zip(used, ok):
         by_src[c.source].append(float(h))
+    word = None
+    if variant_of:  # word labels (docs 15.37): a variant counts as its word, per source too (gate (d))
+        word = e3_alias_rates(results, truths, rec.fusion, variant_of, closed, rule=WORD_RULE)
+        wh = [bool(r.keys) and variant_of.get(r.keys[0], r.keys[0]) == variant_of.get(t, t)
+              for r, t in zip(results, truths)]
+        word["top1_by_source"] = _top1_by_source(used, wh, ok)
     ach = rec.fusion.achieved or {}
     for pol, b in block["policies"].items():  # what each policy uses, and what validation said it achieves
         a = ach.get(pol) or {}
@@ -540,7 +595,8 @@ def e3_fused(rec, clips, label: str, alias_of: dict | None = None) -> dict:
             "metrics": _metrics_from(block), **block, "risk_coverage": curve,
             "aurc": float(np.mean([c["risk"] for c in curve])),
             "top1_by_source": {k: {"n": len(v), "top1": float(np.mean(v))} for k, v in sorted(by_src.items())},
-            **({"alias_labels": e3_alias_rates(results, truths, rec.fusion, alias_of, closed)} if alias_of else {})}
+            **({"alias_labels": e3_alias_rates(results, truths, rec.fusion, alias_of, closed)} if alias_of else {}),
+            **({"word_labels": word} if word is not None else {})}
 
 
 # --------------------------------------------------------------------------------------------- E2
@@ -1068,10 +1124,44 @@ def alias_summary(data, fusion) -> dict:
     al = link or fus
     if not al:
         return {"used": False, "note": "no alias groups (the link step did not turn them on): strict labels only"}
-    return {"used": True, "alias_of": al, "groups": alias_groups(al), "sha256": aliases_sha256(al),
-            "source": "link step" if link else "fusion.json", "fusion_sums_groups": bool(fus),
-            "mismatch": bool(link and fus and link != fus), "stale": bool(link and not fus),
-            "link_alias_version": (getattr(data, "link", None) or {}).get("alias_version"), "rule": ALIAS_RULE}
+    out = {"used": True, "alias_of": al, "groups": alias_groups(al), "sha256": aliases_sha256(al),
+           "source": "link step" if link else "fusion.json", "fusion_sums_groups": bool(fus),
+           "mismatch": bool(link and fus and link != fus), "stale": bool(link and not fus),
+           "link_alias_version": (getattr(data, "link", None) or {}).get("alias_version"), "rule": ALIAS_RULE}
+    vl = variant_links_summary(getattr(data, "link", None))
+    if vl:
+        out["variant_links"] = vl
+    return out
+
+
+def variant_links_summary(link: dict | None) -> dict | None:
+    """The variant-audit file the link step froze (docs 15.36-37): file, sha256, relinks, the evidence scope
+    (``parts_used``) and a warning when validation clips influenced the training labels. None without variants."""
+    link = link or {}
+    if not link.get("variants"):
+        return None
+    m = dict(link.get("variant_links") or {})
+    parts = m.get("parts_used") or {}
+    val = sorted(k for k, v in parts.items() if "val" in (v if isinstance(v, list) else [v]))
+    out = {k: m.get(k) for k in ("file", "sha256", "audit_version", "n_relinks", "parts_used", "top_k",
+                                 "dictionary_rule_usable", "dictionary_false_alarm_rate", "accepted_noisy")
+           if k in m}
+    out["variant_concepts"] = sorted(variant_word_map(link))
+    out["relinked_clips"] = link.get("variant_relinked")
+    sc = m.get("split_check") or {}
+    if sc:
+        out["split_check"] = {k: sc.get(k) for k in ("ok", "override", "moved_groups") if k in sc}
+    warn = []
+    if val:
+        warn.append(f"validation clips of {', '.join(val)} were used as evidence for the training labels (the "
+                    "audit's reverse check): validation numbers of these words are not fully held out")
+    if m.get("accepted_noisy"):
+        warn.append("the audit's dictionary rule was marked not usable and accepted anyway (--accept-noisy)")
+    if sc.get("override"):
+        warn.append("the audit's ISL500 train signers were not all train at link time (--allow-split-change)")
+    if warn:
+        out["warnings"] = warn
+    return out
 
 
 def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_path: Path | None = None,
@@ -1111,9 +1201,10 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     reference = load_e1_reference(Path(compare_to)) if compare_to else None
     aliases = alias_summary(data, rec.fusion)
     alias_of = aliases.get("alias_of") or None
+    variant_of = variant_word_map(getattr(data, "link", None)) or None  # word labels (docs 15.37)
     prot["E1b"] = e1_closed_set(rec, test_inc, f"E1b core words, closed set, INCLUDE test part of {split_name} ({lab}; "
                                 f"signer-independent: {si})", split_name, "primary", reference=reference,
-                                alias_of=alias_of)
+                                alias_of=alias_of, variant_of=variant_of)
     cv = sorted((work / "cv").glob("fold*/classifier.pt")) if (work / "cv").exists() else []
     # class spaces (docs 15.32): a classifier chosen with another signer grouping (e.g. WSLP as its own signers)
     # or an encoder trained with other sources has another class space; they are never pooled silently
@@ -1201,7 +1292,7 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
         log("E1c")
         prot["E1c"] = e1_closed_set(rec, extra_test, "E1c other sources' held-out signers (real signer ids: "
                                     + ", ".join(sorted({c.source for c in extra_test})) + "); signer-independent",
-                                    split_name, "extra_signers", alias_of=alias_of)
+                                    split_name, "extra_signers", alias_of=alias_of, variant_of=variant_of)
     else:
         prot["E1c"] = {"run": False, "reason": "no other labelled source has a signer-held-out test part yet (needs a "
                        "source with real signer ids and >= 6 signers, e.g. ISL500)"}
@@ -1212,7 +1303,7 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     e3_label = ("E3 fused system (classifier + dictionary retrieval + fusion fitted on validation) with accept / "
                 "suggest / abstain; INCLUDE test part + other sources' held-out signers")
     prot["E3"] = refused_entry(e3_label, cls_why) if cls_why else e3_fused(rec, test_inc + extra_test, e3_label,
-                                                                            alias_of=alias_of)
+                                                                            alias_of=alias_of, variant_of=variant_of)
     # E2 held-out-concept one-shot
     one = (paths.splits / "oneshot_concepts.json") if paths is not None else None
     fold_models = sorted((work / "oneshot").glob("fold*/encoder.pt")) if (work / "oneshot").exists() else []
@@ -1506,6 +1597,33 @@ def _alias_lines(doc: dict) -> list[str]:
             row += (f"; balanced accepted precision strict {_fmt(b.get('accepted_precision_strict'))} / alias "
                     f"{_fmt(b.get('accepted_precision'))}")
         out.append(row)
+    out += _word_label_lines(doc)
+    return out
+
+
+def _word_label_lines(doc: dict) -> list[str]:
+    """Variant links (docs 15.36-37): which audit relinked the training labels, and the word-label numbers (a variant
+    counted as its word) that the gates of a variant run use."""
+    vl = (doc.get("aliases") or {}).get("variant_links")
+    if not vl:
+        return []
+    fa = vl.get("dictionary_false_alarm_rate")
+    out = ["", f"Variant links (docs 15.36-37): {vl.get('n_relinks')} words relinked "
+               f"({vl.get('relinked_clips')} ISL500 clips) by {vl.get('file')} (sha256 {str(vl.get('sha256'))[:16]}), "
+               f"evidence {vl.get('parts_used')}, dictionary false-alarm rate on agreeing words "
+               f"{'-' if fa is None else f'{fa:.3f}'}. Word labels count a variant as its word (twins stay strict); "
+               "the gates of a variant run read the word-label numbers."]
+    out += [f"* **warning: {w}**" for w in vl.get("warnings") or []]
+    for pid in ("E1b", "E1c", "E3"):
+        a = (doc["protocols"].get(pid) or {}).get("word_labels")
+        if not a:
+            continue
+        out.append(f"* {pid} word labels: n {a.get('n')}, top-1 strict {_fmt(a.get('top1_strict'))} / word "
+                   f"{_fmt(a.get('top1'))}, top-5 strict {_fmt(a.get('top5_strict'))} / word {_fmt(a.get('top5'))}")
+    cw = ((doc["protocols"].get("E1b") or {}).get("like_for_like") or {}).get("common_clips_word_labels")
+    if cw and cw.get("n"):
+        out.append(f"* E1b common clips, word labels: n {cw['n']}, top-1 {_fmt(cw.get('top1'))}, top-5 "
+                   f"{_fmt(cw.get('top5'))}; reference top-1 {_fmt(cw.get('reference_top1'))}")
     return out
 
 

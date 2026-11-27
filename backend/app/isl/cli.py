@@ -43,9 +43,10 @@ source of the profile, linked to concepts, signer-held-out splits, duplicates dr
 training ones --resume / --max-minutes (exit code 75 = stopped with state saved, run again with --resume):
 
   link-sources           read + link every labelled source -> <work>/multisource.json, sources.json, extra_concepts.jsonl
-                         (--variant-links auto|none|FILE: variant forms of a variant-audit, docs 15.36)
+                         (--variant-links auto|none|FILE: approved variant forms of a variant-audit, docs 15.36-37)
   variant-audit --reference-work artifacts/isl/commercial-safe
-                         research: ISL500 words signed in another form than INCLUDE's -> <work>/variant_links.json
+                         research: ISL500 words signed in another form than INCLUDE's -> <work>/variant_audit.json
+                         (a proposal: copy it to <work>/variant_links.json after reading the evidence)
   pretrain               self-supervised encoder pre-training (temporal contrastive + masked frames) on every
                          unlabelled / sentence source of the profile -> <work>/pretrained_encoder.pt
   train-encoder --init auto
@@ -1005,40 +1006,70 @@ def cmd_build_pack(paths: IslPaths, args) -> int:
     return 0
 
 
-def _variant_links_file(work: Path, choice: str | None) -> Path | None:
-    """``--variant-links``: ``auto`` (default) = ``<work>/variant_links.json`` when it exists; ``none`` = never; else a
-    file path (must exist). docs 15.36, critic 7: only this work folder's audit, or a file named explicitly."""
+def _variant_links_file(work: Path, choice: str | None) -> tuple[Path | None, str]:
+    """``--variant-links``: ``auto`` (default) = ``<work>/variant_links.json`` (the approved copy of an audit) when it
+    exists; ``none`` = never; else a file path (must exist). Returns ``(file, "auto" | "explicit" | "none")``.
+    docs 15.36-37, critic 7: only this work folder's approved audit, or a file named explicitly."""
     from app.isl.training.variant_audit import VARIANT_LINKS
 
     c = (choice or "auto").strip()
     if c in ("none", "off"):
-        return None
+        return None, "none"
     if c == "auto":
         f = Path(work) / VARIANT_LINKS
-        return f if f.exists() else None
+        return (f, "auto") if f.exists() else (None, "auto")
     f = Path(c)
     if not f.is_file():
         raise FileNotFoundError(f"--variant-links {c}: no such file")
-    return f
+    return f, "explicit"
 
 
 def cmd_link_sources(paths: IslPaths, args) -> int:
     """Read every labelled source of the profile, link glosses to concepts, split signers, drop duplicates.
     Writes ``<work>/link_settings.json`` (docs 15.34): every later step of the work folder links the same way.
-    A variant-links file (``cli variant-audit``, docs 15.36) is frozen into it with its SHA-256."""
+    An approved variant-links file (``cli variant-audit``, docs 15.36-37) is frozen into it with its SHA-256, after
+    checking that it belongs to this work folder (auto) and that the ISL500 signers it audited are still train."""
     from app.core.config import get_settings
     from app.isl.profiles import get_profile
-    from app.isl.training.multisource import link_settings, write_link_settings
+    from app.isl.training import variant_audit as va
+    from app.isl.training.common import load_vocab
+    from app.isl.training.multisource import link_settings, source_train_groups, write_link_settings
     from app.isl.training.pipeline import workdir
-    from app.isl.training.variant_audit import VariantLinksError, load_variant_links
+
+    def say(msg: str) -> None:
+        print(f"link-sources: {msg}", file=sys.stderr)
 
     profile = get_profile(args.profile or get_settings().isl_profile).name
+    work_dir = workdir(profile)
+    variants, vmeta = {}, {}
     try:
-        vf = _variant_links_file(workdir(profile), getattr(args, "variant_links", "auto"))
-        variants, vmeta = load_variant_links(vf, profile) if vf is not None else ({}, {})
-    except (FileNotFoundError, VariantLinksError) as e:
-        print(f"link-sources: {e}", file=sys.stderr)
+        vf, how = _variant_links_file(work_dir, getattr(args, "variant_links", "auto"))
+        if vf is not None:
+            variants, vmeta = va.load_variant_links(vf, profile, accept_noisy=bool(getattr(args, "accept_noisy", False)))
+    except (FileNotFoundError, va.VariantLinksError) as e:
+        say(str(e))
         return 2
+    if vf is not None and how == "auto" and vmeta.get("work") and \
+            Path(vmeta["work"]).resolve() != Path(work_dir).resolve():
+        # a copy from another work folder (e.g. seeded into a scratch run): never applied silently (review, critic 7)
+        say(f"ignoring {vf}: it was audited for the work folder {vmeta['work']}, not {work_dir} (name it with "
+            "--variant-links FILE to use it here)")
+        variants, vmeta = {}, {}
+    if variants:
+        # the signers the audit used as ISL500 train must still be train (no val / test signer decides labels)
+        split = va.check_split(va.variant_links_doc_split(vf), source_train_groups(
+            paths, load_vocab(_vocab_path(args)), profile, va.VARIANT_SOURCE, seed=args.seed))
+        if not split["ok"]:
+            if not getattr(args, "allow_split_change", False):
+                say(f"{vf}: {split['reason']} (--allow-split-change links with it anyway, recorded)")
+                return 2
+            split["override"] = True
+            say(f"WARNING {vf}: {split['reason']}; linked anyway (--allow-split-change, recorded)")
+        vmeta["split_check"] = split
+        fa = vmeta.get("dictionary_false_alarm_rate")
+        say(f"variant links {vf} (sha256 {vmeta['sha256'][:16]}): {vmeta['n_relinks']} relinks, dictionary "
+            f"false-alarm rate on agreeing words {'-' if fa is None else f'{fa:.3f}'}, evidence "
+            f"{vmeta.get('parts_used')}" + (" ACCEPTED NOISY" if vmeta.get("accepted_noisy") else ""))
     args.all_sources = True
     args.link_settings_override = link_settings(bool(getattr(args, "link_aliases", False)), variants, vmeta)
     profile, data, fcfg, work = _model_ctx(paths, args)
@@ -1065,14 +1096,14 @@ def cmd_variant_audit(paths: IslPaths, args) -> int:
 
     The commercial-safe classifier (never trained on ISL500) scores ISL500 TRAIN clips; words with few top-5 hits
     are cross-checked against the ISLRTC dictionary with the commercial-safe encoder (and optionally the reverse
-    direction). Writes ``<work>/variant_links.json`` of THIS profile's work folder (or ``--out``), never
-    ``data/isl/derived``. The link step of that work folder reads it."""
+    direction). Writes the proposal ``<work>/variant_audit.json`` of THIS profile's work folder (or ``--out``), never
+    ``data/isl/derived``. The link step reads only the approved copy ``<work>/variant_links.json`` (docs 15.37)."""
     from app.isl.models.encoder import EncoderPredictor
     from app.isl.models.index import EmbeddingIndex, file_sha256
     from app.isl.profiles import WORD_SOURCES, get_profile
     from app.isl.training import variant_audit as va
     from app.isl.training.common import load_isl_data, load_vocab, set_threads
-    from app.isl.training.multisource import attach_all_sources, link_settings
+    from app.isl.training.multisource import SIGNER_SPLIT, attach_all_sources, link_settings
     from app.isl.training.pipeline import workdir
     from app.isl.vocab.aliases import TWIN_ALIASES, resolve_aliases
     from app.models.checkpoint import Predictor
@@ -1093,7 +1124,7 @@ def cmd_variant_audit(paths: IslPaths, args) -> int:
     if ref_prof not in WORD_SOURCES or va.VARIANT_SOURCE in WORD_SOURCES[ref_prof]:
         return refuse(f"the reference classifier's profile is {ref_prof!r}: it must be one that never trains on "
                       f"{va.VARIANT_SOURCE} (commercial-safe), or the audit scores its own training clips")
-    out = Path(args.out) if args.out else workdir(profile) / va.VARIANT_LINKS
+    out = Path(args.out) if args.out else workdir(profile) / va.VARIANT_AUDIT
     try:
         Path(out).resolve().relative_to(Path(paths.derived).resolve())
         return refuse(f"{out} is inside the shared {paths.derived}: write the audit into the work folder (critic 7)")
@@ -1135,18 +1166,33 @@ def cmd_variant_audit(paths: IslPaths, args) -> int:
                  "reverse_classifier_profile": rc.meta.get("profile"), "reverse_part": args.reverse_part,
                  "reverse_note": "every classifier also trains on INCLUDE train clips: a jointly trained model "
                                  "says 'no difference' easily, so its veto is weak evidence"}
-    models = va.AuditModels(list(clf.class_names), va.model_scorer(clf, enc), dictionary, rev_names, rev_score, prov)
+    # the INCLUDE centroid needs only the encoder (no classifier pass)
+    models = va.AuditModels(list(clf.class_names), va.model_scorer(clf, enc), dictionary, rev_names, rev_score, prov,
+                            embed=va.model_scorer(None, enc) if enc is not None else None)
     params = va.AuditParams(min_clips=args.min_clips, max_agreement=args.max_agreement, top_k=args.top_k,
-                            dict_rank_floor=args.dict_rank_floor, dict_rank_ratio=args.dict_rank_ratio,
+                            dict_rank_floor=args.dict_rank_floor, dict_calib_percentile=args.dict_calib_percentile,
+                            dict_calib_min_words=args.dict_calib_min_words,
+                            dict_max_false_alarm=args.dict_max_false_alarm,
                             dict_include_max_rank=args.dict_include_max_rank,
                             reverse_min_agreement=args.reverse_min_agreement, max_per_class=args.max_per_class,
                             seed=args.seed)
     isl500 = data.extra_part("train", (va.VARIANT_SOURCE,))
     doc = va.run_audit(isl500, data.include_part("train"), models, params, twins, rev_clips, progress=_log)
+    # the evidence scope (which parts decided the labels) and the ISL500 signer split it used (docs 15.37)
+    inc_parts = ["train"] if dictionary is not None else []
+    if args.reverse_classifier and args.reverse_part not in inc_parts:
+        inc_parts.append(args.reverse_part)
+    parts = {va.VARIANT_SOURCE: "train", "include": inc_parts}
     meta = va.write_variant_links(out, doc, profile=profile, work=workdir(profile),
                                   extra={"data": {"split": data.split.get("name"), "isl500_train_clips": len(isl500),
-                                                  "include_train_clips": len(data.include_part("train"))}})
-    _print({"variant_links": meta, "summary": doc["summary"], "relinks": doc["relinks"]})
+                                                  "include_train_clips": len(data.include_part("train"))},
+                                         "parts_used": parts,
+                                         "isl500_split": va.split_record(args.seed, SIGNER_SPLIT,
+                                                                         {c.group for c in isl500}),
+                                         "approval": f"a proposal: read the evidence, then copy it to "
+                                                     f"{workdir(profile) / va.VARIANT_LINKS} (or name it with "
+                                                     "link-sources --variant-links FILE)"})
+    _print({"variant_audit": meta, "summary": doc["summary"], "relinks": doc["relinks"]})
     return 0
 
 
@@ -1364,8 +1410,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "woman-female, ...); written to <work>/link_settings.json, which every later step reads "
                          "(docs 15.34). Default: link as before")
     lk.add_argument("--variant-links", default="auto",
-                    help="variant forms (cli variant-audit, docs 15.36): auto = <work>/variant_links.json when it "
-                         "exists (default), none = never, or a file of this profile. Frozen into link_settings.json")
+                    help="variant forms (cli variant-audit, docs 15.36-37): auto = <work>/variant_links.json (the "
+                         "approved copy of <work>/variant_audit.json) when it exists and was audited for this work "
+                         "folder (default), none = never, or a file of this profile. Frozen into link_settings.json")
+    lk.add_argument("--accept-noisy", action="store_true",
+                    help="link with an audit whose dictionary rule is marked not usable (recorded)")
+    lk.add_argument("--allow-split-change", action="store_true",
+                    help="link with an audit whose ISL500 train signers are not all train now (recorded)")
     vau = sub.add_parser("variant-audit")
     _model_args(vau)
     vau.add_argument("--reference-work", help="work folder of the reference models (default: the commercial-safe "
@@ -1380,7 +1431,11 @@ def build_parser() -> argparse.ArgumentParser:
     vau.add_argument("--max-agreement", type=float, default=0.3)
     vau.add_argument("--top-k", type=int, default=5, help="agreement = the word in the reference's top k (plan: 5)")
     vau.add_argument("--dict-rank-floor", type=int, default=10)
-    vau.add_argument("--dict-rank-ratio", type=float, default=3.0)
+    vau.add_argument("--dict-calib-percentile", type=float, default=95.0,
+                     help="another form = ISL500 dictionary rank above this percentile of the agreeing words'")
+    vau.add_argument("--dict-calib-min-words", type=int, default=20)
+    vau.add_argument("--dict-max-false-alarm", type=float, default=0.10,
+                     help="leave-one-out false-alarm rate on agreeing words above this: the rule is not usable")
     vau.add_argument("--dict-include-max-rank", type=int, default=20)
     vau.add_argument("--reverse-min-agreement", type=float, default=0.3)
     vau.add_argument("--max-per-class", type=int, default=0, help="score at most N train clips per word (0 = all)")

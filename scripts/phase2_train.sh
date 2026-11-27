@@ -56,9 +56,12 @@
 # LINK_ALIASES=1|0 (docs 15.34; research 1, commercial-safe 0): the link step strips WSLP's "(N)" numbering
 #   (adult(1) -> isl.adult) and turns on the twin alias groups (female / woman-female, ...) for the work folder
 #   (link-sources --link-aliases -> <work>/link_settings.json, read by every later step). Only the link step reads it.
-# VARIANT_LINKS=auto|none (docs 15.36; default auto for both profiles): the link step reads <work>/variant_links.json
-#   (written by `cli variant-audit` into THIS work folder only) when it exists and freezes its relinks and SHA-256 into
-#   link_settings.json; none = ignore it. No file (every run so far, every scratch run): nothing changes.
+# VARIANT_LINKS=auto|none (docs 15.36-37; default auto for both profiles): the link step reads <work>/variant_links.json
+#   (the APPROVED copy of the proposal <work>/variant_audit.json that `cli variant-audit` writes; never seeded into a
+#   scratch run) when it exists and freezes its relinks and SHA-256 into link_settings.json; none = ignore it. No file
+#   (every run so far, every scratch run): nothing changes. VARIANT_ACCEPT_NOISY=1 / VARIANT_ALLOW_SPLIT_CHANGE=1
+#   pass --accept-noisy / --allow-split-change to the link step (recorded). --only link is refused when the file's
+#   state differs from the folder's frozen one (the later steps would pair new labels with old models: use --from link).
 # EVAL_COMPARE_TO=<report.json>: the evaluate step runs `evaluate --all --compare-to <report.json>` (E1b and E4 like
 # for like against that report, e.g. artifacts/isl/commercial-safe/eval/report.json; docs 15.27, 15.28, 15.31).
 # One profile per run (refused with --profile both); a missing file is refused before anything runs (exit 2).
@@ -217,6 +220,8 @@ LA_ARG=""; [[ $LINK_ALIASES == 1 ]] && LA_ARG="--link-aliases"
 VARIANT_LINKS="${VARIANT_LINKS:-auto}"
 case "$VARIANT_LINKS" in auto|none) ;; *) echo "VARIANT_LINKS must be auto or none" >&2; exit 2 ;; esac
 VL_ARG=""; [[ $VARIANT_LINKS == none ]] && VL_ARG="--variant-links none"
+[[ "${VARIANT_ACCEPT_NOISY:-0}" == 1 ]] && VL_ARG="$VL_ARG --accept-noisy"
+[[ "${VARIANT_ALLOW_SPLIT_CHANGE:-0}" == 1 ]] && VL_ARG="$VL_ARG --allow-split-change"
 if [[ $VARIANT_LINKS == none ]]; then VL_FILE="off"
 elif [[ -f "$WORK/variant_links.json" ]]; then VL_FILE="sha256:$(sha256sum "$WORK/variant_links.json" | cut -c1-16)"
 else VL_FILE="none"; fi
@@ -307,7 +312,7 @@ in_list() { local x n="$1"; shift; for x in "$@"; do [[ "$x" == "$n" ]] && retur
 step_outputs() {  # what a step leaves in the work folder for later steps (a leading ! = required); for seeding
   case "$1" in
     vocab) echo "!vocabulary.jsonl" ;;
-    link) echo "extra_concepts.jsonl sources.json multisource.json link_settings.json variant_links.json" ;;
+    link) echo "extra_concepts.jsonl sources.json multisource.json link_settings.json" ;;
     pretrain_dedup) echo "pretrain_dedup.json" ;;
     pretrain) echo "!pretrained_encoder.pt pretrain_clips.txt" ;;
     encoder) echo "!encoder.pt" ;;
@@ -454,6 +459,21 @@ else
   VL_STATE="(link step not run; folder: $vl_folder)"
 fi
 WSLP_SETTINGS="$WSLP_SETTINGS variant_links=$VL_STATE"
+# --only link with another variant-links state than the folder's frozen one would leave the later steps' stamps on
+# models trained with the old labels (docs 15.37): refused, use --from link
+if [[ "$ONLY" == link ]]; then
+  if [[ ! -f "$WORK/link_settings.json" ]] || ! grep -q '"variants"' "$WORK/link_settings.json"; then vl_frozen="none"
+  else
+    vl_frozen="sha256:$(tr -d '\n' < "$WORK/link_settings.json" | grep -o '"variant_links": *{[^}]*}' \
+      | grep -o '"sha256": *"[0-9a-f]*"' | head -1 | sed 's/.*"\([0-9a-f]*\)"$/\1/' | cut -c1-16)"
+  fi
+  vl_now="$VL_FILE"; [[ "$vl_now" == off ]] && vl_now="none"
+  if [[ "$vl_now" != "$vl_frozen" ]]; then
+    echo "--only link: variant links would change ($vl_frozen -> $vl_now): the later steps were trained with the old" >&2
+    echo "  labels. Run --from link instead." >&2
+    exit 2
+  fi
+fi
 [[ $DRY_RUN == 1 ]] && echo "linker this run: link_aliases=$LA_STATE variant_links=$VL_STATE"
 # (not for --check-only, which runs no step)
 if [[ $SCRATCH == 1 && $ALLOW_SHARED == 0 && $CHECK_ONLY == 0 ]]; then

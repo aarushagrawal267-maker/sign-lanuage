@@ -414,6 +414,19 @@ def drop_leaking(train: list[Clip], held: Iterable[Clip], dedup: DedupIndex) -> 
 
 # --------------------------------------------------------------------------------------------- splits
 
+# the signer split of the other labelled sources (``attach_all_sources``); recorded by ``cli variant-audit`` so the
+# link step can check that the signers it audited as train still are (docs 15.37)
+SIGNER_SPLIT = {"val_frac": 0.1, "test_frac": 0.15, "min_groups": 6}
+
+
+def source_train_groups(paths: IslPaths, vocab, profile: str, source: str, seed: int = 0) -> set[str]:
+    """The signer groups of ``source`` that ``attach_all_sources`` puts in train with this ``seed`` (the split is
+    per source, so the source's clips alone give the same answer)."""
+    clips = read_clips([source], paths, vocab, profile)
+    assign = signer_split(clips, seed=seed, **SIGNER_SPLIT)
+    return {c.group for c in clips if c.group and assign.get(c.clip_id) == "train"}
+
+
 def signer_split(clips: list[Clip], val_frac: float = 0.1, test_frac: float = 0.15, min_groups: int = 6,
                  seed: int = 0) -> dict[str, str]:
     """clip id -> train | val | test with **whole signers** held out (sources with real signer ids). Sources
@@ -465,7 +478,7 @@ def attach_all_sources(data, paths: IslPaths, vocab, profile: str, *, seed: int 
     clips = linker.link_clips(clips)
     # clips of the core INCLUDE / ISLRTC sources that the vocabulary did not link get linked by gloss too
     data.linker = linker
-    assign = signer_split(clips, seed=seed)
+    assign = signer_split(clips, seed=seed, **SIGNER_SPLIT)
     dedup = DedupIndex.build(data.include + data.islrtc + clips,
                              duplicates_file if duplicates_file is not None else paths.derived / "duplicates.jsonl",
                              hash_files=hash_files)
