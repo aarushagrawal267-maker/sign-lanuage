@@ -25,7 +25,8 @@ from app.evaluation.metrics import confidence_curve, pick_threshold
 from app.features.spec import FeatureConfig
 from app.isl.models.calibration import fit_temperature
 from app.isl.training.common import IslData, LazyClipDataset, multi_signer_counts, set_threads
-from app.isl.training.loop import LoopConfig, atomic_save, balanced_batches, run_loop
+from app.isl.training.loop import (LoopConfig, atomic_save, balanced_batches, clips_digest, digest, run_loop,
+                                   train_config_signature)
 from app.isl.training.multisource import SAMPLE_WEIGHTS
 from app.models.checkpoint import frame_mask
 from app.models.networks import build_model
@@ -126,7 +127,14 @@ def train_classifier(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainCo
     lc = LoopConfig(epochs=cfg.epochs, steps_per_epoch=n_steps, lr=cfg.lr, weight_decay=cfg.weight_decay,
                     patience=cfg.patience, max_minutes=max_minutes, seed=cfg.seed,
                     extra={"kind": "classifier", "model": cfg.model_kwargs(), "classes": len(classes),
-                           "items": len(clips), "features": fcfg.to_dict()})
+                           "items": len(clips), "features": fcfg.to_dict(),
+                           # every option that changes what is trained (docs/ISL_DESIGN.md 15.19): a finished or
+                           # half-done state of other settings or other data is refused, never resumed
+                           "train": train_config_signature(cfg), "split": data.split.get("name"),
+                           "min_clips": min_clips, "min_signers": min_signers, "use_extra": use_extra,
+                           "islrtc_oversample": islrtc_oversample, "class_power": class_power,
+                           "source_weights": sw, "class_names": digest(classes),
+                           "data": clips_digest(clips, labels, weights), "val": clips_digest(val_clips)})
     res = run_loop(model, batches, loss_fn, lc, state_path or Path(str(out) + ".state"), val_fn=val_fn,
                    select_key="val_macro_f1", save_best=save_best, fresh=not resume,
                    progress=(lambda m: progress(None, m)) if progress else None)

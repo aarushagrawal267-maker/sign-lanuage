@@ -1772,7 +1772,8 @@ everything under `nice -n 10`, stops before any step if less than 10 GB of disk 
 | index_final | `build-index --all-sources --all-include` | the shipped index: every reference of every source |
 | pack | `build-pack` | `artifacts/packs/isl` or `isl-research` (copies `eval/`, lists every source and licence) |
 
-Options: `--from STEP`, `--only STEP`, `--force STEP` (also deletes that step's training state), `--threads 4` once the
+Options: `--from STEP` and `--force S1,S2` (both also delete the training state of the steps they redo; 15.19),
+`--only STEP`, `--tag NAME` and `--dry-run` (15.19), `--threads 4` once the
 machine is free, `--step-minutes M` (each training call stops after M minutes with its state saved and is re-run with
 `--resume` until done: exit code 75 means "stopped, continue later"). Full-setting sizes can be overridden with
 environment variables (`HIDDEN LAYERS EMB PRE_EPOCHS PRE_STEPS PRE_BATCH ENC_EPOCHS ENC_STEPS CLS_EPOCHS CLS_STEPS
@@ -3013,3 +3014,65 @@ cannot reach 0.90 at this accuracy. The research run's `fusion` step uses this c
 * Engine quirk (pre-existing): two classifier classes of commercial-safe are not in the pack vocabulary. Their
   `class_index` is -1, so sliding mode's streak and repeat suppression treat them as one word. The replay keeps the
   engine's key, so the fit matches what the engine does.
+
+### 15.19 Driver: a retrain really retrains; scratch runs keep their own stamps (Model QA fix 0.1, 27 Nov 2026)
+
+**The bug.** `--from STEP` removed only the `.done` stamps. `train()` always passes `--resume`, and `run_loop`
+returns at once when the saved state says "finished". So a retrain after a code change gave back the OLD weights
+when the config signature was unchanged, and failed with `StateMismatch` when it had changed. `--force` took only
+one step. And the stamps and log were keyed only by profile under `data/isl/logs/`, while `PHASE2_WORK_BASE` moved
+only the work folder: a scratch run with `--profile research` would skip steps on the real run's stamps, or
+overwrite or delete them. Its `pack` and `evaluate` steps also wrote into the shipped `artifacts/packs/<id>/`.
+
+**What changed in `scripts/phase2_train.sh`.**
+* `--from STEP` now forgets, for STEP and every later step, the stamp AND the training state files:
+  `pretrained_encoder.state.pt`, `encoder.pt.state`, `oneshot/fold*/encoder.pt.state`, `classifier.pt.state`,
+  `cv/fold*/classifier.pt.state`, `e1a/classifier.pt.state`, plus any half-written `<state>.tmp<pid>`.
+  Earlier steps keep theirs. Each removed file is written to the log.
+* `--force` takes a comma-separated list (`--force encoder,cv`). Unknown step names in `--from`, `--only` or
+  `--force` are refused (exit 2). Before, a typo in `--from` silently ran every unstamped step.
+* `--only STEP` is unchanged: it ignores the stamp but resumes from the state. To retrain one step, use
+  `--force STEP`.
+* `--dry-run` prints the work folder, the stamp folder, the log, the pack folder, every file that would be removed
+  and every step that would run or be skipped. It writes nothing and runs nothing (no data guard, no cli call).
+* Run tag: `--tag NAME` or env `PHASE2_TAG` (letters, digits, `.`, `_`, `-`).
+  * The real run (no tag, default work folder `artifacts/isl`) keeps the old places:
+    `data/isl/logs/phase2_<profile>.stamps/` and `.log`. The finished research and commercial-safe runs stay "done".
+  * Any other run keeps its stamps, log and readiness output in `<work>/driver/phase2_<profile>[_smoke][_<tag>].*`.
+    That covers a tag, and also `PHASE2_WORK_BASE` without a tag. Such a run never reads, skips on or deletes the
+    real run's stamps.
+  * A tag without `PHASE2_WORK_BASE` gets its own work folder, `artifacts/isl/runs/<tag>/<profile>`. A tag with
+    `PHASE2_WORK_BASE` set to `artifacts/isl` is refused (exit 2), because it would share the real state files.
+  * A non-default work folder sends `evaluate` and `build-pack` to `<work>/pack`, never to `artifacts/packs/<id>`.
+  * Smoke runs without a tag are unchanged. With a tag they use `artifacts/isl/phase2-smoke/runs/<tag>/`.
+* Not changed: the data steps (`trim`, `dedup`, `vocab`, `splits`, `link`) of a full scratch run still write the
+  shared `data/isl/derived/` and `data/isl/splits/` (critic point 7). A scratch run should start after `link`
+  (`--from bench` or later) unless it means to refresh the shared data.
+
+**Resume signatures (`training/loop.py` and the three trainers).** A stale state with any changed training option
+now raises `StateMismatch` instead of resuming. `LoopConfig.extra` now also holds:
+* classifier: the whole `TrainConfig` except `patience` and `device` (dropout, label smoothing, batch size,
+  augment, class weighting...), the split name, `min_clips`, `min_signers`, `use_extra`, `islrtc_oversample`,
+  `class_power`, the merged source weights, a hash of the class list, and a hash of the training list in sampling
+  order (clip id, trim slice, landmark file name, label, weight) and of the validation list;
+* encoder and oneshot: the same `TrainConfig` fields, the split, the encoder version, `arc_weight`, `use_extra`, the
+  source weights, a hash of the excluded concepts, the SHA-256 of the warm-start file (a re-run pretrain at the same
+  path is not resumed on), the training-list hash, and the validation settings and query / gallery hashes;
+* pretrain: a hash of the clip list.
+`patience`, `max_minutes` and `save_every_s` may still change between parts of one run.
+Rule for later work (Batch 1 sampler, quota, selection options): put every new option that changes training into
+`extra`. The helpers are `digest`, `clips_digest`, `file_digest` and `train_config_signature` in `loop.py`.
+
+Consequence: every existing `*.state` file was written with the old, shorter signature, so it is refused on
+`--resume`. That is safe: a stamped step is skipped anyway, and `--from` / `--force` now delete the state first.
+`--only` on a finished training step with such an old state now fails with `StateMismatch` instead of returning the
+old weights. On a state written by this code with the same settings, `--only` still returns the finished weights.
+To retrain, use `--force STEP`. No training job was running when this landed.
+
+Tests: `backend/tests/isl/test_phase2_guards.py` section 9. A dry run `--from classifier` lists `classifier.pt.state`,
+`cv/fold*/classifier.pt.state` and `e1a/...` and keeps the encoder's. A real run with a stand-in python removes them.
+`--force a,b` parses, and a bad name is refused. A tagged scratch run leaves the real stamps byte-identical and uses its own.
+`run_loop` with a finished state and a changed config raises `StateMismatch`. The classifier and encoder refuse a
+state after a change to class power, source weights, ISLRTC oversampling, label smoothing, dropout, batch size,
+`use_extra`, `arc_weight`, validation size or the warm-start file. `test_trim_eval_e8.py` now reads the stamps of its
+`PHASE2_WORK_BASE` run from `<work>/driver/`.

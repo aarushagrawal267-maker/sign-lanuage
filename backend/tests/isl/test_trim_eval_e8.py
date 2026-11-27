@@ -319,7 +319,9 @@ def test_driver_runs_trim_eval_into_the_work_folder(tmp_path):
         (P.manifests / f"{name}_items.json").write_text(json.dumps([{"id": i} for i in ids]))
     proc = tmp_path / "proc"
     proc.mkdir()
-    stamps = P.root / "logs" / "phase2_commercial-safe.stamps"
+    # a run with its own PHASE2_WORK_BASE keeps its stamps and log in that work folder (docs 15.19)
+    drv = tmp_path / "art" / "commercial-safe" / "driver"
+    stamps = drv / "phase2_commercial-safe.stamps"
     stamps.mkdir(parents=True)
     (stamps / "evaluate.done").write_text("old\n")
     (stamps / "pack.done").write_text("old\n")
@@ -327,7 +329,7 @@ def test_driver_runs_trim_eval_into_the_work_folder(tmp_path):
            "SLR_ISL_PROC_ROOT": str(proc), "SLR_TORCH_THREADS": "1"}
     r = subprocess.run(["bash", str(REPO / "scripts" / "phase2_train.sh"), "--profile", "commercial-safe",
                         "--only", "trim_eval"], capture_output=True, text=True, env=env, timeout=300)
-    log = (P.root / "logs" / "phase2_commercial-safe.log").read_text() if (P.root / "logs").exists() else ""
+    log = (drv / "phase2_commercial-safe.log").read_text() if (drv / "phase2_commercial-safe.log").exists() else ""
     assert r.returncode == 0, r.stdout + r.stderr + log
     doc = json.loads((tmp_path / "art" / "commercial-safe" / "trim_eval.json").read_text())
     assert doc["trim_version"] == "trim-2" and doc["learned"] is False  # no model in the test artifacts dir

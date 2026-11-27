@@ -486,3 +486,214 @@ def test_smoke_islrtc_cap_keeps_dictionary_clips_of_include_concepts(tmp_path):
     data = load_isl_data(w["paths"], VocabIndex.load(w["vocab"]), "commercial-safe", w["split"], max_islrtc=4)
     inc = {c.concept_id for c in data.include}
     assert len(data.islrtc) == 4 and all(c.concept_id in inc for c in data.islrtc)
+
+
+# --------------------------------------------------------------------------------------------- 9. retrains retrain
+
+STEPS_DONE = ("trim", "dedup", "vocab", "encoder", "classifier", "cv", "e1a", "pack")
+
+
+def _fake_py(tmp_path) -> tuple[Path, Path]:
+    """A stand-in for the venv python: logs its arguments and succeeds (guard, cli steps, the cv helper)."""
+    log = tmp_path / "fake_py.log"
+    py = tmp_path / "fake_py"
+    py.write_text('#!/usr/bin/env bash\necho "$*" >> "$FAKE_PY_LOG"\nexit 0\n')
+    py.chmod(0o755)
+    return py, log
+
+
+def _run_driver(tmp_path, *args, work_base=None, tag=None, isl_root=None, py=None):
+    proc = tmp_path / "proc_none"
+    proc.mkdir(exist_ok=True)
+    fake, flog = _fake_py(tmp_path)
+    env = {**os.environ, "PY": str(py or fake), "FAKE_PY_LOG": str(flog), "SLR_ISL_DIR": str(isl_root),
+           "SLR_ISL_PROC_ROOT": str(proc), "SLR_TORCH_THREADS": "1"}
+    for k in ("SLR_ISL_PARTIAL_DATA", "PHASE2_WORK_BASE", "PHASE2_TAG"):
+        env.pop(k, None)
+    if work_base is not None:
+        env["PHASE2_WORK_BASE"] = str(work_base)
+    if tag is not None:
+        env["PHASE2_TAG"] = tag
+    return subprocess.run(["bash", str(REPO / "scripts" / "phase2_train.sh"), "--profile", "commercial-safe", *args],
+                          capture_output=True, text=True, env=env, timeout=120)
+
+
+def _old_run(work: Path, stamps: Path) -> list[Path]:
+    """A finished run: every stamp, and the training state files of the classifier, cv folds, e1a, encoder."""
+    stamps.mkdir(parents=True, exist_ok=True)
+    for s in STEPS_DONE:
+        (stamps / f"{s}.done").write_text("old\n")
+    files = [work / "encoder.pt.state", work / "classifier.pt.state", work / "cv" / "fold1" / "classifier.pt.state",
+             work / "cv" / "fold3" / "classifier.pt.state", work / "e1a" / "classifier.pt.state",
+             work / "oneshot" / "fold0" / "encoder.pt.state"]
+    for f in files:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(b"finished state")
+    return files
+
+
+def test_driver_dry_run_from_classifier_removes_state_files(tmp_path):
+    isl = tmp_path / "isl"
+    work = tmp_path / "art" / "commercial-safe"
+    files = _old_run(work, work / "driver" / "phase2_commercial-safe.stamps")
+    r = _run_driver(tmp_path, "--from", "classifier", "--dry-run", work_base=tmp_path / "art", isl_root=isl)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout
+    removed = {ln.split(" ", 2)[2] for ln in out.splitlines() if ln.startswith("would remove ")}
+    assert str(work / "classifier.pt.state") in removed
+    assert str(work / "cv" / "fold1" / "classifier.pt.state") in removed
+    assert str(work / "cv" / "fold3" / "classifier.pt.state") in removed
+    assert str(work / "e1a" / "classifier.pt.state") in removed  # a later step
+    assert str(work / "encoder.pt.state") not in removed and str(work / "oneshot" / "fold0" / "encoder.pt.state") \
+        not in removed  # earlier steps keep their state
+    assert "would skip encoder (done old)" in out and "would run classifier" in out and "would run pack" in out
+    assert all(f.exists() for f in files)  # a dry run writes nothing
+    assert not (tmp_path / "fake_py.log").exists()  # and runs nothing (no data guard, no cli)
+
+
+def test_driver_from_classifier_really_removes_state_and_retrains(tmp_path):
+    isl = tmp_path / "isl"
+    work = tmp_path / "art" / "commercial-safe"
+    stamps = work / "driver" / "phase2_commercial-safe.stamps"
+    files = _old_run(work, stamps)
+    r = _run_driver(tmp_path, "--from", "classifier", work_base=tmp_path / "art", isl_root=isl)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (work / "encoder.pt.state").exists() and (work / "oneshot" / "fold0" / "encoder.pt.state").exists()
+    gone = [f for f in files if "encoder" not in f.name]
+    assert not any(f.exists() for f in gone), [str(f) for f in gone if f.exists()]
+    calls = (tmp_path / "fake_py.log").read_text().splitlines()
+    assert any(" train-classifier " in c and "--resume" in c for c in calls)  # resumes nothing: the state is gone
+    assert not any(" train-encoder " in c for c in calls)  # stamped earlier step skipped
+    assert (stamps / "classifier.done").read_text() != "old\n" and (stamps / "encoder.done").read_text() == "old\n"
+
+
+def test_driver_force_takes_a_comma_separated_list(tmp_path):
+    isl = tmp_path / "isl"
+    work = tmp_path / "art" / "commercial-safe"
+    _old_run(work, work / "driver" / "phase2_commercial-safe.stamps")
+    r = _run_driver(tmp_path, "--force", "encoder,cv", "--dry-run", work_base=tmp_path / "art", isl_root=isl)
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = r.stdout
+    for f in (work / "encoder.pt.state", work / "cv" / "fold1" / "classifier.pt.state",
+              work / "driver" / "phase2_commercial-safe.stamps" / "encoder.done"):
+        assert f"would remove {f}" in out
+    assert f"would remove {work / 'classifier.pt.state'}" not in out
+    assert "would run encoder" in out and "would run cv" in out and "would skip classifier (done old)" in out
+    bad = _run_driver(tmp_path, "--force", "encoder,nope", "--dry-run", work_base=tmp_path / "art", isl_root=isl)
+    assert bad.returncode == 2 and "nope" in bad.stderr
+    assert _run_driver(tmp_path, "--from", "classifer", "--dry-run", work_base=tmp_path / "art",
+                       isl_root=isl).returncode == 2  # a typo is refused, not "run everything"
+
+
+def test_scratch_run_never_touches_the_real_runs_stamps(tmp_path):
+    isl = tmp_path / "isl"
+    real = isl / "logs" / "phase2_commercial-safe.stamps"
+    real_work = tmp_path / "real_work"  # stands in for artifacts/isl/commercial-safe (never written by this test)
+    _old_run(real_work, real)
+    before = {p.name: p.read_text() for p in real.iterdir()}
+    # the real run (no tag, default work folder) keeps the old stamp place
+    r = _run_driver(tmp_path, "--dry-run", isl_root=isl)
+    assert r.returncode == 0 and f"stamps: {real}" in r.stdout and "would skip classifier (done old)" in r.stdout
+    assert "pack: default" in r.stdout
+    # a scratch run (own work base + tag) does not read, skip on or delete them
+    scratch = tmp_path / "scratch"
+    r = _run_driver(tmp_path, "--from", "classifier", work_base=scratch, tag="abl1", isl_root=isl)
+    assert r.returncode == 0, r.stdout + r.stderr
+    own = scratch / "commercial-safe" / "driver" / "phase2_commercial-safe_abl1.stamps"
+    assert (own / "trim.done").exists() and (own / "pack.done").exists()  # it ran trim: no real stamp was used
+    assert {p.name: p.read_text() for p in real.iterdir()} == before
+    assert not (isl / "logs" / "phase2_commercial-safe.log").exists()  # nor its log
+    assert (scratch / "commercial-safe" / "driver" / "phase2_commercial-safe_abl1.log").exists()
+    calls = (tmp_path / "fake_py.log").read_text()
+    assert f"--out {scratch / 'commercial-safe' / 'pack'}" in calls  # pack and eval report stay in the scratch work
+    # a work base without a tag is just as separate
+    r = _run_driver(tmp_path, "--dry-run", work_base=tmp_path / "other", isl_root=isl)
+    assert f"stamps: {tmp_path / 'other' / 'commercial-safe' / 'driver'}" in r.stdout
+    # a tag alone gets its own work folder; a tag on the real work folder is refused
+    r = _run_driver(tmp_path, "--dry-run", tag="abl2", isl_root=isl)
+    assert r.returncode == 0 and "artifacts/isl/runs/abl2/commercial-safe" in r.stdout
+    r = _run_driver(tmp_path, "--tag", "abl3", "--dry-run", work_base=REPO / "artifacts" / "isl", isl_root=isl)
+    assert r.returncode == 2 and "real work folder" in r.stderr
+    assert _run_driver(tmp_path, "--tag", "../x", "--dry-run", isl_root=isl).returncode == 2
+
+
+def test_run_loop_refuses_a_finished_state_of_another_config(tmp_path):
+    import torch
+    from torch import nn
+
+    from app.isl.training.loop import LoopConfig, StateMismatch, run_loop
+
+    def go(cfg, fresh=False):
+        torch.manual_seed(0)
+        m = nn.Linear(3, 2)
+        def batches(e):
+            return iter([(torch.ones(4, 3), torch.zeros(4, dtype=torch.long))] * cfg.steps_per_epoch)
+
+        return run_loop(m, batches, lambda mm, b: nn.functional.cross_entropy(mm(b[0]), b[1]), cfg,
+                        tmp_path / "m.pt.state", fresh=fresh)
+
+    cfg = LoopConfig(epochs=2, steps_per_epoch=2, extra={"kind": "classifier", "class_power": 0.5})
+    assert go(cfg, fresh=True).finished
+    again = go(cfg)
+    assert again.finished and again.resumed_from["finished"] and again.seconds == 0.0  # the old weights, untrained
+    with pytest.raises(StateMismatch):
+        go(LoopConfig(epochs=2, steps_per_epoch=2, extra={"kind": "classifier", "class_power": 0.0}))
+    with pytest.raises(StateMismatch):
+        go(LoopConfig(epochs=2, steps_per_epoch=2, extra={"kind": "classifier", "class_power": 0.5, "quota": 1}))
+    # patience / time budget may change between parts of one run
+    assert go(LoopConfig(epochs=2, steps_per_epoch=2, patience=3, max_minutes=5,
+                         extra={"kind": "classifier", "class_power": 0.5})).finished
+
+
+@pytest.fixture(scope="module")
+def tiny_data(tmp_path_factory):
+    from app.isl.training.common import load_isl_data
+    from app.isl.vocab.build import VocabIndex
+
+    w = make_world(tmp_path_factory.mktemp("sig_world"))
+    return load_isl_data(w["paths"], VocabIndex.load(w["vocab"]), "commercial-safe", w["split"])
+
+
+def test_classifier_and_encoder_signatures_cover_training_options(tiny_data, tmp_path):
+    from dataclasses import replace
+
+    import torch
+
+    from app.isl.models.encoder import SignEncoder
+    from app.isl.training.common import ISL_FEATURES
+    from app.isl.training.loop import StateMismatch
+    from app.isl.training.train_classifier import train_classifier
+    from app.isl.training.train_encoder import train_encoder
+    from app.training.trainer import TrainConfig
+
+    cfg = TrainConfig(hidden=16, layers=1, epochs=1, batch_size=8, patience=1, lr=3e-3)
+
+    def cls(**kw):
+        a = {"threads": 1, "steps_per_epoch": 2, "smoke": True, **kw}
+        return train_classifier(tiny_data, tmp_path / "cls.pt", ISL_FEATURES, a.pop("cfg", cfg), **a)
+
+    cls()
+    assert cls(resume=True)["finished"]
+    for kw in ({"class_power": 0.0}, {"source_weights": {"include": 3.0}}, {"islrtc_oversample": 1},
+               {"cfg": replace(cfg, label_smoothing=0.0)}, {"cfg": replace(cfg, dropout=0.1)},
+               {"cfg": replace(cfg, batch_size=4)}, {"use_extra": False}):
+        with pytest.raises(StateMismatch):
+            cls(resume=True, **kw)
+    assert cls(resume=True, cfg=replace(cfg, patience=5))["finished"]  # patience may change
+
+    def enc(**kw):
+        return train_encoder(tiny_data, tmp_path / "enc.pt", ISL_FEATURES, cfg, emb_dim=16, p=4, k=2, threads=1,
+                             batches_per_epoch=2, smoke=True, **kw)
+
+    init = tmp_path / "pre.pt"
+    torch.save({"state_dict": SignEncoder(ISL_FEATURES.dim, hidden=16, layers=1, emb_dim=16).state_dict(),
+                "meta": {"kind": "isl-encoder", "feature_config": ISL_FEATURES.to_dict()}}, init)
+    enc(init_from=init)
+    assert enc(init_from=init, resume=True)["resumed_from"]["finished"]
+    for kw in ({"arc_weight": 0.0}, {"source_weights": {"isl500": 0.1}}, {"max_val_queries": 3}):
+        with pytest.raises(StateMismatch):
+            enc(init_from=init, resume=True, **kw)
+    torch.save({"state_dict": SignEncoder(ISL_FEATURES.dim, hidden=16, layers=1, emb_dim=16).state_dict(),
+                "meta": {"kind": "isl-encoder", "feature_config": ISL_FEATURES.to_dict(), "retrained": 1}}, init)
+    with pytest.raises(StateMismatch):  # same path, new pre-training: not resumed on the old warm start
+        enc(init_from=init, resume=True)

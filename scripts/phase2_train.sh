@@ -21,9 +21,18 @@
 #  <work>/trim_eval.json, which E8 reads and checks against the trim sidecar's trim_version (stale -> "mismatch");
 #  pretrain_dedup checks the OpenHands Sign Library chunks)
 # Options:
-#   --from STEP      ignore stamps from STEP on (re-run it and everything after it)
-#   --only STEP      run just this step (ignores its stamp)
-#   --force STEP     forget this step's stamp and training state, then run normally
+#   --from STEP      re-run STEP and everything after it: their stamps AND training state files (*.state, incl.
+#                    cv/fold*/ and oneshot/fold*/) are removed, so a retrain really retrains (docs 15.19)
+#   --only STEP      run just this step (ignores its stamp; a training step resumes from its state file, and a
+#                    finished state returns the old weights: use --force STEP to retrain it)
+#   --force S1,S2    forget these steps' stamps and training state, then run normally (comma-separated list)
+#   --tag NAME       a scratch run (also env PHASE2_TAG): its own work folder (artifacts/isl/runs/NAME/<profile>
+#                    unless PHASE2_WORK_BASE is set), its own stamps / log / readiness file under <work>/driver/,
+#                    and its pack and eval report under <work>/pack (never artifacts/packs). Without a tag, a run
+#                    with PHASE2_WORK_BASE set also keeps its stamps under <work>/driver/, so it never reads, skips
+#                    on or deletes the real run's stamps (data/isl/logs/phase2_<profile>.stamps)
+#   --dry-run        print the work folder, the stamp folder, the files that would be removed and the steps that
+#                    would run, then exit without writing anything (no data guard, no training)
 #   --threads N      torch threads (default 2 while other jobs run; 4 when the machine is free)
 #   --max-parts N    how many times a training step stopped by its time budget is re-run (default 1000)
 #   --step-minutes M time budget per training call (0 = none); the step is re-run with --resume until done
@@ -35,7 +44,8 @@
 #
 # Outputs: full -> artifacts/isl/<profile>/ (work) and artifacts/packs/<isl|isl-research>/ (pack the app loads);
 # smoke -> artifacts/isl/phase2-smoke/<profile>/ (work, pack/ inside it; never loaded by the app).
-# Logs: data/isl/logs/phase2_<profile>[_smoke].log. Everything runs under nice -n 10.
+# Logs: data/isl/logs/phase2_<profile>[_smoke].log for the real run (no tag, default work folder); otherwise
+# <work>/driver/phase2_<profile>[_smoke][_<tag>].log. Everything runs under nice -n 10.
 # Test hooks: SLR_ISL_DIR (data root), PHASE2_WORK_BASE (instead of artifacts/isl), SLR_ISL_PROC_ROOT (process table).
 set -uo pipefail
 
@@ -52,6 +62,8 @@ STEP_MIN=0
 LIST=0
 ALLOW_PARTIAL=0
 CHECK_ONLY=0
+DRY_RUN=0
+RUN_TAG="${PHASE2_TAG:-}"
 STEPS=(trim dedup vocab splits link bench pretrain_dedup pretrain encoder oneshot classifier cv e1a fingerspell index fusion trim_eval evaluate index_final pack)
 
 while [[ $# -gt 0 ]]; do
@@ -67,6 +79,8 @@ while [[ $# -gt 0 ]]; do
     --list) LIST=1; shift ;;
     --allow-partial) ALLOW_PARTIAL=1; shift ;;
     --check-only) CHECK_ONLY=1; shift ;;
+    --tag) RUN_TAG="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
     -h|--help) awk 'NR > 1 && /^set -uo/ {exit} NR > 1' "$0"; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
@@ -79,22 +93,32 @@ if [[ "$PROFILE" == "both" ]]; then
     "$0" --profile "$p" $([[ $SMOKE == 1 ]] && echo --smoke) ${FROM:+--from "$FROM"} ${ONLY:+--only "$ONLY"} \
       ${FORCE:+--force "$FORCE"} --threads "$THREADS" --max-parts "$MAX_PARTS" --step-minutes "$STEP_MIN" \
       $([[ $ALLOW_PARTIAL == 1 ]] && echo --allow-partial) $([[ $CHECK_ONLY == 1 ]] && echo --check-only) \
-      $([[ $LIST == 1 ]] && echo --list) || rc=$?
+      $([[ $LIST == 1 ]] && echo --list) ${RUN_TAG:+--tag "$RUN_TAG"} $([[ $DRY_RUN == 1 ]] && echo --dry-run) \
+      || rc=$?
   done
   exit $rc
 fi
 case "$PROFILE" in commercial-safe|research) ;; *) echo "profile must be commercial-safe, research or both" >&2; exit 2 ;; esac
 
-TAG="$PROFILE$([[ $SMOKE == 1 ]] && echo _smoke)"
+is_step() { local x; for x in "${STEPS[@]}"; do [[ "$x" == "$1" ]] && return 0; done; return 1; }
+for s in ${FROM:+"$FROM"} ${ONLY:+"$ONLY"}; do is_step "$s" || { echo "unknown step $s (see --help)" >&2; exit 2; }; done
+FORCE_STEPS=()
+if [[ -n "$FORCE" ]]; then
+  IFS=',' read -r -a FORCE_STEPS <<< "$FORCE"
+  for s in "${FORCE_STEPS[@]}"; do is_step "$s" || { echo "unknown step '$s' in --force (see --help)" >&2; exit 2; }; done
+fi
+if [[ -n "$RUN_TAG" && ! "$RUN_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "--tag / PHASE2_TAG: letters, digits, '.', '_' and '-' only" >&2; exit 2
+fi
+
+NAME="$PROFILE$([[ $SMOKE == 1 ]] && echo _smoke)${RUN_TAG:+_$RUN_TAG}"
 ISL_ROOT="${SLR_ISL_DIR:-$REPO/data/isl}"
-LOGDIR="$ISL_ROOT/logs"
-STAMPS="$LOGDIR/phase2_${TAG}.stamps"
-LOG="$LOGDIR/phase2_${TAG}.log"
-mkdir -p "$LOGDIR" "$STAMPS"
+DEFAULT_BASE="$REPO/artifacts/isl"
+BASE=""
 
 ROOTARG=""
 if [[ $SMOKE == 1 ]]; then
-  export SLR_ISL_WORKDIR="$REPO/artifacts/isl/phase2-smoke"
+  export SLR_ISL_WORKDIR="$REPO/artifacts/isl/phase2-smoke${RUN_TAG:+/runs/$RUN_TAG}"
   WORK="$SLR_ISL_WORKDIR/$PROFILE"
   # a private ISL root: real manifests / landmarks (read-only symlinks), own derived/ and splits/, so the data
   # refresh steps run for real without touching the shared derived files
@@ -116,9 +140,19 @@ if [[ $SMOKE == 1 ]]; then
   LET="--epochs 3"
   PDD="--max-chunks ${SMOKE_SL_CHUNKS:-600} --calib ${SMOKE_SL_CALIB:-100}"
 else
-  if [[ -n "${PHASE2_WORK_BASE:-}" ]]; then export SLR_ISL_WORKDIR="$PHASE2_WORK_BASE"; else unset SLR_ISL_WORKDIR; fi
-  WORK="${PHASE2_WORK_BASE:-$REPO/artifacts/isl}/$PROFILE"
+  BASE="${PHASE2_WORK_BASE:-}"
+  [[ -z "$BASE" && -n "$RUN_TAG" ]] && BASE="$DEFAULT_BASE/runs/$RUN_TAG"  # a tagged run never shares the real work
+  if [[ -n "$BASE" && "$(realpath -m "$BASE")" == "$(realpath -m "$DEFAULT_BASE")" ]]; then
+    if [[ -n "$RUN_TAG" ]]; then
+      echo "--tag $RUN_TAG with PHASE2_WORK_BASE = $DEFAULT_BASE: a scratch run must not use the real work folder" >&2
+      exit 2
+    fi
+    BASE=""  # the real run, named explicitly
+  fi
+  if [[ -n "$BASE" ]]; then export SLR_ISL_WORKDIR="$BASE"; else unset SLR_ISL_WORKDIR; fi
+  WORK="${BASE:-$DEFAULT_BASE}/$PROFILE"
   PACK_OUT=""
+  [[ -n "$BASE" ]] && PACK_OUT="$WORK/pack"  # never over the shipped artifacts/packs/<id> (pack + eval report)
   SM=""
   CAP=""
   H="${HIDDEN:-192}"; L="${LAYERS:-2}"; E="${EMB:-256}"
@@ -129,12 +163,23 @@ else
   LET="--epochs ${LETTER_EPOCHS:-40}"
   PDD=""
 fi
+# stamps / log: the real run (no tag and the default work folder; smoke: no tag) keeps the old place under
+# data/isl/logs, so the finished runs stay "done"; every other run keeps them in its own work folder (docs 15.19)
+if [[ -z "$RUN_TAG" && -z "$BASE" ]]; then
+  LOGDIR="$ISL_ROOT/logs"
+else
+  LOGDIR="$WORK/driver"
+fi
+STAMPS="$LOGDIR/phase2_${NAME}.stamps"
+LOG="$LOGDIR/phase2_${NAME}.log"
+[[ $DRY_RUN == 1 ]] || mkdir -p "$LOGDIR" "$STAMPS"
+
 VOCAB="$WORK/vocabulary.jsonl"
 COMMON="--profile $PROFILE --threads $THREADS --vocab $VOCAB $SM"
 export SLR_TORCH_THREADS="$THREADS"
 cd "$REPO/backend" || exit 1
 
-log() { echo "[$(date -u +%FT%TZ)] $*" | tee -a "$LOG"; }
+log() { if [[ $DRY_RUN == 1 ]]; then echo "$*"; else echo "[$(date -u +%FT%TZ)] $*" | tee -a "$LOG"; fi; }
 cli() { nice -n 10 "$PY" -m app.isl.cli $ROOTARG "$@" >> "$LOG" 2>&1; }
 
 # a training call that may stop early (exit 75 = time budget, state saved): re-run with --resume until done
@@ -148,16 +193,33 @@ train() {
   done
 }
 
-state_files() {  # training state of a step (removed by --force)
+state_files() {  # training state files of a step that exist (removed by --from / --force)
+  local f x y
   case "$1" in
-    pretrain) echo "$WORK/pretrained_encoder.state.pt" ;;
-    encoder) echo "$WORK/encoder.pt.state" ;;
-    oneshot) ls "$WORK"/oneshot/fold*/encoder.pt.state 2>/dev/null ;;
-    classifier) echo "$WORK/classifier.pt.state" ;;
-    e1a) echo "$WORK/e1a/classifier.pt.state" ;;
-    cv) ls "$WORK"/cv/fold*/classifier.pt.state 2>/dev/null ;;
+    pretrain) f=("$WORK/pretrained_encoder.state.pt") ;;
+    encoder) f=("$WORK/encoder.pt.state") ;;
+    oneshot) f=("$WORK"/oneshot/fold*/encoder.pt.state) ;;
+    classifier) f=("$WORK/classifier.pt.state") ;;
+    e1a) f=("$WORK/e1a/classifier.pt.state") ;;
+    cv) f=("$WORK"/cv/fold*/classifier.pt.state) ;;
+    *) return 0 ;;
   esac
+  for x in "${f[@]}"; do
+    # also a half-written atomic save (<state>.tmp<pid>) left by a killed process
+    for y in "$x" "$x".tmp*; do [[ -f "$y" ]] && echo "$y"; done
+  done
+  return 0
 }
+
+forget() {  # forget a step (--from, --force): its stamp and its training state
+  local s="$1" f
+  for f in "$STAMPS/$s.done" $(state_files "$s"); do
+    [[ -f "$f" ]] || continue
+    if [[ $DRY_RUN == 1 ]]; then echo "would remove $f"; else rm -f -- "${f:?}" && log "  removed $f"; fi
+  done
+}
+
+is_forced() { local x; for x in "${FORCE_STEPS[@]}"; do [[ "$x" == "$1" ]] && return 0; done; return 1; }
 
 run_step() {
   local s="$1"
@@ -202,9 +264,41 @@ run_step() {
   esac
 }
 
+if [[ $DRY_RUN == 1 ]]; then
+  echo "dry run: profile=$PROFILE smoke=$SMOKE tag=${RUN_TAG:--} work=$WORK"
+  echo "stamps: $STAMPS"
+  echo "log: $LOG"
+  echo "pack: ${PACK_OUT:-default (artifacts/packs/<id>)}"
+fi
+
 if [[ $LIST == 1 ]]; then
   for s in "${STEPS[@]}"; do printf '%-15s %s\n' "$s" "$(cat "$STAMPS/$s.done" 2>/dev/null || echo -)"; done
   [[ -f "$WORK/partial_data.json" ]] && echo "work folder is marked PARTIAL DATA ($WORK/partial_data.json)"
+  exit 0
+fi
+
+# ---- dry run: what --from / --force would remove and which steps would run (writes nothing) ----------------
+if [[ $DRY_RUN == 1 ]]; then
+  if [[ "$FROM" == "${STEPS[0]}" && -z "$ONLY" && -f "$WORK/partial_data.json" ]]; then
+    echo "would remove $WORK/partial_data.json"
+  fi
+  for s in "${FORCE_STEPS[@]}"; do forget "$s"; done
+  reached_from=0
+  [[ -z "$FROM" ]] && reached_from=1
+  for s in "${STEPS[@]}"; do
+    [[ "$s" == "$FROM" ]] && reached_from=1
+    if [[ -n "$ONLY" && "$s" != "$ONLY" ]]; then continue; fi
+    redo=0
+    if [[ -z "$ONLY" && $reached_from == 1 && -n "$FROM" ]]; then
+      is_forced "$s" || forget "$s"
+      redo=1
+    fi
+    if [[ -z "$ONLY" && $redo == 0 && -f "$STAMPS/$s.done" ]] && ! is_forced "$s"; then
+      echo "would skip $s (done $(cat "$STAMPS/$s.done"))"
+    else
+      echo "would run $s"
+    fi
+  done
   exit 0
 fi
 
@@ -212,14 +306,14 @@ fi
 [[ "$FROM" == "${STEPS[0]}" && -z "$ONLY" ]] && rm -f "$WORK/partial_data.json"  # rebuilt from scratch
 guard_args=(readiness --profile "$PROFILE" --out "$WORK/data_readiness.json" --work "$WORK")
 if [[ $SMOKE == 1 || $ALLOW_PARTIAL == 1 ]]; then guard_args+=(--allow-partial); fi
-nice -n 10 "$PY" -m app.isl.cli $ROOTARG "${guard_args[@]}" > "$LOGDIR/phase2_${TAG}.readiness.out" 2>&1
+nice -n 10 "$PY" -m app.isl.cli $ROOTARG "${guard_args[@]}" > "$LOGDIR/phase2_${NAME}.readiness.out" 2>&1
 grc=$?
-cat "$LOGDIR/phase2_${TAG}.readiness.out" >> "$LOG"
+cat "$LOGDIR/phase2_${NAME}.readiness.out" >> "$LOG"
 if [[ $grc -ne 0 ]]; then
   log "data guard: NOT READY - refusing to start a full run (an ingestion job is running or a manifest is incomplete;"
   log "  details: $WORK/data_readiness.json). Wait for ingestion to finish, or pass --allow-partial (results and"
   log "  packs are then labelled PARTIAL DATA)."
-  grep -A40 '"reasons"' "$LOGDIR/phase2_${TAG}.readiness.out" | sed -n '1,25p' >&2
+  grep -A40 '"reasons"' "$LOGDIR/phase2_${NAME}.readiness.out" | sed -n '1,25p' >&2
   exit 4
 fi
 if [[ -f "$WORK/partial_data.json" ]]; then
@@ -231,15 +325,16 @@ fi
 mkdir -p "$WORK"
 free_gb=$(df -Pk "$REPO" | awk 'NR==2 {print int($4/1048576)}')
 if [[ "$free_gb" -lt 10 ]]; then log "only ${free_gb} GB free (< 10 GB floor): not starting"; exit 3; fi
-if [[ -n "$FORCE" ]]; then rm -f "$STAMPS/$FORCE.done"; for f in $(state_files "$FORCE"); do rm -f "$f"; done; fi
 
-log "phase 2 driver: profile=$PROFILE smoke=$SMOKE allow_partial=$ALLOW_PARTIAL threads=$THREADS work=$WORK git=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+log "phase 2 driver: profile=$PROFILE smoke=$SMOKE tag=${RUN_TAG:--} allow_partial=$ALLOW_PARTIAL threads=$THREADS work=$WORK stamps=$STAMPS git=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+for s in "${FORCE_STEPS[@]}"; do forget "$s"; done
 reached_from=0
 [[ -z "$FROM" ]] && reached_from=1
 for s in "${STEPS[@]}"; do
   [[ "$s" == "$FROM" ]] && reached_from=1
   if [[ -n "$ONLY" && "$s" != "$ONLY" ]]; then continue; fi
-  if [[ -z "$ONLY" && $reached_from == 1 && -n "$FROM" ]]; then rm -f "$STAMPS/$s.done"; fi
+  # --from: forget the stamp AND the training state, else train()'s --resume returns the old (finished) weights
+  if [[ -z "$ONLY" && $reached_from == 1 && -n "$FROM" ]] && ! is_forced "$s"; then forget "$s"; fi
   if [[ -z "$ONLY" && -f "$STAMPS/$s.done" ]]; then log "skip $s (done $(cat "$STAMPS/$s.done"))"; continue; fi
   free_gb=$(df -Pk "$REPO" | awk 'NR==2 {print int($4/1048576)}')
   if [[ "$free_gb" -lt 10 ]]; then log "only ${free_gb} GB free: stopping before $s"; exit 3; fi

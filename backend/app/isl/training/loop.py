@@ -83,6 +83,49 @@ class StateMismatch(RuntimeError):
     pass
 
 
+def digest(obj) -> str:
+    """Short, stable hash of any JSON-able value (for ``LoopConfig.extra``)."""
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def clips_digest(clips, labels=None, weights=None) -> str:
+    """Hash of a training list in sampling order: clip id, trim slice, landmark file name, label and weight. Any
+    change to the data a run trains on (another clip, re-trim, relink, re-weight) changes it, so a saved state of
+    the old data is refused instead of resumed (docs/ISL_DESIGN.md 15.19)."""
+    rows = []
+    for i, c in enumerate(clips):
+        r = [c.clip_id, c.start, c.end, Path(c.path).name]
+        if labels is not None:
+            r.append(labels[i])
+        if weights is not None:
+            r.append(round(float(weights[i]), 6))
+        rows.append(r)
+    return digest(rows)
+
+
+def file_digest(path) -> str | None:
+    """SHA-256 (first 16 hex) of a file, None when there is no file (e.g. a warm-start checkpoint)."""
+    if not path:
+        return None
+    p = Path(path)
+    if not p.is_file():
+        return None
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()[:16]
+
+
+def train_config_signature(cfg) -> dict:
+    """Every field of a shared ``TrainConfig`` that changes training (all but early-stopping patience, which may
+    change between parts of one run, and the device)."""
+    d = asdict(cfg)
+    for k in ("patience", "device"):
+        d.pop(k, None)
+    return d
+
+
 def run_loop(model: nn.Module, batches: Callable[[int], Iterator], loss_fn: Callable, cfg: LoopConfig,
              state_path: Path, *, val_fn: Callable[[nn.Module], dict] | None = None, select_key: str = "val",
              save_best: Callable[[int, dict], None] | None = None, params=None, fresh: bool = False,

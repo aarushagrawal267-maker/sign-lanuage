@@ -47,7 +47,7 @@ from app.features.spec import FeatureConfig
 from app.isl.augment import StrongAugmentConfig, augment_strong
 from app.isl.data.sources import Clip
 from app.isl.models.encoder import SignEncoder
-from app.isl.training.loop import LoopConfig, atomic_save, run_loop
+from app.isl.training.loop import LoopConfig, atomic_save, clips_digest, run_loop
 from app.models.checkpoint import frame_mask
 
 log = logging.getLogger(__name__)
@@ -285,7 +285,9 @@ def pretrain_encoder(clips: list[Clip], out: Path, fcfg: FeatureConfig, cfg: Pre
                     max_minutes=max_minutes, seed=cfg.seed,
                     extra={"pretrain": asdict(cfg), "clips": len(clips), "dim": fcfg.dim,
                            # a state from another objective version or feature config is refused, not continued
-                           "version": PRETRAIN_VERSION, "features": fcfg.to_dict()})
+                           "version": PRETRAIN_VERSION, "features": fcfg.to_dict(),
+                           # the clip list itself (Sign Library dedupe, eval-clip exclusion, sampling): docs 15.19
+                           "data": clips_digest(clips)})
     res = run_loop(model, batches, loss_fn, lc, state_path or out.with_suffix(".state.pt"), val_fn=val_fn,
                    select_key="val", save_best=save_best, fresh=fresh,
                    progress=(lambda m: progress(m)) if progress else None)

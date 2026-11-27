@@ -31,7 +31,8 @@ from app.features.spec import FeatureConfig
 from app.isl.models.encoder import SignEncoder, load_encoder_weights
 from app.isl.models.losses import SubCenterArcFace, SupConLoss
 from app.isl.training.common import ClipDataset, IslData, LazyClipDataset, set_threads
-from app.isl.training.loop import LoopConfig, atomic_save, pk_batches, run_loop
+from app.isl.training.loop import (LoopConfig, atomic_save, clips_digest, digest, file_digest, pk_batches, run_loop,
+                                   train_config_signature)
 from app.isl.training.multisource import SAMPLE_WEIGHTS
 from app.models.checkpoint import frame_mask
 from app.training.trainer import TrainConfig, set_seed
@@ -208,7 +209,14 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
                     patience=cfg.patience, max_minutes=max_minutes, seed=cfg.seed,
                     extra={"kind": "encoder", "model": model_kwargs, "p": p, "k": k, "concepts": len(concepts),
                            "items": len(train_clips), "excluded": len(excl), "init": str(init_from or ""),
-                           "features": fcfg.to_dict()})
+                           "features": fcfg.to_dict(),
+                           # every option that changes what is trained or which epoch is kept (docs 15.19)
+                           "train": train_config_signature(cfg), "split": data.split.get("name"),
+                           "version": version, "arc_weight": arc_weight, "use_extra": use_extra,
+                           "source_weights": sw, "excluded_concepts": digest(sorted(excl)),
+                           "init_sha": file_digest(init_from), "data": clips_digest(train_clips, labels, weights),
+                           "val": [max_val_queries, max_gallery, per_concept_gallery, clips_digest(vq),
+                                   clips_digest(gal)]})
     res = run_loop(both, batches, loss_fn, lc, state_path or Path(str(out) + ".state"), val_fn=val_fn,
                    select_key="val_r1", save_best=save_best, fresh=not resume,
                    progress=(lambda m: progress(None, m)) if progress else None)
