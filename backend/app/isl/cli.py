@@ -628,7 +628,9 @@ def cmd_train_classifier(paths: IslPaths, args) -> int:
                            threads=args.threads, progress=lambda f, m: _log(f"  classifier {m}"),
                            use_extra=args.all_sources, min_signers=args.min_signers, resume=args.resume,
                            max_minutes=args.max_minutes, steps_per_epoch=args.batches,
-                           dictionary_group=bool(getattr(args, "dictionary_group", False)))
+                           dictionary_group=bool(getattr(args, "dictionary_group", False)),
+                           source_quota=getattr(args, "source_quota", None),
+                           select_on=getattr(args, "select_on", None) or "macro_f1")
     _print(res)
     return 0 if res.get("finished", True) else EX_PARTIAL
 
@@ -663,6 +665,16 @@ def _exclude_sources_arg(v: str) -> str:
     except ValueError as e:
         raise argparse.ArgumentTypeError(str(e)) from None
     return v
+
+
+def _source_quota_arg(v: str) -> dict | None:
+    """argparse type of ``--source-quota``: ``name=share,...``, ``default`` or ``none`` (docs 15.38; exit 2)."""
+    from app.isl.training.source_quota import parse_source_quota
+
+    try:
+        return parse_source_quota(v)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
 
 
 def _fusion_fit_space(rec) -> dict:
@@ -1400,6 +1412,15 @@ def build_parser() -> argparse.ArgumentParser:
             spx.add_argument("--dictionary-group", action="store_true",
                              help="count ISLRTC, WSLP and CISLR as ONE signer group when choosing classes (WSLP is "
                                   "a second view of the ISLRTC videos; docs 15.32). Default: the old grouping")
+            spx.add_argument("--source-quota", type=_source_quota_arg, default=None,
+                             help="two-stage sampler (docs 15.38): draw a source group by these shares, then a class "
+                                  "inside it, then a clip. 'include=0.45,isl500=0.35,dictionary=0.12,mendeley=0.08' "
+                                  "(dictionary = islrtc+wslp+cislr, mendeley = mendeley_*; renormalised over the "
+                                  "sources present), 'default' (that one) or 'none'. Default: none (the old sampler)")
+            spx.add_argument("--select-on", choices=["macro_f1", "worst_source"], default="macro_f1",
+                             help="epoch selection: macro_f1 over all validation clips (default, as before) or "
+                                  "worst_source = the lowest macro F1 of INCLUDE and ISL500 (those present), with the "
+                                  "temperature fitted on source-balanced validation (docs 15.38)")
         if name in ("train-encoder", "train-oneshot"):
             spx.add_argument("--exclude-sources", default="", type=_exclude_sources_arg,
                              help="comma-separated sources left out of encoder supervision, e.g. wslp (docs 15.32)")

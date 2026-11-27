@@ -43,8 +43,11 @@ def wilson_lower(k: int, n: int, z: float = 1.96) -> float:
     return (p + z * z / (2 * n) - z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / d
 
 
-def fit_temperature(logits: np.ndarray, y: np.ndarray, grid: np.ndarray | None = None) -> float:
-    """Temperature T minimising the NLL of softmax(logits / T). ``logits`` may be log-probabilities."""
+def fit_temperature(logits: np.ndarray, y: np.ndarray, grid: np.ndarray | None = None,
+                    weights: np.ndarray | None = None) -> float:
+    """Temperature T minimising the NLL of softmax(logits / T). ``logits`` may be log-probabilities. ``weights``
+    (per row, e.g. 1 / clips of the row's source for a source-balanced fit, docs 15.38): weighted mean NLL; None =
+    the plain mean (unchanged)."""
     if len(y) == 0:
         return 1.0
     grid = grid if grid is not None else np.exp(np.linspace(math.log(0.25), math.log(6.0), 49))
@@ -53,7 +56,8 @@ def fit_temperature(logits: np.ndarray, y: np.ndarray, grid: np.ndarray | None =
         z = logits / t
         z = z - z.max(1, keepdims=True)
         lse = np.log(np.exp(z).sum(1))
-        nll = float(np.mean(lse - z[np.arange(len(y)), y]))
+        rows = lse - z[np.arange(len(y)), y]
+        nll = float(np.mean(rows)) if weights is None else float(np.average(rows, weights=weights))
         if nll < best:
             best_t, best = float(t), nll
     return best_t

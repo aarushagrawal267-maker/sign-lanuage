@@ -226,10 +226,21 @@ def run_loop(model: nn.Module, batches: Callable[[int], Iterator], loss_fn: Call
 # --------------------------------------------------------------------------------------------- samplers
 
 def balanced_batches(labels: list[int], weights: list[float] | None, batch: int, n_batches: int, seed: int,
-                     epoch: int, class_power: float = 0.5) -> Iterator[list[int]]:
+                     epoch: int, class_power: float = 0.5, *, groups: list[str] | None = None,
+                     group_quota: dict[str, float] | None = None) -> Iterator[list[int]]:
     """Class-balanced batches: a class is drawn with probability proportional to ``count ** class_power``
     (0 = uniform over classes, 1 = natural frequency), then an item of it by its per-item weight
-    (source weighting)."""
+    (source weighting).
+
+    With ``group_quota`` (and ``groups``, the quota group of every item; docs/ISL_DESIGN.md 15.38) the draw has two
+    stages: first a group with probability ``group_quota[g]`` (renormalised over the groups that have items), then a
+    class among that group's items by ``count_in_group ** class_power``, then an item of that class and group by its
+    weight. Without it the draws are exactly the old ones."""
+    if group_quota is not None:
+        if groups is None or len(groups) != len(labels):
+            raise ValueError("group_quota needs the quota group of every item")
+        yield from _quota_batches(labels, weights, batch, n_batches, seed, epoch, class_power, groups, group_quota)
+        return
     rng = random.Random(f"{seed}:{epoch}")
     by = defaultdict(list)
     for i, y in enumerate(labels):
@@ -247,6 +258,60 @@ def balanced_batches(labels: list[int], weights: list[float] | None, batch: int,
             ww = w[idx]
             out.append(idx[rng.choices(range(len(idx)), weights=ww)[0]] if len(idx) > 1 else idx[0])
         yield out
+
+
+def _quota_batches(labels, weights, batch, n_batches, seed, epoch, class_power, groups, group_quota):
+    rng = random.Random(f"{seed}:{epoch}")
+    w = np.asarray(weights if weights is not None else np.ones(len(labels)), np.float64)
+    by: dict[str, dict[int, list[int]]] = defaultdict(lambda: defaultdict(list))
+    for i, (y, g) in enumerate(zip(labels, groups)):
+        by[g][y].append(i)
+    gnames = sorted(g for g in by if group_quota.get(g, 0.0) > 0)
+    if not gnames:
+        raise ValueError(f"source quota {group_quota}: no item in a group with a share > 0")
+    gq = np.array([group_quota[g] for g in gnames], np.float64)
+    gcum = np.cumsum(gq / gq.sum())
+    plan = []  # per group: (classes, class cumsum, per class (items, cumulative item weights))
+    for g in gnames:
+        cls = sorted(by[g])
+        cw = np.array([len(by[g][c]) ** class_power for c in cls], np.float64)
+        items = [(by[g][c], list(np.cumsum(w[by[g][c]]))) for c in cls]
+        plan.append((cls, np.cumsum(cw / cw.sum()), items))
+    for _ in range(n_batches):
+        out = []
+        for _ in range(batch):
+            cls, ccum, items = plan[min(len(gnames) - 1, int(np.searchsorted(gcum, rng.random())))]
+            idx, cum = items[min(len(cls) - 1, int(np.searchsorted(ccum, rng.random())))]
+            out.append(idx[rng.choices(range(len(idx)), cum_weights=cum)[0]] if len(idx) > 1 else idx[0])
+        yield out
+
+
+def expected_draw_shares(labels: list[int], weights: list[float] | None, keys: list[str], class_power: float = 0.5,
+                         groups: list[str] | None = None, group_quota: dict[str, float] | None = None) -> dict:
+    """Expected share of draws per ``keys`` value (e.g. the source of every item) under :func:`balanced_batches`
+    with the same settings (for the run's meta: how often an INCLUDE clip is seen)."""
+    w = np.asarray(weights if weights is not None else np.ones(len(labels)), np.float64)
+    out: dict[str, float] = defaultdict(float)
+    if group_quota is None:
+        parts = {"": (1.0, list(range(len(labels))))}
+    else:
+        members = defaultdict(list)
+        for i, g in enumerate(groups):
+            members[g].append(i)
+        live = {g: group_quota.get(g, 0.0) for g in members if group_quota.get(g, 0.0) > 0}
+        tot = sum(live.values())
+        parts = {g: (q / tot, members[g]) for g, q in live.items()}
+    for share, idx in parts.values():
+        by = defaultdict(list)
+        for i in idx:
+            by[labels[i]].append(i)
+        cw = {c: len(v) ** class_power for c, v in by.items()}
+        ctot = sum(cw.values())
+        for c, v in by.items():
+            wt = w[v].sum()
+            for i in v:
+                out[keys[i]] += share * cw[c] / ctot * (w[i] / wt if wt > 0 else 1.0 / len(v))
+    return {k: round(v, 6) for k, v in sorted(out.items())}
 
 
 def pk_batches(labels: list[int], p: int, k: int, n_batches: int, seed: int, epoch: int,

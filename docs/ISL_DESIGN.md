@@ -4231,3 +4231,66 @@ is refused and the override is recorded; `auto` ignores a file of another work f
 word labels count a variant as its word while a twin stays wrong, also on common clips; the report and the pack
 carry the audit and warn on validation evidence; the driver refuses `--only link` on a changed state and does not
 seed the audit file.
+
+### 15.38 Classifier: a source quota sampler and selection on the worst source (QA plan 1.4, critics 2, 9 and 10, 27 Nov 2026)
+
+**Why.** The research classifier draws a class by `count ** 0.5`, then a clip of that class by source weight. ISL500
+has 59,463 training clips and INCLUDE 2,566, so inside a shared class almost every draw is an ISL500 clip. INCLUDE
+clips are seen less often than in the commercial-safe run, and the critic showed that the E1b drop is confusion
+inside the shared classes (critic 2). Selection on the pooled validation macro F1 has the same bias: about 94 % of
+the research validation clips are ISL500.
+
+**The sampler (`loop.balanced_batches`, new `groups` and `group_quota`).** With a quota every draw has two stages:
+1. a quota group, with probability equal to its share;
+2. a class among that group's clips, by `count_in_group ** class_power`, then a clip of that class and group by its
+   per-clip weight (the ISLRTC x4 and the WSLP 0.8 still apply inside the dictionary group).
+Without a quota the draws are exactly the old ones (a test compares them with the old code).
+
+**Quota groups (`training/source_quota.py`).** A key is a source name or a family: `dictionary` (islrtc, wslp,
+cislr) and `mendeley` (every `mendeley_*`). An exact source name wins over its family. Groups with no training clip
+are dropped and the rest renormalised, so one quota fits every split. A training source with no share is refused
+(a new source never silently gets no draws), and so is an unknown name (a typo). Research default:
+`include=0.45,isl500=0.35,dictionary=0.12,mendeley=0.08`.
+
+**Selection (`train_classifier(select_on=...)`).**
+* `macro_f1` (default): as before, the pooled validation macro F1.
+* `worst_source`: the epoch with the highest `val_worst_major_f1`, the lowest validation macro F1 of INCLUDE and
+  ISL500 (those present). With neither present it falls back to the pooled number. The temperature is then fitted on
+  source-balanced validation: every source weighs the same in total, a source with fewer than 20 clips weighs
+  `clips / 20` (`fit_temperature(weights=...)`; without weights the fit is unchanged).
+* Every history row now has `val_f1_<source>` and `val_acc_<source>` per validation source and `val_worst_major_f1`,
+  in both modes.
+
+**Recorded.** The checkpoint meta has `source_quota` (requested shares, source -> group, renormalised shares, sources
+never drawn), `select_on`, `select_key`, `temperature_fit`, `val_by_source` (clips and top-1 per source after
+calibration) and `data.expected_draw_share` (expected share of draws per source; the first log line prints it). The
+quota and the selection mode are in `LoopConfig.extra` only when on (rule of 15.19), so a stale state of other
+settings is refused and an old default state still resumes.
+
+**CLI.** `train-classifier --source-quota SPEC|default|none` and `--select-on macro_f1|worst_source`. A bad quota exits 2.
+
+**Driver.** `CLS_SOURCE_QUOTA` (empty or `none` = off) and `CLS_SELECT` (`macro_f1` / `worst_source`).
+* Research defaults: the quota above, `worst_source`, `CLS_STEPS=800` and a new `CLS_PATIENCE=8` (full runs).
+* Commercial-safe defaults: no quota, `macro_f1`, 300 steps, patience 10. Its commands are unchanged.
+* The quota and selection go to the classifier and cv steps. e1a (INCLUDE official split) never gets them and keeps
+  patience 10.
+* The classifier and cv stamps record `quota=` and `select=`; the start line and `--dry-run` print them.
+
+**How to read the results (critics 2, 9, 10).**
+* Run the quota ablation alone first (critic 2), in a tagged scratch run, for example
+  `PHASE2_TAG=q30 CLS_SOURCE_QUOTA=include=0.30,isl500=0.50,dictionary=0.12,mendeley=0.08 scripts/phase2_train.sh
+  --profile research --from classifier`. Credit an E1b gain to 1.4 only from that run.
+* Choose the quota on INCLUDE validation, never on test (critic 9). The per-source history makes that possible
+  without a test pass.
+* QA plan 1.6 moves two ISL500 signers to validation. Selection then sees a different ISL500 validation set, and an
+  ablation on the old split does not measure that change (critic 10). Compare runs on the same split only.
+* Open (critic 8): worst-source selection selects on the same INCLUDE validation clips that later certify the
+  thresholds. Out-of-fold calibration (cv folds) is still the cleaner fix.
+* Not done (plan 1.4): an encoder-initialised classifier. It needs a new architecture and pack changes (Batch 2).
+
+Tests (`backend/tests/isl/test_source_quota.py`): 10,000 draws give every group its share within 2 %; the expected
+share formula matches the draws; no quota draws exactly as the old code; class power inside a group; parsing,
+renormalisation and refusals; the CLI refuses a bad quota; source-balanced weights and the weighted temperature fit;
+the classifier's `val_worst_major_f1` is the minimum of the INCLUDE and ISL500 F1 in every history row and picks the
+best epoch; meta records the quota; a changed quota or selection raises `StateMismatch`; the default run is unchanged
+but logs per-source rows; the driver's research and commercial-safe defaults; e1a gets no quota.

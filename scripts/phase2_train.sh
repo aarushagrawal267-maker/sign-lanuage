@@ -62,6 +62,13 @@
 #   (every run so far, every scratch run): nothing changes. VARIANT_ACCEPT_NOISY=1 / VARIANT_ALLOW_SPLIT_CHANGE=1
 #   pass --accept-noisy / --allow-split-change to the link step (recorded). --only link is refused when the file's
 #   state differs from the folder's frozen one (the later steps would pair new labels with old models: use --from link).
+# Classifier sampler and selection (docs 15.38, QA plan 1.4; research on, commercial-safe off):
+#   CLS_SOURCE_QUOTA=include=0.45,isl500=0.35,dictionary=0.12,mendeley=0.08 | none   classifier and cv draw a source
+#     group by these shares, then a class inside it, then a clip (--source-quota; renormalised over the sources present;
+#     e1a never gets it). Research default: the shares shown; commercial-safe default: none.
+#   CLS_SELECT=worst_source|macro_f1   classifier and cv select the epoch on the lowest validation macro F1 of INCLUDE and
+#     ISL500 and fit the temperature on source-balanced validation (--select-on). Research worst_source, else macro_f1.
+#   Full research runs also default to CLS_STEPS=800 and CLS_PATIENCE=8 (commercial-safe 300 and 10; e1a keeps 10).
 # EVAL_COMPARE_TO=<report.json>: the evaluate step runs `evaluate --all --compare-to <report.json>` (E1b and E4 like
 # for like against that report, e.g. artifacts/isl/commercial-safe/eval/report.json; docs 15.27, 15.28, 15.31).
 # One profile per run (refused with --profile both); a missing file is refused before anything runs (exit 2).
@@ -176,6 +183,7 @@ if [[ $SMOKE == 1 ]]; then
   ENC="--hidden 32 --layers 1 --emb-dim 32 --epochs 1 --batches 4 --p 8 --k 2 --batch-size 16"
   ONE="--hidden 32 --layers 1 --emb-dim 32 --epochs 1 --batches 3 --p 8 --k 2 --batch-size 16 --folds 0"
   CLS="--hidden 32 --layers 1 --epochs 2 --batches 6 --batch-size 16"
+  E1A_PAT=""
   LET="--epochs 3"
   PDD="--max-chunks ${SMOKE_SL_CHUNKS:-600} --calib ${SMOKE_SL_CALIB:-100}"
 else
@@ -198,7 +206,10 @@ else
   PRE="--hidden $H --layers $L --emb-dim $E --epochs ${PRE_EPOCHS:-20} --batches ${PRE_STEPS:-400} --batch-size ${PRE_BATCH:-48}"
   ENC="--hidden $H --layers $L --emb-dim $E --epochs ${ENC_EPOCHS:-40} --batches ${ENC_STEPS:-400} --p 32 --k 2 --patience 10"
   ONE="--hidden $H --layers $L --emb-dim $E --epochs ${ONESHOT_EPOCHS:-20} --batches ${ENC_STEPS:-300} --p 32 --k 2 --patience 6 --folds ${ONESHOT_FOLDS:-0 1}"
-  CLS="--hidden $H --layers $L --epochs ${CLS_EPOCHS:-40} --batches ${CLS_STEPS:-300} --patience 10"
+  # research: more steps and a shorter patience on the worst-source key (docs 15.38); commercial-safe as before
+  if [[ "$PROFILE" == "research" ]]; then CS_DEF=800; CP_DEF=8; else CS_DEF=300; CP_DEF=10; fi
+  CLS="--hidden $H --layers $L --epochs ${CLS_EPOCHS:-40} --batches ${CLS_STEPS:-$CS_DEF} --patience ${CLS_PATIENCE:-$CP_DEF}"
+  E1A_PAT="--patience 10"  # e1a keeps its old patience (it gets no quota either)
   LET="--epochs ${LETTER_EPOCHS:-40}"
   PDD=""
 fi
@@ -209,6 +220,21 @@ else
   DG_DEFAULT=0; XS_DEFAULT=""; TW_DEFAULT="keep"
 fi
 DICT_GROUP="${CLS_DICTIONARY_GROUP:-$DG_DEFAULT}"
+# classifier source quota and selection (docs 15.38): research on, commercial-safe off; "" or none = off
+if [[ "$PROFILE" == "research" ]]; then
+  CQ_DEFAULT="include=0.45,isl500=0.35,dictionary=0.12,mendeley=0.08"; CSEL_DEFAULT="worst_source"
+else
+  CQ_DEFAULT="none"; CSEL_DEFAULT="macro_f1"
+fi
+CLS_QUOTA="${CLS_SOURCE_QUOTA-$CQ_DEFAULT}"
+[[ -z "$CLS_QUOTA" ]] && CLS_QUOTA="none"
+CLS_SEL="${CLS_SELECT:-$CSEL_DEFAULT}"
+case "$CLS_SEL" in macro_f1|worst_source) ;; *) echo "CLS_SELECT must be macro_f1 or worst_source" >&2; exit 2 ;; esac
+if [[ "$CLS_QUOTA" != none && ! "$CLS_QUOTA" =~ ^[a-z0-9_]+=[0-9.]+(,[a-z0-9_]+=[0-9.]+)*$ ]]; then
+  echo "CLS_SOURCE_QUOTA: name=share,... (e.g. $CQ_DEFAULT) or none" >&2; exit 2
+fi
+CQ_ARG=""; [[ "$CLS_QUOTA" != none ]] && CQ_ARG="--source-quota $CLS_QUOTA"
+[[ "$CLS_SEL" != macro_f1 ]] && CQ_ARG="$CQ_ARG --select-on $CLS_SEL"
 ENC_XSRC="${ENC_EXCLUDE_SOURCES-$XS_DEFAULT}"
 WSLP_TWINS="${INDEX_WSLP_TWINS:-$TW_DEFAULT}"
 # linker aliases (docs 15.34): research on, commercial-safe off; only the link step passes it (later steps read the
@@ -237,7 +263,8 @@ WSLP_SETTINGS="dict_group=$DICT_GROUP enc_exclude=${ENC_XSRC:--} wslp_twins=$WSL
 # the setting a step ran with, written into its stamp so the log's "skip ... (done ...)" lines show it (docs 15.33)
 step_settings() {
   case "$1" in
-    classifier|cv|e1a) echo " dict_group=$DICT_GROUP" ;;
+    classifier|cv) echo " dict_group=$DICT_GROUP quota=$CLS_QUOTA select=$CLS_SEL" ;;
+    e1a) echo " dict_group=$DICT_GROUP" ;;
     encoder|oneshot) echo " enc_exclude=${ENC_XSRC:--}" ;;
     index|index_final) echo " wslp_twins=$WSLP_TWINS" ;;
     link) echo " link_aliases=$LINK_ALIASES variant_links=$VL_FILE" ;;
@@ -362,7 +389,7 @@ run_step() {
     pretrain) train pretrain $COMMON $CAP $PRE ;;
     encoder) train train-encoder $COMMON --all-sources $CAP $ENC --init auto $XS_ARG ;;
     oneshot) train train-oneshot $COMMON --all-sources $CAP $ONE --init auto $XS_ARG ;;
-    classifier) train train-classifier $COMMON --all-sources $CAP $CLS $DG_ARG ;;
+    classifier) train train-classifier $COMMON --all-sources $CAP $CLS $DG_ARG $CQ_ARG ;;
     cv)  # classifiers for the other folds of the primary split: E1b mean / spread and a signer-grouped interval
       local base
       base=$("$PY" -c "import json,sys; print(json.load(open(sys.argv[1])).get('primary_split',''))" \
@@ -370,12 +397,12 @@ run_step() {
       if [[ -z "$base" ]]; then log "  no splits_report.json: skipped"; return 0; fi
       for k in ${CV_FOLDS-$([[ $SMOKE == 1 ]] && echo 1 || echo 1 2 3 4)}; do
         mkdir -p "$WORK/cv/fold$k"
-        train train-classifier $COMMON --all-sources $CAP $CLS $DG_ARG --split "$base-fold$k" --ckpt "$WORK/cv/fold$k/classifier.pt" || return $?
+        train train-classifier $COMMON --all-sources $CAP $CLS $DG_ARG $CQ_ARG --split "$base-fold$k" --ckpt "$WORK/cv/fold$k/classifier.pt" || return $?
       done ;;
     e1a)  # E1a needs its own model trained on the official (not signer-independent) INCLUDE split
       if [[ ! -f "${SROOT:-$REPO/data/isl}/splits/include-official.json" ]]; then log "  no official split: skipped"; return 0; fi
       mkdir -p "$WORK/e1a"
-      train train-classifier $COMMON $CAP $CLS $DG_ARG --batches ${E1A_STEPS:-$([[ $SMOKE == 1 ]] && echo 6 || echo 120)} --split include-official --ckpt "$WORK/e1a/classifier.pt" ;;
+      train train-classifier $COMMON $CAP $CLS $E1A_PAT $DG_ARG --batches ${E1A_STEPS:-$([[ $SMOKE == 1 ]] && echo 6 || echo 120)} --split include-official --ckpt "$WORK/e1a/classifier.pt" ;;
     fingerspell) cli train-fingerspell --profile "$PROFILE" --threads "$THREADS" --vocab "$VOCAB" $SM $LET ;;
     # training parts only, into <work>/index: fit-fusion and evaluate read it and refuse anything else (docs 15.21).
     # A rebuilt index makes the later steps that used or must follow it stale: forget their stamps (docs 15.22),
@@ -404,6 +431,7 @@ if [[ $DRY_RUN == 1 ]]; then
   [[ -n "$COMPARE_TO" ]] && echo "evaluate compares to: $COMPARE_TO"
   echo "wslp/dictionary: classifier dictionary group=$DICT_GROUP, encoder excludes=${ENC_XSRC:--}, index wslp twins=$WSLP_TWINS"
   echo "linker: aliases and WSLP number stripping=$LINK_ALIASES (link step only)"
+  echo "classifier: source quota=$CLS_QUOTA, selection=$CLS_SEL (classifier and cv), settings: $CLS"
   echo "variant links: VARIANT_LINKS=$VARIANT_LINKS, $WORK/variant_links.json: $VL_FILE (link step only)"
 fi
 
@@ -536,7 +564,7 @@ mkdir -p "$WORK"
 free_gb=$(df -Pk "$REPO" | awk 'NR==2 {print int($4/1048576)}')
 if [[ "$free_gb" -lt 10 ]]; then log "only ${free_gb} GB free (< 10 GB floor): not starting"; exit 3; fi
 
-log "phase 2 driver: profile=$PROFILE smoke=$SMOKE tag=${RUN_TAG:--} allow_partial=$ALLOW_PARTIAL threads=$THREADS work=$WORK stamps=$STAMPS${COMPARE_TO:+ compare_to=$COMPARE_TO} $WSLP_SETTINGS git=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+log "phase 2 driver: profile=$PROFILE smoke=$SMOKE tag=${RUN_TAG:--} allow_partial=$ALLOW_PARTIAL threads=$THREADS work=$WORK stamps=$STAMPS${COMPARE_TO:+ compare_to=$COMPARE_TO} $WSLP_SETTINGS cls_quota=$CLS_QUOTA cls_select=$CLS_SEL git=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
 [[ -n "${LA_WARN:-}" ]] && log "warning: $LA_WARN"
 if [[ ${#SEED[@]} -gt 0 ]]; then
   for s in "${SEED[@]}"; do seed_step "$s" || { log "seeding $s FAILED"; exit 2; }; done
