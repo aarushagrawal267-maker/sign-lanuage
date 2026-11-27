@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import itertools
 import math
+from typing import NamedTuple
 
 import numpy as np
 
@@ -50,6 +51,38 @@ def fit_temperature(logits: np.ndarray, y: np.ndarray, grid: np.ndarray | None =
     return best_t
 
 
+# fit_temperature's default grid, shared with the compact path below (fit-fusion, docs 15.24)
+TEMPERATURE_GRID = np.exp(np.linspace(math.log(0.25), math.log(6.0), 49))
+
+
+def temperature_nll_terms(logits: np.ndarray, y: np.ndarray, grid: np.ndarray | None = None) -> np.ndarray:
+    """(len(grid), N): per temperature and row, the term ``fit_temperature`` averages (log-sum-exp of logits / T
+    minus the true logit / T), with exactly its arithmetic. Rows are independent, so fit-fusion computes them clip
+    by clip and keeps 49 numbers per clip instead of its full classifier row (docs 15.24)."""
+    grid = grid if grid is not None else TEMPERATURE_GRID
+    out = []
+    for t in grid:
+        z = logits / t
+        z = z - z.max(1, keepdims=True)
+        lse = np.log(np.exp(z).sum(1))
+        out.append(lse - z[np.arange(len(y)), y])
+    return np.stack(out) if out else np.zeros((0, len(y)))
+
+
+def fit_temperature_terms(terms: np.ndarray, grid: np.ndarray | None = None) -> float:
+    """``fit_temperature`` from ``temperature_nll_terms`` (rows = the grid, columns = clips): the same choice."""
+    grid = grid if grid is not None else TEMPERATURE_GRID
+    terms = np.ascontiguousarray(terms)
+    if terms.ndim != 2 or terms.shape[1] == 0:
+        return 1.0
+    best_t, best = 1.0, float("inf")
+    for t, row in zip(grid, terms):
+        nll = float(np.mean(row))
+        if nll < best:
+            best_t, best = float(t), nll
+    return best_t
+
+
 def true_prob(res: FusionResult, truth: str) -> float:
     try:
         return float(res.probs[res.keys.index(truth)])
@@ -78,14 +111,15 @@ def fit_fusion_weights(inputs: list[FusionInputs], truths: list[str], base: Fusi
     has_c = any(i.cls_logp is not None for i in inputs)
     has_r = any(i.ret is not None for i in inputs)
     g = grid or weight_grid(has_c, has_r, base)
-    best, best_p, tried = float("inf"), base, 0
+    best, best_p, tried, points = float("inf"), base, 0, []
     for a, b, c, t in itertools.product(g["alpha"], g["beta"], g["gamma"], g["tau_r"]):
         p = base.with_(alpha=a, beta=b, gamma=c, tau_r=t)
         nll = fusion_nll(inputs, truths, p)
         tried += 1
+        points.append((nll, p))  # in grid order; fit-fusion re-scores the best few on every clip (docs 15.24)
         if nll < best:
             best, best_p = nll, p
-    return best_p, {"nll": best, "tried": tried, "grid": g}
+    return best_p, {"nll": best, "tried": tried, "grid": g, "points": points}
 
 
 def _decisions(results: list[FusionResult], params: FusionParams, policy: str) -> list[tuple[str, str]]:
@@ -275,19 +309,51 @@ def _classifier_alone_parts(per_crop: list[np.ndarray], margin: float, min_agree
     return P, p1, (p1 - p2 >= margin) & (agree >= need)
 
 
-def fit_classifier_thresholds(per_crop: list[np.ndarray], class_names: list[str], truths: list[str], margin: float,
+class ClassifierSummary(NamedTuple):
+    """What the classifier-alone segment rule reads from one segment's (crops, C) probabilities
+    (``classifier_summary``): crop-mean top-1 and top-2, the crop-mean top class and each crop's top class. Fit-fusion
+    keeps this per clip instead of the full rows (docs 15.24)."""
+    p1: np.floating
+    p2: np.floating
+    top: int
+    crop_top: np.ndarray
+
+
+def classifier_summary(per_crop: np.ndarray) -> ClassifierSummary:
+    P = per_crop.mean(0)
+    srt = -np.sort(-P)
+    p2 = srt[1] if len(P) > 1 else np.float64(0.0)
+    return ClassifierSummary(srt[0], p2, int(P.argmax()), per_crop.argmax(1).astype(np.int32))
+
+
+def _summary_parts(rows: list[ClassifierSummary], margin: float, min_agree: int = 2):
+    """``_classifier_alone_parts`` from summaries: the same top classes, p1 and accept mask."""
+    p1 = np.array([r.p1 for r in rows])
+    p2 = np.array([r.p2 for r in rows])
+    top = np.array([r.top for r in rows])
+    agree = np.array([int((r.crop_top == r.top).sum()) for r in rows])
+    need = np.array([min(min_agree, len(r.crop_top)) for r in rows])
+    return top, p1, (p1 - p2 >= margin) & (agree >= need)
+
+
+def fit_classifier_thresholds(per_crop: list, class_names: list[str], truths: list[str], margin: float,
                               min_agree: int = 2, targets: dict | None = None,
                               min_accepted: int = 5) -> tuple[dict | None, dict]:
     """Per-policy thresholds of the classifier ALONE (sliding mode) on validation: ``per_crop`` are the
-    temperature-scaled (crops, C) probabilities the engine sees. Every validation query counts; a query whose word
-    is not one of the classifier's classes can only be a wrong accept (in the app nothing stops anyone signing it).
-    Same targets and graded fallback as the fused thresholds (``choose_policy_thresholds``)."""
+    temperature-scaled (crops, C) probabilities the engine sees, or their ``classifier_summary`` (the same result).
+    Every validation query counts; a query whose word is not one of the classifier's classes can only be a wrong
+    accept (in the app nothing stops anyone signing it). Same targets and graded fallback as the fused thresholds
+    (``choose_policy_thresholds``)."""
     targets = {pol: float((targets or {}).get(pol, TARGETS[pol])) for pol in POLICIES}
     rep: dict = {"n": len(per_crop), "margin": margin, "min_agree": min_agree}
     if not per_crop:
         return None, {**rep, "note": "no validation data"}
-    P, p1, base = _classifier_alone_parts(per_crop, margin, min_agree)
-    correct = np.array([class_names[int(i)] == t for i, t in zip(P.argmax(1), truths)])
+    if isinstance(per_crop[0], ClassifierSummary):
+        top, p1, base = _summary_parts(per_crop, margin, min_agree)
+    else:
+        P, p1, base = _classifier_alone_parts(per_crop, margin, min_agree)
+        top = P.argmax(1)
+    correct = np.array([class_names[int(i)] == t for i, t in zip(top, truths)])
     rep["n_in_classes"] = int(sum(t in set(class_names) for t in truths))
     n_acc, n_ok = _scan(p1, base, correct)
     accept, trep = choose_policy_thresholds(THRESHOLD_GRID, n_acc, n_ok, targets, min_accepted, len(per_crop))

@@ -156,10 +156,15 @@ def _same(a: FusionResult, b: FusionResult, atol: float):
     assert a.components == b.components
 
 
+T_CS = sorted({p.t_c for p in PARAMS})
+
+
 @pytest.mark.parametrize("users", [0, 4])
-def test_compact_inputs_and_shared_prior_give_the_old_fuse_result(users):
+@pytest.mark.parametrize("compact_cls", [False, True])
+def test_compact_inputs_and_shared_prior_give_the_old_fuse_result(users, compact_cls):
     """On fixed inputs, fuse(compact, shared prior) equals the pre-15.23 fuse(full matrix, per-segment prior dict)
-    within 1e-6 - bit for bit without user signs - and every policy decides the same."""
+    within 1e-6 - bit for bit without user signs - and every policy decides the same. With ``compact_cls`` the
+    classifier is compacted too (docs 15.24): its kept log-probabilities are bit for bit the old ones."""
     rng = np.random.default_rng(7 + users)
     shared = ConceptPrior(VOCAB)
     worst = 0.0
@@ -167,8 +172,12 @@ def test_compact_inputs_and_shared_prior_give_the_old_fuse_result(users):
         truth = int(rng.integers(0, C + 200))
         full = _evidence(rng, truth, users)
         old_in = dataclasses.replace(full, prior=_old_prior(full))
-        new_in = compact_inputs(dataclasses.replace(full, prior=shared), TAUS, 50)
+        new_in = compact_inputs(dataclasses.replace(full, prior=shared), TAUS, 50, t_cs=T_CS if compact_cls else None)
         assert new_in.compact and new_in.ret.shape[1] < 0.2 * G and new_in.ret_size == G
+        assert new_in.compact_cls == compact_cls
+        if compact_cls:
+            assert new_in.cls_size == C and new_in.cls_top == 100 and new_in.cls_logp.shape[1] < 0.6 * C
+            assert new_in.cls_lse.shape == (len(T_CS), 2, 3) and new_in.cls_lse.dtype == np.float32
         for p in PARAMS + [PARAMS[0].with_(user_cls_mode="neutral")]:
             a, b = _fuse_ref(old_in, p), fuse(new_in, p)
             _same(a, b, 1e-6)
@@ -201,6 +210,19 @@ def test_compact_inputs_refuse_what_they_cannot_answer():
     with pytest.raises(ValueError, match="top_n"):
         fuse(inp, FusionParams(top_n=80))
     assert compact_inputs(inp, TAUS, 50) is inp  # already compact
+    # compact classifier (docs 15.24): an unstored t_c, a top_n beyond the kept classes, full retrieval
+    full = _evidence(rng, 4)
+    ci = compact_inputs(full, TAUS, 50, t_cs=T_CS)
+    with pytest.raises(ValueError, match="t_c"):
+        fuse(ci, FusionParams(t_c=1.3))
+    with pytest.raises(ValueError, match="top_n"):
+        fuse(ci, FusionParams(top_n=120, tau_r=0.05))
+    with pytest.raises(ValueError, match="compact retrieval"):
+        fuse(dataclasses.replace(ci, ret=full.ret, ret_ids=IDX, ret_lse=None), FusionParams())
+    assert compact_inputs(ci, TAUS, 50, t_cs=T_CS) is ci
+    cls_only = compact_inputs(FusionInputs(cls_logp=full.cls_logp, cls_ids=CLS), TAUS, 50, t_cs=T_CS)
+    assert cls_only.compact_cls and not cls_only.compact
+    _same(_fuse_ref(FusionInputs(cls_logp=full.cls_logp, cls_ids=CLS), PARAMS[1]), fuse(cls_only, PARAMS[1]), 0.0)
     only_cls = FusionInputs(cls_logp=inp.cls_logp, cls_ids=CLS)
     assert compact_inputs(only_cls, TAUS) is only_cls  # nothing to compact
     # the retrieval-only E2 form (no classifier) compacts too
@@ -238,6 +260,44 @@ def test_recogniser_evidence_shares_one_prior():
     assert {k: a.prior.get(k, 0.0) for k in CLS[:5]} == {k: VOCAB.prior(k) for k in CLS[:5]}
 
 
+def test_temperature_terms_clip_by_clip_give_fit_temperatures_choice():
+    """fit-fusion fits t_c from 49 numbers per clip (docs 15.24): the per-row terms are bit for bit those of the
+    whole matrix, and the chosen temperature is fit_temperature's."""
+    from app.isl.models.calibration import (TEMPERATURE_GRID, fit_temperature, fit_temperature_terms,
+                                            temperature_nll_terms)
+
+    rng = np.random.default_rng(5)
+    for scale in (0.4, 1.0, 3.0):
+        y = rng.integers(0, C, 257)
+        lg = rng.normal(0, 1, (257, C)) * scale
+        lg[np.arange(257), y] += 2.0
+        lg = _log_softmax(lg).astype(np.float32)
+        whole = temperature_nll_terms(lg, y)
+        rows = np.stack([temperature_nll_terms(lg[i:i + 1], y[i:i + 1])[:, 0] for i in range(257)], axis=1)
+        assert np.array_equal(whole, rows)
+        assert fit_temperature_terms(rows, TEMPERATURE_GRID) == fit_temperature(lg, y)
+    assert fit_temperature_terms(np.zeros((49, 0))) == 1.0
+
+
+def test_classifier_summaries_give_the_same_segment_proxy_thresholds():
+    from app.isl.models.calibration import classifier_summary, fit_classifier_thresholds
+    from app.isl.recognizer import calibrated_probs
+
+    rng = np.random.default_rng(9)
+    per_crop, truths = [], []
+    for i in range(400):
+        t = int(rng.integers(0, C + 30))
+        lg = rng.normal(0, 1.5, C) + rng.normal(0, 0.6, (3, C))
+        if t < C:
+            lg[:, t] += rng.uniform(0, 9)
+        per_crop.append(calibrated_probs(np.exp(_log_softmax(lg).astype(np.float32)), 1.4))
+        truths.append(CLS[t] if t < C else f"isl.x{t}")
+    summ = [classifier_summary(p) for p in per_crop]
+    for margin in (0.0, 0.1):
+        assert (fit_classifier_thresholds(per_crop, CLS, truths, margin, min_agree=2)
+                == fit_classifier_thresholds(summ, CLS, truths, margin, min_agree=2))
+
+
 # ------------------------------------------------------------------ weight-grid subsample
 def test_weight_subsample_is_seeded_and_source_stratified():
     from app.isl.training.fit_fusion import weight_subsample
@@ -250,6 +310,26 @@ def test_weight_subsample_is_seeded_and_source_stratified():
     assert sum(cnt.values()) == 3000
     assert cnt["isl500"] == pytest.approx(3000 * 9000 / 9907, abs=1)
     assert cnt["include"] == pytest.approx(3000 * 900 / 9907, abs=1) and cnt["mendeley"] >= 1
+
+
+def test_weight_subsample_with_many_tiny_sources_stays_at_n_and_balances_signers():
+    """Every source keeps at least one clip, but the minimums no longer push the total above n: the excess comes
+    back from the largest sources. Within a source the signer groups keep their share (docs 15.24)."""
+    from app.isl.training.fit_fusion import weight_subsample
+
+    src = ["isl500"] * 4000 + ["include"] * 300 + [f"tiny{i}" for i in range(60)]
+    grp = [f"s{i % 4}" for i in range(4000)] + [f"i{i % 30}" for i in range(300)] + [f"t{i}" for i in range(60)]
+    for n in (100, 500):
+        sub = weight_subsample(src, n, seed=2, groups=grp)
+        assert len(sub) == n == len(set(sub))
+        assert all(any(src[i] == f"tiny{k}" for i in sub) for k in range(60))  # every source kept
+        sig = [grp[i] for i in sub if src[i] == "isl500"]
+        assert max(sig.count(f"s{k}") for k in range(4)) - min(sig.count(f"s{k}") for k in range(4)) <= 1
+    # more sources than n: one clip each, nothing more (the documented exception)
+    assert len(weight_subsample(src, 50, seed=2, groups=grp)) == 62
+    # without groups the source counts are the same as with them
+    a, b = weight_subsample(src, 500, seed=2), weight_subsample(src, 500, seed=2, groups=grp)
+    assert sorted(src[i] for i in a) == sorted(src[i] for i in b)
 
 
 # ------------------------------------------------------------------ fit-fusion on a toy world
@@ -342,6 +422,12 @@ def test_fit_fusion_grid_on_a_subsample_is_recorded_and_thresholds_use_every_cli
     assert wf["subsample"] == 60 and wf["seed"] == 5 and wf["n_full"] == len(clips) == rep["val_queries"]
     assert wf["subsample_by_source"] == {"include": 15, "isl500": 45} and wf["grid_points"] == 81
     assert wf["nll_full"] > 0 and wf["nll_subsample"] > 0 and rep["weights"]["nll"] == pytest.approx(wf["nll_full"], abs=1e-6)
+    # the best 5 subsample points were re-scored on every clip and the best full-set NLL was kept (docs 15.24)
+    rs = wf["rescored"]
+    assert len(rs) == ff.WEIGHT_FIT_RESCORE == 5 and [r["nll_subsample"] for r in rs] == sorted(r["nll_subsample"] for r in rs)
+    best = min(rs, key=lambda r: r["nll_full"])
+    assert wf["nll_full"] == best["nll_full"] and all(getattr(p, k) == best[k] for k in ("alpha", "beta", "gamma", "tau_r"))
+    assert wf["subsample_best_kept"] == (best is rs[0])
     assert rep["thresholds"]["per_policy"]["balanced"]["n_accepted"] <= len(clips)
     assert p.achieved["balanced"]["n"] == len(clips)  # thresholds and achieved numbers: every validation clip
     q = FusionParams.from_json(p.to_json())
@@ -384,3 +470,141 @@ def test_prepared_windows_give_identical_sliding_fits():
         assert np.array_equal(a, b)
     assert fit_sliding_thresholds(windows, truths, 0.1, 3, 700.0) == fit_sliding_thresholds(prep, truths, 0.1, 3, 700.0)
     assert sliding_commits(windows[0], 0.2, 0.05, 2, 300.0) == sliding_commits(prep[0], 0.2, 0.05, 2, 300.0)
+
+
+def test_fit_fusion_with_compact_classifier_gives_the_old_temperature_and_segment_proxy(toy, monkeypatch):
+    """With a classifier and no replayable clip (segment-proxy fallback), the compact classifier evidence (docs
+    15.24) gives exactly the temperature, weights, thresholds and classifier-alone thresholds of the full rows."""
+    import app.isl.evaluation.runners as runners
+    import app.isl.models.calibration as cal
+    import app.isl.training.fit_fusion as ff
+
+    clips, truth_of = toy
+
+    class Clf:
+        class_names = CLS
+        meta = {"temperature": 1.3, "recommended_threshold": 0.6, "class_names": CLS}
+
+    def rec():
+        r = _ToyRec(truth_of)
+        r.classifier = Clf()
+        return r
+
+    monkeypatch.setattr(ff, "replay_sliding", lambda rec, clips, cfg=None, **k: ([], [], len(clips)))
+    seen = []
+    real_fct = ff.fit_classifier_thresholds
+    monkeypatch.setattr(ff, "fit_classifier_thresholds", lambda pc, *a, **k: (seen.append(type(pc[0])), real_fct(pc, *a, **k))[1])
+    new, rep = ff.fit_fusion(rec(), clips, "research")
+    assert rep["classifier_alone"]["rule"] == "segment proxy" and new.classifier_accept
+    assert seen[-1] is cal.ClassifierSummary  # the compact path read summaries, not full rows
+    assert "temperature" in rep
+
+    monkeypatch.setattr(ff, "compact_inputs", lambda inp, *a, **k: inp)
+    for mod in (ff, cal, runners):
+        monkeypatch.setattr(mod, "fuse", _fuse_ref)
+    old, orep = ff.fit_fusion(rec(), clips, "research")
+    assert seen[-1] is np.ndarray
+    assert new == old and rep["temperature"] == orep["temperature"]
+    assert rep["classifier_alone"] == orep["classifier_alone"] and rep["my_signs"] == orep["my_signs"]
+
+
+# ------------------------------------------------------------------ batched sliding replay (docs 15.24)
+class _RowClf:
+    """A classifier whose output for a window does not depend on the batch it is in (row by row), so the batched
+    replay must give exactly the reference windows. ``jitter`` adds a batch-dependent rounding-size change."""
+
+    def __init__(self, k: int = 6, jitter: float = 0.0):
+        from app.features.spec import FeatureConfig
+
+        self.feature_config = FeatureConfig(canonical_hand=True)
+        self.class_names = CLS[:k]
+        self.meta = {"class_names": CLS[:k], "temperature": 1.2, "recommended_threshold": 0.5}
+        self.k, self.jitter, self.calls = k, jitter, 0
+
+    def predict(self, feats):
+        self.calls += 1
+        out = []
+        for x in np.asarray(feats, np.float64):
+            v = np.nan_to_num(x).reshape(len(x), -1)
+            lg = np.array([v[:, j::self.k].mean() for j in range(self.k)]) * 60.0
+            e = np.exp(lg - lg.max())
+            out.append(e / e.sum())
+        P = np.array(out, np.float32)
+        if self.jitter and len(P) > 1:
+            P = P + np.float32(self.jitter) * (np.arange(P.shape[1]) % 2)
+        return P, 0.0
+
+
+def _sliding_clips():
+    from app.dataset.synthetic import make_sequence
+
+    out = []
+    for i in range(10):
+        raw = make_sequence(i % 6, signer=i % 3, n_frames=int(40 + 9 * i), fps=25.0, n_classes=6,
+                            rng=np.random.default_rng(50 + i))
+        if i % 3 == 1:  # hands gone for a while: a sign boundary inside the clip
+            a = len(raw.t_ms) // 3
+            raw.left[a:a + 15] = np.nan
+            raw.right[a:a + 15] = np.nan
+        out.append(raw)
+    return out
+
+
+def _isl_rec(clf):
+    from app.features.spec import FeatureConfig
+    from app.isl.recognizer import IslRecognizer
+
+    return IslRecognizer("isl", FeatureConfig(canonical_hand=True), VOCAB, classifier=clf)
+
+
+def _same_windows(a, b):
+    assert len(a) == len(b)
+    for x, y in zip(a, b):
+        assert x[0] == y[0] and x[2:] == y[2:] and np.array_equal(x[1], y[1])
+
+
+def test_batched_sliding_replay_gives_the_engines_windows(monkeypatch):
+    """One classifier call per clip, the engine's own EMA / streak / boundary code: the same windows as the
+    window-by-window reference replay, and a clip near a decision edge falls back to the reference."""
+    import app.isl.training.fit_fusion as ff
+
+    clips = _sliding_clips()
+    n_ref = n_bat = 0
+    batched_used = 0
+    for raw in clips:
+        ref_clf, bat_clf = _RowClf(), _RowClf()
+        ref = ff.sliding_windows(_isl_rec(ref_clf), raw)
+        bat, replayed = ff.batched_sliding_windows(_isl_rec(bat_clf), raw)
+        _same_windows(ref, bat)
+        n_ref, n_bat = n_ref + ref_clf.calls, n_bat + bat_clf.calls
+        batched_used += not replayed
+    assert n_ref > 40 and batched_used >= 8 and n_bat <= len(clips) + (len(clips) - batched_used) * 100
+    assert any(w[3] for raw in clips for w in ff.sliding_windows(_isl_rec(_RowClf()), raw))  # a boundary is tested
+    monkeypatch.setattr(ff, "REPLAY_BAND", 2.0)  # every window "near an edge": the reference replays every clip
+    for raw in clips[:3]:
+        bat, replayed = ff.batched_sliding_windows(_isl_rec(_RowClf()), raw)
+        assert replayed
+        _same_windows(ff.sliding_windows(_isl_rec(_RowClf()), raw), bat)
+
+
+def test_batched_replay_with_rounding_differences_commits_the_same():
+    """A batch-dependent change of rounding size (as a real network's batched call has) moves EMA values slightly
+    but never a commit: the sliding fit's counts and thresholds equal the reference replay's."""
+    from types import SimpleNamespace
+
+    import app.isl.training.fit_fusion as ff
+    from app.inference.engine import EngineConfig
+    from app.isl.models.calibration import THRESHOLD_GRID, fit_sliding_thresholds, sliding_commit_counts
+
+    clips = [SimpleNamespace(load=lambda r=r: r, concept_id=CLS[i % 6]) for i, r in enumerate(_sliding_clips())]
+    e = EngineConfig()
+    ref = ff.replay_sliding(_isl_rec(_RowClf()), clips, e, batched=False)
+    cnt: dict = {}
+    bat = ff.replay_sliding(_isl_rec(_RowClf(jitter=3e-7)), clips, e, batched=True, counts=cnt)
+    assert cnt["batched"] >= 8 and cnt["batched"] + cnt["reference"] == len(clips)
+    assert ref[1] == bat[1] and ref[2] == bat[2]
+    for a, b in zip(sliding_commit_counts(ref[0], ref[1], THRESHOLD_GRID, e.min_margin, e.agree_n, e.cooldown_ms),
+                    sliding_commit_counts(bat[0], bat[1], THRESHOLD_GRID, e.min_margin, e.agree_n, e.cooldown_ms)):
+        assert np.array_equal(a, b)
+    assert (fit_sliding_thresholds(ref[0], ref[1], e.min_margin, e.agree_n, e.cooldown_ms)
+            == fit_sliding_thresholds(bat[0], bat[1], e.min_margin, e.agree_n, e.cooldown_ms))

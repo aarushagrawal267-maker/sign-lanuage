@@ -176,7 +176,13 @@ class FusionInputs:
     ``fuse`` can read - the ``ret_top`` best index concepts by crop-mean cosine, in that order, plus the columns of the
     classifier classes in ``ret_cover`` that are in the index - and ``ret_lse[tau]`` is the per-crop log-sum-exp of
     ``ret / tau`` over ALL ``ret_size`` index concepts (the softmax normaliser of the retrieval term), so ``fuse`` gives
-    the same result as on the full matrix without keeping it."""
+    the same result as on the full matrix without keeping it.
+
+    **Compact classifier** (``compact_inputs(..., t_cs=...)``, fit-fusion only, docs 15.24): ``cls_logp`` then holds
+    only the ``cls_top`` best classes by crop-mean log-probability, best first, plus the classes of kept retrieval
+    columns (``ret_cls`` points into these columns), and ``cls_lse[j]`` = (max, log-sum-exp after the max) of
+    ``cls_logp / t`` over ALL ``cls_size`` classes, per crop, for each temperature ``t = cls_t[j]``: the two
+    numbers ``_log_softmax`` computes, so ``fuse`` gives bit for bit the old classifier log-probabilities."""
 
     cls_logp: np.ndarray | None = None  # (crops, C) log-probabilities at temperature 1
     cls_ids: list[str] = field(default_factory=list)
@@ -191,6 +197,11 @@ class FusionInputs:
     ret_size: int = 0  # index concepts in the full matrix
     ret_cls: np.ndarray | None = None  # (columns,) classifier class index of each kept column, -1 = not a class
     ret_cover: np.ndarray | None = None  # classifier class indices whose index column is kept when they have one
+    # compact classifier only (None / 0 otherwise), see the class docstring
+    cls_lse: np.ndarray | None = None  # (len(cls_t), 2, crops): max and log-sum-exp of cls_logp / t over every class
+    cls_t: tuple = ()  # the temperatures of cls_lse (one shared tuple)
+    cls_top: int = 0  # leading columns of ``cls_logp``: the best classes by crop-mean log-probability, best first
+    cls_size: int = 0  # classes in the full classifier output
 
     @property
     def crops(self) -> int:
@@ -203,6 +214,10 @@ class FusionInputs:
     def compact(self) -> bool:
         return self.ret_lse is not None
 
+    @property
+    def compact_cls(self) -> bool:
+        return self.cls_lse is not None
+
 
 def _ret_logz(ret: np.ndarray, tau: float) -> np.ndarray:
     """Per-crop log-sum-exp of ``ret / tau``: the exact expression ``fuse`` evaluates on the full matrix."""
@@ -211,16 +226,55 @@ def _ret_logz(ret: np.ndarray, tau: float) -> np.ndarray:
 
 
 def compact_inputs(inp: FusionInputs, taus, top_n: int = 50, cover: int | None = None,
-                   ret_pos: dict | None = None) -> FusionInputs:
+                   ret_pos: dict | None = None, t_cs=None) -> FusionInputs:
     """``inp`` with the retrieval matrix reduced to what ``fuse`` reads for ``top_n`` <= the kept top and ``tau_r``
     in ``taus`` (docs 15.23): the ``top_n`` (at least 10) best index concepts by crop-mean cosine, the columns of
     the ``cover`` (default 2 x top_n) best classifier classes by crop-mean log-probability, and the per-crop
     retrieval normaliser for every tau. For research validation that is about 150 of 12,440 columns, so a clip
     keeps about 2 KB of retrieval evidence instead of 149 KB. ``ret_pos``: concept -> column of ``inp.ret_ids``
     (pass the index's map to avoid rebuilding it per clip). Inputs without retrieval, or already compact, are
-    returned unchanged. ``fuse`` raises for a ``top_n`` or ``tau_r`` the compact inputs cannot answer."""
-    if inp.ret is None or not len(inp.ret_ids) or inp.compact:
-        return inp
+    returned unchanged. ``fuse`` raises for a ``top_n`` or ``tau_r`` the compact inputs cannot answer.
+
+    ``t_cs`` (temperatures ``t_c``) also compacts the classifier (docs 15.24): the same ``cover`` best classes plus
+    the classes of the kept retrieval columns, and the per-crop softmax normaliser for every ``t_c`` - about 2 KB
+    instead of 3 x C float32 (52 KB for research's 4,354 classes)."""
+    out = inp
+    if inp.ret is not None and len(inp.ret_ids) and not inp.compact:
+        out = _compact_retrieval(inp, taus, top_n, cover, ret_pos)
+    if t_cs is not None and out.cls_logp is not None and len(out.cls_ids) and not out.compact_cls:
+        out = _compact_classifier(out, t_cs, top_n, cover)
+    return out
+
+
+def _cls_normaliser(x: np.ndarray, t: float) -> tuple[np.ndarray, np.ndarray]:
+    """(max, log-sum-exp after the max) of ``x / t`` per row, exactly as ``_log_softmax`` computes them in ``fuse``."""
+    xt = x / max(t, 1e-3)
+    m = np.max(xt, axis=-1, keepdims=True)
+    return m, np.log(np.sum(np.exp(xt - m), axis=-1, keepdims=True))
+
+
+def _compact_classifier(inp: FusionInputs, t_cs, top_n: int, cover: int | None) -> FusionInputs:
+    x = inp.cls_logp
+    C = x.shape[1]
+    m = int(cover) if cover is not None else 2 * int(top_n)
+    order = np.argsort(-x.mean(0))  # the ranking of fuse (and of ret_cover): T > 0 does not change it
+    top = [int(i) for i in order[:m]]
+    have = set(top)
+    extra = sorted({int(c) for c in (inp.ret_cls if inp.ret_cls is not None else ()) if c >= 0} - have)
+    kept = top + extra
+    new_pos = {c: j for j, c in enumerate(kept)}
+    ts = t_cs if isinstance(t_cs, tuple) else tuple(float(t) for t in t_cs)  # pass a tuple to share it
+    lse = np.stack([np.stack([a[:, 0] for a in _cls_normaliser(x, t)]) for t in ts])
+    ret_cls = ret_cover = None
+    if inp.ret_cls is not None:
+        ret_cls = np.array([new_pos[int(c)] if c >= 0 else -1 for c in inp.ret_cls], np.int32)
+    if inp.ret_cover is not None:
+        ret_cover = np.array(sorted(new_pos[int(c)] for c in inp.ret_cover if int(c) in new_pos), np.int32)
+    return replace(inp, cls_logp=np.ascontiguousarray(x[:, kept]), cls_ids=[inp.cls_ids[c] for c in kept],
+                   cls_lse=lse, cls_t=ts, cls_top=len(top), cls_size=C, ret_cls=ret_cls, ret_cover=ret_cover)
+
+
+def _compact_retrieval(inp: FusionInputs, taus, top_n: int, cover: int | None, ret_pos: dict | None) -> FusionInputs:
     G = inp.ret.shape[1]
     order = np.argsort(-inp.ret.mean(0))  # the order fuse uses
     n_top = min(G, max(int(top_n), 10))
@@ -254,6 +308,13 @@ def _lse_lookup(lse: dict, tau: float):
     return None
 
 
+def _t_index(ts: tuple, t: float) -> int | None:
+    for j, v in enumerate(ts):
+        if abs(v - t) <= 1e-12 * max(1.0, abs(t)):
+            return j
+    return None
+
+
 @dataclass
 class FusionResult:
     keys: list[str]  # candidate keys (concept ids or "mysign:<id>"), sorted by mean probability
@@ -277,9 +338,28 @@ def fuse(inp: FusionInputs, p: FusionParams) -> FusionResult:
     comps: dict[str, set[str]] = {"classifier": set(), "retrieval": set(), "my_signs": set()}
     cand: dict[str, None] = {}
     if has_c:
-        clp = _log_softmax(inp.cls_logp / max(p.t_c, 1e-3))
+        if inp.compact_cls:
+            # the kept columns of _log_softmax(cls_logp / t_c) with the stored normaliser: bit for bit the old values
+            # (docs 15.24); the row maximum of the full matrix is 0 - lse
+            if has_r and not compact:
+                raise ValueError("compact classifier inputs need compact retrieval inputs (docs 15.24)")
+            j = _t_index(inp.cls_t, p.t_c)
+            if j is None:
+                raise ValueError(f"compact fusion inputs have no classifier normaliser for t_c={p.t_c} "
+                                 f"(stored: {len(inp.cls_t)} temperatures; docs 15.24)")
+            if min(p.top_n, inp.cls_size) > inp.cls_top:
+                raise ValueError(f"compact fusion inputs keep the best {inp.cls_top} classifier classes; top_n "
+                                 f"{p.top_n} needs more (docs 15.24)")
+            cm, cs = inp.cls_lse[j, 0][:, None], inp.cls_lse[j, 1][:, None]
+            clp = inp.cls_logp / max(p.t_c, 1e-3) - cm - cs
+            clp_max = -cs
+        else:
+            clp = _log_softmax(inp.cls_logp / max(p.t_c, 1e-3))
+            clp_max = None
         mean_c = clp.mean(0)
         order = np.argsort(-mean_c)
+        if inp.compact_cls and (order[: p.top_n] >= inp.cls_top).any():
+            raise ValueError("compact fusion inputs do not cover this classifier candidate set (docs 15.24)")
         for i in order[: p.top_n]:
             cand[inp.cls_ids[i]] = None
         comps["classifier"] = {inp.cls_ids[i] for i in order[:10]}
@@ -320,7 +400,7 @@ def fuse(inp: FusionInputs, p: FusionParams) -> FusionResult:
         fill = np.full((crops, K), p.noncore_logp)
         if has_u and p.user_cls_mode == "neutral":
             is_user = np.array([k in set(inp.user_ids) for k in keys])
-            fill[:, is_user] = clp.max(1, keepdims=True)
+            fill[:, is_user] = clp.max(1, keepdims=True) if clp_max is None else clp_max
         cl = np.where(col[None, :] >= 0, clp[:, np.maximum(col, 0)], fill)
         z += p.alpha * cl
     if has_r or has_u:

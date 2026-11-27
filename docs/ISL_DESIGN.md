@@ -3258,7 +3258,7 @@ that does not fit.
 subsample (last point).
 * **Shared prior.** `FusionInputs.prior` is now one read-only `ConceptPrior` per recogniser (`rec.prior`), not a dict
   per segment. It gives `Vocabulary.prior` for any vocabulary concept and 0 for user signs and unknown keys, as the
-  old dict did for every key `fuse()` reads.
+  old dict did for every key `fuse()` reads, as long as the recogniser's `top_n` is the fitting `top_n` (see 15.24).
 * **Compact retrieval evidence** (`fusion.compact_inputs`, used by fit-fusion only). A clip keeps:
   * the best `top_n` (50) index concepts by crop-mean cosine, already in `fuse()`'s order;
   * the index columns of the classifier's best 2 x `top_n` classes (a classifier candidate keeps its real
@@ -3330,3 +3330,87 @@ report of the old path with one evidence pass instead of two; a subsampled fit r
 thresholds on every clip; a fusion.json without the new field loads; prepared windows give identical sliding fits).
 `test_eval_runners.py`: fit-fusion's compact evidence fills the E4 cache, and `choose_user_mode` then computes no
 evidence and reports what a fresh pass reports.
+
+### 15.24 Fit-fusion review fixes: compact classifier evidence, a faster sliding replay, a safer grid subsample (review of 15.23, 27 Nov 2026)
+
+**Problem.** The review of 15.23 found that fit-fusion still missed the plan's memory target, and that three smaller
+points were open:
+* Each validation clip still kept its full classifier log-probabilities (3 x 4,354 float32, 52 KB) and its own copy of
+  the class list (35 KB). That was about 93 KB per clip, so the full research run would need about 2.3-3.2 GB, and
+  about 4-6 GB once Batch 1 doubles the ISL500 validation set. The plan asks for under 2 GB.
+* The sliding replay was about 60 % of fit-fusion's time. It called the classifier once per window.
+* Only the subsample's best weight point was scored on every clip. A near-tie on the subsample could pick a worse
+  point, and nothing would show it.
+* `weight_subsample` gave every source at least one clip. With many tiny sources the subsample grew above `n`. It
+  also ignored signer groups.
+
+**Fix.**
+* **Compact classifier evidence** (`compact_inputs(..., t_cs=...)`, fit-fusion only). A clip keeps:
+  * the columns of the classifier's best 2 x `top_n` classes by crop-mean log-probability (best first), plus the
+    classes of the kept retrieval columns;
+  * per crop and per temperature `t_c`, the two numbers `_log_softmax` computes over all classes (the row maximum and
+    the log-sum-exp after it). The temperatures are the 49 points of `fit_temperature`'s grid, 1.0 and the default.
+  `fuse()` rebuilds the kept log-probabilities with the same arithmetic, so they are bit for bit the old values. The
+  row maximum that the "neutral" user-sign mode reads is `0 - log-sum-exp`, also exact. `fuse()` raises a
+  `ValueError` for a `t_c` without stored numbers, a `top_n` above the kept classes, or full retrieval next to a
+  compact classifier. It never gives a silent wrong answer.
+* **What fit-fusion still needs from the full rows** is taken during the same evidence pass
+  (`collect_evidence(stats=...)`):
+  * for the temperature fit, crop 0's 49 terms per clip whose word is a class (`calibration.temperature_nll_terms`).
+    `fit_temperature_terms` then picks exactly what `fit_temperature` picks;
+  * for the segment-proxy fallback of the sliding thresholds, a `ClassifierSummary` per clip at the checkpoint
+    temperature: crop-mean top-1 and top-2, the top class and each crop's top class. `fit_classifier_thresholds`
+    gives the same result from these summaries as from the full rows.
+* **Batched sliding replay** (`fit_fusion.batched_sliding_windows`, the default in `replay_sliding`). The app's engine
+  stays the reference. The engine runs once to find the windows it classifies; that never depends on the
+  probabilities. Their features go through the classifier as one batch. Then the engine runs again with those
+  probabilities injected, so EMA, streak, boundaries and repeat keys still come from the engine's own code.
+  A batched call can differ from a one-window call by float rounding (up to about 4e-7 on the research classifier).
+  So when any window's EMA top-1 is within 1e-5 of a threshold of the grid, or its top-1 minus top-2 is within 1e-5 of
+  the margin or of 0, that clip is replayed window by window. The commits, counts and thresholds are therefore the
+  engine's own. The report says how many clips went each way (`classifier_alone.replay_clips`).
+* **Grid re-scoring.** The best 5 subsample points (`WEIGHT_FIT_RESCORE`) are scored on every clip, and the best full-set
+  NLL wins. `weight_fit` records them (`rescored`, each with `nll_subsample` and `nll_full`) and
+  `subsample_best_kept` (false when re-scoring changed the choice).
+* **Subsample size and signers.** When the one-clip minimums push the total above `n`, the excess comes back from the
+  largest sources, so the subsample has exactly `n` clips unless there are more sources than `n` (then one clip per
+  source). Inside each source, signer groups keep their share by largest remainders, so ISL500's four signers are
+  balanced. `weight_fit.stratified_by` is now "source, then signer group". With at most 3,000 validation clips nothing
+  changes: there is no subsample.
+* **The shared prior and `top_n`.** The old per-segment prior dict held only the classifier classes and the
+  recogniser's own best `top_n` retrieval concepts; any other candidate got prior 0. Fit-fusion fits with the default
+  `top_n` (50). If a recogniser's `top_n` was smaller, the extra retrieval candidates got prior 0 in the old path and
+  get their real `Vocabulary.prior` now. That was a latent mismatch between fitting and the app; the shared prior
+  makes them consistent. With equal `top_n` (every pack so far) nothing changes.
+
+**Measured** (the research models copied to a scratch folder, 2 threads, old = 15.23 at commit e7a6160):
+
+| | 536 clips, 15.23 | 536 clips, now | 2,007 clips (grid on 450), 15.23 | 2,007 clips (grid on 450), now |
+|---|---|---|---|---|
+| total | 88 s | 63 s | 278 s | 196 s |
+| evidence | 17 s | 18 s | 63 s | 67 s |
+| weight grid | 26 s | 18 s | 22 s | 15 s |
+| sliding replay | 42 s | 25 s | 176 s | 100 s |
+| E4 ("My signs" choice) | 2.6 s | 1.9 s | 10.8 s | 9.1 s |
+| peak RSS growth | 94 MB | 38 MB | 355 MB | 48 MB |
+
+* Both runs gave the same `fusion.json` as 15.23 (every field except `weight_fit`), the same sliding thresholds and the
+  same "My signs" report. On 2,007 clips the subsample's best point stayed best on every clip (nll 0.3316; the next
+  re-scored points were 0.3336-0.3377).
+* Evidence kept per clip after the evidence pass (tracemalloc, 300 clips, with the E4 cache): 93 KB before, 12.9 KB
+  now. Adding the fused results (about 4 KB, twice while re-scoring) and the prepared windows (about 2 KB), the peak is
+  about 23 KB per clip.
+* **Expected full research run** (13,156 clips): about 1,300 s at 2 threads on an idle machine (evidence about 440 s,
+  replay about 650 s, grid on 3,000 clips plus 5 re-scoring passes about 120 s, E4 about 60 s). Scaled like 15.23 to
+  the real run, that is about 0.5 h. Memory: about 0.3 GB above the 1.05 GB of loaded data and models, so about
+  1.35 GB peak. With the ISL500 validation set doubled (about 25,600 clips): about 1 h and about 1.65 GB peak. Both are
+  under the 2 GB target.
+
+Tests: `test_fusion_efficiency.py`: compact classifier inputs give the old `fuse()` result (bit for bit without user
+signs, within 1e-6 with them, same decisions, both user modes); refusals; temperature terms clip by clip equal
+`fit_temperature`; summaries give the same segment-proxy thresholds; a toy fit-fusion with a classifier and the proxy
+fallback gives exactly the old temperature, weights, thresholds and classifier-alone thresholds; the batched replay
+gives exactly the engine's windows on synthetic clips (with a sign boundary) and falls back near an edge; with
+batch-dependent rounding the sliding counts and thresholds equal the reference; the subsample with many 1-clip
+sources has exactly `n` clips and balanced signers; a subsampled fit records the re-scored points and keeps the best
+full-set NLL.
