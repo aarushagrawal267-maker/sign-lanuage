@@ -45,13 +45,62 @@ def _record(gloss: str, class_index: int, score: float, source: str, exp_id: int
         db.add(ev)
 
 
-def _record_commit(commit: dict, source: str, exp_id: int | None, language: str | None) -> None:
-    """ASL commits are stored exactly as before; language-pack commits also keep concept/text/decision."""
+def _record_commit(commit: dict, source: str, exp_id: int | None, language: str | None,
+                   decision: str | None = None) -> None:
+    """ASL commits are stored exactly as before; language-pack commits also keep concept/text/decision.
+
+    A pack commit that waits for the user's tap (``needs_confirm``, docs/ISL_DESIGN.md 15.30) also stores
+    ``needs_confirm: true``, so History can tell it from a word the app gave by itself. The live socket stores such a
+    word only once the user confirmed it (``decision`` "confirmed_by_user")."""
     detail = None
     if "concept_id" in commit:
         detail = {k: commit.get(k) for k in ("concept_id", "text", "source", "segment_id", "chosen_by_user")}
-        detail["decision"] = "chosen" if commit.get("chosen_by_user") else "accept"
+        detail["decision"] = decision or ("chosen" if commit.get("chosen_by_user") else "accept")
+        if "needs_confirm" in commit:
+            detail["needs_confirm"] = bool(commit.get("needs_confirm"))
     _record(commit["gloss"], commit["class_index"], commit["score"], source, exp_id, language, detail)
+
+
+def _waits_for_tap(commit: dict) -> bool:
+    """A language-pack commit the app shows as "add it?" / "did you mean" and adds only after a tap (docs 15.29)."""
+    return "concept_id" in commit and not commit.get("chosen_by_user") and bool(
+        commit.get("needs_confirm") or commit.get("open_vocabulary"))
+
+
+class _Unconfirmed:
+    """Words the server accepted that wait for the user's tap, per socket (docs/ISL_DESIGN.md 15.30).
+
+    They are not logged when they arrive. A ``confirm`` message logs one as ``confirmed_by_user``; a word the user
+    ignored, rejected or replaced by another guess is never logged as a recognised word. A sign-by-sign word is found
+    by its ``segment_id``; a continuous-mode word (no segment id) by its commit time ``t``. Only the last few are
+    kept."""
+
+    MAX = 32
+
+    def __init__(self) -> None:
+        self.items: dict[tuple, tuple[dict, int | None, str | None]] = {}
+
+    @staticmethod
+    def key(segment_id=None, t=None) -> tuple:
+        if segment_id is not None:
+            return ("s", int(segment_id))
+        if t is not None:
+            tf = float(t)
+            if tf != tf or tf in (float("inf"), float("-inf")):
+                raise ValueError("t must be a finite number")
+            return ("t", tf)
+        raise ValueError("confirm needs a segment_id or a t")
+
+    def add(self, commit: dict, exp_id: int | None, language: str | None) -> None:
+        self.items[self.key(commit.get("segment_id"), commit.get("t"))] = (commit, exp_id, language)
+        while len(self.items) > self.MAX:
+            self.items.pop(next(iter(self.items)))
+
+    def pop(self, key: tuple):
+        return self.items.pop(key, None)
+
+    def clear(self) -> None:
+        self.items.clear()
 
 
 @router.get("/api/vocabulary", summary="WLASL100 vocabulary with data and per-class performance")
@@ -149,10 +198,12 @@ async def ws_recognize(ws: WebSocket, language: str | None = None):
     client -> {"type":"config","width":W,"height":H,"engine":{...},"language":"isl"?}
               {"type":"frame","t":ms,"pose":[[x,y,z,v]*33]|null,"left":[[x,y,z]*21]|null,"right":...,"face":[[x,y,z]*K]|null}
               {"type":"choose","segment_id":N,"concept_id":"isl.pen"} | {"type":"reject","segment_id":N}
+              {"type":"confirm","segment_id":N} | {"type":"confirm","t":ms}   (language packs: the user tapped "add")
               {"type":"reset"} | {"type":"ping","t":ms}
     server -> {"type":"hello",...} | {"type":"state",...} | {"type":"choice_ack",...} | {"type":"reject_ack",...}
-              | {"type":"config_ack",...} | {"type":"pong"} | {"type":"error","message":...}
+              | {"type":"confirm_ack",...} | {"type":"config_ack",...} | {"type":"pong"} | {"type":"error","message":...}
     ``language`` (query string or config message) selects a language pack; default ASL (unchanged behaviour).
+    A pack commit with ``needs_confirm`` / ``open_vocabulary`` is logged only after its ``confirm`` (docs 15.30).
     """
     await ws.accept()
     lang_error = None
@@ -165,6 +216,7 @@ async def ws_recognize(ws: WebSocket, language: str | None = None):
     if lang_error:
         await ws.send_json({"type": "error", "message": lang_error})
     lang_id = lang["id"]
+    unconfirmed = _Unconfirmed()
     try:
         while True:
             try:
@@ -185,7 +237,10 @@ async def ws_recognize(ws: WebSocket, language: str | None = None):
                     continue
                 state["server_ms"] = (time.perf_counter() - t0) * 1000
                 commit = state.get("commit")
-                if commit:
+                if commit and _waits_for_tap(commit):
+                    # not a word yet: logged when (and only if) the user confirms it (docs/ISL_DESIGN.md 15.30)
+                    unconfirmed.add(commit, exp_id, lang_id)
+                elif commit:
                     await asyncio.to_thread(_record_commit, commit, "live", exp_id,
                                             None if lang_id == "asl-wlasl100" else lang_id)
                 await ws.send_json(state)
@@ -209,6 +264,7 @@ async def ws_recognize(ws: WebSocket, language: str | None = None):
                         continue
                     engine, info, problem, lang, exp_id = new
                     lang_id = lang["id"]
+                    unconfirmed.clear()
                     await ws.send_json(_hello(engine, info, problem, lang))
                     continue
                 try:
@@ -226,6 +282,8 @@ async def ws_recognize(ws: WebSocket, language: str | None = None):
                     await ws.send_json({"type": "error", "message": f"invalid choice: {e}"})
                     continue
                 if not commit.get("duplicate"):
+                    # another guess picked instead of the word waiting for a tap: that word is never logged
+                    unconfirmed.pop(_Unconfirmed.key(commit.get("segment_id"), commit.get("t")))
                     await asyncio.to_thread(_record_commit, commit, "live", exp_id, lang_id)
                 await ws.send_json({"type": "choice_ack", "commit": commit,
                                     **({"duplicate": True} if commit.get("duplicate") else {})})
@@ -235,13 +293,28 @@ async def ws_recognize(ws: WebSocket, language: str | None = None):
                 except (ValueError, TypeError, OverflowError) as e:
                     await ws.send_json({"type": "error", "message": f"invalid reject: {e}"})
                     continue
+                unconfirmed.pop(_Unconfirmed.key(rej["segment_id"]))
                 if rej["rejected"]:
                     await asyncio.to_thread(_record, rej["rejected"], -1, 0.0, "feedback", exp_id, lang_id,
                                             {"segment_id": rej["segment_id"], "decision": "rejected_by_user",
                                              "concept_id": rej["rejected"]})
                 await ws.send_json({"type": "reject_ack", **rej})
+            elif kind == "confirm":
+                try:
+                    key = _Unconfirmed.key(msg.get("segment_id"), msg.get("t"))
+                except (ValueError, TypeError, OverflowError) as e:
+                    await ws.send_json({"type": "error", "message": f"invalid confirm: {e}"})
+                    continue
+                item = unconfirmed.pop(key)
+                if item is not None:
+                    c, c_exp, c_lang = item
+                    await asyncio.to_thread(_record_commit, c, "live", c_exp, c_lang, "confirmed_by_user")
+                # a repeated tap, or a word the server no longer holds: nothing is logged twice
+                await ws.send_json({"type": "confirm_ack", "segment_id": msg.get("segment_id"), "t": msg.get("t"),
+                                    "confirmed": item[0]["concept_id"] if item is not None else None})
             elif kind == "reset":
                 engine.reset()
+                unconfirmed.clear()
                 await ws.send_json({"type": "reset_ack"})
             elif kind == "ping":
                 await ws.send_json({"type": "pong", "t": msg.get("t")})

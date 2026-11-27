@@ -3730,7 +3730,9 @@ default policy was balanced. The certified floors (strict 0.95, balanced 0.90, l
 2. **A tap before every word.** A commit with `needs_confirm: true` (or `open_vocabulary: true`) is not added to the
    sentence. It waits as a "pending" word. Only "Add" (or "Yes, add") puts it in the sentence, and only then can it
    be spoken or copied. "Wrong word" / "No" never adds it and sends `reject` for that sign (logged as feedback).
-   The next recognised sign replaces a word that was never confirmed. A word the user picked from "did you mean"
+   The next sign that brings a word (an accepted word, or a "did you mean" with guesses) replaces a word that was
+   never confirmed; a too-short movement, an abstain or "not sure" leaves it on show (15.30). A word the user picked
+   from "did you mean"
    (`chosen_by_user`) has had its tap and is added at once. ASL commits carry no certification and are added as
    before.
 3. **Two looks.** "Recognised – add it?" (teal, a tick) only when the word's policy is certified, the word is in the
@@ -3776,3 +3778,53 @@ Tests: `backend/tests/isl/test_app_defaults.py` (sliding auto-commits only when 
 "wrong" sends `reject` and adds nothing; the next sign replaces it; continuous commits; ASL unchanged),
 `frontend/src/components/confirm.test.tsx` (both looks, the precision line, dictionary-only words, Hindi, keyboard
 buttons, axe-core, announcements) and a new step in `frontend/e2e/a11y.spec.ts` (not run here: no browser).
+
+### 15.30 App default review fixes: log only confirmed words, keep the waiting word, safer taps (review of 15.29, 27 Nov 2026)
+
+**Problems** (code review of 15.29):
+1. The server logged a word that waits for a tap as `accept` the moment it arrived. History and
+   `/api/recognition/summary` counted words the user ignored, rejected, or replaced by another guess. If the user
+   picked another guess, both words were logged.
+2. Any new sign result cleared the waiting word, even an abstain or "not sure". A stray hand movement dropped the word
+   without telling the user.
+3. A "My signs" word showed the policy's certified precision. User signs follow their own per-sign rule (15.25), so
+   that number does not cover them.
+4. When the next sign replaced the waiting word, React kept the same buttons. A tap or Enter meant for the old word
+   could add the new one.
+5. In spelling mode the spelling panel hid the waiting word. Sliding mode was offered through state copied by an
+   effect. An ungated pack said "Start recognition to see…" even while recognition ran.
+
+**What changed:**
+1. **Only confirmed words are logged** (`backend/app/api/recognition.py`). A pack commit with `needs_confirm` or
+   `open_vocabulary` (and not `chosen_by_user`) is no longer logged when it arrives. The socket keeps the last 32 of
+   them. A new client message `{"type": "confirm", "segment_id": N}` (or `{"type": "confirm", "t": ms}` for a
+   continuous-mode word, which has no segment id) logs the word with `decision: "confirmed_by_user"` and
+   `needs_confirm: true`, and answers `confirm_ack` (`confirmed`: the concept id, or null for a second tap or a word
+   the server no longer holds). A word that is rejected, replaced by another guess (`choose`), reset or left alone
+   is never logged as a word. A rejected word still gives its `rejected_by_user` feedback event. Offline video
+   analysis has no tap: its pack commits are logged as before, now with `needs_confirm` in the detail. ASL commits
+   are logged exactly as before.
+2. **The waiting word stays** (`live.ts` `bringsWord`, `useLiveRecognition.ts`). Only a result that brings a word
+   replaces it: `accept`, or `suggest` with at least one guess. A too-short movement, an abstain or "not sure" keeps
+   it on show. The app now sends `confirm` when the user taps "Add" (not in the static demo).
+3. **User signs get their own line** (`SignResult.tsx`). A waiting word or a confirm-only suggestion whose word comes
+   from "My signs" shows "Your own sign: the tested figure does not cover it, so check it before you add it." instead
+   of the policy's precision. Dictionary-only words still show no number.
+4. **Safer taps** (`ConfirmWord.tsx`, `SignResult.tsx`). The confirm card is keyed on the word (segment id and time),
+   so a new word gets new buttons. After a replacement, taps are ignored for 350 ms. If focus was inside the old card,
+   it moves to the new card itself (not to "Add"), so the new word is read first. The first word of a series is not
+   delayed.
+5. **Smaller fixes.** While spelling, the waiting word is shown above the spelling panel. Sliding mode is offered
+   when the server's certification has sliding rows: the hook and the page derive this, with no copied state, and
+   the hook sends a `config` message only when the engine settings really change. An ungated pack (developer
+   parameters) says "{policy}: not calibrated (developer settings), so there is no tested figure".
+
+Tests: `backend/tests/isl/test_app_defaults.py` (a "My signs" top word is never dictionary-only; the store of waiting
+words; `needs_confirm` in the logged detail; over the WebSocket: logged only after `confirm`, once, never after
+`reject` or `choose`, bad `confirm` messages are errors), `frontend/src/recognition/useLiveRecognition.test.tsx`
+(abstain and empty "not sure" keep the waiting word, guesses or a new word replace it; `confirm` by segment id or by
+time; sliding from the hello), `frontend/src/components/confirm.test.tsx` (the user-sign line, the replacement guard
+and focus, no delay for the first word, the card while spelling) and the new `frontend/src/pages/LivePage.test.tsx`
+(a fake socket hello: the strict precision in the settings and on the model card, confirm-only and ungated lines, the
+continuous toggle shown only with sliding rows and sending `mode: "sliding"`). The e2e step of 15.29 in
+`frontend/e2e/a11y.spec.ts` now ran (system Chrome, `scripts/e2e_env.sh`) and passed.

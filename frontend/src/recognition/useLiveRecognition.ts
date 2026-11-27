@@ -5,7 +5,7 @@ import { IS_STATIC, api, wsUrl, type Candidate, type FeatureSpec, type LanguageI
 import { DEFAULT_FACE_IDX, loadHolistic, toRawFrame } from "../mediapipe/holistic";
 import { drawFrame } from "../mediapipe/draw";
 import {
-  RollingStat, deriveStatus, engineConfigPayload, needsConfirm, segmentFromCommit, transcriptFromCandidate, transcriptItem,
+  RollingStat, bringsWord, deriveStatus, engineConfigPayload, needsConfirm, segmentFromCommit, transcriptFromCandidate, transcriptItem,
   type CertificationByPolicy, type Commit, type LiveSettings, type SegmentResult, type ServerState, type SpellState,
   type TranscriptItem,
 } from "./live";
@@ -77,9 +77,18 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
   settingsRef.current = settings;
   const langRef = useRef(language);
   langRef.current = language;
-  const optsRef = useRef(opts);
-  optsRef.current = opts;
-  const payload = () => engineConfigPayload(settingsRef.current.engine, optsRef.current);
+  // Sliding (continuous) mode needs the pack's classifier: unless the caller says, it is available when the server's
+  // certification has sliding rows (docs/ISL_DESIGN.md 15.29, 15.30).
+  const slidingAvailable = !!opts.pack && (opts.sliding ?? !!certs?.sliding);
+  const effOpts = { pack: opts.pack, spell: opts.spell, sliding: slidingAvailable };
+  const optsRef = useRef(effOpts);
+  optsRef.current = effOpts;
+  const lastConfigRef = useRef<string | null>(null);
+  const payload = () => {
+    const p = engineConfigPayload(settingsRef.current.engine, optsRef.current);
+    lastConfigRef.current = JSON.stringify(p);
+    return p;
+  };
   const stats = useRef({ fps: new RollingStat(), mp: new RollingStat(), srv: new RollingStat(), inf: new RollingStat(4000), e2e: new RollingStat(), send: new RollingStat() });
   const idRef = useRef(1);
   const pausedRef = useRef(false);
@@ -162,8 +171,9 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
         }
         if (st.spell) setSpell(st.spell);
         if (st.segment_result) {
-          // a new recognised sign replaces a word that was never confirmed (it is not added); a too-short movement does not
-          if (st.segment_result.segment_id !== undefined) setPending(null);
+          // a new sign that brings a word replaces a word that was never confirmed (it is not added). A too-short
+          // movement, an abstain or a "not sure" brings no word, so the waiting word stays (docs/ISL_DESIGN.md 15.30)
+          if (bringsWord(st.segment_result)) setPending(null);
           setLastResult(st.segment_result);
           lastResultRef.current = st.segment_result;
           setResolved(null);
@@ -185,12 +195,20 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
     };
   }, [closeSocket]);
 
-  // Push engine setting changes (and spelling mode) to an open socket.
+  // Push engine setting changes (and spelling mode) to an open socket; nothing is sent when the engine settings did not
+  // change (e.g. sliding became available but continuous signing is off).
   useEffect(() => {
     const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "config", engine: engineConfigPayload(settings.engine, opts) }));
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const p = engineConfigPayload(settings.engine, effOpts);
+      const sig = JSON.stringify(p);
+      if (sig !== lastConfigRef.current) {
+        lastConfigRef.current = sig;
+        ws.send(JSON.stringify({ type: "config", engine: p }));
+      }
+    }
     setSpell(null);
-  }, [settings.engine, opts.pack, opts.spell, opts.sliding]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [settings.engine, opts.pack, opts.spell, slidingAvailable]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Switching the sign language: the open socket changes pack (the server answers with a new hello) and the
   // sentence starts again, because words of two sign languages do not form one sentence.
@@ -435,6 +453,12 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
     if (!p) return;
     pendingRef.current = null;
     setPending(null);
+    // packs log the word on the server only now, as confirmed_by_user (docs/ISL_DESIGN.md 15.30)
+    const ws = wsRef.current;
+    if (p.commit.concept_id && ws && ws.readyState === WebSocket.OPEN && !IS_STATIC) {
+      const sid = p.commit.segment_id;
+      ws.send(JSON.stringify(sid !== null && sid !== undefined ? { type: "confirm", segment_id: sid } : { type: "confirm", t: p.commit.t }));
+    }
     setTranscript((tr) => [...tr, transcriptItem(idRef.current++, { ...p.commit, needs_confirm: false })]);
     setLastResult(p.segment);
     lastResultRef.current = p.segment;

@@ -111,3 +111,133 @@ def test_open_vocabulary_words_are_flagged_on_results_and_commits():
     plain = _run(RecognitionEngine(None, recognizer=FakeRecognizer("accept")))
     assert not any("open_vocabulary" in s.get("segment_result", {}) or "open_vocabulary" in s.get("commit", {})
                    for s in plain)
+
+
+def _cert_recognizer(decision="accept", ov=frozenset(), source=None):
+    """A fake pack recogniser whose words carry a certification with a confirm tap (and, optionally, a source)."""
+    cert = {"rule": "certified", "certified_precision": 0.96, "confirm_tap": True}
+
+    class R(FakeRecognizer):
+        def recognize(self, crops, top_k=5, policy="balanced", use_my_signs=True):
+            r = super().recognize(crops, top_k, policy, use_my_signs)
+            r.detail["certification"] = dict(cert)
+            if source is not None:
+                r.candidates[0].source = source
+            return r
+
+        def is_open_vocabulary(self, key):
+            return key in ov
+
+    return R(decision)
+
+
+def test_my_signs_never_counts_as_dictionary_only():
+    # the recogniser says "outside the classifier" for this word, but it is the user's own sign (docs 15.29)
+    states = _run(RecognitionEngine(None, recognizer=_cert_recognizer(ov={"isl.pencil"}, source="my_signs")))
+    seg = next(s["segment_result"] for s in states if "decision" in s.get("segment_result", {}))
+    commit = next(s["commit"] for s in states if "commit" in s)
+    assert seg["top"][0]["source"] == "my_signs"
+    assert seg["open_vocabulary"] is False and commit["open_vocabulary"] is False
+    assert commit["needs_confirm"] is True
+
+
+def test_unconfirmed_words_are_kept_by_segment_id_or_time():
+    from app.api.recognition import _Unconfirmed
+
+    u = _Unconfirmed()
+    u.add({"concept_id": "isl.a", "segment_id": 3, "t": 10.0}, None, "isl")
+    u.add({"concept_id": "isl.b", "segment_id": None, "t": 1234.5}, None, "isl")
+    assert u.pop(_Unconfirmed.key(segment_id=3))[0]["concept_id"] == "isl.a"
+    assert u.pop(_Unconfirmed.key(segment_id=3)) is None  # a second tap logs nothing
+    assert u.pop(_Unconfirmed.key(t=1234.5))[0]["concept_id"] == "isl.b"
+    for i in range(_Unconfirmed.MAX + 5):
+        u.add({"concept_id": f"isl.{i}", "segment_id": i, "t": float(i)}, None, "isl")
+    assert len(u.items) == _Unconfirmed.MAX and u.pop(_Unconfirmed.key(segment_id=0)) is None
+    import pytest
+
+    for bad in ({}, {"t": float("nan")}, {"t": "x"}, {"segment_id": "x"}):
+        with pytest.raises((ValueError, TypeError)):
+            _Unconfirmed.key(**bad)
+
+
+def test_record_commit_keeps_needs_confirm_in_the_detail(monkeypatch):
+    import app.api.recognition as api
+
+    rows = []
+    monkeypatch.setattr(api, "_record", lambda *a: rows.append(a))
+    c = {"gloss": "pencil", "class_index": 7, "score": 0.8, "t": 1.0, "concept_id": "isl.pencil", "text": {"en": "pencil"},
+         "source": "classifier", "segment_id": 2, "chosen_by_user": False, "needs_confirm": True}
+    api._record_commit(c, "video", None, "isl")
+    api._record_commit(c, "live", None, "isl", "confirmed_by_user")
+    assert rows[0][6]["needs_confirm"] is True and rows[0][6]["decision"] == "accept"
+    assert rows[1][6]["decision"] == "confirmed_by_user"
+    # ASL commits (no concept id) are stored exactly as before: no detail
+    api._record_commit({"gloss": "book", "class_index": 2, "score": 0.9, "t": 1.0}, "live", 1, None)
+    assert rows[2][6] is None
+
+
+def test_websocket_logs_a_word_that_needs_a_tap_only_once_it_is_confirmed(monkeypatch):
+    """docs/ISL_DESIGN.md 15.30: an accepted word with needs_confirm is not logged when it arrives; "confirm" logs it as
+    confirmed_by_user (once); a word the user rejected or replaced by another guess is never logged as a word."""
+    from fastapi.testclient import TestClient
+
+    import app.api.recognition as api
+    from app.dataset.synthetic import frames_for_stream, idle_frames, make_sequence
+    from app.main import app
+
+    rows = []
+    monkeypatch.setattr(api, "_record", lambda *a: rows.append(a))
+
+    def session(pack_id=None, width=640, height=480, engine_cfg=None):
+        eng = RecognitionEngine(None, width, height, EngineConfig(cooldown_ms=0), recognizer=_cert_recognizer())
+        return eng, {"name": "fake"}, None, {"id": "isl", "display_name": {"en": "ISL"}, "output_languages": ["en"],
+                                              "capabilities": ["words"], "profile": "commercial-safe", "status": "ready",
+                                              "sign_language": "ISL"}, None
+
+    monkeypatch.setattr(api, "_language_session", session)
+    monkeypatch.setattr(api, "_languages", lambda: [])
+
+    def sign(ws, t0):
+        commits, out = [], []
+        frames = idle_frames(10, t0) + frames_for_stream(make_sequence(4, 2, n_frames=40), t0 + 400) + idle_frames(20, t0 + 2400)
+        for f in frames:
+            ws.send_json({"type": "frame", **f})
+            st = ws.receive_json()
+            out.append(st)
+            if "commit" in st:
+                commits.append(st["commit"])
+        return commits
+
+    with TestClient(app) as c, c.websocket_connect("/api/ws/recognize?language=isl") as ws:
+        assert ws.receive_json()["type"] == "hello"
+        (c1,) = sign(ws, 0)
+        assert c1["needs_confirm"] is True and c1["segment_id"] is not None
+        assert rows == []  # not logged on arrival
+        ws.send_json({"type": "confirm", "segment_id": c1["segment_id"]})
+        ack = ws.receive_json()
+        assert ack == {"type": "confirm_ack", "segment_id": c1["segment_id"], "t": None, "confirmed": "isl.pencil"}
+        assert len(rows) == 1 and rows[0][6]["decision"] == "confirmed_by_user" and rows[0][6]["needs_confirm"] is True
+        ws.send_json({"type": "confirm", "segment_id": c1["segment_id"]})  # a double tap
+        assert ws.receive_json()["confirmed"] is None and len(rows) == 1
+        # rejected: only the feedback event, never the word
+        (c2,) = sign(ws, 10_000)
+        ws.send_json({"type": "reject", "segment_id": c2["segment_id"]})
+        assert ws.receive_json()["type"] == "reject_ack"
+        ws.send_json({"type": "confirm", "segment_id": c2["segment_id"]})
+        assert ws.receive_json()["confirmed"] is None
+        assert [r[6]["decision"] for r in rows] == ["confirmed_by_user", "rejected_by_user"]
+        # another guess picked instead: only the chosen word is logged
+        (c3,) = sign(ws, 20_000)
+        ws.send_json({"type": "choose", "segment_id": c3["segment_id"], "concept_id": "isl.pen"})
+        assert ws.receive_json()["type"] == "choice_ack"
+        ws.send_json({"type": "confirm", "segment_id": c3["segment_id"]})
+        assert ws.receive_json()["confirmed"] is None
+        assert [r[6]["decision"] for r in rows] == ["confirmed_by_user", "rejected_by_user", "chosen"]
+        assert rows[-1][6]["concept_id"] == "isl.pen"
+        # ignored (never confirmed): nothing is logged; bad confirm messages are errors
+        sign(ws, 30_000)
+        ws.send_json({"type": "confirm"})
+        assert ws.receive_json()["type"] == "error"
+        ws.send_json({"type": "confirm", "segment_id": "x"})
+        assert ws.receive_json()["type"] == "error"
+    assert len(rows) == 3

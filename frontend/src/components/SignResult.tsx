@@ -89,30 +89,75 @@ function ProgressLine({ top }: { top: Candidate | null }) {
   );
 }
 
+/**
+ * The line under a word that waits for a tap. The policy's certified precision covers classifier and dictionary words
+ * of the pack, so it is not shown for a dictionary-only word (open vocabulary) nor for one of the user's own signs,
+ * which follow their own per-sign rule (docs/ISL_DESIGN.md 15.25, 15.30); a user sign gets its own line instead.
+ */
+function wordNote(word: Candidate, openVocabulary: boolean, cert: Certification | undefined,
+  precisionNote: SignResultProps["precisionNote"], ownSign: string): string | null {
+  if (word.source === "my_signs") return ownSign;
+  if (openVocabulary) return null;
+  return precisionNote?.(cert) ?? null;
+}
+
+/** How long taps are ignored after the next sign replaced the word on show. */
+const REPLACE_GUARD_MS = 350;
+
+/**
+ * The confirm card for the word waiting for a tap. It is keyed on the word (segment id and time), so when the next
+ * sign replaces the word React mounts new buttons: a key press or tap meant for the old word cannot add the new one.
+ * Taps are also ignored for a moment after such a replacement, and focus returns to the card if it was inside the old
+ * one (docs/ISL_DESIGN.md 15.30).
+ */
+function PendingConfirm({ pending, slidingStrict, precisionNote, onConfirm, onReject, onChoose }: {
+  pending: PendingWord; slidingStrict?: boolean; precisionNote?: SignResultProps["precisionNote"];
+  onConfirm: () => void; onReject: () => void; onChoose: (segment: SegmentResult, c: Candidate) => void;
+}) {
+  const { t } = useT();
+  const c = pending.commit;
+  const seg = pending.segment;
+  const key = `${c.segment_id ?? "c"}-${c.t}`;
+  const last = useRef<{ key: string; replaced: boolean } | null>(null);
+  if (last.current?.key !== key) last.current = { key, replaced: last.current !== null };
+  const focusInside = useRef(false);
+  const word = candidateFromCommit(c);
+  const kind = confirmKind(c, { continuous: pending.continuous, slidingStrict });
+  return (
+    <div onFocus={() => { focusInside.current = true; }}
+      onBlur={(e) => { if (e.relatedTarget && !e.currentTarget.contains(e.relatedTarget as Node)) focusInside.current = false; }}>
+      <ConfirmWord key={key} word={word} kind={kind} note={wordNote(word, !!c.open_vocabulary, c.certification, precisionNote, t("live.precisionOwnSign"))}
+        dictionaryOnly={!!c.open_vocabulary} others={kind === "did_you_mean" ? seg.top : undefined}
+        armMs={last.current.replaced ? REPLACE_GUARD_MS : 0} takeFocus={last.current.replaced && focusInside.current}
+        onConfirm={onConfirm} onReject={onReject} onChooseOther={(x) => onChoose(seg, x)} />
+    </div>
+  );
+}
+
 export function SignResult(p: SignResultProps) {
   const { t } = useT();
+  const ownSign = t("live.precisionOwnSign");
   const origin = useOriginLabel();
   const { lastResult } = p;
   const decision = segmentDecision(lastResult);
   const isResolved = !!p.resolved && p.resolved.segment === lastResult;
   const settledTop = lastResult?.top?.[0] ?? null;
 
-  if (p.spellOn && (p.inProgress || !lastResult)) return <SpellPanel spell={p.spell} experimental={p.spellExperimental} />;
+  const spelling = p.spellOn && (p.inProgress || !lastResult);
 
-  // A word waiting for the user's tap stays on show while the next sign is in progress (docs/ISL_DESIGN.md 15.29).
+  // A word waiting for the user's tap stays on show while the next sign is in progress, also while spelling
+  // (docs/ISL_DESIGN.md 15.29, 15.30).
   if (p.pending && p.onConfirmPending && p.onRejectPending) {
-    const c = p.pending.commit;
-    const seg = p.pending.segment;
-    const kind = confirmKind(c, { continuous: p.pending.continuous, slidingStrict: p.slidingStrict });
     return (
       <div className="flex flex-col gap-3">
-        <ConfirmWord word={candidateFromCommit(c)} kind={kind} note={c.open_vocabulary ? null : p.precisionNote?.(c.certification)}
-          dictionaryOnly={!!c.open_vocabulary} others={kind === "did_you_mean" ? seg.top : undefined}
-          onConfirm={p.onConfirmPending} onReject={p.onRejectPending} onChooseOther={(x) => p.onChoose(seg, x)} />
-        {p.inProgress && <ProgressLine top={p.provisionalTop} />}
+        <PendingConfirm pending={p.pending} slidingStrict={p.slidingStrict} precisionNote={p.precisionNote}
+          onConfirm={p.onConfirmPending} onReject={p.onRejectPending} onChoose={p.onChoose} />
+        {spelling ? <SpellPanel spell={p.spell} experimental={p.spellExperimental} /> : p.inProgress && <ProgressLine top={p.provisionalTop} />}
       </div>
     );
   }
+
+  if (spelling) return <SpellPanel spell={p.spell} experimental={p.spellExperimental} />;
 
   // "Did you mean X?" because of the rules (an uncertified policy, a dictionary-only word), not because of doubt.
   if (lastResult && isConfirmOnlySuggestion(lastResult) && !isResolved) {
@@ -120,7 +165,7 @@ export function SignResult(p: SignResultProps) {
     const ov = lastResult.reason === "open_vocabulary" || !!lastResult.open_vocabulary;
     return (
       <div className="flex flex-col gap-3">
-        <ConfirmWord word={top} kind="did_you_mean" note={ov ? null : p.precisionNote?.(lastResult.certification)} dictionaryOnly={ov}
+        <ConfirmWord word={top} kind="did_you_mean" note={wordNote(top, ov, lastResult.certification, p.precisionNote, ownSign)} dictionaryOnly={ov}
           others={lastResult.top} onConfirm={() => p.onChoose(lastResult, top)} onReject={() => p.onDismiss(lastResult)}
           onChooseOther={(x) => p.onChoose(lastResult, x)} />
         {p.inProgress && <ProgressLine top={p.provisionalTop} />}

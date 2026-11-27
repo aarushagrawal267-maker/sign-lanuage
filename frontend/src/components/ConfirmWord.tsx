@@ -4,7 +4,7 @@
 //  * "recognised": the policy is certified for this word. Teal, a tick, "Add water" / "Wrong word".
 //  * "did you mean": the policy is not certified (confirm-only) or the word is dictionary-only. Amber, a question
 //    mark, "Yes, add water" / "No, sign again", and the other guesses as smaller buttons.
-import { useId } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Check, HelpCircle, RotateCcw, X } from "lucide-react";
 import type { Candidate } from "../api/client";
 import { useT } from "../i18n";
@@ -15,7 +15,7 @@ import { Button, cx } from "./ui";
 
 export type ConfirmKind = "recognised" | "did_you_mean";
 
-export function ConfirmWord({ word, kind, note, dictionaryOnly, others, onConfirm, onReject, onChooseOther }: {
+export function ConfirmWord({ word, kind, note, dictionaryOnly, others, onConfirm, onReject, onChooseOther, armMs = 0, takeFocus = false }: {
   word: Candidate;
   kind: ConfirmKind;
   /** The certified precision of the active policy, in words ("Strict: right about 95 of 100 times when it answers"). */
@@ -25,8 +25,21 @@ export function ConfirmWord({ word, kind, note, dictionaryOnly, others, onConfir
   onConfirm: () => void;
   onReject: () => void;
   onChooseOther?: (c: Candidate) => void;
+  /** Ignore taps for this long after the card appears. Used when the next sign replaced the word on show, so a tap
+   *  meant for the old word does not add the new one (docs/ISL_DESIGN.md 15.30). */
+  armMs?: number;
+  /** Move focus to the card when it appears and focus has fallen back to the page (the replaced card had it). */
+  takeFocus?: boolean;
 }) {
   const { t } = useT();
+  const ref = useRef<HTMLElement>(null);
+  const [shownAt] = useState(() => performance.now());
+  const armed = () => armMs <= 0 || performance.now() - shownAt >= armMs;
+  const guard = <A extends unknown[]>(fn: (...a: A) => void) => (...a: A) => { if (armed()) fn(...a); };
+  useEffect(() => {
+    const active = document.activeElement;
+    if (takeFocus && (!active || active === document.body)) ref.current?.focus({ preventScroll: true });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const origin = useOriginLabel();
   const headingId = useId();
   const helpId = useId();
@@ -35,7 +48,7 @@ export function ConfirmWord({ word, kind, note, dictionaryOnly, others, onConfir
   const recognised = kind === "recognised";
   const rest = (others ?? []).filter((c) => c.concept_id !== word.concept_id).slice(0, 4);
   return (
-    <section data-testid="confirm-word" data-state={recognised ? "confirm-recognised" : "confirm-did-you-mean"}
+    <section ref={ref} tabIndex={-1} data-testid="confirm-word" data-state={recognised ? "confirm-recognised" : "confirm-did-you-mean"}
       aria-labelledby={headingId} aria-describedby={helpId}
       className={cx("rounded-xl border-2 p-3.5", recognised ? "border-teal/60 bg-teal-soft/40" : "border-warn/60 bg-warn/[0.06]")}>
       <div className={cx("flex items-center gap-2.5", recognised ? "text-teal" : "text-warn")}>
@@ -52,10 +65,10 @@ export function ConfirmWord({ word, kind, note, dictionaryOnly, others, onConfir
       {dictionaryOnly && <p className="mt-1 text-xs text-fg-3">{t("live.dictionaryOnly")}</p>}
       <p id={helpId} className="mt-1 text-xs text-fg-3">{t("live.confirmHelp")}</p>
       <div className="mt-3 flex flex-wrap gap-2">
-        <Button size="md" variant="primary" icon={<Check className="size-4" />} onClick={onConfirm}>
+        <Button size="md" variant="primary" icon={<Check className="size-4" />} onClick={guard(onConfirm)}>
           {recognised ? t("live.confirmAdd", { word: w.en }) : t("live.confirmYes", { word: w.en })}
         </Button>
-        <Button size="md" variant={recognised ? "danger" : "secondary"} icon={recognised ? <X className="size-4" /> : <RotateCcw className="size-4" />} onClick={onReject}>
+        <Button size="md" variant={recognised ? "danger" : "secondary"} icon={recognised ? <X className="size-4" /> : <RotateCcw className="size-4" />} onClick={guard(onReject)}>
           {recognised ? t("live.confirmWrong") : t("live.confirmNo")}
         </Button>
       </div>
@@ -68,7 +81,7 @@ export function ConfirmWord({ word, kind, note, dictionaryOnly, others, onConfir
               return (
                 <li key={`${c.concept_id ?? c.gloss}-${i}`}>
                   {/* named by its visible text (WCAG 2.5.3); the Hindi word keeps its lang="hi" span */}
-                  <button type="button" onClick={() => onChooseOther(c)}
+                  <button type="button" onClick={guard(() => onChooseOther(c))}
                     className="inline-flex min-h-11 items-center gap-1 rounded-lg border-2 border-ink-600 bg-ink-800 px-3 py-1.5 text-left hover:border-accent hover:bg-ink-700">
                     <span className="sr-only">{t("live.choose")}</span>{" "}
                     <BilingualWord en={cw.en} hi={cw.hi} review={c.hi_review} size="sm" inline showMark={false} />

@@ -80,14 +80,52 @@ describe("useLiveRecognition: a confirm tap before a word is added", () => {
     expect(ws.sent.at(-1)).toEqual({ type: "reject", segment_id: 3 });
   });
 
-  it("the next recognised sign replaces an unconfirmed word; a too-short movement does not", () => {
+  it("only a sign that brings a word replaces an unconfirmed word; a too-short movement or 'not sure' does not", () => {
     const { h, ws } = start();
     act(() => ws.receive({ type: "state", t: 1, status: "recognized", hands: false, pose: true, threshold: 0.9, server_ms: 1, segment_result: segResult, commit }));
     act(() => ws.receive({ type: "state", t: 2, status: "waiting_for_hands", hands: false, pose: true, threshold: 0.9, server_ms: 1, segment_result: { accepted: false, reason: "too_short", frames: 3 } }));
     expect(h.result.current.pending).not.toBeNull();
+    // a stray hand movement: abstain / "not sure" brings no word, so the waiting word stays
     act(() => ws.receive({ type: "state", t: 3, status: "not_sure", hands: false, pose: true, threshold: 0.9, server_ms: 1, segment_result: { segment_id: 4, accepted: false, decision: "abstain", reason: "out_of_vocabulary", frames: 30, top: [] } }));
+    expect(h.result.current.pending?.commit.concept_id).toBe("isl.water");
+    act(() => ws.receive({ type: "state", t: 4, status: "uncertain", hands: false, pose: true, threshold: 0.9, server_ms: 1, segment_result: { segment_id: 5, accepted: false, decision: "suggest", reason: "ambiguous", frames: 30, top: [] } }));
+    expect(h.result.current.pending?.commit.concept_id).toBe("isl.water");
+    // a "did you mean" with guesses brings words: it replaces the waiting word (which is not added)
+    const pen = { concept_id: "isl.pen", class_index: 6, gloss: "pen", prob: 0.5 };
+    act(() => ws.receive({ type: "state", t: 5, status: "uncertain", hands: false, pose: true, threshold: 0.9, server_ms: 1, segment_result: { segment_id: 6, accepted: false, decision: "suggest", reason: "ambiguous", frames: 30, top: [pen] } }));
     expect(h.result.current.pending).toBeNull();
+    // a new accepted word replaces it too
+    act(() => ws.receive({ type: "state", t: 6, status: "recognized", hands: false, pose: true, threshold: 0.9, server_ms: 1, segment_result: segResult, commit }));
+    act(() => ws.receive({ type: "state", t: 7, status: "recognized", hands: false, pose: true, threshold: 0.9, server_ms: 1, segment_result: { ...segResult, segment_id: 7, top: [pen] }, commit: { ...commit, segment_id: 7, concept_id: "isl.pen", gloss: "pen", t: 7 } }));
+    expect(h.result.current.pending?.commit.concept_id).toBe("isl.pen");
     expect(h.result.current.transcript).toEqual([]);
+  });
+
+  it("'add' tells the server, which logs the word only now (by segment id, or by time in continuous mode)", () => {
+    const { h, ws } = start();
+    act(() => ws.receive({ type: "state", t: 1, status: "recognized", hands: false, pose: true, threshold: 0.9, server_ms: 1, segment_result: segResult, commit }));
+    act(() => h.result.current.actions.confirmPending());
+    expect(ws.sent.at(-1)).toEqual({ type: "confirm", segment_id: 3 });
+    act(() => ws.receive({ type: "state", t: 9, status: "recognized", hands: true, pose: true, threshold: 0.9, server_ms: 1, commit: { ...commit, segment_id: null, t: 1234.5 } }));
+    act(() => h.result.current.actions.confirmPending());
+    expect(ws.sent.at(-1)).toEqual({ type: "confirm", t: 1234.5 });
+    expect(h.result.current.transcript).toHaveLength(2);
+  });
+
+  it("without an explicit choice, sliding mode is available once the hello has sliding rows", () => {
+    const on = { ...DEFAULT_SETTINGS, engine: { ...DEFAULT_SETTINGS.engine, continuous: true } };
+    const h = renderHook(() => useLiveRecognition(on, "isl", { pack: true, spell: false }));
+    act(() => h.result.current.actions.startRecognition());
+    const ws = FakeSocket.last!;
+    act(() => ws.onopen?.());
+    expect(ws.sent[0]).toMatchObject({ type: "config", engine: { mode: "segment" } });
+    act(() => ws.receive({ type: "hello", model: { name: "isl" }, engine: { config: {}, certification_by_policy: certs }, language: null }));
+    expect(ws.sent.at(-1)).toMatchObject({ type: "config", engine: { mode: "sliding", policy: "strict" } });
+    const n = ws.sent.length;
+    // a pack without a classifier (no sliding rows) goes back to sign by sign
+    act(() => ws.receive({ type: "config_ack", engine: { config: {}, certification_by_policy: { ...certs, sliding: null } } }));
+    expect(ws.sent).toHaveLength(n + 1);
+    expect(ws.sent.at(-1)).toMatchObject({ type: "config", engine: { mode: "segment" } });
   });
 
   it("a continuous-mode commit (no sign result) waits too", () => {

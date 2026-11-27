@@ -293,6 +293,17 @@ export function isConfirmOnlySuggestion(r: SegmentResult | null | undefined): bo
   return !!r && segmentDecision(r) === "suggest" && (r.reason === "confirm_only" || r.reason === "open_vocabulary") && !!r.top?.length;
 }
 
+/**
+ * Does this sign result bring a word of its own? Only then may it replace a word that waits for the user's tap: an
+ * accepted word, or a "did you mean" with at least one guess. A too-short movement, an abstain or a "not sure" does
+ * not, so a stray hand movement never drops the waiting word (docs/ISL_DESIGN.md 15.30).
+ */
+export function bringsWord(r: SegmentResult | null | undefined): boolean {
+  if (!r || r.segment_id === undefined) return false;
+  const d = segmentDecision(r);
+  return d === "accept" || (d === "suggest" && !!r.top?.length);
+}
+
 /** The word of a commit as a candidate (for the confirm card). */
 export function candidateFromCommit(c: Commit): Candidate {
   return { concept_id: c.concept_id, class_index: c.class_index, gloss: c.gloss, prob: c.score, text: c.text, hi_review: c.hi_review ?? null, source: c.source };

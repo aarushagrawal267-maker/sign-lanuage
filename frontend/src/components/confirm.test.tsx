@@ -118,6 +118,57 @@ describe("SignResult with a word waiting for a tap", () => {
     wrap(<SignResult {...props({ pending: pw, continuous: true, slidingStrict: true, inProgress: true })} />);
     expect(screen.getByTestId("confirm-word")).toHaveAttribute("data-state", "confirm-recognised");
   });
+  it("one of the user's own signs never shows the policy's certified precision, but its own line", () => {
+    const pw = pendingFrom(commit({ source: "my_signs" }));
+    wrap(<SignResult {...props({ pending: pw, lastResult: pw.segment })} />);
+    const line = screen.getByTestId("confirm-precision");
+    expect(line).not.toHaveTextContent("95 of 100");
+    expect(line).toHaveTextContent("Your own sign: the tested figure does not cover it");
+  });
+  it("a confirm-only suggestion of a user sign gets the same line", () => {
+    const mine: Candidate = { ...water, source: "my_signs" };
+    const sugg: SegmentResult = { segment_id: 9, accepted: false, decision: "suggest", reason: "confirm_only", frames: 30, top: [mine, drink], certification: certified, needs_confirm: true };
+    wrap(<SignResult {...props({ lastResult: sugg })} />);
+    expect(screen.getByTestId("confirm-precision")).toHaveTextContent("Your own sign");
+    expect(screen.getByTestId("confirm-precision")).not.toHaveTextContent("95 of 100");
+  });
+  it("when the next sign replaces the word, new buttons are mounted and a tap meant for the old word is ignored", () => {
+    let now = 1000;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const first = pendingFrom(commit());
+    const p = props({ pending: first, lastResult: first.segment });
+    const { rerender } = wrap(<SignResult {...p} />);
+    const oldAdd = screen.getByRole("button", { name: "Add water" });
+    oldAdd.focus();
+    expect(document.activeElement).toBe(oldAdd);
+    const pen: Commit = commit({ concept_id: "isl.pen", gloss: "pen", text: { en: "pen", hi: "कलम" }, segment_id: 5, t: 20 });
+    const second = pendingFrom(pen);
+    rerender(<MemoryRouter><UiLangProvider initial="en"><SignResult {...p} pending={second} lastResult={second.segment} /></UiLangProvider></MemoryRouter>);
+    const newAdd = screen.getByRole("button", { name: "Add pen" });
+    expect(newAdd).not.toBe(oldAdd); // remounted: Enter on the old button cannot reach the new word
+    expect(oldAdd.isConnected).toBe(false);
+    // focus was inside the old card: it moves to the new card (not to the Add button), so the word is read first
+    expect(document.activeElement).toBe(screen.getByTestId("confirm-word"));
+    fireEvent.click(newAdd); // a tap right after the change
+    expect(p.onConfirmPending).not.toHaveBeenCalled();
+    now += 400;
+    fireEvent.click(newAdd);
+    expect(p.onConfirmPending).toHaveBeenCalledOnce();
+    vi.restoreAllMocks();
+  });
+  it("the first word of a series is not delayed", () => {
+    const pw = pendingFrom(commit());
+    const p = props({ pending: pw, lastResult: pw.segment });
+    wrap(<SignResult {...p} />);
+    fireEvent.click(screen.getByRole("button", { name: "Add water" }));
+    expect(p.onConfirmPending).toHaveBeenCalledOnce();
+  });
+  it("while spelling, the waiting word stays visible above the spelling panel", () => {
+    const pw = pendingFrom(commit());
+    wrap(<SignResult {...props({ pending: pw, spellOn: true, spellAvailable: true, inProgress: true })} />);
+    expect(screen.getByTestId("confirm-word")).toBeInTheDocument();
+    expect(screen.getByTestId("spell-panel")).toBeInTheDocument();
+  });
   it("choosing another guess sends that word for the same sign", () => {
     const pw = pendingFrom(commit({ certification: confirmOnly }));
     const p = props({ pending: pw, lastResult: pw.segment });

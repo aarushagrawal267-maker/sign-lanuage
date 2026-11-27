@@ -41,13 +41,14 @@ export default function LivePage() {
   const [settings, setSettings] = useLocalStorage<LiveSettings>(SETTINGS_KEY, initialSettings);
   const [showSettings, setShowSettings] = useState(false);
   const [spellOn, setSpellOn] = useState(false);
-  const [slidingOffered, setSlidingOffered] = useState(false);
   const pack = !sign.isAsl;
-  const live = useLiveRecognition(settings, sign.id, { pack, spell: pack && spellOn, sliding: pack && slidingOffered });
+  // sliding mode is offered when the server's certification has sliding rows (the hook reads them from the hello)
+  const live = useLiveRecognition(settings, sign.id, { pack, spell: pack && spellOn });
   const { status, camera, recognizing, paused, model, provisional, lastResult, resolved, transcript, detection, metrics, server, actions } = live;
-  // Certification of every policy, from the server's hello / config_ack. Sliding mode needs the pack's classifier.
+  // Certification of every policy, from the server's hello / config_ack. Sliding mode needs the pack's classifier,
+  // so it is offered only when the server sends sliding rows (derived: no extra render, no extra config message).
   const certs = pack ? live.certs : null;
-  useEffect(() => { setSlidingOffered(!!certs?.sliding); }, [certs]);
+  const slidingOffered = !!certs?.sliding;
   const slidingStrict = slidingStrictCertified(certs);
   const continuous = pack && !spellOn && slidingOffered && !!settings.engine.continuous;
   const policy: Policy = settings.engine.policy ?? "strict";
@@ -56,6 +57,7 @@ export default function LivePage() {
     if (!c) return null;
     const n = precisionOutOf100(c);
     if (n !== null) return t("live.precisionCertified", { policy: label, n });
+    if (c.rule === "ungated") return t("live.precisionUngated", { policy: label });
     return c.rule === "confirm_only" ? t("live.precisionUncertified", { policy: label }) : null;
   };
   const activeCert = certs ? (continuous ? certs.sliding?.[policy] : certs.segment[policy]) : null;
