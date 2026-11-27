@@ -344,6 +344,14 @@ def test_e1b_cross_validation_pools_held_out_signers(phase2, tmp_path):
     (work / "cv" / "fold1").mkdir(parents=True, exist_ok=True)
     train_classifier(d2, work / "cv" / "fold1" / "classifier.pt", ISL_FEATURES, TrainConfig(**TINY), smoke=True,
                      threads=1, use_extra=False)
+    # fold2: the same model, but its classes chosen with the dictionary signer group: never pooled (docs 15.32/33)
+    import torch
+
+    ck = torch.load(work / "cv" / "fold1" / "classifier.pt", map_location="cpu", weights_only=False)
+    ck["meta"]["split"] = "test-split-c"
+    ck["meta"]["class_space"] = {**(ck["meta"].get("class_space") or {}), "signer_grouping": "dictionary"}
+    (work / "cv" / "fold2").mkdir()
+    torch.save(ck, work / "cv" / "fold2" / "classifier.pt")
     try:
         doc = evaluate_all(work, data, ISL_FEATURES, profile="research", smoke=True, vocab_path=w["vocab"],
                            paths=P, out_dirs=[], e4_ks=(1,), latency_n=1)
@@ -354,7 +362,68 @@ def test_e1b_cross_validation_pools_held_out_signers(phase2, tmp_path):
     cv = doc["protocols"]["E1b"]["cv"]
     assert cv["folds"] == 2 and cv["pooled_n"] == 8 and cv["pooled_groups"] >= 2 and cv["pooled_top1_interval"]
     assert "_hits" not in doc["protocols"]["E1b"]
-    assert "E1b cross-validation" in (work / "eval" / "report.md").read_text()
+    not_pooled = [{"fold": "fold2", "signer_grouping": "dictionary", "main_signer_grouping": "source"}]
+    assert cv["not_pooled"] == not_pooled
+    assert doc["leakage_guards"]["class_space"]["cv_folds_not_pooled"] == not_pooled
+    md = (work / "eval" / "report.md").read_text()
+    assert "E1b cross-validation" in md and "NOT pooled (other signer grouping): fold2 (dictionary)" in md
+    assert "* cv fold2 NOT pooled" in md
+    assert json.loads((work / "eval" / "report.json").read_text())["protocols"]["E1b"]["cv"]["not_pooled"] == not_pooled
+
+
+def test_evaluate_all_never_mixes_class_spaces(phase2, tmp_path):
+    """docs 15.32 / 15.33 on the toy world: the only cv fold has another signer grouping, so E1b.cv says it did not
+    run and why; a one-shot fold encoder trained without WSLP is listed (E2 rebuilds its own training list); a
+    fusion.json fitted on another classifier is flagged by evaluate and refused by build-pack."""
+    import shutil
+
+    import torch
+
+    from app.isl.evaluation.runners import evaluate_all
+    from app.isl.models.fusion import FusionParams
+    from app.isl.training.common import ISL_FEATURES
+    from app.isl.training.pipeline import build_pack
+
+    w, data = phase2["world"], phase2["data"]
+    work = tmp_path / "work"
+    shutil.copytree(phase2["work"], work, ignore=shutil.ignore_patterns("eval", "cv"))
+    ck = torch.load(work / "classifier.pt", map_location="cpu", weights_only=False)
+    ck["meta"]["split"] = "test-split-b"
+    ck["meta"].pop("class_space", None)  # a fold written before 15.32: "source"
+    (work / "cv" / "fold1").mkdir(parents=True)
+    torch.save(ck, work / "cv" / "fold1" / "classifier.pt")
+    main = torch.load(work / "classifier.pt", map_location="cpu", weights_only=False)
+    main["meta"]["class_space"] = {**(main["meta"].get("class_space") or {}), "signer_grouping": "dictionary"}
+    torch.save(main, work / "classifier.pt")
+    one = work / "oneshot" / "fold0" / "encoder.pt"
+    ek = torch.load(one, map_location="cpu", weights_only=False)
+    ek["meta"]["class_space"] = {**(ek["meta"].get("class_space") or {}), "excluded_sources": ["wslp"]}
+    torch.save(ek, one)
+    from app.isl.cli import _fusion_fit_space
+    from app.isl.training.pipeline import load_recognizer
+
+    rec = load_recognizer(phase2["work"], ISL_FEATURES, w["vocab"], profile="research")
+    fitted_on = _fusion_fit_space(rec)  # the original classifier: "source" grouping
+    assert set(fitted_on) == {"classifier", "encoder", "index_row_filters"}
+    FusionParams.load(work / "fusion.json").with_(fitted_on=fitted_on).save(work / "fusion.json")
+    doc = evaluate_all(work, data, ISL_FEATURES, profile="research", smoke=True, vocab_path=w["vocab"],
+                       paths=w["paths"], out_dirs=[], e4_ks=(1,), latency_n=1)
+    not_pooled = [{"fold": "fold1", "signer_grouping": "source", "main_signer_grouping": "dictionary"}]
+    cv = doc["protocols"]["E1b"]["cv"]
+    assert cv["run"] is False and "signer grouping" in cv["reason"] and cv["not_pooled"] == not_pooled
+    assert "folds" not in cv and "top1_cv_pooled" not in (doc["protocols"]["E1b"].get("intervals") or {})
+    cs = doc["leakage_guards"]["class_space"]
+    assert cs["cv_folds_not_pooled"] == not_pooled
+    assert cs["oneshot_folds_other_sources"] == [{"fold": 0, "excluded_sources": ["wslp"], "main_excluded_sources": []}]
+    assert doc["protocols"]["E2"]["folds"][0].get("run", True) is not False
+    assert cs["fusion_mismatch"] == ["classifier"]
+    md = (work / "eval" / "report.md").read_text()
+    assert "E1b cross-validation NOT run" in md and "* cv fold1 NOT pooled" in md
+    assert "* E2 fold 0 encoder was trained without wslp, the main encoder without no source" in md
+    assert "fusion.json was fitted on another class space (classifier)" in md
+    with pytest.raises(ValueError, match="another class space"):
+        build_pack(work, "research", ISL_FEATURES, tmp_path / "pack", smoke=True, vocab_path=w["vocab"])
+    assert not (tmp_path / "pack").exists()
 
 
 def test_e4_runs_with_both_user_sign_classifier_modes(phase2):

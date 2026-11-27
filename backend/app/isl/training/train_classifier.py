@@ -61,6 +61,9 @@ def train_classifier(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainCo
     set_threads(threads)
     set_seed(cfg.seed)
     t0 = time.time()
+    # the grouping only counts signers of the other sources (use_extra with data.extra); without them (E1a, a
+    # commercial-safe run without extra clips) it changes nothing and is recorded as "source" (docs 15.33)
+    dictionary_group = bool(dictionary_group and use_extra and data.extra)
     classes = classifier_classes(data, min_clips, min_signers, use_extra, dictionary_group)
     if len(classes) < 2:
         raise RuntimeError(f"not enough training data: {len(classes)} concepts with >= {min_clips} clips")

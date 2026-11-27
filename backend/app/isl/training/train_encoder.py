@@ -123,6 +123,29 @@ def encoder_training_clips(data: IslData, exclude: set[str], use_extra: bool = T
     return [c for c in clips if c.source not in xs] if xs else clips
 
 
+# the core sources: the encoder's validation gallery is built from ISLRTC and its queries from INCLUDE, so leaving
+# either out of supervision gives a validation that does not match the training list (docs 15.33)
+CORE_SOURCES = ("include", "islrtc")
+
+
+def check_exclude_sources(names) -> list[str]:
+    """The sorted source names of ``exclude_sources``; ``ValueError`` for a name that is no word source of any profile
+    (a typo such as ``wlsp`` would otherwise train that source in silently) or for a core source (docs 15.33)."""
+    from app.isl.profiles import WORD_SOURCES
+
+    xs = sorted(set(names or ()))
+    known = {n for v in WORD_SOURCES.values() for n in v}
+    unknown = [n for n in xs if n not in known]
+    if unknown:
+        raise ValueError(f"unknown source(s) {', '.join(unknown)}; word sources: "
+                         f"{', '.join(sorted(known - set(CORE_SOURCES)))}")
+    core = [n for n in xs if n in CORE_SOURCES]
+    if core:
+        raise ValueError(f"{', '.join(core)} cannot be left out of encoder supervision (core source: the validation "
+                         "gallery and queries are built from it)")
+    return xs
+
+
 def encoder_excluded_sources(meta: dict | None) -> list[str]:
     """The sources an encoder checkpoint was trained without (``[]`` for one written before 15.32)."""
     return class_space_of(meta)["excluded_sources"]
@@ -140,7 +163,7 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
     set_seed(cfg.seed)
     t0 = time.time()
     excl = set(exclude_concepts or ())
-    xsrc = sorted(set(exclude_sources or ()))
+    xsrc = check_exclude_sources(exclude_sources)
     train_clips = encoder_training_clips(data, excl, use_extra, xsrc)
     concepts = sorted({c.concept_id for c in train_clips})
     label_of = {c: i for i, c in enumerate(concepts)}
@@ -254,4 +277,4 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
 
 
 __all__ = ["ENCODER_VERSION", "ClipDataset", "embed_items", "retrieval_metrics", "train_encoder",
-           "encoder_training_clips", "encoder_excluded_sources"]
+           "encoder_training_clips", "encoder_excluded_sources", "check_exclude_sources"]

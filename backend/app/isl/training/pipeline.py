@@ -337,6 +337,20 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
         cls_meta = torch.load(work / "classifier.pt", map_location="cpu", weights_only=False).get("meta") or {}
         if cls_meta.get("class_space"):
             class_spaces["classifier"] = cls_meta["class_space"]
+    if (work / "fusion.json").exists():
+        # a fusion.json fitted on another classifier / encoder class space is never shipped with this one (docs
+        # 15.33); one fitted before 15.33 records nothing and passes as before
+        from app.isl.training.common import fusion_fit_space, fusion_space_mismatch
+
+        fitted_on = FusionParams.load(work / "fusion.json").fitted_on
+        bad = fusion_space_mismatch(fitted_on, fusion_fit_space(
+            cls_meta if (work / "classifier.pt").exists() else None,
+            enc_meta if (work / "encoder.pt").exists() else None,
+            imeta.row_filters if src_index is not None else None)) if fitted_on else []
+        if bad:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise ValueError(f"{work / 'fusion.json'} was fitted on another class space ({', '.join(bad)}) than the "
+                             "components of this pack: run fit-fusion (and evaluate) again before build-pack")
     from app.isl.training.readiness import partial_data_flag
 
     base = json.loads((PACK_DIR / "pack.json").read_text())

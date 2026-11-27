@@ -646,6 +646,25 @@ def _exclude_sources(args) -> tuple[str, ...]:
     return tuple(sorted({x.strip() for x in v.split(",") if x.strip()}))
 
 
+def _exclude_sources_arg(v: str) -> str:
+    """argparse type of ``--exclude-sources``: only known word sources, never a core one (docs 15.33; exit 2)."""
+    from app.isl.training.train_encoder import check_exclude_sources
+
+    try:
+        check_exclude_sources(x.strip() for x in v.split(",") if x.strip())
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+    return v
+
+
+def _fusion_fit_space(rec) -> dict:
+    from app.isl.training.common import fusion_fit_space
+
+    idx = getattr(rec, "index", None)
+    return fusion_fit_space(getattr(rec.classifier, "meta", None), getattr(rec.encoder, "meta", None),
+                            idx.meta.row_filters if idx is not None else None)
+
+
 def _init_path(args, work: Path) -> Path | None:
     v = getattr(args, "init", None)
     if not v or v == "none":
@@ -910,6 +929,8 @@ def cmd_fit_fusion(paths: IslPaths, args) -> int:
     # data: the leak guard also checks the index's split and training clips against this run's (docs 15.22)
     params, rep = fit_fusion(rec, data.labelled_part("val"), profile, data=data)
     assert set(params.accept) == {"strict", "balanced", "lenient"}, params.accept  # decide() needs all three
+    # the class spaces it was fitted on (docs 15.33): evaluate flags, build-pack refuses another classifier / encoder
+    params = params.with_(fitted_on=_fusion_fit_space(rec))
     params.save(work / "fusion.json")
     _print(rep)
     return 0
@@ -1013,6 +1034,7 @@ def cmd_smoke(paths: IslPaths, args) -> int:
     _log(f"[smoke] index: {report['index']}")
     rec = load_recognizer(work, fcfg, profile=profile)
     params, report["fusion"] = fit_fusion(rec, data.include_part("val"), profile, data=data)
+    params = params.with_(fitted_on=_fusion_fit_space(rec))
     params.save(work / "fusion.json")
     _log(f"[smoke] fusion: {report['fusion'].get('weights')} {report['fusion'].get('thresholds')}")
     doc = evaluate(work, data, fcfg, smoke=True)
@@ -1187,7 +1209,7 @@ def build_parser() -> argparse.ArgumentParser:
                              help="count ISLRTC, WSLP and CISLR as ONE signer group when choosing classes (WSLP is "
                                   "a second view of the ISLRTC videos; docs 15.32). Default: the old grouping")
         if name in ("train-encoder", "train-oneshot"):
-            spx.add_argument("--exclude-sources", default="",
+            spx.add_argument("--exclude-sources", default="", type=_exclude_sources_arg,
                              help="comma-separated sources left out of encoder supervision, e.g. wslp (docs 15.32)")
     lk = sub.add_parser("link-sources")
     _model_args(lk)

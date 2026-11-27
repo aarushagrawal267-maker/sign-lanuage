@@ -205,9 +205,20 @@ WSLP_TWINS="${INDEX_WSLP_TWINS:-$TW_DEFAULT}"
 case "$DICT_GROUP" in 0|1) ;; *) echo "CLS_DICTIONARY_GROUP must be 0 or 1" >&2; exit 2 ;; esac
 case "$WSLP_TWINS" in keep|drop|auto) ;; *) echo "INDEX_WSLP_TWINS must be keep, drop or auto" >&2; exit 2 ;; esac
 [[ "$ENC_XSRC" =~ ^[a-z0-9_,]*$ ]] || { echo "ENC_EXCLUDE_SOURCES: comma-separated source names" >&2; exit 2; }
+# the core sources are never left out (docs 15.33); train-encoder also refuses an unknown name (exit 2)
+[[ ",$ENC_XSRC," =~ ,(include|islrtc), ]] && { echo "ENC_EXCLUDE_SOURCES: include and islrtc are core sources" >&2; exit 2; }
 DG_ARG=""; [[ $DICT_GROUP == 1 ]] && DG_ARG="--dictionary-group"
 XS_ARG=""; [[ -n "$ENC_XSRC" ]] && XS_ARG="--exclude-sources $ENC_XSRC"
 TW_ARG=""; [[ "$WSLP_TWINS" != keep ]] && TW_ARG="--wslp-twins $WSLP_TWINS"
+WSLP_SETTINGS="dict_group=$DICT_GROUP enc_exclude=${ENC_XSRC:--} wslp_twins=$WSLP_TWINS"
+# the setting a step ran with, written into its stamp so the log's "skip ... (done ...)" lines show it (docs 15.33)
+step_settings() {
+  case "$1" in
+    classifier|cv|e1a) echo " dict_group=$DICT_GROUP" ;;
+    encoder|oneshot) echo " enc_exclude=${ENC_XSRC:--}" ;;
+    index|index_final) echo " wslp_twins=$WSLP_TWINS" ;;
+  esac
+}
 # a scratch run: a full run with a tag or its own work folder (smoke runs have their own private ISL root). It must
 # not rewrite the shared data under data/isl (docs 15.20): the steps in SHARED_STEPS are refused there unless
 # --allow-shared-data, and with --from the steps before STEP are seeded from SEED_WORK instead of run.
@@ -457,7 +468,7 @@ mkdir -p "$WORK"
 free_gb=$(df -Pk "$REPO" | awk 'NR==2 {print int($4/1048576)}')
 if [[ "$free_gb" -lt 10 ]]; then log "only ${free_gb} GB free (< 10 GB floor): not starting"; exit 3; fi
 
-log "phase 2 driver: profile=$PROFILE smoke=$SMOKE tag=${RUN_TAG:--} allow_partial=$ALLOW_PARTIAL threads=$THREADS work=$WORK stamps=$STAMPS${COMPARE_TO:+ compare_to=$COMPARE_TO} git=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+log "phase 2 driver: profile=$PROFILE smoke=$SMOKE tag=${RUN_TAG:--} allow_partial=$ALLOW_PARTIAL threads=$THREADS work=$WORK stamps=$STAMPS${COMPARE_TO:+ compare_to=$COMPARE_TO} $WSLP_SETTINGS git=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
 if [[ ${#SEED[@]} -gt 0 ]]; then
   for s in "${SEED[@]}"; do seed_step "$s" || { log "seeding $s FAILED"; exit 2; }; done
   if [[ -f "$SEED_WORK/partial_data.json" && ! -f "$WORK/partial_data.json" ]]; then
@@ -484,7 +495,7 @@ for s in "${STEPS[@]}"; do
     fi
     exit $rc
   fi
-  echo "$(date -u +%FT%TZ) $(( $(date +%s) - t0 ))s" > "$STAMPS/$s.done"
+  echo "$(date -u +%FT%TZ) $(( $(date +%s) - t0 ))s$(step_settings "$s")" > "$STAMPS/$s.done"
   log "step $s done in $(( $(date +%s) - t0 )) s"
 done
 log "phase 2 driver finished: profile=$PROFILE smoke=$SMOKE (report: $WORK/eval/report.md)"

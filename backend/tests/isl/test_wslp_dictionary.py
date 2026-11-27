@@ -242,3 +242,140 @@ def test_cli_parses_the_new_options():
     assert _exclude_sources(p.parse_args(["train-oneshot"])) == ()
     assert p.parse_args(["build-index"]).wslp_twins == "keep"
     assert p.parse_args(["build-index", "--wslp-twins", "auto"]).wslp_twins == "auto"
+
+
+# --------------------------------------------------------------------------- review fixes (docs 15.33)
+
+def test_exclude_sources_refuses_unknown_and_core_sources():
+    """A typo (``wlsp``) would silently train WSLP in; a core source would leave the validation gallery / queries
+    without their training list. Both are refused: ValueError in code, argparse exit 2 on the command line."""
+    from app.isl.cli import build_parser
+    from app.isl.training.train_encoder import check_exclude_sources
+
+    assert check_exclude_sources(["wslp", "cislr", "wslp"]) == ["cislr", "wslp"] and check_exclude_sources(()) == []
+    for bad, msg in ((["wlsp"], "unknown"), (["islrtc"], "core"), (["include", "wslp"], "core")):
+        with pytest.raises(ValueError, match=msg):
+            check_exclude_sources(bad)
+    p = build_parser()
+    for cmd in ("train-encoder", "train-oneshot"):
+        for v in ("wlsp", "islrtc", "wslp,include"):
+            with pytest.raises(SystemExit) as e:
+                p.parse_args([cmd, "--exclude-sources", v])
+            assert e.value.code == 2
+
+
+def test_default_arguments_add_no_new_resume_keys(wslp_world, monkeypatch, tmp_path):
+    """Backward compatibility (docs 15.19): with no new option, LoopConfig.extra has neither ``dictionary_group`` nor
+    ``exclude_sources``, so a training state written in Batch 0 still resumes; with the options it has them."""
+    from app.isl.training import train_classifier as tc
+    from app.isl.training import train_encoder as te
+    from app.isl.training.common import ISL_FEATURES
+    from app.training.trainer import TrainConfig
+
+    class Captured(Exception):
+        pass
+
+    seen = []
+
+    def fake_loop(model, batches, loss_fn, cfg, state_path, **kw):
+        seen.append(cfg.extra)
+        raise Captured
+
+    monkeypatch.setattr(tc, "run_loop", fake_loop)
+    monkeypatch.setattr(te, "run_loop", fake_loop)
+    data = wslp_world["data"]
+    cfg = TrainConfig(**TINY)
+    runs = [lambda **kw: tc.train_classifier(data, tmp_path / "c.pt", ISL_FEATURES, cfg, smoke=True, threads=1,
+                                             use_extra=True, steps_per_epoch=2, **kw),
+            lambda **kw: te.train_encoder(data, tmp_path / "e.pt", ISL_FEATURES, cfg, emb_dim=16, p=4, k=2, smoke=True,
+                                          threads=1, batches_per_epoch=2, **kw)]
+    for run, on in zip(runs, ({"dictionary_group": True}, {"exclude_sources": ("wslp",)})):
+        with pytest.raises(Captured):
+            run()
+        with pytest.raises(Captured):
+            run(**on)
+    cls_default, cls_on, enc_default, enc_on = seen
+    for extra in (cls_default, enc_default):
+        assert "dictionary_group" not in extra and "exclude_sources" not in extra
+    assert cls_on["dictionary_group"] is True and enc_on["exclude_sources"] == ["wslp"]
+    # E1a (no --all-sources): the grouping changes nothing, so it is neither in the signature nor in the meta
+    with pytest.raises(Captured):
+        tc.train_classifier(data, tmp_path / "c.pt", ISL_FEATURES, cfg, smoke=True, threads=1, use_extra=False,
+                            steps_per_epoch=2, dictionary_group=True)
+    assert "dictionary_group" not in seen[-1]
+
+
+def test_e1a_records_the_effective_signer_grouping(wslp_world, tmp_path):
+    """--dictionary-group without --all-sources (the driver's E1a) records "source": the classes are INCLUDE's own."""
+    from app.isl.training.common import ISL_FEATURES
+    from app.isl.training.train_classifier import train_classifier
+    from app.training.trainer import TrainConfig
+
+    res = train_classifier(wslp_world["data"], tmp_path / "e1a.pt", ISL_FEATURES, TrainConfig(**TINY), smoke=True,
+                           threads=1, use_extra=False, steps_per_epoch=2, dictionary_group=True)
+    assert res["class_space"]["signer_grouping"] == "source" and res["class_space"]["use_extra"] is False
+
+
+def test_encoder_state_without_exclusion_is_not_resumed_with_it(wslp_world, tmp_path):
+    """The other direction of the resume signature: a state trained WITH WSLP is never continued without it."""
+    from app.isl.training.common import ISL_FEATURES
+    from app.isl.training.loop import StateMismatch
+    from app.isl.training.train_encoder import train_encoder
+    from app.training.trainer import TrainConfig
+
+    data, out = wslp_world["data"], tmp_path / "encoder.pt"
+    kw = dict(emb_dim=16, p=4, k=2, smoke=True, threads=1, batches_per_epoch=2)
+    train_encoder(data, out, ISL_FEATURES, TrainConfig(**TINY), exclude_sources=(), **kw)
+    with pytest.raises(StateMismatch):
+        train_encoder(data, out, ISL_FEATURES, TrainConfig(**TINY), exclude_sources=("wslp",), resume=True, **kw)
+
+
+def test_fusion_fit_space_and_mismatch():
+    old_cls = {"class_names": ["isl.a", "isl.b"]}  # written before 15.32
+    new_cls = {"class_names": ["isl.a"], "class_space": {"signer_grouping": "dictionary"}}
+    enc = {"class_space": {"excluded_sources": ["wslp"]}}
+    a = common.fusion_fit_space(old_cls, enc, {"wslp_twins": {"dropped": 3}})
+    assert a == {"classifier": {"signer_grouping": "source", "n_classes": 2,
+                                "classes_sha256": a["classifier"]["classes_sha256"]},
+                 "encoder": {"excluded_sources": ["wslp"]}, "index_row_filters": ["wslp_twins"]}
+    # index_final drops the same kind of rows from more clips: the counts are not compared
+    assert common.fusion_space_mismatch(a, common.fusion_fit_space(old_cls, enc, {"wslp_twins": {"dropped": 9}})) == []
+    assert common.fusion_space_mismatch(a, common.fusion_fit_space(new_cls, {}, {})) == [
+        "classifier", "encoder", "index_row_filters"]
+    assert common.fusion_space_mismatch({}, a) == []  # a fusion.json fitted before 15.33 records nothing
+    assert common.fusion_fit_space(None, None, None) == {}
+
+
+def test_driver_cv_e1a_and_the_run_log_carry_the_settings(tmp_path, monkeypatch):
+    """cv and e1a get --dictionary-group too (research); the start line of the run log and the step stamps name the
+    grouping, the encoder exclusion and the twin mode; include / islrtc are refused before anything runs."""
+    from tests.isl.test_phase2_guards import _calls, _run_driver
+
+    for k in ("CLS_DICTIONARY_GROUP", "ENC_EXCLUDE_SOURCES", "INDEX_WSLP_TWINS"):
+        monkeypatch.delenv(k, raising=False)
+    sroot = tmp_path / "sroot"
+    (sroot / "splits").mkdir(parents=True)
+    (sroot / "splits" / "splits_report.json").write_text('{"primary_split": "toy"}')
+    (sroot / "splits" / "include-official.json").write_text("{}")
+    monkeypatch.setenv("SROOT", str(sroot))  # the cv / e1a split files of a run without --smoke (never data/isl)
+    py = tmp_path / "py_c"  # the fake python, but `-c` snippets (the cv step's split reader) really run
+    py.write_text('#!/usr/bin/env bash\nif [[ "$1" == "-c" ]]; then exec python3 "$@"; fi\n'
+                  'echo "$*" >> "$FAKE_PY_LOG"\nexit 0\n')
+    py.chmod(0o755)
+    isl, base = tmp_path / "isl", tmp_path / "art"
+    for step, split in (("cv", "--split toy-fold1"), ("e1a", "--split include-official")):
+        f = tmp_path / "fake_py.log"
+        if f.exists():
+            f.unlink()
+        r = _run_driver(tmp_path, "--only", step, work_base=base, isl_root=isl, profile="research", py=py)
+        assert r.returncode == 0, r.stdout + r.stderr
+        calls = [c for c in _calls(tmp_path) if "train-classifier" in c]
+        assert calls and all("--dictionary-group" in c for c in calls) and any(split in c for c in calls), (step, calls)
+        assert "dict_group=1 enc_exclude=wslp wslp_twins=auto" in r.stdout
+        stamp = next(base.rglob(f"{step}.done")).read_text()
+        assert "dict_group=1" in stamp, stamp
+    r = _run_driver(tmp_path, "--only", "encoder", work_base=base, isl_root=isl, profile="research", py=py)
+    assert "enc_exclude=wslp" in next(base.rglob("encoder.done")).read_text()
+    monkeypatch.setenv("ENC_EXCLUDE_SOURCES", "wslp,islrtc")
+    bad = _run_driver(tmp_path, "--only", "encoder", "--dry-run", work_base=base, isl_root=isl, profile="research")
+    assert bad.returncode == 2 and "core sources" in bad.stderr

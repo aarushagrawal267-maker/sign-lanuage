@@ -3928,3 +3928,38 @@ when asked; a toy encoder trained without WSLP records it, and its `auto` index 
 WSLP-only word and keeps the clip digest; `keep` indexes every WSLP clip; the classifier meta records the grouping
 and a dictionary-group state is refused without it; the driver passes the flags for research only and refuses a bad
 value.
+
+### 15.33 WSLP / dictionary review fixes: class spaces visible everywhere (review of 15.32, 27 Nov 2026)
+
+The review of 15.32 found no blocker. These fixes make a class-space change hard to miss and hard to mix.
+
+* **CV number.** When `evaluate --all` leaves a cv fold out (another signer grouping), `E1b.cv.not_pooled` lists it
+  next to the CV number, and `report.md` prints a "NOT pooled" line under it. When every fold is left out,
+  `E1b.cv` is `{"run": false, "reason": "cv folds trained with another signer grouping", "not_pooled": [...]}`
+  instead of being missing. Anyone reading the Batch 1 gate ("E1b and CV pooled >= 0.72") sees the dropped folds.
+* **Source names are checked.** `--exclude-sources` takes only word sources of a profile (`isl500`, `wslp`, `cislr`,
+  `mendeley_emergency`, `mendeley_agri`). A typo such as `wlsp` is refused (argparse, exit 2), so WSLP is never
+  trained in by mistake. `include` and `islrtc` are refused too: the encoder's validation queries and gallery are
+  built from them. `train_encoder` checks the same rule (`check_exclude_sources`). The driver refuses `include` and
+  `islrtc` in `ENC_EXCLUDE_SOURCES` before anything runs; an unknown name fails at the encoder step.
+* **Effective grouping.** `--dictionary-group` without `--all-sources` (the driver's E1a) changes no class, so the
+  classifier records `signer_grouping: "source"` and the resume signature gets no `dictionary_group` key. The
+  driver still passes the flag to e1a, so an E1a run with other sources would use the same grouping.
+* **fusion.json says what it was fitted on.** `fit-fusion` writes `fitted_on`: the classifier's signer grouping,
+  class count and class-name digest, the encoder's left-out sources, and the kinds of index rows left out (only the
+  kinds: `index` and `index_final` drop the same kind of rows from different clip counts). `evaluate --all` flags a
+  fusion fitted on another class space (`leakage_guards.class_space.fusion_mismatch`, a bold line in `report.md`).
+  `build-pack` refuses it. A fusion.json written before this has no `fitted_on` and passes as before, so the running
+  0.6 refresh is not affected. This catches `--only classifier` followed by `--only evaluate` without fit-fusion.
+* **Run log.** The driver's start line ends with `dict_group=… enc_exclude=… wslp_twins=…`. Each step's stamp
+  records the setting it ran with (classifier / cv / e1a: `dict_group`, encoder / oneshot: `enc_exclude`, index /
+  index_final: `wslp_twins`), so the "skip … (done …)" lines of a later partial run show it.
+* `report.md` lists excluded sources as plain words ("trained without wslp"), not as a Python list.
+
+Tests: `test_wslp_dictionary.py` (unknown and core sources refused in code and on the command line; with default
+arguments `LoopConfig.extra` has no new key, so Batch 0 states resume; an encoder state without the exclusion is not
+resumed with it; E1a records the effective grouping; `fusion_fit_space` and its mismatch; the driver passes
+`--dictionary-group` to cv and e1a and writes the settings into the start line and the stamps) and
+`test_eval_runners.py` (a cv fold of another grouping is not pooled and is named in `E1b.cv`, `report.json` and
+`report.md`; with every fold left out `E1b.cv` says why; a one-shot fold encoder trained without WSLP is listed; a
+fusion fitted on another classifier is flagged by evaluate and refused by build-pack).

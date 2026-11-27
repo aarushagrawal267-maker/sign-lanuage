@@ -410,3 +410,31 @@ def classifier_grouping_mismatch(main_meta: dict | None, other_meta: dict | None
     (``{"signer_grouping", "main_signer_grouping"}``). Evaluation never pools such a pair (docs 15.32)."""
     a, b = class_space_of(main_meta)["signer_grouping"], class_space_of(other_meta)["signer_grouping"]
     return None if a == b else {"signer_grouping": b, "main_signer_grouping": a}
+
+
+def fusion_fit_space(classifier_meta: dict | None, encoder_meta: dict | None,
+                     index_row_filters: dict | None) -> dict:
+    """What a fusion.json was fitted on (docs 15.33): the classifier's classes (signer grouping, count, digest of the
+    class names), the encoder's left-out sources and the kinds of index rows left out on purpose (e.g.
+    ``["wslp_twins"]``). Only the kinds of row filters, not their counts: fit-fusion uses ``<work>/index`` and the pack
+    ships ``<work>/index_final``, which drop the same kind of rows from more clips. A missing component has no key."""
+    from app.isl.training.loop import digest
+
+    out: dict = {}
+    if classifier_meta is not None:
+        names = list(classifier_meta.get("class_names") or [])
+        out["classifier"] = {"signer_grouping": class_space_of(classifier_meta)["signer_grouping"],
+                             "n_classes": len(names), "classes_sha256": digest(names)}
+    if encoder_meta is not None:
+        out["encoder"] = {"excluded_sources": class_space_of(encoder_meta)["excluded_sources"]}
+    if index_row_filters is not None:
+        out["index_row_filters"] = sorted(index_row_filters)
+    return out
+
+
+def fusion_space_mismatch(fitted_on: dict | None, current: dict) -> list[str]:
+    """The parts (``classifier``, ``encoder``, ``index_row_filters``) whose class space differs from the one the
+    fusion was fitted on; ``[]`` when they match or when the fusion.json records nothing (fitted before 15.33)."""
+    if not fitted_on:
+        return []
+    return sorted(k for k in set(fitted_on) | set(current) if fitted_on.get(k) != current.get(k))

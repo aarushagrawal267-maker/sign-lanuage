@@ -1000,7 +1000,8 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     from app.isl.evaluation.protocols import e6_latency
     from app.isl.models.encoder import EncoderPredictor
     from app.isl.training.pipeline import load_recognizer
-    from app.isl.training.common import class_space_of, classifier_grouping_mismatch
+    from app.isl.training.common import (class_space_of, classifier_grouping_mismatch, fusion_fit_space,
+                                         fusion_space_mismatch)
     from app.isl.training.train_encoder import encoder_excluded_sources, encoder_training_clips
 
     from app.isl.training.readiness import partial_data_flag, readiness_summary
@@ -1032,6 +1033,13 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     class_space = {"classifier": class_space_of(cls_meta) if cls_meta is not None else None,
                    "encoder": class_space_of(enc_meta) if enc_meta is not None else None,
                    "cv_folds_not_pooled": [], "oneshot_folds_other_sources": []}
+    # a fusion.json fitted on another classifier / encoder class space (docs 15.33; one fitted before records none)
+    fitted_on = getattr(rec.fusion, "fitted_on", None) or {}
+    if fitted_on:
+        idx = getattr(rec, "index", None)
+        class_space["fusion_fitted_on"] = fitted_on
+        class_space["fusion_mismatch"] = fusion_space_mismatch(
+            fitted_on, fusion_fit_space(cls_meta, enc_meta, idx.meta.row_filters if idx is not None else None))
     if cv:
         from app.isl.training.common import load_split
         from app.models.checkpoint import Predictor
@@ -1074,6 +1082,14 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
             if prot["E1b"]["cv"]["pooled_top1_interval_reason"]:
                 prot["E1b"].setdefault("interval_reasons", {})["top1_cv_pooled"] = \
                     prot["E1b"]["cv"]["pooled_top1_interval_reason"]
+        # folds left out for another class space are named next to the CV number itself (docs 15.33), and a CV
+        # with every fold left out says why instead of vanishing
+        if class_space["cv_folds_not_pooled"]:
+            if "cv" in prot["E1b"]:
+                prot["E1b"]["cv"]["not_pooled"] = list(class_space["cv_folds_not_pooled"])
+            else:
+                prot["E1b"]["cv"] = {"run": False, "reason": "cv folds trained with another signer grouping",
+                                     "not_pooled": list(class_space["cv_folds_not_pooled"])}
     off = work / "e1a" / "classifier.pt"
     if off.exists() and paths is not None:
         from app.isl.training.common import load_split
@@ -1453,12 +1469,18 @@ def markdown_report(doc: dict) -> str:
                      f"{_fmt(m.get('wrong_accept_rate'))} | "
                      f"{p.get('label', '')} |")
     cvb = doc["protocols"].get("E1b", {}).get("cv")
-    if cvb:
+    if cvb and cvb.get("run") is False:
+        lines += ["", f"E1b cross-validation NOT run: {cvb.get('reason', '')} ("
+                  + "; ".join(f"{f['fold']}: {f['signer_grouping']}" for f in cvb.get("not_pooled") or []) + ")"]
+    elif cvb:
         ci = cvb.get("pooled_top1_interval")
         lines += ["", f"E1b cross-validation: {cvb['folds']} folds, top-1 mean {cvb['top1_mean']:.3f} (sd "
                   f"{cvb['top1_sd']:.3f}); pooled over {cvb['pooled_groups']} held-out signer groups: "
                   f"{cvb['pooled_top1']:.3f} (95% CI " + format_interval(ci, cvb['pooled_groups'],
                                                                        cvb.get('pooled_top1_interval_reason')) + ")"]
+        if cvb.get("not_pooled"):
+            lines.append("NOT pooled (other signer grouping): " + ", ".join(
+                f"{f['fold']} ({f['signer_grouping']})" for f in cvb["not_pooled"]))
     lines += _like_for_like_lines((doc["protocols"].get("E1b") or {}).get("like_for_like"))
     oov = (doc["protocols"].get("E2") or {}).get("oov_false_accept")
     if oov:
@@ -1498,8 +1520,12 @@ def markdown_report(doc: dict) -> str:
         lines.append(f"* cv {f['fold']} NOT pooled: its classes were chosen with signer grouping "
                      f"{f['signer_grouping']}, the main classifier's with {f['main_signer_grouping']}")
     for f in cs.get("oneshot_folds_other_sources") or []:
-        lines.append(f"* E2 fold {f['fold']} encoder was trained without {f['excluded_sources'] or 'no source'}, "
-                     f"the main encoder without {f['main_excluded_sources'] or 'no source'}")
+        lines.append(f"* E2 fold {f['fold']} encoder was trained without "
+                     f"{', '.join(f['excluded_sources']) or 'no source'}, the main encoder without "
+                     f"{', '.join(f['main_excluded_sources']) or 'no source'}")
+    if cs.get("fusion_mismatch"):
+        lines.append("* **fusion.json was fitted on another class space (" + ", ".join(cs["fusion_mismatch"])
+                     + "): run fit-fusion again; the fused numbers above use stale parameters**")
     if lg.get("pretraining_excludes_eval_clips") is False:
         lines.append("* **LEAKAGE: pre-training saw evaluation clips; the numbers above are not clean.** Examples: "
                      + ", ".join(pc.get("overlap_examples") or []))

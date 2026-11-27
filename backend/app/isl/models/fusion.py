@@ -75,6 +75,10 @@ class FusionParams:
     # top candidate becomes "did you mean"). A fusion.json written before 15.25 has no such record and loads as {}:
     # UNCERTIFIED, every policy confirm-only.
     certification: dict | None = None
+    # what the parameters were fitted on (docs 15.33): the classifier's class space, the encoder's left-out sources and
+    # the kinds of index rows left out (``common.fusion_fit_space``). {} = not recorded (fitted before 15.33): no check.
+    # evaluate --all flags a fusion fitted on another class space; build-pack refuses it.
+    fitted_on: dict = field(default_factory=dict)
 
     def __post_init__(self):
         # Every policy must always have a threshold: a fusion.json written with only some policies (or none) made
@@ -98,6 +102,7 @@ class FusionParams:
             raise ValueError(f"user_cls_mode must be one of {USER_CLS_MODES}, not {self.user_cls_mode!r}")
         if self.certification is not None:
             object.__setattr__(self, "certification", dict(self.certification))
+        object.__setattr__(self, "fitted_on", dict(self.fitted_on or {}))
 
     def to_json(self) -> dict:
         return asdict(self)
