@@ -10,6 +10,14 @@ validation INCLUDE clips (about 3,400 clips over every session); fold 0's test p
 Each clip is scored by ITS fold's classifier; the rest of the fused system (encoder, fusion weights, temperature,
 aliases) is the primary one, and the retrieval gallery leaves out the clip's own fold (see below).
 
+The E1b test is NOT invisible to the fold classifiers (review of 15.42, docs 15.43). ``grouped_kfold`` gives fold K
+validation = fold K+1, so fold 4's classifier was early-stopped and temperature-fitted on fold 0's test part: it
+SELECTED on the E1b test. ``oof_parts`` skips such a fold by default (``allow_test_selected`` uses it, recorded).
+Folds 1-3 TRAIN on E1b test clips (fold 0 is in their train part). That is training data, not selection: their
+probabilities on their own test parts set the INCLUDE thresholds, and E1b precision is then measured at those
+thresholds, so E1b is not fully clean of the calibration. Each part records how many of its fold's train and
+validation clips (and duplicates of them) are E1b test clips.
+
 Assumptions, stated:
 * **Exchangeable fold classifiers.** At run time the app uses the fold-0 classifier. A fold-K classifier is trained
   with the same code and settings on another 3/5 of the INCLUDE sessions (``check_fold_classifier`` refuses one of
@@ -20,10 +28,12 @@ Assumptions, stated:
   1. *Leave-fold-out gallery.* Fold K's clips are scored against the training-only index with every row built from a
      fold-K test clip (or a duplicate of one) removed; an INCLUDE centroid is recomputed from its other clips. So no
      clip ever retrieves itself.
-  2. *An in-sample screen.* Retrieval top-1 on the in-sample folds minus the out-of-sample fold (fold 1 = the
-     primary validation part, which the encoder never trained on), minus the same difference for the fold
-     classifiers (all out of sample: a control for fold difficulty). This difference-in-differences is the
-     encoder's in-sample advantage. Above ``max_encoder_gain`` (default 0.03) the in-sample folds are NOT used for
+  2. *An in-sample screen.* Retrieval top-1 on an in-sample fold j minus the out-of-sample fold (fold 1 = the
+     primary validation part, which the encoder never trained on) scored against THE SAME leave-fold-j-out gallery,
+     minus the same difference for the fold classifiers (all out of sample: a control for fold difficulty). Pooled
+     over j (weighted by fold size), this difference-in-differences is the encoder's in-sample advantage. The same
+     gallery on both arms matters: a leave-fold-out gallery has fewer clips per INCLUDE centroid, which lowers
+     retrieval for reasons that are not memorisation (docs 15.43). Above ``max_encoder_gain`` (default 0.03) the in-sample folds are NOT used for
      certification (only the out-of-sample folds are). Passing the screen is not proof of no bias (its 95 % interval
      is reported); a per-fold encoder would remove the assumption.
 """
@@ -35,7 +45,7 @@ import hashlib
 import json
 import re
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -65,6 +75,9 @@ class OofPart:
     clips: list[Clip]
     # share of the part's clips in the primary split's TRAIN part (the encoder and the index were built from them)
     encoder_in_sample: float = 0.0
+    # clips of this fold's TRAIN / VALIDATION part that are primary (E1b) test clips or duplicates of one (docs 15.43)
+    trained_on_primary_test: int = 0
+    selected_on_primary_test: int = 0
 
     @property
     def in_sample(self) -> bool:
@@ -83,6 +96,11 @@ class OofCalibration:
     n_boot: int = 1000
     seed: int = 0
     progress: object = None  # callable(str) for log lines, or None
+    # provenance (docs 15.43): the folds asked for (None = every fold), whether folds that selected on the E1b test
+    # were allowed, and the folds ``oof_parts`` skipped (with their overlap counts)
+    requested_folds: list | None = None
+    allow_test_selected: bool = False
+    skipped: list = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------------------------- setup
@@ -95,10 +113,27 @@ def split_base(name: str) -> tuple[str, int]:
     return m.group(1), int(m.group(2))
 
 
-def oof_parts(paths, data, work: Path, folds=None) -> list[OofPart]:
+def primary_test_ids(data) -> tuple[set[str], object]:
+    """The primary split's test clip ids (the E1b test) and a predicate "is this clip one of them or a duplicate of
+    one" (``data.dedup``)."""
+    test = {i for i, p in (getattr(data, "assign", None) or {}).items() if p == "test"}
+    dedup = getattr(data, "dedup", None)
+    if dedup is not None and getattr(dedup, "parent", None):
+        tg = {dedup.group(i) for i in test}
+        return test, (lambda i: i in test or dedup.group(i) in tg)
+    return test, (lambda i: i in test)
+
+
+def oof_parts(paths, data, work: Path, folds=None, allow_test_selected: bool = False,
+              skipped: list | None = None) -> list[OofPart]:
     """The INCLUDE test clips of every other fold of the primary split (``folds``: None = every fold file but the
     primary one), each with its ``<work>/cv/foldK/classifier.pt``. OofError for the primary fold, a missing split
-    file or classifier, or no clip at all."""
+    file or classifier, or no clip at all.
+
+    A fold whose VALIDATION part holds primary test clips (or duplicates of them) selected its classifier on the
+    E1b test (``grouped_kfold``: fold K validation = fold K+1, so fold 4 of 5 validates on fold 0). It is skipped
+    unless ``allow_test_selected``; ``skipped`` (a list) gets one dict per skipped fold. Every part records how many
+    of its train / validation clips are primary test clips (docs 15.43)."""
     from app.isl.training.common import load_split
 
     base, primary = split_base(data.split.get("name"))
@@ -106,6 +141,8 @@ def oof_parts(paths, data, work: Path, folds=None) -> list[OofPart]:
         folds = sorted(int(m.group(1)) for f in Path(paths.splits).glob(f"{base}-fold*.json")
                        if (m := re.fullmatch(rf"{re.escape(base)}-fold(\d+)\.json", f.name)))
         folds = [k for k in folds if k != primary]
+    skipped = [] if skipped is None else skipped
+    _, in_test = primary_test_ids(data)
     by_id = {c.clip_id: c for c in data.include if c.concept_id}
     parts = []
     for k in folds:
@@ -118,14 +155,25 @@ def oof_parts(paths, data, work: Path, folds=None) -> list[OofPart]:
             assign = load_split(paths, name)["assign"]
         except FileNotFoundError as e:
             raise OofError(str(e)) from None
+        tr = sum(1 for i, p in assign.items() if p == "train" and in_test(i))
+        va = sum(1 for i, p in assign.items() if p == "val" and in_test(i))
+        if va and not allow_test_selected:
+            skipped.append({"fold": k, "split": name, "selected_on_primary_test_clips": va,
+                            "trained_on_primary_test_clips": tr,
+                            "reason": f"its validation part holds {va} primary (E1b) test clips: its classifier was "
+                                      "early-stopped and temperature-fitted on the E1b test (--oof-allow-test-selected "
+                                      "uses it anyway)"})
+            continue
         ck = Path(work) / "cv" / f"fold{k}" / "classifier.pt"
         if not ck.exists():
             raise OofError(f"no cross-validation classifier {ck} (run the driver's cv step first)")
         clips = [by_id[i] for i, p in sorted(assign.items()) if p == "test" and i in by_id]
         ins = sum(1 for c in clips if data.assign.get(c.clip_id) == "train")
-        parts.append(OofPart(k, name, ck, clips, ins / len(clips) if clips else 0.0))
+        parts.append(OofPart(k, name, ck, clips, ins / len(clips) if clips else 0.0, tr, va))
     if not any(p.clips for p in parts):
-        raise OofError("no out-of-fold INCLUDE clip found (no other fold, or no labelled clip in their test parts)")
+        why = f" ({len(skipped)} folds skipped: they selected on the E1b test)" if skipped else ""
+        raise OofError("no out-of-fold INCLUDE clip found (no other fold, or no labelled clip in their test parts)"
+                       + why)
     return parts
 
 
@@ -282,7 +330,15 @@ def fold_gallery(index, banned: set[str], emb_of: dict[str, np.ndarray]):
     left = g.row_clip_ids() & banned
     if left:  # never: the loop above removed them (the check the plan asks for, on the gallery itself)
         raise OofError(f"the leave-fold-out gallery still holds {len(left)} clips of the fold")
-    return g, {"rows": len(rows), "rows_before": len(index.rows), **dict(sorted(st.items()))}
+    return g, {"rows": len(rows), "rows_before": len(index.rows), **dict(sorted(st.items())),
+               "include_support": centroid_support(rows)}
+
+
+def centroid_support(rows: list[dict]) -> dict:
+    """INCLUDE centroids of a gallery and their mean number of clips (docs 15.43: the gallery support per arm)."""
+    n = [len(r.get("clips") or []) or int(r.get("n_clips") or 0) for r in rows
+         if r.get("source") == "include" and r.get("kind") == "centroid"]
+    return {"centroids": len(n), "mean_clips": round(float(np.mean(n)), 3) if n else None}
 
 
 def banned_ids(part: OofPart, index, data) -> set[str]:
@@ -306,8 +362,14 @@ def _top(ids, mat) -> str | None:
 def oof_evidence(rec, oof: OofCalibration, params, progress=None) -> dict:
     """Score every part's clips with its fold classifier, the primary encoder and the leave-fold-out gallery, and
     fuse them with ``params``. Returns rows (one dict per clip: fold, clip, source, group, truth, result, the
-    classifier-, retrieval- and fused top-1 hits, in_sample, cluster) and per-part summaries."""
-    from app.isl.models.fusion import compact_inputs, fuse
+    classifier-, retrieval- and fused top-1 hits, in_sample, cluster) and per-part summaries.
+
+    The out-of-sample parts (no clip the encoder trained on) are scored first and their query embeddings and
+    classifier outputs kept; every in-sample fold j's gallery then also scores them (``r_hit_g[j]``,
+    ``f_hit_g[j]``), so the in-sample screen compares both arms on the same gallery (docs 15.43). Rows whose truth
+    is a primary classifier class the fold classifier does not have are dropped (``dropped_not_a_fold_class``): such
+    a word would be retrieval-only for the fold system but is judged as a classifier word."""
+    from app.isl.models.fusion import FusionInputs, compact_inputs, fuse
     from app.isl.training.common import engine_crops
     from app.models.checkpoint import Predictor
 
@@ -315,6 +377,7 @@ def oof_evidence(rec, oof: OofCalibration, params, progress=None) -> dict:
     main_meta = getattr(getattr(rec, "classifier", None), "meta", None) or {}
     if getattr(rec, "classifier", None) is None:
         raise OofError("out-of-fold calibration needs the primary classifier (classifier.pt)")
+    primary_classes = set(rec.classifier.class_names)
     idx = getattr(rec, "index", None)
     emb_of: dict = {}
     cent: dict = {"checked": 0}
@@ -327,12 +390,23 @@ def oof_evidence(rec, oof: OofCalibration, params, progress=None) -> dict:
     t_cs = (float(params.t_c),)
     rows: list[dict] = []
     parts_rep = []
-    for p in oof.parts:
+    cache: list[tuple[dict, np.ndarray | None, np.ndarray | None, list]] = []  # out-of-sample rows: (row, z, logp, ids)
+
+    def fused(inp, r_index):
+        pos = r_index.concept_pos if r_index is not None else None
+        inp = compact_inputs(inp, taus, params.top_n, ret_pos=pos if r_index is not None and inp.ret_ids is getattr(
+            r_index, "concepts", None) else None, t_cs=t_cs)
+        return fuse(inp, params)
+
+    # out-of-sample parts first: their cached evidence is re-scored on every in-sample fold's gallery
+    for p in sorted(oof.parts, key=lambda q: (q.in_sample, q.fold)):
         t0 = time.time()
         clf = Predictor(p.classifier_path)
         bad = check_fold_classifier(main_meta, clf.meta, p.split)
         if bad:
             raise OofError(f"{p.classifier_path} is not exchangeable with the primary classifier: {'; '.join(bad)}")
+        fold_classes = set(clf.class_names)
+        missing = primary_classes - fold_classes
         r = copy.copy(rec)
         r.classifier = clf
         r._cls_cal = None
@@ -340,95 +414,172 @@ def oof_evidence(rec, oof: OofCalibration, params, progress=None) -> dict:
         grep: dict = {}
         if idx is not None:
             r.index, grep = fold_gallery(idx, banned_ids(p, idx, data), emb_of)
-        pos = r.index.concept_pos if getattr(r, "index", None) is not None else None
+        g = getattr(r, "index", None)
         n0 = len(rows)
+        n_drop = 0
         for c in p.clips:
+            if c.concept_id in missing:
+                n_drop += 1
+                continue
             try:
                 raw = c.load()
                 feats = np.stack([build_features(x, rec.feature_config) for x in engine_crops(raw)])
             except (FeatureError, OSError, ValueError):
                 continue
-            inp, _ = r.evidence(feats, use_my_signs=False)
+            inp, info = r.evidence(feats, use_my_signs=False)
             c_top = _top(inp.cls_ids, inp.cls_logp)
             r_top = _top(inp.ret_ids, inp.ret)
-            inp = compact_inputs(inp, taus, params.top_n, ret_pos=pos if inp.ret_ids is getattr(r.index, "concepts",
-                                                                                                  None) else None,
-                                 t_cs=t_cs)
-            res = fuse(inp, params)
+            row = {"fold": p.fold, "clip": c.clip_id, "source": OOF_SOURCE, "group": c.group,
+                   "truth": c.concept_id, "in_sample": data.assign.get(c.clip_id) == "train",
+                   "c_hit": c_top == c.concept_id, "r_hit": r_top == c.concept_id,
+                   "cluster": oof.sessions.get(c.clip_id) or c.clip_id}
+            if not p.in_sample:
+                cache.append((row, info.get("z"), inp.cls_logp, inp.cls_ids))
+            res = fused(inp, g)
             del inp
-            rows.append({"fold": p.fold, "clip": c.clip_id, "source": OOF_SOURCE, "group": c.group,
-                         "truth": c.concept_id, "result": res, "in_sample": data.assign.get(c.clip_id) == "train",
-                         "c_hit": c_top == c.concept_id, "r_hit": r_top == c.concept_id,
-                         "f_hit": bool(res.keys) and res.keys[0] == c.concept_id,
-                         "cluster": oof.sessions.get(c.clip_id) or c.clip_id})
+            row["result"] = res
+            row["f_hit"] = bool(res.keys) and res.keys[0] == c.concept_id
+            rows.append(row)
         got = rows[n0:]
+        gm = None
+        if p.in_sample and g is not None and cache:  # the out-of-sample clips on THIS fold's gallery (docs 15.43)
+            for row, z, logp, ids in cache:
+                if z is None:
+                    continue
+                inp = FusionInputs(cls_logp=logp, cls_ids=ids, ret=g.concept_matrix(z), ret_ids=g.concepts,
+                                   prior=rec.prior)
+                row.setdefault("r_hit_g", {})[p.fold] = _top(inp.ret_ids, inp.ret) == row["truth"]
+                res = fused(inp, g)
+                row.setdefault("f_hit_g", {})[p.fold] = bool(res.keys) and res.keys[0] == row["truth"]
+                del inp, res
+            gm = {"retrieval_top1": _rate([x for x, *_ in cache if p.fold in x.get("r_hit_g", {})],
+                                          None, lambda x: x["r_hit_g"][p.fold]),
+                  "n": sum(1 for x, *_ in cache if p.fold in x.get("r_hit_g", {}))}
         cls_names = list(clf.class_names)
         parts_rep.append({
             "fold": p.fold, "split": p.split, "classifier": str(p.classifier_path),
             "classifier_sha256": hashlib.sha256(Path(p.classifier_path).read_bytes()).hexdigest(),
-            "classes": len(cls_names), "classes_shared_with_primary": len(set(cls_names) &
-                                                                          set(rec.classifier.class_names)),
+            "classes": len(cls_names), "classes_shared_with_primary": len(set(cls_names) & primary_classes),
+            "primary_classes_missing": len(missing), "dropped_not_a_fold_class": n_drop,
+            "trained_on_primary_test_clips": p.trained_on_primary_test,
+            "selected_on_primary_test_clips": p.selected_on_primary_test,
             "clips": len(p.clips), "scored": len(got), "encoder_in_sample": round(p.encoder_in_sample, 4),
             "groups": len({x["group"] for x in got if x["group"]}),
             "classifier_top1": _rate(got, "c_hit"), "retrieval_top1": _rate(got, "r_hit"),
-            "fused_top1": _rate(got, "f_hit"), "gallery": grep, "seconds": round(time.time() - t0, 1)})
+            "fused_top1": _rate(got, "f_hit"), "gallery": grep,
+            **({"out_of_sample_on_this_gallery": gm} if gm else {}), "seconds": round(time.time() - t0, 1)})
         if progress:
             progress(f"oof fold{p.fold}: {len(got)} clips, classifier top-1 {parts_rep[-1]['classifier_top1']}, "
-                     f"retrieval {parts_rep[-1]['retrieval_top1']}, fused {parts_rep[-1]['fused_top1']}")
+                     f"retrieval {parts_rep[-1]['retrieval_top1']}, fused {parts_rep[-1]['fused_top1']}"
+                     + (f"; out-of-sample clips on this gallery: retrieval {gm['retrieval_top1']}" if gm else ""))
         del clf, r
+    del cache
+    parts_rep.sort(key=lambda x: x["fold"])
+    rows.sort(key=lambda x: x["fold"])  # stable: clip order within a fold is kept
     return {"rows": rows, "parts": parts_rep, "centroid_check": cent}
 
 
-def _rate(rows, key) -> float | None:
-    return round(float(np.mean([bool(x[key]) for x in rows])), 4) if rows else None
+def _rate(rows, key, get=None) -> float | None:
+    get = get or (lambda x: x[key])
+    return round(float(np.mean([bool(get(x)) for x in rows])), 4) if rows else None
 
 
 # --------------------------------------------------------------------------------------------- in-sample screen
 
-def _did(rows_in, rows_out, key) -> float:
+def _arm_arrays(rin: list[dict], rout: list[dict], folds: list[int]) -> dict:
+    """0/1 arrays of the screen. In arm: fold index, classifier / retrieval / fused hits. Out arm: classifier hits and,
+    per in-sample fold j, the retrieval / fused hits on fold j's gallery (``r_hit_g[j]``; a row without one, e.g. no
+    index, uses its own ``r_hit``: then the arms share no gallery, reported as ``gallery_matched`` False)."""
+    fi = {f: i for i, f in enumerate(folds)}
+    cl_in = {c: i for i, c in enumerate(sorted({x["cluster"] for x in rin}))}
+    cl_out = {c: i for i, c in enumerate(sorted({x["cluster"] for x in rout}))}
+    b = lambda v: np.asarray(v, np.float64)  # noqa: E731
+    return {
+        "J": len(folds), "f": np.asarray([fi[x["fold"]] for x in rin], np.int64),
+        "c_in": b([bool(x["c_hit"]) for x in rin]), "r_in": b([bool(x["r_hit"]) for x in rin]),
+        "fh_in": b([bool(x["f_hit"]) for x in rin]),
+        "c_out": b([bool(x["c_hit"]) for x in rout]),
+        "r_out": b([[bool((x.get("r_hit_g") or {}).get(f, x["r_hit"])) for f in folds] for x in rout]),
+        "fh_out": b([[bool((x.get("f_hit_g") or {}).get(f, x["f_hit"])) for f in folds] for x in rout]),
+        "k_in": np.asarray([cl_in[x["cluster"]] for x in rin], np.int64), "n_k_in": len(cl_in),
+        "k_out": np.asarray([cl_out[x["cluster"]] for x in rout], np.int64), "n_k_out": len(cl_out)}
+
+
+def _did_w(A: dict, w_in: np.ndarray, w_out: np.ndarray, which: str) -> tuple[float, np.ndarray]:
+    """Pooled and per-fold DiD with row weights (1 = the sample; bootstrap counts otherwise). DiD_j =
+    (hit(fold j | G_-j) - hit(out | G_-j)) - (cls(fold j) - cls(out)); pooled = mean of DiD_j weighted by fold j's
+    in-arm weight."""
+    J = A["J"]
+    hin, hout = (A["r_in"], A["r_out"]) if which == "r" else (A["fh_in"], A["fh_out"])
+    n_j = np.bincount(A["f"], weights=w_in, minlength=J)
+    W = max(float(w_out.sum()), 1e-12)
+    h_out = (w_out @ hout) / W
+    c_out = float(w_out @ A["c_out"]) / W
+    with np.errstate(invalid="ignore", divide="ignore"):
+        h_in = np.bincount(A["f"], weights=w_in * hin, minlength=J) / n_j
+        c_in = np.bincount(A["f"], weights=w_in * A["c_in"], minlength=J) / n_j
+    d = (h_in - h_out) - (c_in - c_out)
+    ok = n_j > 0
+    return float(np.sum(d[ok] * n_j[ok]) / np.sum(n_j[ok])), d
+
+
+def _did_unmatched(rin, rout, key) -> float:
+    """The statistic before docs 15.43: in-sample rows on their own gallery against out-of-sample rows on theirs."""
     m = lambda rr, k: float(np.mean([bool(x[k]) for x in rr]))  # noqa: E731
-    return (m(rows_in, key) - m(rows_out, key)) - (m(rows_in, "c_hit") - m(rows_out, "c_hit"))
+    return (m(rin, key) - m(rout, key)) - (m(rin, "c_hit") - m(rout, "c_hit"))
 
 
 def encoder_in_sample_check(rows: list[dict], max_gain: float = DEFAULT_MAX_ENCODER_GAIN, n_boot: int = 1000,
                             seed: int = 0) -> dict:
     """Difference-in-differences of top-1 between the folds whose clips the encoder trained on (in) and those it did
-    not (out): (retrieval in - out) - (fold classifier in - out), and the same for the fused top-1. The classifier
-    difference controls for fold difficulty (every fold classifier is out of sample). 95 % interval from a cluster
-    bootstrap (recording sessions, resampled within each arm). ``passed`` = retrieval DiD <= ``max_gain``.
-    Not testable (no out-of-sample or no in-sample clip): ``passed`` None."""
+    not (out), on the SAME gallery (docs 15.43): for each in-sample fold j, (retrieval on fold j - retrieval on the
+    out-of-sample clips, both against fold j's leave-fold-out gallery) - (fold classifier on fold j - on the out
+    clips), pooled over j weighted by fold size; the same for the fused top-1. The classifier difference controls
+    for fold difficulty (every fold classifier is out of sample); the shared gallery controls for its smaller
+    support (fewer clips per INCLUDE centroid). 95 % interval from a cluster bootstrap (recording sessions,
+    resampled within each arm). ``passed`` = pooled retrieval DiD <= ``max_gain``. Not testable (no out-of-sample or
+    no in-sample clip): ``passed`` None. ``did_retrieval_unmatched`` is the old statistic (each arm on its own
+    gallery), reported for comparison only."""
     rin = [x for x in rows if x["in_sample"]]
     rout = [x for x in rows if not x["in_sample"]]
     rep = {"n_in": len(rin), "n_out": len(rout), "max_gain": max_gain,
-           "statistic": "(retrieval top-1 in - out) - (fold classifier top-1 in - out); in = folds whose clips the "
-                        "encoder trained on"}
+           "statistic": "pooled over in-sample folds j: (retrieval top-1 fold j - out, both on fold j's leave-fold-out "
+                        "gallery) - (fold classifier top-1 fold j - out); in = folds whose clips the encoder trained on"}
     if not rin or not rout:
         return {**rep, "testable": False, "passed": None,
                 "reason": "needs clips the encoder trained on AND clips it did not (fold 1 = primary validation)"}
+    folds = sorted({x["fold"] for x in rin})
+    matched = {f: all(f in (x.get("r_hit_g") or {}) for x in rout) for f in folds}
     for arm, rr in (("in", rin), ("out", rout)):
         rep[arm] = {k: _rate(rr, k) for k in ("c_hit", "r_hit", "f_hit")} | {
             "clusters": len({x["cluster"] for x in rr})}
-    did_r, did_f = _did(rin, rout, "r_hit"), _did(rin, rout, "f_hit")
+    A = _arm_arrays(rin, rout, folds)
+    one_in, one_out = np.ones(len(rin)), np.ones(len(rout))
+    did_r, per_r = _did_w(A, one_in, one_out, "r")
+    did_f, per_f = _did_w(A, one_in, one_out, "f")
     rng = np.random.default_rng(seed)
-
-    def clusters(rr):
-        by = defaultdict(list)
-        for x in rr:
-            by[x["cluster"]].append(x)
-        return list(by.values())
-
-    cin, cout = clusters(rin), clusters(rout)
     br, bf = [], []
     for _ in range(max(0, int(n_boot))):
-        a = [x for j in rng.integers(0, len(cin), len(cin)) for x in cin[j]]
-        b = [x for j in rng.integers(0, len(cout), len(cout)) for x in cout[j]]
-        br.append(_did(a, b, "r_hit"))
-        bf.append(_did(a, b, "f_hit"))
+        w_in = np.bincount(rng.integers(0, A["n_k_in"], A["n_k_in"]), minlength=A["n_k_in"])[A["k_in"]].astype(float)
+        w_out = np.bincount(rng.integers(0, A["n_k_out"], A["n_k_out"]),
+                            minlength=A["n_k_out"])[A["k_out"]].astype(float)
+        if w_out.sum() == 0 or w_in.sum() == 0:
+            continue
+        br.append(_did_w(A, w_in, w_out, "r")[0])
+        bf.append(_did_w(A, w_in, w_out, "f")[0])
     ci = (lambda v: [round(float(np.percentile(v, 2.5)), 4), round(float(np.percentile(v, 97.5)), 4)]
           if v else None)
+    per_fold = {}
+    for j, f in enumerate(folds):
+        nj = int(np.sum(A["f"] == j))
+        per_fold[str(f)] = {"n_in": nj, "gallery_matched": matched[f],
+                            "out_retrieval_top1_on_this_gallery": round(float(A["r_out"][:, j].mean()), 4),
+                            "did_retrieval": round(float(per_r[j]), 4), "did_fused": round(float(per_f[j]), 4)}
     passed = bool(did_r <= max_gain)
     return {**rep, "testable": True, "did_retrieval": round(did_r, 4), "did_retrieval_ci95": ci(br),
             "did_fused": round(did_f, 4), "did_fused_ci95": ci(bf), "n_boot": int(n_boot), "passed": passed,
+            "gallery_matched": all(matched.values()), "per_fold": per_fold,
+            "did_retrieval_unmatched": round(_did_unmatched(rin, rout, "r_hit"), 4),
             "note": "a screen, not a proof: passing means the in-sample advantage was not seen above the margin; the "
                     "interval shows how large it could still be"}
 
@@ -446,8 +597,19 @@ def select_rows(ev: dict, oof: OofCalibration) -> tuple[list[dict], dict]:
     if dropped:
         why = ("encoder in-sample screen failed" if chk.get("testable") else
                "encoder in-sample screen not testable") + " (--oof-keep-in-sample uses them anyway)"
+    support = {}
+    for p in ev.get("parts") or []:
+        gs = (p.get("gallery") or {})
+        if gs:
+            support[str(p["fold"])] = {"arm": "in" if p.get("encoder_in_sample") else "out",
+                                       **(gs.get("include_support") or {}),
+                                       "centroids_dropped": gs.get("include_centroids_dropped", 0)}
+    if support:
+        chk = {**chk, "gallery_support": support}
     return used, {"version": OOF_VERSION, "assumption": ASSUMPTION, "in_sample_check": chk,
-                  "keep_in_sample": bool(oof.keep_in_sample), "folds_used": folds_used, "folds_dropped": dropped,
+                  "keep_in_sample": bool(oof.keep_in_sample), "max_encoder_gain": oof.max_encoder_gain,
+                  "requested_folds": oof.requested_folds, "allow_test_selected": bool(oof.allow_test_selected),
+                  "folds_skipped": list(oof.skipped), "folds_used": folds_used, "folds_dropped": dropped,
                   **({"dropped_reason": why} if why else {}),
                   "clips_used": len(used), "groups_used": len({x["group"] for x in used if x["group"]}),
                   "parts": ev["parts"], "centroid_check": ev.get("centroid_check")}

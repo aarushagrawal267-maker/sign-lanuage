@@ -4572,7 +4572,9 @@ quota. And 856 clips could not reach a 0.95 lower bound.
 **Fix 2: out-of-fold calibration** (`training/oof_calibration.py`, `fit-fusion --oof-calibration`, driver
 `FUSION_OOF=1`).
 * The cv classifiers `cv/fold1-4/classifier.pt` never trained or selected on their own fold's test part. Those four
-  test parts together are exactly the primary train and validation INCLUDE clips. On the real data: 3,422 clips, 1,070
+  test parts together are exactly the primary train and validation INCLUDE clips. **Correction (15.43):** they are
+  not blind to the E1b test. Fold 4's classifier was early-stopped on it, so fold 4 is now skipped by default.
+  Folds 1-3 trained on E1b test clips. On the real data: 3,422 clips, 1,070
   sessions, the 4 pseudo-signer groups. Fold 1's test part is the primary validation part; folds 2-4 are primary train.
 * Each clip is scored by ITS fold's classifier. Encoder, fusion weights, temperature and aliases are the primary
   ones. The clips certify under source `include` with their own signer group. They replace the primary validation
@@ -4582,7 +4584,7 @@ quota. And 856 clips could not reach a 0.95 lower bound.
   "My signs" mode choice.
 * **Leak checks.** No out-of-fold clip, and no duplicate of one, may be in the primary split's test part (the E1b
   test): `LeakageError`, before any work, in the cli and again in `fit_fusion`. Fold 0 itself is refused. Parts must
-  not overlap.
+  not overlap. This checks the calibration clips only. What the fold classifiers trained or selected on is in 15.43.
 * **Assumption: the fold classifiers are exchangeable.** The app uses the fold-0 classifier. A fold-K classifier is
   the same code and settings on another 3/5 of the sessions, so we take its accuracy on unseen sessions to be the
   same. `check_fold_classifier` refuses a fold classifier of another split, architecture, size, features, train
@@ -4595,7 +4597,7 @@ quota. And 856 clips could not reach a 0.95 lower bound.
      every stored centroid from the clips and refuses when one does not match (cosine < 0.995). So no clip retrieves
      itself.
   2. In-sample screen. DiD = (retrieval top-1 on folds 2-4 minus fold 1) minus (fold-classifier top-1 on folds 2-4
-     minus fold 1). The classifier difference controls for fold difficulty, since every fold classifier is out of
+     minus fold 1). (15.43: both arms are now scored on the same leave-fold-out gallery.) The classifier difference controls for fold difficulty, since every fold classifier is out of
      sample. 95 % interval from a session-cluster bootstrap. When the DiD is above `--oof-max-encoder-gain` (0.03), the
      in-sample folds are not used: only fold 1 certifies (then INCLUDE still gains an out-of-fold classifier, not more
      clips). `--oof-keep-in-sample` (driver `FUSION_OOF_KEEP_IN_SAMPLE=1`) uses them anyway, recorded.
@@ -4605,7 +4607,8 @@ quota. And 856 clips could not reach a 0.95 lower bound.
 * Report and record. `fit-fusion` prints `oof_calibration`: per fold the classifier and its SHA-256, clips, groups,
   classifier / retrieval / fused top-1, the gallery changes, the screen, the folds used and dropped, and the
   certification clips per source. `fusion.json` `certification.calibration_sets` records the clips, the folds, the
-  assumption and the screen. `selection_note` then says INCLUDE was certified out of fold.
+  assumption and the screen. `selection_note` then says INCLUDE was certified out of fold. (15.43: more provenance,
+  and a note that says what the clips really are.)
 * Cost: one extra evidence pass over about 3,400 clips plus about 2,600 INCLUDE embeddings for the centroids.
 * Opt-in for both profiles. Without the flag, fit-fusion is exactly as before. The fusion step needs the cv step
   (fit-fusion exits 2 when a cv classifier is missing).
@@ -4620,3 +4623,78 @@ leave-fold-out gallery holds no row of the fold and rebuilds the centroids; a fo
 refused; certification uses each out-of-fold clip with source `include` and its own group, replaces the primary
 validation INCLUDE clips, and leaves the weights unchanged; the screen drops in-sample folds when the encoder
 memorised them, not when a fold is just easier for every model.
+
+### 15.43 Out-of-fold review fixes: what the fold classifiers saw, a fair screen, provenance in fusion.json (review of 15.42, 27 Nov 2026)
+
+**The fold classifiers are not blind to the E1b test.** `grouped_kfold` gives fold K validation = fold K+1. So:
+* fold 4 validates on fold 0. Its classifier was early-stopped and temperature-fitted on the E1b test. That is
+  selection on the test.
+* folds 1-3 have fold 0 in their train part. They trained on E1b test clips. That is training data, not selection.
+  But their probabilities set the INCLUDE thresholds, and E1b precision is then measured at those thresholds. So E1b
+  strict precision at out-of-fold thresholds is not fully clean. The bias should be small: no E1b label chooses a
+  threshold. A fully clean set needs nested folds (classifiers trained without fold 0). Those would train on 2/5 of
+  the sessions, so they would not be exchangeable with the runtime classifier.
+
+What changed:
+* `oof_parts` counts, for every fold, its train and validation clips that are primary test clips or duplicates of
+  one (`data.dedup`). A fold whose validation part holds any is **skipped by default** and listed with its counts.
+  `fit-fusion --oof-allow-test-selected` uses it anyway, recorded. Asking for it with `--oof-folds` alone still
+  skips it. Real split files (read-only check, `include-session-cv5`): fold 4's validation part is all 856 E1b test clips,
+  and folds 1-3 each train on all 856. So fold 4 is skipped and out-of-fold INCLUDE has 2,567 clips (folds 1-3:
+  856 + 856 + 855) instead of 3,422.
+* Every part reports `trained_on_primary_test_clips` and `selected_on_primary_test_clips`. So does
+  `certification.calibration_sets.fold_classifiers` in fusion.json.
+* `selection_note` says it. When fold classifiers trained on E1b clips, the note says so.
+
+**A fair in-sample screen.** Before, fold 1 (out arm) was scored against the full training index, and fold j (in
+arm) against the index without fold j. The leave-fold-out gallery has fewer clips per INCLUDE centroid (2 folds
+instead of 3), and a word whose train clips are all in fold j loses its centroid. That lowers retrieval for reasons
+that are not memorisation. The old DiD then had a negative term that could hide real memorisation, the one bias the
+screen exists to catch. The classifier control did not have this problem (every fold classifier trains on 3/5).
+
+Now:
+* The out-of-sample parts are scored first. Their query embeddings and classifier outputs are kept (fold 1: about
+  856 clips, about 45 MB). Each in-sample fold j's gallery then also scores them: one retrieval and one fuse per
+  clip and fold.
+* DiD_j = (retrieval top-1 on fold j minus on fold 1, both against fold j's gallery) minus (fold-classifier top-1 on
+  fold j minus on fold 1). Pooled over j, weighted by fold j's clips. Same for the fused top-1.
+* The 95 % interval is a session-cluster bootstrap of the pooled value. Clusters are resampled within each arm.
+* The report gives each fold's DiD, `gallery_matched`, the gallery support per arm (INCLUDE centroids and mean clips
+  per centroid, centroids dropped) and the old statistic as `did_retrieval_unmatched` (for comparison only).
+
+**Certification uses a weaker gallery for folds 2-3.** An in-sample fold certifies against its leave-fold-out
+gallery (about 2/5 of the INCLUDE clips per centroid). Fold 1 uses the training index (3/5). The app uses the final
+index (every clip). A weaker gallery shifts the fused scores the thresholds are fitted on. We assume the thresholds
+still hold. The gallery support is reported per fold so this can be checked.
+
+**Class lists.** A fold classifier can lack a few primary classes (real data: fold 2 lacks 2). An out-of-fold clip
+whose truth is such a class would be retrieval-only for the fold system, but it would be judged as a classifier word.
+These clips are now dropped before scoring (by truth, never by outcome). Each part reports
+`primary_classes_missing` and `dropped_not_a_fold_class`. If a fold-1 clip is dropped, its primary validation row is
+not used either (no clip counts twice).
+
+**Provenance in fusion.json.** `certification.calibration_sets` now also has the requested folds, the folds used,
+dropped and skipped, `allow_test_selected`, `keep_in_sample`, `max_encoder_gain`, and per fold the classifier
+SHA-256, the class-list difference, the dropped clips and the overlap with the E1b test. `selection_note` depends on
+the folds used. When only fold 1 is used, it says the INCLUDE clips are the primary validation clips (they also chose
+the encoder epoch, the fusion weights and the temperature) and only the classifier is out of fold. The cv classifier
+SHA-256s are not added to `fitted_on`: evaluate and build-pack compare `fitted_on` with the models they load, and the
+cv classifiers are never loaded there.
+
+**Driver.** With `FUSION_OOF=1` the fusion step passes `--oof-folds` from `CV_FOLDS` (the folds the cv step trains:
+smoke 1, else 1 2 3 4). `FUSION_OOF=1` with an empty `CV_FOLDS` is refused at start (exit 2, dry run too), not hours
+later in the fusion step. `CV_FOLDS` must be fold numbers. A resume that skips the fusion step warns when the stamp's
+`oof=1` differs from `FUSION_OOF`.
+
+**Pre-training guard.** A v2 run with an explicit `--init .../pretrained_encoder.pt` is now checked against the
+`pretrain_clips.txt` next to it (refused on overlap). Any other `--init` cannot be checked; a warning says so.
+`IslData.signer_split` and `signer_split_signature` now call `multisource.signer_split_version`.
+
+Tests (`backend/tests/isl/test_signer_split_oof.py`): a toy fold whose validation part is the primary test is skipped
+(also when asked for), used only with the opt-in, and the overlap counts are right (duplicates too); with no
+memorisation and a shrunken gallery the screen gives DiD 0 (the old statistic -0.1), and a memorising encoder that the
+old statistic missed is caught; per-fold DiDs are pooled by fold size; `cli fit-fusion --oof-calibration` exits 2 for a
+split that is not a cv split, a missing cv classifier and a leaking fold, all before the recogniser is loaded, and
+succeeds with `oof_calibration` in its output and the provenance in fusion.json; the selection note follows the folds
+used; clips of a word the fold classifier lacks are dropped; the driver passes `--oof-folds`, refuses an empty
+`CV_FOLDS` and warns on a fusion stamp of the other setting; an explicit `--init` is checked or warned.

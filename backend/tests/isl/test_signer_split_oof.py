@@ -113,7 +113,8 @@ def isl500_world(tmp_path):
         ms.register_adapter("isl500", None)
 
 
-def test_attach_all_sources_and_the_pretraining_guards_follow_the_link_settings(isl500_world, tmp_path, monkeypatch):
+def test_attach_all_sources_and_the_pretraining_guards_follow_the_link_settings(isl500_world, tmp_path, monkeypatch,
+                                                                                   capsys):
     from app.isl import cli
     from app.isl.evaluation.runners import pretraining_guard
 
@@ -142,6 +143,19 @@ def test_attach_all_sources_and_the_pretraining_guards_follow_the_link_settings(
     assert cli._pretrain_split_guard("train-encoder", args, work, d2) is False
     none = cli.build_parser().parse_args(["train-encoder", "--init", "none"])
     assert cli._pretrain_split_guard("train-encoder", none, work, d2) is True
+    # an explicit --init of ANOTHER folder's pretrained_encoder.pt is checked against the list next to it (15.43)
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "pretrained_encoder.pt").write_bytes(b"x")
+    ms.write_pretrain_list(other, [c for c in d1.extra if c.clip_id in set(pre)])
+    ext = cli.build_parser().parse_args(["train-encoder", "--init", str(other / "pretrained_encoder.pt")])
+    assert cli._pretrain_split_guard("train-encoder", ext, work, d2) is False
+    assert cli._pretrain_split_guard("train-encoder", ext, work, d1) is True
+    # ... and one that cannot be checked (no list next to it) passes with a warning
+    (other / ms.PRETRAIN_LIST).unlink()
+    capsys.readouterr()
+    assert cli._pretrain_split_guard("train-encoder", ext, work, d2) is True
+    assert "not checked" in capsys.readouterr().err
     # a pre-training on the v2 split passes
     ms.write_pretrain_list(work, [c for c in d2.extra if d2.extra_assign[c.clip_id] == "train"])
     assert cli._pretrain_split_guard("train-encoder", args, work, d2) is True
@@ -180,7 +194,7 @@ def test_cli_link_sources_freezes_v2(isl500_world, tmp_path, monkeypatch):
 
 
 def test_driver_passes_the_signer_split_and_oof_flags(tmp_path, monkeypatch):
-    from tests.isl.test_phase2_guards import _calls, _run_driver
+    from tests.isl.test_phase2_guards import STEPS_DONE, _calls, _run_driver
 
     for k in ("SIGNER_SPLIT", "FUSION_OOF", "FUSION_OOF_KEEP_IN_SAMPLE"):
         monkeypatch.delenv(k, raising=False)
@@ -213,6 +227,48 @@ def test_driver_passes_the_signer_split_and_oof_flags(tmp_path, monkeypatch):
         bad = _run_driver(tmp_path, "--only", "link", "--dry-run", work_base=base, isl_root=isl, profile="research")
         assert bad.returncode == 2 and k in bad.stderr
         monkeypatch.delenv(k)
+    # FUSION_OOF=1 passes the folds the cv step trains, and is refused at start when cv is skipped (docs 15.43)
+    monkeypatch.setenv("FUSION_OOF", "1")
+    c, _ = calls("research", "fusion")
+    assert c and all(x.rstrip().endswith("--oof-folds 1 2 3 4") for x in c)
+    monkeypatch.setenv("CV_FOLDS", "1 3")
+    c, _ = calls("research", "fusion")
+    assert c and all(x.rstrip().endswith("--oof-folds 1 3") for x in c)
+    monkeypatch.setenv("CV_FOLDS", "")
+    bad = _run_driver(tmp_path, "--only", "fusion", "--dry-run", work_base=base, isl_root=isl, profile="research")
+    assert bad.returncode == 2 and "CV_FOLDS is empty" in bad.stderr
+    monkeypatch.setenv("CV_FOLDS", "1;rm")
+    bad = _run_driver(tmp_path, "--only", "fusion", "--dry-run", work_base=base, isl_root=isl, profile="research")
+    assert bad.returncode == 2 and "CV_FOLDS" in bad.stderr
+    monkeypatch.delenv("CV_FOLDS")
+    # smoke trains cv fold 1 only (dry run: a smoke run's work folder is the real artifacts/isl/phase2-smoke)
+    smoke = _run_driver(tmp_path, "--smoke", "--only", "fusion", "--dry-run", work_base=base, isl_root=isl,
+                        profile="research")
+    assert smoke.returncode == 0 and "--oof-keep-in-sample --oof-folds 1)" in smoke.stdout
+    # a resume over a fusion stamp of the other setting says so (it never silently keeps the other fusion.json)
+    c, _ = calls("research", "fusion")
+    stamp = next(base.rglob("research/**/fusion.done"))
+    assert " oof=1" in stamp.read_text()
+    for s in STEPS_DONE:  # every step done, so a resume skips fusion
+        if s != "fusion":
+            (stamp.parent / f"{s}.done").write_text("old\n")
+    stamp.write_text("2026-11-27T00:00:00Z 10s\n")
+
+    def dry():
+        r = _run_driver(tmp_path, "--dry-run", "--from", "trim_eval", work_base=base, isl_root=isl,
+                        profile="research", seed_base=tmp_path / "no_seed")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "would skip fusion" in r.stdout
+        return r.stdout
+
+    assert "warning: fusion stamp settings differ from the current ones (stamp oof=0, FUSION_OOF=1)" in dry()
+    monkeypatch.delenv("FUSION_OOF")
+    assert "warning: fusion stamp" not in dry()
+    stamp.write_text("2026-11-27T00:00:00Z 10s oof=1\n")
+    assert "warning: fusion stamp settings differ from the current ones (stamp oof=1, FUSION_OOF=0)" in dry()
+    for s in STEPS_DONE:
+        (stamp.parent / f"{s}.done").unlink(missing_ok=True)
+    monkeypatch.setenv("FUSION_OOF_KEEP_IN_SAMPLE", "0")
     # a folder linked with v1 and a run that does not link: the start line says the folder's split
     monkeypatch.setenv("SIGNER_SPLIT", "v2")
     dry = _run_driver(tmp_path, "--only", "fusion", "--dry-run", work_base=base, isl_root=isl, profile="research")
@@ -330,7 +386,10 @@ def test_leave_fold_out_gallery_has_no_row_of_the_fold(oof_world):
     # fold 1's clips (fold 0 validation) are not in the index: the gallery is the index itself
     p1 = oc.oof_parts(P, d, work, folds=[1])[0]
     g1, rep1 = oc.fold_gallery(idx, oc.banned_ids(p1, idx, d), emb)
-    assert rep1 == {"rows": len(idx.rows), "rows_before": len(idx.rows)}
+    assert rep1 == {"rows": len(idx.rows), "rows_before": len(idx.rows),
+                    "include_support": {"centroids": 4, "mean_clips": 4.0}}
+    # the leave-fold-out gallery has less support per INCLUDE centroid (docs 15.43: why the screen shares a gallery)
+    assert rep["include_support"] == {"centroids": 4, "mean_clips": 2.0}
     # a centroid that cannot be rebuilt (another encoder's embeddings) is refused
     bad = {k: np.random.default_rng(0).normal(size=v.shape).astype(np.float32) for k, v in emb.items()}
     with pytest.raises(oc.OofError, match="cannot be rebuilt"):
@@ -392,6 +451,12 @@ def test_fit_fusion_certifies_include_on_out_of_fold_clips_with_their_source_and
     assert params.certification["calibration_clips"] == len(oof_clips)
     chk = orep["in_sample_check"]
     assert chk["testable"] and chk["n_in"] == 8 and chk["n_out"] == 4 and len(chk["did_retrieval_ci95"]) == 2
+    # both arms on the same gallery: fold 1's clips were also scored on fold 2's leave-fold-out gallery (docs 15.43)
+    assert chk["gallery_matched"] and set(chk["per_fold"]) == {"2"}
+    assert chk["gallery_support"]["1"] == {"arm": "out", "centroids": 4, "mean_clips": 4.0, "centroids_dropped": 0}
+    assert chk["gallery_support"]["2"]["arm"] == "in" and chk["gallery_support"]["2"]["mean_clips"] == 2.0
+    assert orep["parts"][1]["out_of_sample_on_this_gallery"]["n"] == 4
+    assert all(p["dropped_not_a_fold_class"] == 0 for p in orep["parts"])
     assert [p["fold"] for p in orep["parts"]] == [1, 2] and orep["parts"][1]["gallery"][
         "include_centroids_recomputed"] == 4
     # the weights and temperature are the primary validation fit, unchanged by the out-of-fold clips
@@ -426,3 +491,196 @@ def test_in_sample_screen_drops_the_folds_the_encoder_trained_on():
     # nothing out of sample: not testable, the in-sample folds are not used
     used, rep = oc.select_rows({"rows": rows(50, 2, True, 0.5, 0.5), "parts": []}, oc.OofCalibration([], None))
     assert rep["in_sample_check"]["testable"] is False and used == [] and rep["folds_dropped"] == [2]
+
+
+# ------------------------------------------------------------------------------------------------ review of 15.42 (15.43)
+
+def _fold_file(P, k, test, val):
+    base = json.loads((P.splits / "test-split.json").read_text())
+    a = {i: "test" if _signer(i) in test else ("val" if _signer(i) in val else "train") for i in base["assign"]}
+    f = P.splits / f"toy-cv5-fold{k}.json"
+    f.write_text(json.dumps({**base, "name": f"toy-cv5-fold{k}", "assign": a}))
+    return f
+
+
+def test_a_fold_classifier_selected_on_the_primary_test_is_skipped_and_overlaps_are_reported(oof_world):
+    import shutil
+
+    d, P, work = oof_world["data"], oof_world["P"], oof_world["work"]
+    n_test = sum(1 for p in d.assign.values() if p == "test")
+    # as grouped_kfold's last fold: its validation part IS fold 0's test part (the E1b test)
+    f3 = _fold_file(P, 3, test={1}, val=FOLD_TEST[0])
+    ck3 = work / "cv" / "fold3" / "classifier.pt"
+    try:
+        skipped: list = []
+        parts = oc.oof_parts(P, d, work, skipped=skipped)  # skipped before its (missing) classifier is looked for
+        assert [p.fold for p in parts] == [1, 2]
+        assert skipped == [{"fold": 3, "split": "toy-cv5-fold3", "selected_on_primary_test_clips": n_test,
+                            "trained_on_primary_test_clips": 0, "reason": skipped[0]["reason"]}]
+        assert "E1b test" in skipped[0]["reason"]
+        # folds 1 and 2 TRAIN on fold 0's test clips (fold 0 is in their train part) but never selected on them
+        assert all(p.trained_on_primary_test == n_test and p.selected_on_primary_test == 0 for p in parts)
+        with pytest.raises(oc.OofError, match="selected on the E1b test"):
+            oc.oof_parts(P, d, work, folds=[3])  # asked for explicitly: still refused, nothing left
+        ck3.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(work / "cv" / "fold1" / "classifier.pt", ck3)
+        p3 = oc.oof_parts(P, d, work, folds=[3], allow_test_selected=True)[0]  # the explicit opt-in
+        assert p3.selected_on_primary_test == n_test and p3.trained_on_primary_test == 0
+        # duplicates of a test clip count too (data.dedup)
+        extra = next(i for i, p in json.loads(f3.read_text())["assign"].items() if p == "train")
+        test0 = {i for i, p in d.assign.items() if p == "test"}
+
+        class _Dup:
+            parent = {"x": "x"}
+
+            def group(self, i):
+                return "g" if i in test0 or i == extra else i
+
+        d.dedup = _Dup()
+        try:
+            p3 = oc.oof_parts(P, d, work, folds=[3], allow_test_selected=True)[0]
+            assert p3.trained_on_primary_test == 1
+        finally:
+            d.dedup = None
+    finally:
+        f3.unlink()
+        shutil.rmtree(ck3.parent, ignore_errors=True)
+
+
+def _screen_rows(n, fold, ins, r, c, r_g=None):
+    out = []
+    for i in range(n):
+        x = {"fold": fold, "in_sample": ins, "r_hit": i < r * n, "c_hit": i < c * n, "f_hit": i < r * n,
+             "cluster": f"{fold}-{i % 10}", "group": "g", "result": None, "truth": "x", "source": "include"}
+        if r_g is not None:
+            x["r_hit_g"] = {j: i < v * n for j, v in r_g.items()}
+            x["f_hit_g"] = dict(x["r_hit_g"])
+        out.append(x)
+    return out
+
+
+def test_in_sample_screen_compares_both_arms_on_the_same_gallery():
+    # no memorisation: a leave-fold-out gallery has fewer clips per centroid, so retrieval drops from 0.8 to 0.7 for
+    # EVERY clip. The old statistic (each arm on its own gallery) reads that as -0.1 and would hide memorisation.
+    out = _screen_rows(200, 1, False, 0.8, 0.6, r_g={2: 0.7, 3: 0.7})
+    fair = out + _screen_rows(200, 2, True, 0.7, 0.6) + _screen_rows(200, 3, True, 0.7, 0.6)
+    chk = oc.encoder_in_sample_check(fair, 0.03, n_boot=100)
+    assert chk["gallery_matched"] and abs(chk["did_retrieval"]) < 1e-9 and chk["passed"]
+    assert abs(chk["did_retrieval_unmatched"] + 0.1) < 1e-9
+    assert chk["per_fold"]["2"]["out_retrieval_top1_on_this_gallery"] == 0.7
+    lo, hi = chk["did_retrieval_ci95"]
+    assert lo <= 0 <= hi
+    # the encoder memorised the in-sample folds (+0.12 on the shrunk gallery): the old statistic missed it (0.02),
+    # the gallery-matched one catches it
+    memo = out + _screen_rows(200, 2, True, 0.82, 0.6) + _screen_rows(200, 3, True, 0.82, 0.6)
+    chk = oc.encoder_in_sample_check(memo, 0.03, n_boot=100)
+    assert abs(chk["did_retrieval_unmatched"] - 0.02) < 1e-9 and chk["passed"] is False
+    assert abs(chk["did_retrieval"] - 0.12) < 1e-9 and chk["did_retrieval_ci95"][0] > 0.03
+    # per fold: each in-sample fold against its own gallery's out-of-sample rate, pooled by fold size
+    mixed = (_screen_rows(100, 1, False, 0.8, 0.6, r_g={2: 0.7, 3: 0.5}) + _screen_rows(100, 2, True, 0.7, 0.6)
+             + _screen_rows(300, 3, True, 0.6, 0.6))
+    chk = oc.encoder_in_sample_check(mixed, 0.03, n_boot=20)
+    assert chk["per_fold"]["2"]["did_retrieval"] == 0.0 and chk["per_fold"]["3"]["did_retrieval"] == 0.1
+    assert abs(chk["did_retrieval"] - 0.075) < 1e-9
+
+
+def test_cli_fit_fusion_oof_calibration(oof_world, tmp_path, monkeypatch, capsys):
+    import shutil
+
+    from app.isl import cli
+    from app.isl.training import pipeline
+
+    w, P, src = oof_world["w"], oof_world["P"], oof_world["work"]
+    base = tmp_path / "art"
+    work = base / "commercial-safe"
+    work.mkdir(parents=True)
+    for f in ("encoder.pt", "classifier.pt"):
+        shutil.copy2(src / f, work / f)
+    shutil.copytree(src / "index", work / "index")
+    shutil.copytree(src / "cv", work / "cv")
+    monkeypatch.setenv("SLR_ISL_WORKDIR", str(base))
+    root = ["--root", str(P.root)]
+
+    def run(*extra, split="toy-cv5-fold0"):
+        return cli.main(root + ["fit-fusion", "--profile", "commercial-safe", "--vocab", str(w["vocab"]), "--split",
+                                split, "--threads", "1", "--oof-calibration", *extra])
+
+    real = pipeline.load_recognizer
+
+    def refuse(*a, **k):
+        raise AssertionError("the out-of-fold checks run before the recogniser is loaded")
+
+    monkeypatch.setattr(pipeline, "load_recognizer", refuse)
+    assert run(split="test-split") == 2  # not a fold of a cross-validation split
+    assert "not a fold" in capsys.readouterr().err
+    shutil.move(work / "cv" / "fold1", tmp_path / "fold1")
+    assert run() == 2
+    assert "no cross-validation classifier" in capsys.readouterr().err
+    shutil.move(tmp_path / "fold1", work / "cv" / "fold1")
+    f3 = _fold_file(P, 3, test=FOLD_TEST[0], val={1})  # a "fold" whose test part is fold 0's: the leak check
+    (work / "cv" / "fold3").mkdir()
+    shutil.copy2(work / "cv" / "fold1" / "classifier.pt", work / "cv" / "fold3" / "classifier.pt")
+    try:
+        assert run("--oof-folds", "3") == 2
+        assert "test part" in capsys.readouterr().err
+    finally:
+        f3.unlink()
+        shutil.rmtree(work / "cv" / "fold3")
+    assert not (work / "fusion.json").exists()
+    monkeypatch.setattr(pipeline, "load_recognizer", real)
+    capsys.readouterr()
+    assert run("--oof-folds", "1", "2") == 0
+    out = capsys.readouterr().out
+    assert "oof_calibration" in out
+    cert = json.loads((work / "fusion.json").read_text())["certification"]
+    cs = cert["calibration_sets"]
+    assert cs["requested_folds"] == [1, 2] and cs["keep_in_sample"] is False and cs["max_encoder_gain"] == 0.03
+    assert set(cs["fold_classifiers"]) == {"1", "2"} and len(cs["fold_classifiers"]["1"]["classifier_sha256"]) == 64
+    assert cs["fold_classifiers"]["1"]["trained_on_primary_test_clips"] > 0  # disclosed (docs 15.43)
+    assert "TRAINED on E1b test clips" in cert["selection_note"]
+    if cs["folds_used"] == [1]:  # the screen dropped fold 2: only the primary validation clips certify
+        assert "primary validation clips" in cert["selection_note"]
+    else:
+        assert "let through" in cert["selection_note"]
+
+
+def test_selection_note_says_what_the_include_clips_are():
+    from app.isl.training.fit_fusion import _oof_certification
+
+    parts = [{"fold": 1, "encoder_in_sample": 0.0, "classifier_sha256": "a" * 64, "trained_on_primary_test_clips": 5,
+              "selected_on_primary_test_clips": 0},
+             {"fold": 2, "encoder_in_sample": 1.0, "classifier_sha256": "b" * 64, "trained_on_primary_test_clips": 5,
+              "selected_on_primary_test_clips": 0}]
+    orep = {"version": "oof-1", "folds_used": [1], "folds_dropped": [2], "parts": parts, "keep_in_sample": False,
+            "max_encoder_gain": 0.03, "requested_folds": None, "in_sample_check": {"passed": False}}
+    c = _oof_certification({"version": 1}, orep, 10)
+    assert c["selection_note"].startswith("INCLUDE certified on the clips of folds [1], which are the primary "
+                                          "validation clips")
+    assert c["calibration_sets"]["fold_classifiers"]["2"]["classifier_sha256"] == "b" * 64
+    c = _oof_certification({"version": 1}, {**orep, "folds_used": [1, 2], "folds_dropped": []}, 10)
+    assert "the encoder trained on folds [2]" in c["selection_note"]
+    assert _oof_certification({}, orep, 0) == {}
+
+
+def test_oof_rows_of_a_word_the_fold_classifier_lacks_are_dropped(oof_world, monkeypatch):
+    from app.models import checkpoint
+
+    rec, d, P, work = oof_world["rec"], oof_world["data"], oof_world["P"], oof_world["work"]
+    parts = oc.oof_parts(P, d, work, folds=[1])
+    word = parts[0].clips[0].concept_id
+    real = checkpoint.Predictor
+
+    class Lacking(real):  # fold 1's classifier without ``word`` (as fold 2 of the real data lacks 2 primary classes)
+        def __init__(self, path, *a, **k):
+            super().__init__(path, *a, **k)
+            if "cv" in str(path):
+                self.class_names = [n if n != word else "zz_other" for n in self.class_names]
+
+    monkeypatch.setattr(checkpoint, "Predictor", Lacking)
+    from app.isl.training.fit_fusion import FusionParams
+
+    ev = oc.oof_evidence(rec, oc.OofCalibration(parts, d), FusionParams(profile=oof_world["prof"]))
+    n_word = sum(1 for c in parts[0].clips if c.concept_id == word)
+    rp = ev["parts"][0]
+    assert rp["primary_classes_missing"] == 1 and rp["dropped_not_a_fold_class"] == n_word
+    assert not any(x["truth"] == word for x in ev["rows"])

@@ -199,7 +199,9 @@ class IslData:
     @property
     def signer_split(self) -> str:
         """The signer split version of the other sources (docs 15.42): the link settings' ``signer_split``, else v1."""
-        return str((self.link or {}).get("signer_split") or "v1")
+        from app.isl.training.multisource import signer_split_version
+
+        return signer_split_version(self.link)
 
     def summary(self) -> dict:
         parts = {p: len(self.include_part(p)) for p in ("train", "val", "test")}
@@ -392,7 +394,9 @@ class LazyClipDataset:
 def signer_split_signature(data) -> dict:
     """The resume-signature entry of the signer split (docs 15.19, 15.42): ``{"signer_split": "v2"}`` when the data's
     link settings chose a split other than v1, else ``{}`` (so a state of a v1 run written before 15.42 resumes)."""
-    v = str((getattr(data, "link", None) or {}).get("signer_split") or "v1")
+    from app.isl.training.multisource import signer_split_version
+
+    v = signer_split_version(getattr(data, "link", None))
     return {"signer_split": v} if v != "v1" else {}
 
 

@@ -838,26 +838,35 @@ def _fusion_fit_space(rec) -> dict:
 
 
 def _pretrain_split_guard(cmd: str, args, work: Path, data) -> bool:
-    """Signer split v2 (docs 15.42): the warm start ``<work>/pretrained_encoder.pt`` must not have seen an evaluation
-    clip of THIS split (a pre-training of the v1 split saw the two ISL500 signers v2 moves to validation). Checked
-    from ``<work>/pretrain_clips.txt``; prints the reason and returns False when refused. v1 (every run before
-    15.42): not checked here, exactly as before (the report's pre-training guard still reports it)."""
+    """Signer split v2 (docs 15.42, 15.43): a pre-trained warm start must not have seen an evaluation clip of THIS
+    split (a pre-training of the v1 split saw the two ISL500 signers v2 moves to validation). Checked from the
+    ``pretrain_clips.txt`` next to it: ``<work>/pretrained_encoder.pt`` (missing list = refused) or an explicit
+    ``--init .../pretrained_encoder.pt`` whose folder holds the list. Any other ``--init`` cannot be checked: a
+    warning says so. Prints the reason and returns False when refused. v1 (every run before 15.42): not checked
+    here, exactly as before (the report's pre-training guard still reports it)."""
     from app.isl.training.multisource import eval_clip_ids, read_pretrain_list, signer_split_version
 
     ver = signer_split_version(getattr(data, "link", None))
     init = _init_path(args, work)
-    if ver == "v1" or init is None or Path(init).resolve() != (work / "pretrained_encoder.pt").resolve():
+    if ver == "v1" or init is None:
         return True
-    ids = read_pretrain_list(work)
+    own = Path(init).resolve() == (work / "pretrained_encoder.pt").resolve()
+    folder = work if own else Path(init).parent
+    ids = read_pretrain_list(folder) if (own or Path(init).name == "pretrained_encoder.pt") else None
     if ids is None:
+        if not own:
+            print(f"{cmd}: warning: signer split {ver}: the warm start {init} is not checked against this split's "
+                  f"validation / test clips (no {folder / 'pretrain_clips.txt'} for a pretrained_encoder.pt next to "
+                  "it); make sure it never saw them (docs 15.43)", file=sys.stderr)
+            return True
         print(f"{cmd}: signer split {ver}: {work / 'pretrain_clips.txt'} is missing, so the warm start cannot be "
               "shown to exclude this split's validation / test clips; re-run pretrain_dedup and pretrain "
               "(scripts/phase2_train.sh --from link) or pass --init none", file=sys.stderr)
         return False
     hit = sorted(ids & eval_clip_ids(data))
     if hit:
-        print(f"{cmd}: signer split {ver}: the pre-training saw {len(hit)} clips that are validation / test clips "
-              f"of this split (e.g. {hit[:3]}); re-run pretrain_dedup and pretrain after the link step "
+        print(f"{cmd}: signer split {ver}: the pre-training of {init} saw {len(hit)} clips that are validation / test "
+              f"clips of this split (e.g. {hit[:3]}); re-run pretrain_dedup and pretrain after the link step "
               "(scripts/phase2_train.sh --from link) or pass --init none", file=sys.stderr)
         return False
     return True
@@ -1141,14 +1150,21 @@ def cmd_fit_fusion(paths: IslPaths, args) -> int:
         from app.isl.training.oof_calibration import (OofCalibration, OofError, check_oof_clips, load_sessions,
                                                       oof_parts)
 
+        skipped: list = []
+        allow = bool(getattr(args, "oof_allow_test_selected", False))
         try:
-            parts = oof_parts(paths, data, work, folds=args.oof_folds or None)
+            parts = oof_parts(paths, data, work, folds=args.oof_folds or None, allow_test_selected=allow,
+                              skipped=skipped)
             check_oof_clips(parts, data)
         except (OofError, LeakageError) as e:
             print(f"fit-fusion --oof-calibration: {e}", file=sys.stderr)
             return 2
+        for sk in skipped:  # docs 15.43: a fold classifier selected on the E1b test is not used by default
+            _log(f"  fusion: out-of-fold fold {sk['fold']} skipped: {sk['reason']}")
         oof = OofCalibration(parts, data, sessions=load_sessions(paths), max_encoder_gain=args.oof_max_encoder_gain,
-                             keep_in_sample=bool(args.oof_keep_in_sample), progress=lambda m: _log(f"  fusion {m}"))
+                             keep_in_sample=bool(args.oof_keep_in_sample), progress=lambda m: _log(f"  fusion {m}"),
+                             requested_folds=list(args.oof_folds) if args.oof_folds else None,
+                             allow_test_selected=allow, skipped=skipped)
         _log(f"  fusion: out-of-fold calibration on folds {[p.fold for p in parts]} "
              f"({sum(len(p.clips) for p in parts)} INCLUDE clips)")
     rec = load_recognizer(work, fcfg, _vocab_path(args), profile=profile)
@@ -1746,6 +1762,9 @@ def build_parser() -> argparse.ArgumentParser:
                                   "classifiers) is at most this (default 0.03)")
             sp2.add_argument("--oof-keep-in-sample", action="store_true",
                              help="use the in-sample folds even when the screen fails (recorded)")
+            sp2.add_argument("--oof-allow-test-selected", action="store_true",
+                             help="also use a fold whose classifier was early-stopped on primary (E1b) test clips "
+                                  "(its validation part holds them; fold 4 of 5). Default: skipped (docs 15.43)")
         if name == "evaluate":
             sp2.add_argument("--part", default="test", choices=["val", "test"])
             sp2.add_argument("--all", action="store_true",

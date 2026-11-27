@@ -91,7 +91,9 @@
 #   step: re-run `cli variant-audit --signer-split v2` first.
 # FUSION_OOF=1 (docs 15.42, critic 8; default 0 for both profiles): the fusion step runs `fit-fusion --oof-calibration`:
 #   INCLUDE is certified on the out-of-fold test parts of cv/fold1-4 (each scored by its fold's classifier, never fold
-#   0's test part). Needs the cv step. FUSION_OOF_KEEP_IN_SAMPLE=1 adds --oof-keep-in-sample.
+#   0's test part). Needs the cv step: the folds are the ones the cv step trains (CV_FOLDS, passed as --oof-folds);
+#   FUSION_OOF=1 with an empty CV_FOLDS is refused at start (exit 2). A fold whose classifier was early-stopped on the
+#   E1b test (fold 4) is skipped by fit-fusion (docs 15.43). FUSION_OOF_KEEP_IN_SAMPLE=1 adds --oof-keep-in-sample.
 # EVAL_COMPARE_TO=<report.json>: the evaluate step runs `evaluate --all --compare-to <report.json>` (E1b and E4 like
 # for like against that report, e.g. artifacts/isl/commercial-safe/eval/report.json; docs 15.27, 15.28, 15.31).
 # One profile per run (refused with --profile both); a missing file is refused before anything runs (exit 2).
@@ -294,10 +296,16 @@ SS_ARG=""; [[ "$SIGNER_SPLIT" != v1 ]] && SS_ARG="--signer-split $SIGNER_SPLIT"
 # out-of-fold INCLUDE calibration in the fusion step (docs 15.42): opt-in for both profiles
 FUSION_OOF="${FUSION_OOF:-0}"
 case "$FUSION_OOF" in 0|1) ;; *) echo "FUSION_OOF must be 0 or 1" >&2; exit 2 ;; esac
+# the folds the cv step trains (unset: smoke 1, else 1 2 3 4; empty: cv skipped); fit-fusion's --oof-folds (docs 15.43)
+CVF="${CV_FOLDS-$([[ $SMOKE == 1 ]] && echo 1 || echo 1 2 3 4)}"
+[[ "$CVF" =~ ^[0-9\ ]*$ ]] || { echo "CV_FOLDS: fold numbers separated by spaces" >&2; exit 2; }
+CVF="$(echo $CVF)"
 FO_ARG=""
 if [[ $FUSION_OOF == 1 ]]; then
+  [[ -n "$CVF" ]] || { echo "FUSION_OOF=1 needs the cv step's classifiers, but CV_FOLDS is empty (cv skipped)" >&2; exit 2; }
   FO_ARG="--oof-calibration"
   [[ "${FUSION_OOF_KEEP_IN_SAMPLE:-0}" == 1 ]] && FO_ARG="$FO_ARG --oof-keep-in-sample"
+  FO_ARG="$FO_ARG --oof-folds $CVF"
 fi
 WSLP_TWINS="${INDEX_WSLP_TWINS:-$TW_DEFAULT}"
 # linker aliases (docs 15.34): research on, commercial-safe off; only the link step passes it (later steps read the
@@ -343,6 +351,12 @@ step_settings() {
 stamp_warn() {
   case "$1" in
     classifier|cv) ;;
+    fusion)  # docs 15.43: a resume must not silently keep a fusion.json fitted with(out) out-of-fold calibration
+      local has=0
+      [[ "$(cat "$STAMPS/fusion.done" 2>/dev/null)" == *" oof=1"* ]] && has=1
+      [[ $has == "$FUSION_OOF" ]] && return 0
+      log "warning: fusion stamp settings differ from the current ones (stamp oof=$has, FUSION_OOF=$FUSION_OOF); use --from fusion to refit"
+      return 0 ;;
     encoder|oneshot)
       [[ "$ENC_BP" == 0 && -z "$ENC_SW" && "$ENC_VP" == mixed \
          && "$(cat "$STAMPS/$1.done" 2>/dev/null)" != *"bridge_p="* ]] && return 0 ;;
@@ -497,7 +511,7 @@ run_step() {
       base=$("$PY" -c "import json,sys; print(json.load(open(sys.argv[1])).get('primary_split',''))" \
              "${SROOT:-$REPO/data/isl}/splits/splits_report.json" 2>/dev/null)
       if [[ -z "$base" ]]; then log "  no splits_report.json: skipped"; return 0; fi
-      for k in ${CV_FOLDS-$([[ $SMOKE == 1 ]] && echo 1 || echo 1 2 3 4)}; do
+      for k in $CVF; do
         mkdir -p "$WORK/cv/fold$k"
         train train-classifier $COMMON --all-sources $CAP $CLS $DG_ARG $CQ_ARG --split "$base-fold$k" --ckpt "$WORK/cv/fold$k/classifier.pt" || return $?
       done ;;
@@ -538,7 +552,7 @@ if [[ $DRY_RUN == 1 ]]; then
   [[ -n "$ENC_BAR_FILE" ]] && echo "encoder probe after the encoder step: bar $ENC_BAR_FILE -> $WORK/eval/encoder_probe.json"
   [[ -n "$UNTIL" ]] && echo "until: $UNTIL (later steps are not run)"
   echo "variant links: VARIANT_LINKS=$VARIANT_LINKS, $WORK/variant_links.json: $VL_FILE (link step only)"
-  echo "signer split: SIGNER_SPLIT=$SIGNER_SPLIT (link step only); fusion out-of-fold calibration: FUSION_OOF=$FUSION_OOF"
+  echo "signer split: SIGNER_SPLIT=$SIGNER_SPLIT (link step only); fusion out-of-fold calibration: FUSION_OOF=$FUSION_OOF${FO_ARG:+ ($FO_ARG)}"
 fi
 
 if [[ $LIST == 1 ]]; then

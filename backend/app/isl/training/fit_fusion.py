@@ -346,22 +346,49 @@ def _with_oof(rec, oof, params, used, results, truths, src, grp):
 
 
 def _oof_certification(cert: dict | None, orep: dict, n: int) -> dict:
-    """The certification record with the calibration sets it used (docs 15.42)."""
+    """The certification record with the calibration sets it used and their provenance (docs 15.42, 15.43): the folds
+    asked for, used, dropped and skipped, the screen's settings and result, each fold classifier's SHA-256, class
+    list difference and overlap with the E1b test. ``selection_note`` says what the INCLUDE clips really are."""
     c = dict(cert or {})
     if not c:  # no validation data: nothing was certified
         return c
     used = orep.get("folds_used") or []
+    parts = {p["fold"]: p for p in orep.get("parts") or []}
+    in_sample_used = [f for f in used if (parts.get(f) or {}).get("encoder_in_sample")]
+    keys = ("classifier_sha256", "classes", "classes_shared_with_primary", "primary_classes_missing",
+            "dropped_not_a_fold_class", "trained_on_primary_test_clips", "selected_on_primary_test_clips", "scored",
+            "encoder_in_sample")
     c["calibration_sets"] = {
         "version": orep.get("version"), "clips": n, "by_source": orep.get("certification_by_source"),
         "groups_by_source": orep.get("certification_groups_by_source"),
         "include": f"out-of-fold clips of folds {used}, each scored by its own fold's classifier",
-        "folds_dropped": orep.get("folds_dropped"), "assumption": orep.get("assumption"),
+        "requested_folds": orep.get("requested_folds"), "folds_used": used,
+        "folds_dropped": orep.get("folds_dropped"), "folds_skipped": orep.get("folds_skipped") or [],
+        "allow_test_selected": orep.get("allow_test_selected", False),
+        "keep_in_sample": orep.get("keep_in_sample", False), "max_encoder_gain": orep.get("max_encoder_gain"),
+        "fold_classifiers": {str(f): {k: p.get(k) for k in keys if k in p} for f, p in sorted(parts.items())},
+        "assumption": orep.get("assumption"),
         "encoder_in_sample_check": {k: v for k, v in (orep.get("in_sample_check") or {}).items()
                                     if k in ("testable", "passed", "did_retrieval", "did_retrieval_ci95",
-                                             "did_fused", "did_fused_ci95", "max_gain")}}
-    c["selection_note"] = ("INCLUDE certified on out-of-fold cross-validation clips (no fold-0 test clip; each scored "
-                           "by a classifier that neither trained nor selected on it); the other sources on the "
-                           "primary validation clips, which also selected the models (docs 15.42)")
+                                             "did_fused", "did_fused_ci95", "max_gain", "gallery_matched",
+                                             "did_retrieval_unmatched", "per_fold", "gallery_support")}}
+    selected = [f for f in used if (parts.get(f) or {}).get("selected_on_primary_test_clips")]
+    trained = [f for f in used if (parts.get(f) or {}).get("trained_on_primary_test_clips")]
+    test_note = (f"; fold classifiers {selected} were SELECTED on E1b test clips (--oof-allow-test-selected)"
+                 if selected else "") + (f"; fold classifiers {trained} TRAINED on E1b test clips (training data, "
+                                         "not selection; E1b precision at these thresholds is not fully clean)"
+                                         if trained else "")
+    if in_sample_used:
+        what = (f"INCLUDE certified on out-of-fold cross-validation clips of folds {used} (no fold-0 test clip; each "
+                "scored by a fold classifier that did not train or select on it; the encoder trained on folds "
+                f"{in_sample_used}, which the in-sample screen let through"
+                + (" or --oof-keep-in-sample kept" if orep.get("keep_in_sample") else "") + ")")
+    else:
+        what = (f"INCLUDE certified on the clips of folds {used}, which are the primary validation clips: they also "
+                "chose the encoder epoch, the fusion weights and the temperature; only the classifier scoring them "
+                "is out of fold")
+    c["selection_note"] = (what + test_note + "; the other sources on the primary validation clips, which also "
+                           "selected the models (docs 15.42, 15.43)")
     return c
 
 
