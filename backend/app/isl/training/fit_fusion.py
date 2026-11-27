@@ -2,32 +2,85 @@
 
 from __future__ import annotations
 
+import math
 import time
+from collections import defaultdict
 
 import numpy as np
 
 from app.features.build import FeatureError, build_features
 from app.isl.data.sources import Clip
 from app.isl.models.calibration import (fit_classifier_thresholds, fit_fusion_weights, fit_temperature,
-                                        fit_thresholds)
-from app.isl.models.fusion import FusionInputs, FusionParams, fuse
+                                        fit_thresholds, prepare_windows, true_prob, weight_grid)
+from app.isl.models.fusion import FusionInputs, FusionParams, compact_inputs, fuse
 from app.isl.training.common import engine_crops
 
+# The fusion-weight grid (81 points x every clip, 54 % of research fit-fusion's 8,144 s) runs on a seeded,
+# source-stratified subsample of this many validation clips; the chosen point is then scored on all of them
+# (docs 15.23). Validation sets of at most this size use every clip, exactly as before.
+WEIGHT_FIT_CLIPS = 3000
+WEIGHT_FIT_SEED = 0
 
-def collect_evidence(rec, clips: list[Clip], use_my_signs: bool = False) -> tuple[list[FusionInputs], list[str], list[Clip]]:
-    """Per clip: the three engine crops through every component of ``rec`` (an ``IslRecognizer``)."""
+
+def collect_evidence(rec, clips: list[Clip], use_my_signs: bool = False, compact: dict | None = None,
+                     e4_cache: dict | None = None) -> tuple[list[FusionInputs], list[str], list[Clip]]:
+    """Per clip: the three engine crops through every component of ``rec`` (an ``IslRecognizer``).
+
+    ``compact`` = {"taus": [...], "top_n": n} keeps only the retrieval evidence ``fuse`` reads at those ``tau_r``
+    values (``fusion.compact_inputs``, docs 15.23; fit-fusion only). ``e4_cache`` (a dict) is filled with
+    clip_id -> (inputs, embedding), the entries ``runners.e4_my_signs`` would compute again, for clips with a word
+    and a signer group."""
     inputs, truths, used = [], [], []
+    ret_pos = getattr(getattr(rec, "index", None), "concept_pos", None) if compact is not None else None
+    emb = None
     for c in clips:
         try:
             raw = c.load()
             feats = np.stack([build_features(x, rec.feature_config) for x in engine_crops(raw)])
         except (FeatureError, OSError, ValueError):
             continue
-        inp, _ = rec.evidence(feats, use_my_signs=use_my_signs)
+        inp, info = rec.evidence(feats, use_my_signs=use_my_signs)
+        if compact is not None:
+            pos = ret_pos if (ret_pos is not None and inp.ret_ids is getattr(rec.index, "concepts", None)) else None
+            inp = compact_inputs(inp, compact["taus"], compact.get("top_n", 50), ret_pos=pos)
+        if e4_cache is not None and c.concept_id and c.group:
+            z = (info or {}).get("z")
+            if z is None or getattr(rec, "encoder", None) is None:
+                if emb is None:
+                    from app.isl.models.encoder import FeatureStatsEmbedder
+
+                    emb = FeatureStatsEmbedder(rec.feature_config)
+                z = emb.embed(feats)[0]
+            e4_cache[c.clip_id] = (inp, z)
         inputs.append(inp)
         truths.append(c.concept_id)
         used.append(c)
     return inputs, truths, used
+
+
+def weight_subsample(sources: list, n: int = WEIGHT_FIT_CLIPS, seed: int = WEIGHT_FIT_SEED) -> list[int] | None:
+    """Indices of a seeded, source-stratified subsample of about ``n`` clips (``sources[i]`` = clip i's source):
+    every source keeps its share, largest remainders first, and at least one clip. None when there are at most
+    ``n`` clips (then the grid uses every clip, as before docs 15.23)."""
+    N = len(sources)
+    if n <= 0 or N <= n:
+        return None
+    by: dict[str, list[int]] = defaultdict(list)
+    for i, s in enumerate(sources):
+        by[str(s or "")].append(i)
+    keys = sorted(by)
+    quota = {k: n * len(by[k]) / N for k in keys}
+    take = {k: max(1, math.floor(quota[k])) for k in keys}
+    rest = n - sum(take.values())
+    for k in sorted(keys, key=lambda k: (-(quota[k] - math.floor(quota[k])), k))[:max(0, rest)]:
+        take[k] += 1
+    rng = np.random.default_rng(seed)
+    out: list[int] = []
+    for k in keys:
+        idx = by[k]
+        m = min(take[k], len(idx))
+        out += [idx[int(j)] for j in rng.choice(len(idx), m, replace=False)]
+    return sorted(out)
 
 
 def check_index_for_fitting(rec, clips: list[Clip], data=None) -> dict | None:
@@ -54,12 +107,21 @@ def check_index_for_fitting(rec, clips: list[Clip], data=None) -> dict | None:
 
 
 def fit_fusion(rec, val_clips: list[Clip], profile: str, version: str = "fusion-1",
-               data=None) -> tuple[FusionParams, dict]:
-    """``data``: the run's ``IslData``, for the full index leak guard (split + training clips, docs 15.22)."""
+               data=None, weight_clips: int = WEIGHT_FIT_CLIPS, weight_seed: int = WEIGHT_FIT_SEED
+               ) -> tuple[FusionParams, dict]:
+    """``data``: the run's ``IslData``, for the full index leak guard (split + training clips, docs 15.22).
+
+    Cost (docs 15.23): the evidence is computed once - compact (only the retrieval columns ``fuse`` reads), with a
+    shared prior - and reused by the "My signs" mode choice; the weight grid runs on a seeded, source-stratified
+    subsample of ``weight_clips`` clips (``weight_seed``) and the chosen point is scored on every clip; the sliding
+    replay keeps only what the commit rule reads."""
     t0 = time.time()
     guard = check_index_for_fitting(rec, val_clips, data)  # before any work: an eval-including index is refused
-    inputs, truths, used = collect_evidence(rec, val_clips)
     base = FusionParams(profile=profile, version=version)
+    taus = sorted({*weight_grid(True, True, base)["tau_r"], float(base.tau_r)})
+    e4_cache: dict = {}
+    inputs, truths, used = collect_evidence(rec, val_clips, compact={"taus": taus, "top_n": base.top_n},
+                                            e4_cache=e4_cache)
     rep: dict = {"val_queries": len(inputs)}
     if guard is not None:
         rep["index_guard"] = guard
@@ -73,10 +135,27 @@ def fit_fusion(rec, val_clips: list[Clip], profile: str, version: str = "fusion-
             lg = np.stack([inputs[i].cls_logp[0] for i, _ in sel])
             base = base.with_(t_c=fit_temperature(lg, np.array([y for _, y in sel])))
             rep["temperature"] = base.t_c
-    params, wrep = fit_fusion_weights(inputs, truths, base)
-    rep["weights"] = {k: getattr(params, k) for k in ("alpha", "beta", "gamma", "tau_r", "t_c")} | {"nll": wrep["nll"]}
+    sub = weight_subsample([c.source for c in used], weight_clips, weight_seed)
+    if sub is None:
+        params, wrep = fit_fusion_weights(inputs, truths, base)
+    else:
+        params, wrep = fit_fusion_weights([inputs[i] for i in sub], [truths[i] for i in sub], base)
     results = [fuse(i, params) for i in inputs]
+    nll_full = float(np.mean([-math.log(max(1e-6, true_prob(r, t))) for r, t in zip(results, truths)]))
+    wfit = {"subsample": len(sub) if sub is not None else None, "seed": weight_seed if sub is not None else None,
+            "max_clips": weight_clips, "stratified_by": "source", "n_full": len(inputs), "grid_points": wrep["tried"],
+            "nll_subsample": round(float(wrep["nll"]), 6) if sub is not None else None,
+            "nll_full": round(nll_full, 6)}
+    if sub is not None:
+        cnt: dict = defaultdict(int)
+        for i in sub:
+            cnt[str(used[i].source or "")] += 1
+        wfit["subsample_by_source"] = dict(sorted(cnt.items()))
+    params = params.with_(weight_fit=wfit)
+    rep["weights"] = {k: getattr(params, k) for k in ("alpha", "beta", "gamma", "tau_r", "t_c")} | {
+        "nll": nll_full, "fit": wfit}
     params, trep = fit_thresholds(results, truths, params)
+    del results
     rep["thresholds"] = {"accept": params.accept, "s_min": params.s_min,
                          "suggest_min_top5_mass": params.suggest_min_top5_mass,
                          "suggest_min_top5_mass_by_policy": params.suggest_min_top5_mass_by_policy,
@@ -86,7 +165,7 @@ def fit_fusion(rec, val_clips: list[Clip], profile: str, version: str = "fusion-
                          "note": trep.get("accept_fit", {}).get("note")}
     rep["achieved"] = params.achieved
     params, rep["classifier_alone"] = fit_classifier_alone(rec, inputs, truths, params, clips=used)
-    params, rep["my_signs"] = choose_user_mode(rec, val_clips, params)
+    params, rep["my_signs"] = choose_user_mode(rec, val_clips, params, cache=e4_cache)
     rep["seconds"] = round(time.time() - t0, 1)
     return params, rep
 
@@ -126,7 +205,7 @@ def replay_sliding(rec, clips: list[Clip], cfg=None) -> tuple[list, list[int], i
         except (FeatureError, OSError, ValueError):
             failed += 1
             continue
-        windows.append(w)
+        windows.append(prepare_windows(w))  # what the commit rule reads, not ~10 EMA vectors (docs 15.23)
         truths.append(pos.get(c.concept_id, -1))
     return windows, truths, failed
 
@@ -189,12 +268,14 @@ MIN_TOP1_GAIN = 0.02
 MIN_EXTRA_CORRECT = 2
 
 
-def choose_user_mode(rec, val_clips: list[Clip], params: FusionParams, ks=(3, 1)) -> tuple[FusionParams, dict]:
+def choose_user_mode(rec, val_clips: list[Clip], params: FusionParams, ks=(3, 1),
+                     cache: dict | None = None) -> tuple[FusionParams, dict]:
     """Pick the classifier term of "My signs" keys (``user_cls_mode``) on validation few-shot data: the val part's
     signer groups enrol ``k`` takes of half of their words (the E4 protocol, run on validation, never on test).
     ``neutral`` is chosen only when it raises top-1 on the enrolled words by more than noise (``MIN_TOP1_GAIN`` and
     ``MIN_EXTRA_CORRECT`` takes) and the false-accept rate of user signs on the other words rises by at most
-    ``MAX_FA_INCREASE``; with too little data the default ``penalty`` stays."""
+    ``MAX_FA_INCREASE``; with too little data the default ``penalty`` stays. ``cache``: per-clip evidence already
+    computed (fit-fusion passes its own, ``collect_evidence(e4_cache=...)``, so nothing is computed twice)."""
     from collections import Counter, defaultdict
 
     from app.isl.evaluation.runners import e4_my_signs
@@ -212,7 +293,7 @@ def choose_user_mode(rec, val_clips: list[Clip], params: FusionParams, ks=(3, 1)
                    reason=f"insufficient validation few-shot data ({len(eligible)} signer groups with repeated takes; "
                           f"need {MIN_E4_GROUPS}): kept {params.user_cls_mode!r}")
         return params, rep
-    cache: dict = {}
+    cache = {} if cache is None else cache
     res = {"penalty": e4_my_signs(rec, val_clips, ks=ks, params=params.with_(user_cls_mode="penalty"), cache=cache)}
     if any((res["penalty"].get("by_k") or {}).get(f"k{k}", {}).get("n", 0) >= MIN_E4_TESTS for k in ks):
         res["neutral"] = e4_my_signs(rec, val_clips, ks=ks, params=params.with_(user_cls_mode="neutral"), cache=cache)

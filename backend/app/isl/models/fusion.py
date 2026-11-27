@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
@@ -64,6 +65,10 @@ class FusionParams:
     fitted: bool = False  # False = defaults (not calibrated): the UI must say so
     achieved: dict = field(default_factory=dict)  # measured on validation: per policy precision / coverage / n
     enrol: dict = field(default_factory=lambda: {"c_min": 0.5, "min_takes": 3, "max_takes": 5})
+    # how fit-fusion chose alpha / beta / gamma / tau_r (docs 15.23): the weight grid runs on a seeded,
+    # source-stratified subsample of the validation clips ("subsample", "seed", "n_full", "nll_subsample",
+    # "nll_full"). Empty in packs fitted before 15.23 (grid on every validation clip).
+    weight_fit: dict = field(default_factory=dict)
 
     def __post_init__(self):
         # Every policy must always have a threshold: a fusion.json written with only some policies (or none) made
@@ -138,9 +143,40 @@ def _log_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     return x - m - np.log(np.sum(np.exp(x - m), axis=axis, keepdims=True))
 
 
+class ConceptPrior(Mapping):
+    """The fusion prior of every vocabulary concept (``Vocabulary.prior``: 1 core, 0.5 single word, 0 other), read
+    only and shared by reference: one per recogniser, not a dict per segment (docs 15.23; a per-segment dict of
+    about 4,400 classifier keys was 104 KB per validation clip in fit-fusion). User signs ("mysign:...") and unknown
+    keys are missing, so ``get(k, 0.0)`` gives 0 for them, as before. Values are computed once per concept."""
+
+    def __init__(self, vocab):
+        self._vocab = vocab
+        self._cache: dict[str, float] = {}
+
+    def __getitem__(self, key: str) -> float:
+        v = self._cache.get(key)
+        if v is None:
+            if not isinstance(key, str) or key.startswith(USER_PREFIX) or self._vocab.get(key) is None:
+                raise KeyError(key)
+            v = self._cache[key] = float(self._vocab.prior(key))
+        return v
+
+    def __iter__(self):
+        return iter(self._vocab.pos)
+
+    def __len__(self) -> int:
+        return len(self._vocab)
+
+
 @dataclass
 class FusionInputs:
-    """Per-crop evidence for one segment. Any part may be missing (None / empty)."""
+    """Per-crop evidence for one segment. Any part may be missing (None / empty).
+
+    **Compact retrieval** (``compact_inputs``, fit-fusion only, docs 15.23): ``ret`` then holds only the columns
+    ``fuse`` can read - the ``ret_top`` best index concepts by crop-mean cosine, in that order, plus the columns of the
+    classifier classes in ``ret_cover`` that are in the index - and ``ret_lse[tau]`` is the per-crop log-sum-exp of
+    ``ret / tau`` over ALL ``ret_size`` index concepts (the softmax normaliser of the retrieval term), so ``fuse`` gives
+    the same result as on the full matrix without keeping it."""
 
     cls_logp: np.ndarray | None = None  # (crops, C) log-probabilities at temperature 1
     cls_ids: list[str] = field(default_factory=list)
@@ -148,7 +184,13 @@ class FusionInputs:
     ret_ids: list[str] = field(default_factory=list)
     user: np.ndarray | None = None  # (crops, U) max cosine per user sign
     user_ids: list[str] = field(default_factory=list)  # "mysign:<sign_id>"
-    prior: dict[str, float] = field(default_factory=dict)
+    prior: Mapping[str, float] = field(default_factory=dict)  # a shared ConceptPrior in recogniser evidence
+    # compact retrieval only (None / 0 otherwise), see the class docstring
+    ret_lse: dict | None = None  # {tau: (crops,) float32 log-sum-exp of ret / tau over every index concept}
+    ret_top: int = 0  # leading columns of ``ret``: the best index concepts by crop-mean cosine, best first
+    ret_size: int = 0  # index concepts in the full matrix
+    ret_cls: np.ndarray | None = None  # (columns,) classifier class index of each kept column, -1 = not a class
+    ret_cover: np.ndarray | None = None  # classifier class indices whose index column is kept when they have one
 
     @property
     def crops(self) -> int:
@@ -156,6 +198,60 @@ class FusionInputs:
             if a is not None:
                 return int(a.shape[0])
         return 0
+
+    @property
+    def compact(self) -> bool:
+        return self.ret_lse is not None
+
+
+def _ret_logz(ret: np.ndarray, tau: float) -> np.ndarray:
+    """Per-crop log-sum-exp of ``ret / tau``: the exact expression ``fuse`` evaluates on the full matrix."""
+    L = ret / tau
+    return np.log(np.exp(L - L.max(1, keepdims=True)).sum(1)) + L.max(1)
+
+
+def compact_inputs(inp: FusionInputs, taus, top_n: int = 50, cover: int | None = None,
+                   ret_pos: dict | None = None) -> FusionInputs:
+    """``inp`` with the retrieval matrix reduced to what ``fuse`` reads for ``top_n`` <= the kept top and ``tau_r``
+    in ``taus`` (docs 15.23): the ``top_n`` (at least 10) best index concepts by crop-mean cosine, the columns of
+    the ``cover`` (default 2 x top_n) best classifier classes by crop-mean log-probability, and the per-crop
+    retrieval normaliser for every tau. For research validation that is about 150 of 12,440 columns, so a clip
+    keeps about 2 KB of retrieval evidence instead of 149 KB. ``ret_pos``: concept -> column of ``inp.ret_ids``
+    (pass the index's map to avoid rebuilding it per clip). Inputs without retrieval, or already compact, are
+    returned unchanged. ``fuse`` raises for a ``top_n`` or ``tau_r`` the compact inputs cannot answer."""
+    if inp.ret is None or not len(inp.ret_ids) or inp.compact:
+        return inp
+    G = inp.ret.shape[1]
+    order = np.argsort(-inp.ret.mean(0))  # the order fuse uses
+    n_top = min(G, max(int(top_n), 10))
+    cols = [int(i) for i in order[:n_top]]
+    have = set(cols)
+    ret_cover = None
+    has_c = inp.cls_logp is not None and len(inp.cls_ids) > 0
+    if has_c:
+        pos = ret_pos if ret_pos is not None else {c: i for i, c in enumerate(inp.ret_ids)}
+        m = int(cover) if cover is not None else 2 * int(top_n)
+        ret_cover = np.sort(np.argsort(-inp.cls_logp.mean(0))[:m]).astype(np.int32)
+        for ci in ret_cover:
+            j = pos.get(inp.cls_ids[int(ci)])
+            if j is not None and j not in have:
+                cols.append(int(j))
+                have.add(int(j))
+    ids = [inp.ret_ids[j] for j in cols]
+    ret_cls = None
+    if has_c:
+        cpos = {c: i for i, c in enumerate(inp.cls_ids)}
+        ret_cls = np.array([cpos.get(k, -1) for k in ids], np.int32)
+    lse = {float(t): _ret_logz(inp.ret, float(t)) for t in taus}
+    return replace(inp, ret=np.ascontiguousarray(inp.ret[:, cols]), ret_ids=ids, ret_lse=lse, ret_top=n_top,
+                   ret_size=G, ret_cls=ret_cls, ret_cover=ret_cover)
+
+
+def _lse_lookup(lse: dict, tau: float):
+    for t, v in lse.items():
+        if abs(t - tau) <= 1e-12 * max(1.0, abs(tau)):
+            return v
+    return None
 
 
 @dataclass
@@ -177,6 +273,7 @@ def fuse(inp: FusionInputs, p: FusionParams) -> FusionResult:
     has_c = inp.cls_logp is not None and len(inp.cls_ids) > 0
     has_r = inp.ret is not None and len(inp.ret_ids) > 0
     has_u = inp.user is not None and len(inp.user_ids) > 0
+    compact = has_r and inp.compact
     comps: dict[str, set[str]] = {"classifier": set(), "retrieval": set(), "my_signs": set()}
     cand: dict[str, None] = {}
     if has_c:
@@ -186,15 +283,30 @@ def fuse(inp: FusionInputs, p: FusionParams) -> FusionResult:
         for i in order[: p.top_n]:
             cand[inp.cls_ids[i]] = None
         comps["classifier"] = {inp.cls_ids[i] for i in order[:10]}
-        c_pos = {c: i for i, c in enumerate(inp.cls_ids)}
+        if compact:
+            # classifier positions of the candidates only (the full map costs more than the rest of fuse)
+            c_pos = {inp.cls_ids[i]: int(i) for i in order[: p.top_n]}
+            if inp.ret_cls is not None:
+                c_pos.update((k, int(c)) for k, c in zip(inp.ret_ids, inp.ret_cls) if c >= 0)
+            if inp.ret_cover is not None and not np.isin(order[: p.top_n], inp.ret_cover).all():
+                raise ValueError("compact fusion inputs do not cover this classifier candidate set (docs 15.23)")
+        else:
+            c_pos = {c: i for i, c in enumerate(inp.cls_ids)}
     if has_r:
         mean_r = inp.ret.mean(0)
-        order = np.argsort(-mean_r)
+        if compact:
+            if min(p.top_n, inp.ret_size) > inp.ret_top:
+                raise ValueError(f"compact fusion inputs keep the best {inp.ret_top} retrieval columns; top_n "
+                                 f"{p.top_n} needs more (docs 15.23)")
+            order = np.arange(inp.ret_top)  # the kept top columns are stored in fuse's order
+            floor_idx = order[min(p.top_n, inp.ret_size) - 1]
+        else:
+            order = np.argsort(-mean_r)
+            floor_idx = order[min(p.top_n, len(order)) - 1]
         for i in order[: p.top_n]:
             cand[inp.ret_ids[i]] = None
         comps["retrieval"] = {inp.ret_ids[i] for i in order[:10]}
         r_pos = {c: i for i, c in enumerate(inp.ret_ids)}
-        floor_idx = order[min(p.top_n, len(order)) - 1]
     if has_u:
         mean_u = inp.user.mean(0)
         for k in inp.user_ids:
@@ -217,8 +329,22 @@ def fuse(inp: FusionInputs, p: FusionParams) -> FusionResult:
             logits_all.append(inp.ret / p.tau_r)
         if has_u:
             logits_all.append(inp.user / p.tau_r + p.user_bonus)
-        L = np.concatenate(logits_all, axis=1)
-        logZ = np.log(np.exp(L - L.max(1, keepdims=True)).sum(1)) + L.max(1)
+        if compact:
+            # the normaliser over every index concept, stored per tau; user signs join it by log-add-exp. logZ is a
+            # per-crop constant of every key, so it cancels in the softmax below up to float rounding (docs 15.23)
+            lz = _lse_lookup(inp.ret_lse, p.tau_r)
+            if lz is None:
+                raise ValueError(f"compact fusion inputs have no retrieval normaliser for tau_r={p.tau_r} "
+                                 f"(stored: {sorted(inp.ret_lse)}; docs 15.23)")
+            if has_u:
+                lu = _ret_logz(logits_all[1], 1.0)
+                m = np.maximum(lz, lu)
+                logZ = (m + np.log(np.exp(lz - m) + np.exp(lu - m))).astype(lz.dtype)
+            else:
+                logZ = lz
+        else:
+            L = np.concatenate(logits_all, axis=1)
+            logZ = np.log(np.exp(L - L.max(1, keepdims=True)).sum(1)) + L.max(1)
         u_pos = {k: i for i, k in enumerate(inp.user_ids)} if has_u else {}
         cols = []
         for k in keys:

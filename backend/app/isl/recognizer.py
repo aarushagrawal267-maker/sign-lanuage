@@ -14,7 +14,7 @@ from app.features.build import FeatureError, build_features
 from app.features.spec import FeatureConfig
 from app.inference.recognizer import Candidate, Recognition
 from app.isl.models.encoder import EncoderPredictor, FeatureStatsEmbedder, RawEmbedder
-from app.isl.models.fusion import POLICIES, USER_PREFIX, FusionInputs, FusionParams, decide, fuse
+from app.isl.models.fusion import POLICIES, USER_PREFIX, ConceptPrior, FusionInputs, FusionParams, decide, fuse
 from app.isl.models.index import EmbeddingIndex
 from app.landmarks.raw import RawSequence
 from app.models.checkpoint import Predictor
@@ -125,7 +125,7 @@ class IslRecognizer:
         if speller is not None:
             caps.add("spelling")
         self.capabilities = frozenset(caps)
-        self._prior = {}
+        self._prior = None  # ConceptPrior of self.vocab, shared by every segment's FusionInputs (docs 15.23)
 
     # ------------------------------------------------------------------ helpers
     @property
@@ -201,11 +201,17 @@ class IslRecognizer:
                 inp.user = uidx.concept_matrix(zu)
                 inp.user_ids = uidx.concepts
             timing["my_signs_ms"] = (time.perf_counter() - t0) * 1000
-        keys = set(inp.cls_ids)
-        if inp.ret is not None:
-            keys |= {inp.ret_ids[i] for i in np.argsort(-inp.ret.mean(0))[: self.fusion.top_n]}
-        inp.prior = {k: self._prior.setdefault(k, self.vocab.prior(k)) for k in keys}
+        inp.prior = self.prior
         return inp, {"z": z, **timing}
+
+    @property
+    def prior(self) -> ConceptPrior:
+        """The fusion prior of every concept, one shared read-only mapping (docs 15.23). Before, each segment got its
+        own dict over the classifier classes and the best ``top_n`` retrieval concepts; ``fuse`` reads only its
+        candidates, which are all among those for the recogniser's own ``top_n``."""
+        if self._prior is None or self._prior._vocab is not self.vocab:
+            self._prior = ConceptPrior(self.vocab)
+        return self._prior
 
     # ----------------------------------------------------------------- recognise
     def recognize(self, crops: list[RawSequence], top_k: int = 5, policy: str = "balanced",

@@ -28,6 +28,7 @@ the training-only ``work/index`` of this very encoder file (never ``index_final`
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import subprocess
@@ -427,7 +428,7 @@ def e4_my_signs(rec, clips, ks=(1, 3, 5), seed: int = 0, max_groups: int = 40, p
             enrolled = set(names[: max(1, len(names) // 2)])
             signs = {}
             try:
-                for w in enrolled:
+                for w in sorted(enrolled):  # a set: its order (string hashing) changed per process
                     takes = list(words[w])
                     rng.shuffle(takes)
                     E = np.stack([ev(t)[1].mean(0) for t in takes[:k]])
@@ -451,7 +452,7 @@ def e4_my_signs(rec, clips, ks=(1, 3, 5), seed: int = 0, max_groups: int = 40, p
                     continue
                 zz = z / np.maximum(np.linalg.norm(z, axis=1, keepdims=True), 1e-8)
                 U = np.stack([(zz @ signs[s][0].T).max(1) for s in sorted(signs)], axis=1)
-                inp2 = FusionInputs(inp.cls_logp, inp.cls_ids, inp.ret, inp.ret_ids, U.astype(np.float32), uid, inp.prior)
+                inp2 = dataclasses.replace(inp, user=U.astype(np.float32), user_ids=uid)  # keeps compact fields
                 base = fuse(inp, fp)
                 r = fuse(inp2, fp)
                 dec, _ = decide(r.probs, r.agree, len(r.per_crop_top1), fp, "balanced", r.best_cos)

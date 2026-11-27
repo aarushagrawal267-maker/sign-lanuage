@@ -63,16 +63,21 @@ def fusion_nll(inputs: list[FusionInputs], truths: list[str], params: FusionPara
     return float(np.mean([-math.log(max(floor, true_prob(fuse(i, params), t))) for i, t in zip(inputs, truths)]))
 
 
-def fit_fusion_weights(inputs: list[FusionInputs], truths: list[str], base: FusionParams,
-                       grid: dict | None = None) -> tuple[FusionParams, dict]:
-    has_c = any(i.cls_logp is not None for i in inputs)
-    has_r = any(i.ret is not None for i in inputs)
-    g = grid or {
+def weight_grid(has_c: bool, has_r: bool, base: FusionParams) -> dict:
+    """The 3 x 3 x 3 x 3 grid of ``fit_fusion_weights`` (fewer points without a classifier or retrieval)."""
+    return {
         "alpha": [0.5, 1.0, 1.5] if has_c else [0.0],
         "beta": [0.5, 1.0, 1.5] if has_r else [0.0],
         "gamma": [0.0, 0.5, 1.0],
         "tau_r": [0.02, 0.05, 0.1] if has_r else [base.tau_r],
     }
+
+
+def fit_fusion_weights(inputs: list[FusionInputs], truths: list[str], base: FusionParams,
+                       grid: dict | None = None) -> tuple[FusionParams, dict]:
+    has_c = any(i.cls_logp is not None for i in inputs)
+    has_r = any(i.ret is not None for i in inputs)
+    g = grid or weight_grid(has_c, has_r, base)
     best, best_p, tried = float("inf"), base, 0
     for a, b, c, t in itertools.product(g["alpha"], g["beta"], g["gamma"], g["tau_r"]):
         p = base.with_(alpha=a, beta=b, gamma=c, tau_r=t)
@@ -298,7 +303,20 @@ def fit_classifier_thresholds(per_crop: list[np.ndarray], class_names: list[str]
 SlidingWindow = tuple  # (float, np.ndarray, int, bool[, int])
 
 
+class PreparedWindows(list):
+    """One clip's sliding windows already reduced to what the commit rule reads (``prepare_windows``): per window
+    (t, top-1, top-1 minus top-2, top class, streak, boundary, key) instead of the full EMA vector. A replayed
+    validation clip then keeps about 1 KB instead of ~10 windows x 35 KB of EMA probabilities (docs 15.23). Every
+    function here accepts either form and gives the same result."""
+
+
+def prepare_windows(windows: list[SlidingWindow]) -> PreparedWindows:
+    return windows if isinstance(windows, PreparedWindows) else PreparedWindows(_sliding_prep(windows))
+
+
 def _sliding_prep(windows: list[SlidingWindow]) -> list[tuple[float, float, float, int, int, bool, int]]:
+    if isinstance(windows, PreparedWindows):
+        return windows
     out = []
     for w in windows:
         t, ema, streak, boundary = w[:4]

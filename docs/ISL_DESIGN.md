@@ -3244,3 +3244,89 @@ digest), `--split <other>` refused in the API and the CLI, a missing `work/index
 eval-including index and write no report, the pack falls back from an older `index_final`, the driver's `index` step
 forgets the later stamps). `test_eval_runners.py`: other-source centroids list their clips, and every listed clip is
 a training clip.
+
+### 15.23 Fit-fusion is fast and small: one compact evidence pass, the weight grid on a subsample (Model QA fix 0.3 / RC11, 27 Nov 2026)
+
+**Problem.** Research `fit-fusion` took 8,144 s and about 9.7 GB RSS for 13,156 validation clips. Measured causes:
+the 81-point weight grid ran a full `fuse()` per clip per point (54 % of the time); `choose_user_mode` computed every
+clip's evidence a second time for its E4 cache (18 %); each clip kept the full retrieval matrix (3 x 12,440 cosines,
+149 KB), a prior dict over about 4,400 keys (104 KB) and, in the sliding replay, about ten full EMA vectors
+(about 35 KB each). On a 16 GB machine shared with other jobs, and with Batch 1 doubling the ISL500 validation set,
+that does not fit.
+
+**Fix.** Nothing here changes what `fuse()` or fit-fusion decides; only the cost changes, except the weight grid's
+subsample (last point).
+* **Shared prior.** `FusionInputs.prior` is now one read-only `ConceptPrior` per recogniser (`rec.prior`), not a dict
+  per segment. It gives `Vocabulary.prior` for any vocabulary concept and 0 for user signs and unknown keys, as the
+  old dict did for every key `fuse()` reads.
+* **Compact retrieval evidence** (`fusion.compact_inputs`, used by fit-fusion only). A clip keeps:
+  * the best `top_n` (50) index concepts by crop-mean cosine, already in `fuse()`'s order;
+  * the index columns of the classifier's best 2 x `top_n` classes (a classifier candidate keeps its real
+    retrieval score, and one without an index row still gets the neutral floor);
+  * per crop, the retrieval softmax normaliser (log-sum-exp of `ret / tau` over all index concepts) for each `tau_r`
+    of the grid. It is computed with the same expression as `fuse()`, so without user signs the result is bit for
+    bit the same. With user signs the normaliser is joined by log-add-exp. It is a per-crop constant of every
+    candidate, so it cancels in the softmax up to float rounding (worst seen: 2e-14).
+  That is about 150 of 12,440 columns (about 2 KB instead of 149 KB). `fuse()` raises a `ValueError` for a `tau_r`
+  without a stored normaliser or a `top_n` larger than the kept top, never a silent wrong answer. The values stay
+  float32. The plan said float16, but float16 cosines divided by `tau_r = 0.02` move the fused probabilities by far
+  more than the required 1e-6, and the saving (300 bytes per clip) is not worth it.
+* **One evidence pass.** `collect_evidence(..., e4_cache=)` stores `(inputs, embedding)` per clip with a word and a
+  signer group, and `choose_user_mode(..., cache=)` uses it. The embedding is the one `rec.evidence` already computed
+  (or the feature-statistics embedding when there is no encoder), so the E4 numbers are the same.
+* **Weight grid on a subsample.** `fit_fusion(weight_clips=3000, weight_seed=0)` runs the 81-point grid on a seeded,
+  source-stratified subsample (`fit_fusion.weight_subsample`: each source keeps its share, at least one clip). The
+  chosen point is then scored on every clip, and temperature, thresholds, suggest masses, the sliding thresholds and
+  the "My signs" choice still use every validation clip. With at most 3,000 clips nothing is subsampled, exactly as
+  before. fusion.json gets a new field `weight_fit`: `subsample`, `seed`, `max_clips`, `stratified_by`,
+  `subsample_by_source`, `n_full`, `grid_points`, `nll_subsample` and `nll_full`. Older fusion.json files have no
+  such field and load with `weight_fit = {}`.
+* **Compact sliding replay.** `replay_sliding` keeps each clip's windows as `calibration.PreparedWindows`: per window
+  only what the commit rule reads (time, top-1, top-1 minus top-2, class, streak, boundary, key). The EMA vectors are
+  dropped as soon as a clip is replayed. Every sliding function accepts both forms and gives identical counts and
+  thresholds. The replay itself is unchanged (it is the app's engine, so it stays the reference).
+
+**Also fixed: E4 was not reproducible.** `e4_my_signs` enrolled words in the order of a Python `set` of strings,
+and that order changes per process (string hashing). The order decides which takes the seeded generator picks, so
+two runs of the same fit-fusion could choose differently (on a 536-clip research sample: top-1 with enrolment 0.936
+in one process, 0.925 in another). The words are now enrolled in sorted order. E4 numbers change once (other takes
+are drawn), then stay the same in every run.
+
+**Measured** (research models copied to a scratch folder, 2 threads, same 536-clip validation sample as the RC11
+check, old = 8abf6f2 with the E4 order fix so both are deterministic):
+
+| 536 clips (513 ISL500, 23 INCLUDE) | old | new |
+|---|---|---|
+| total | 224 s (0.418 s per clip) | 82 s (0.154 s per clip) |
+| weight grid | 127 s | 25 s |
+| E4 ("My signs" choice) | 35 s | 2.6 s |
+| evidence | 21 s | 15 s |
+| sliding replay | 39 s | 38 s |
+| peak RSS growth during fit-fusion | 340 MB (0.63 MB per clip) | 56 MB (0.10 MB per clip) |
+
+* Old and new give the same `fusion.json` (every field except the new `weight_fit`) and the same "My signs" report,
+  run in two processes with different string-hash seeds.
+* On 2,007 clips the full grid and a 450-clip subsample (the same ratio as 3,000 of 13,156) chose the same point
+  (alpha 0.5, beta 1.0, gamma 0, tau_r 0.05), so every threshold and achieved number was identical. The grid took
+  94 s on every clip and 21 s on the subsample. Peak RSS growth was 316 MB (0.16 MB per clip, with the grid's
+  temporaries).
+* What each clip still holds: the classifier log-probabilities (3 x 4,354 float32, 52 KB, the largest part), compact
+  retrieval (about 1.5 KB), the embedding for E4 (3 KB), the fused result (about 4 KB) and the prepared windows
+  (about 2 KB).
+* **Expected full research run** (13,156 clips): about 1,700 s at 2 threads on an idle machine (old code: about
+  5,500 s on the same basis, and 8,144 s measured in the real run). Scaled by the same factor, the real run should
+  take about 0.7 h. Memory should be 1.2-2.1 GB above the 1.05 GB the loaded data and models take, so about 2.3-3.2
+  GB peak instead of about 9.7 GB. The sliding replay (about 0.08 s per clip) is now about 60 % of the time. It
+  runs the app's own engine, so making it faster means changing the engine.
+* **Left open:** the classifier log-probabilities could be kept compact too (best classes plus a per-temperature
+  normaliser, as for retrieval). That would roughly halve the remaining memory. It also needs the temperature fit
+  and the segment-proxy fallback to read the full rows first, so it was not done here.
+
+Tests: `test_fusion_efficiency.py` (the pre-15.23 `fuse()` kept as a reference: compact inputs plus the shared prior
+give the same keys, probabilities within 1e-6 (bit for bit without user signs), crops, cosines and decisions for
+every policy on random 300-class / 1,500-concept inputs with tied columns, with and without user signs and both
+user modes; refusals; the shared prior; the subsample; a toy fit-fusion gives exactly the parameters and "My signs"
+report of the old path with one evidence pass instead of two; a subsampled fit records `weight_fit` and still fits
+thresholds on every clip; a fusion.json without the new field loads; prepared windows give identical sliding fits).
+`test_eval_runners.py`: fit-fusion's compact evidence fills the E4 cache, and `choose_user_mode` then computes no
+evidence and reports what a fresh pass reports.

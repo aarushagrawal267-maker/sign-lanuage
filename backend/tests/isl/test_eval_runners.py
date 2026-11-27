@@ -365,6 +365,39 @@ def test_e4_runs_with_both_user_sign_classifier_modes(phase2):
     assert rep["chosen"] in ("penalty", "neutral") and p.user_cls_mode == rep["chosen"]
 
 
+def test_fit_fusion_evidence_feeds_the_my_signs_choice(phase2):
+    """docs 15.23: fit-fusion's own (compact) evidence fills the E4 cache, so choose_user_mode computes nothing again
+    and reports exactly what a fresh evidence pass gives."""
+    from app.isl.models.calibration import weight_grid
+    from app.isl.training.common import ISL_FEATURES
+    from app.isl.training.fit_fusion import choose_user_mode, collect_evidence
+    from app.isl.training.pipeline import load_recognizer
+
+    w, data, work = phase2["world"], phase2["data"], phase2["work"]
+    rec = load_recognizer(work, ISL_FEATURES, w["vocab"], profile="research")
+    clips = data.extra_part("train")[:60]
+    cache: dict = {}
+    taus = weight_grid(True, True, rec.fusion)["tau_r"] + [rec.fusion.tau_r]
+    inputs, _, used = collect_evidence(rec, clips, compact={"taus": taus, "top_n": rec.fusion.top_n}, e4_cache=cache)
+    assert set(cache) == {c.clip_id for c in used} and all(i.compact for i in inputs)
+    c0 = used[0]
+    from app.isl.evaluation.runners import _features
+
+    assert np.allclose(cache[c0.clip_id][1], rec.encoder.embed(_features(c0, ISL_FEATURES))[0], atol=1e-6)
+    calls = {"n": 0}
+    real = rec.evidence
+
+    def counted(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    rec.evidence = counted
+    p1, r1 = choose_user_mode(rec, clips, rec.fusion, ks=(1,), cache=cache)
+    assert calls["n"] == 0
+    p2, r2 = choose_user_mode(rec, clips, rec.fusion, ks=(1,))
+    assert calls["n"] > 0 and r1 == r2 and p1 == p2
+
+
 def test_e3_and_e4_are_refused_with_a_classifier_from_another_split(phase2, tmp_path):
     """Review fix: E1b refused a classifier trained on another split, but E3 / E4 used the same classifier and
     still reported numbers."""
