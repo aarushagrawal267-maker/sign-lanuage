@@ -420,8 +420,12 @@ class RecognitionEngine:
         if "spell" in rec.detail:
             res["spell"] = rec.detail["spell"]
         cert = rec.detail.get("certification")
+        ov = None
         if cert:  # language packs: the rule and certified precision per word (docs/ISL_DESIGN.md 15.25, 15.26)
             res["certification"], res["needs_confirm"] = cert, bool(cert.get("confirm_tap"))
+            # a dictionary-only word (outside the classifier): the app always shows it as "did you mean" (docs 15.29)
+            ov = self._open_vocabulary(top[0]) if top else False
+            res["open_vocabulary"] = ov
         self.recent[sid] = {"candidates": top, "t": t, "committed": None, "certification": cert}
         for old in [k for k in self.recent if k <= sid - 32]:
             self.recent.pop(old, None)
@@ -431,11 +435,20 @@ class RecognitionEngine:
             self.last_commit_class = top[0]["class_index"]
             self.status = "recognized"
             out["commit"] = self._commit_from(top[0], sid, t, chosen=False, certification=cert)
+            if ov is not None:
+                out["commit"]["open_vocabulary"] = ov
             self.recent[sid]["committed"] = top[0]["concept_id"]
         else:
             self.status = "uncertain" if decision == "suggest" else "not_sure"
         self.last_prediction = res
         return out
+
+    def _open_vocabulary(self, cand: dict) -> bool:
+        """Is this word outside the pack's classifier (retrieval only)? A user sign never counts (docs 15.29)."""
+        fn = getattr(self.recognizer, "is_open_vocabulary", None)
+        if not callable(fn) or cand.get("source") == "my_signs":
+            return False
+        return bool(fn(str(cand.get("concept_id") or "")))
 
     @staticmethod
     def _commit_from(cand: dict, sid: int | None, t: float, chosen: bool, certification: dict | None = None) -> dict:
@@ -614,4 +627,10 @@ class RecognitionEngine:
         info = getattr(self.recognizer, "certification_info", None) if self.recognizer is not None else None
         if callable(info):  # language packs only: what the UI shows next to words (docs/ISL_DESIGN.md 15.25)
             out["certification"] = info(self.cfg.policy, self.cfg.mode)
+            # every policy, for segment and sliding mode, so the settings can show each one's certified precision
+            # and whether sliding mode is offered at all (it needs the pack's classifier; docs 15.29)
+            sliding = getattr(self.recognizer, "classifier", True) is not None
+            out["certification_by_policy"] = {
+                "segment": {p: info(p, "segment") for p in POLICIES},
+                "sliding": {p: info(p, "sliding") for p in POLICIES} if sliding else None}
         return out

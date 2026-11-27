@@ -8,7 +8,10 @@ import { useLocalStorage } from "../lib/hooks";
 import { ms, pct } from "../lib/format";
 import { useT, type StringKey } from "../i18n";
 import { useSignLanguage } from "../state/language";
-import { DEFAULT_SETTINGS, segmentDecision, wordText, type LiveSettings, type Policy } from "../recognition/live";
+import {
+  SETTINGS_KEY, loadLiveSettings, precisionOutOf100, segmentDecision, slidingStrictCertified, wordText,
+  type Certification, type LiveSettings, type Policy,
+} from "../recognition/live";
 import { STATUS, TONE_CLASS } from "../recognition/status";
 import { useLiveRecognition } from "../recognition/useLiveRecognition";
 import { Badge, Button, Card, Field, Notice, ScrollRegion, Segmented, Toggle, cx, inputCls } from "../components/ui";
@@ -33,12 +36,29 @@ const POLICY_KEYS: Record<Policy, StringKey> = { strict: "live.policy.strict", b
 export default function LivePage() {
   const { t, reasonText } = useT();
   const sign = useSignLanguage();
-  const [settings, setSettings] = useLocalStorage<LiveSettings>("live-settings-v1", DEFAULT_SETTINGS);
+  // v2 settings (docs/ISL_DESIGN.md 15.29): ISL starts strict, sign by sign, continuous signing off
+  const [initialSettings] = useState(loadLiveSettings);
+  const [settings, setSettings] = useLocalStorage<LiveSettings>(SETTINGS_KEY, initialSettings);
   const [showSettings, setShowSettings] = useState(false);
   const [spellOn, setSpellOn] = useState(false);
+  const [slidingOffered, setSlidingOffered] = useState(false);
   const pack = !sign.isAsl;
-  const live = useLiveRecognition(settings, sign.id, { pack, spell: pack && spellOn });
+  const live = useLiveRecognition(settings, sign.id, { pack, spell: pack && spellOn, sliding: pack && slidingOffered });
   const { status, camera, recognizing, paused, model, provisional, lastResult, resolved, transcript, detection, metrics, server, actions } = live;
+  // Certification of every policy, from the server's hello / config_ack. Sliding mode needs the pack's classifier.
+  const certs = pack ? live.certs : null;
+  useEffect(() => { setSlidingOffered(!!certs?.sliding); }, [certs]);
+  const slidingStrict = slidingStrictCertified(certs);
+  const continuous = pack && !spellOn && slidingOffered && !!settings.engine.continuous;
+  const policy: Policy = settings.engine.policy ?? "strict";
+  const policyLabel = t(POLICY_KEYS[policy]);
+  const precisionNote = (c: Certification | undefined | null, label = policyLabel): string | null => {
+    if (!c) return null;
+    const n = precisionOutOf100(c);
+    if (n !== null) return t("live.precisionCertified", { policy: label, n });
+    return c.rule === "confirm_only" ? t("live.precisionUncertified", { policy: label }) : null;
+  };
+  const activeCert = certs ? (continuous ? certs.sliding?.[policy] : certs.segment[policy]) : null;
   const meta = STATUS[status];
   const threshold = settings.engine.threshold ?? server?.threshold ?? model?.threshold ?? null;
 
@@ -199,8 +219,20 @@ export default function LivePage() {
                 {pack ? (
                   <>
                     <Field label={t("live.policy")} group hint={t("live.policyHint")}>
-                      <Segmented<Policy> ariaLabel={t("live.policy")} value={settings.engine.policy ?? "balanced"} onChange={(v) => setEngine({ policy: v })}
+                      <Segmented<Policy> ariaLabel={t("live.policy")} value={policy} onChange={(v) => setEngine({ policy: v })}
                         options={(["strict", "balanced", "lenient"] as Policy[]).map((p) => ({ value: p, label: t(POLICY_KEYS[p]) }))} />
+                      {/* the certified worst-source precision of the active policy, never the 0.98 target (critic 15) */}
+                      <p data-testid="policy-precision" className="text-xs text-fg-2">
+                        {precisionNote(activeCert) ?? t("live.precisionUnknown")}
+                      </p>
+                    </Field>
+                    <Field label={t("live.continuous")} group
+                      hint={!certs ? undefined : !slidingOffered ? t("live.continuousUnavailable")
+                        : !settings.engine.continuous ? t("live.continuousOff")
+                        : slidingStrict ? t("live.continuousCertified") : t("live.continuousUncertified")}>
+                      {(!certs || slidingOffered) && (
+                        <Toggle label={t("live.continuousToggle")} checked={!!settings.engine.continuous} onChange={(v) => setEngine({ continuous: v })} />
+                      )}
                     </Field>
                     <div className="flex flex-col gap-1.5">
                       <span className="text-xs font-medium text-fg-2">{t("nav.mySigns")}</span>
@@ -268,15 +300,19 @@ export default function LivePage() {
         {/* ------------------------------------------------ prediction column */}
         <div className="flex flex-col gap-4">
           <Card title={t("live.currentSign")} subtitle={statusHelp}>
-            <ResultAnnouncer lastResult={lastResult} resolved={resolved} inProgress={inProgress} />
+            <ResultAnnouncer lastResult={lastResult} resolved={resolved} inProgress={inProgress} pending={live.pending} slidingStrict={slidingStrict} />
             <SignResult
               lastResult={lastResult} resolved={resolved} inProgress={inProgress} provisionalTop={top} recognizedNow={status === "recognized"}
               pack={pack} threshold={threshold} spellOn={spellOn} spell={live.spell} spellAvailable={spellAvailable} spellExperimental={spellExperimental}
               acceptedItem={acceptedItem} spellHint={spellHint}
+              pending={live.pending} continuous={continuous} slidingStrict={slidingStrict} precisionNote={precisionNote}
+              onConfirmPending={actions.confirmPending} onRejectPending={actions.rejectPending}
               onChoose={actions.choose} onDismiss={actions.dismiss} onReject={actions.rejectWord} onSpell={() => setSpellOn(true)} />
             {lastResult && !inProgress && (
               <div className="mt-3 text-xs text-fg-3">
-                {lastResult.accepted ? t("live.accepted") : `${t("live.notShown")}: ${reasonText(lastResult.reason)}`}
+                {lastResult.accepted
+                  ? (lastResult.needs_confirm ? (live.pending ? `${t("live.notShown")}: ${t("live.waitingForTap")}` : t("live.notShown")) : t("live.accepted"))
+                  : `${t("live.notShown")}: ${reasonText(lastResult.reason)}`}
                 {lastResult.agreement && ` · ${t("live.cropsAgree", { a: lastResult.agreement })}`}
                 {lastResult.frames ? ` · ${lastResult.frames} frames` : ""}
               </div>
@@ -331,6 +367,7 @@ export default function LivePage() {
                   {model.version ?? ""} · {model.profile === "commercial-safe" ? t("live.profileSafe") : t("live.profileResearch")}
                 </div>
                 <div className="font-mono text-xs text-fg-3">{t("live.dictionaryEntries", { n: model.num_classes.toLocaleString() })}</div>
+                {activeCert && <div data-testid="model-precision" className="text-xs text-fg-2">{precisionNote(activeCert)}</div>}
               </div>
             ) : model && model.architecture ? (
               <div className="flex flex-col gap-1.5 text-sm">

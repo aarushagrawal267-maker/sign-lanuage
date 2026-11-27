@@ -1316,6 +1316,7 @@ export function speechAvailable(lang: "hi-IN" | "en-IN"): boolean;
 ```
 
 Optional and off by default (a "Speak" button per word and per sentence, and an "auto-speak accepted words" toggle).
+Since 15.29 an ISL word joins the sentence, and so can be spoken, only after the user taps to confirm it.
 If the browser has no `hi-IN` voice, the button explains that and offers `en-IN`. Nothing is sent to a server.
 
 ### 8.4 Implementation notes and deviations (AI Engineer, Hindi and sentences, 25 Nov 2026)
@@ -1549,7 +1550,7 @@ Implemented (section 11, task 4): `state/language.tsx`, `i18n/` (English/Hindi i
   machine / doubtful / your text) or "Hindi not available yet / हिंदी उपलब्ध नहीं"; `suggest` shows up to five tappable
   English+Hindi chips ("Did you mean…?") that send `choose`; nothing enters the sentence until the user taps; `abstain` shows
   "Not sure – try again or spell it". An accepted word has a "Wrong word? Remove it" button that sends `reject`. The
-  ASL threshold sliders are replaced by the pack policy (Careful / Balanced / More words = strict / balanced / lenient) and a
+  ASL threshold sliders are replaced by the pack policy (Strict / Balanced / Lenient – more mistakes since 15.29; default strict) and a
   "Recognise my own signs" switch; the ASL engine still receives exactly the config fields it always did
   (`engineConfigPayload`, unit-tested). Switching language on an open socket sends `config` with `language`, clears the
   sentence and waits for the new `hello`.
@@ -3472,6 +3473,7 @@ let every policy auto-accept. Nothing in the app read `target_reached`.
   every `segment_result` and `commit` of a language pack carries `certification` and `needs_confirm`.
 * **Open item (frontend follow-up).** The frontend does not read these fields yet. It should show the certified
   precision next to a word and require a tap before a committed word with `needs_confirm: true` is spoken or sent.
+  (Done in 15.29.)
 
 **Old packs.** A `fusion.json` without the `certification` record loads as `{}`: uncertified, every policy
 confirm-only, never a crash. That includes the commercial-safe file with accept 0.96 x 3 and no classifier
@@ -3542,7 +3544,7 @@ was certified before only because DEFF dropped to 1 there.
 
 **Open items.**
 * Frontend: show `certification.certified_precision` next to a word, and require a tap before a word with
-  `needs_confirm: true` is spoken or sent (see 15.25).
+  `needs_confirm: true` is spoken or sent (see 15.25). (Done in 15.29.)
 * Out-of-fold CV calibration (15.25 TODO) would add INCLUDE groups and clips, and is the main way to certify
   INCLUDE at all.
 
@@ -3712,3 +3714,65 @@ worse; a rebuilt pack's checkpoint is flagged; `--compare-to` without `--all`; c
 `test_mysigns.py` (a non-default c_min in the store and the recogniser), `test_engine_recognizer.py`
 (`threshold_source` and the spell-mode value) and `LanguageEvaluation.test.tsx` (an auto rate of 0 next to a
 threshold-rule rate above 0, the all-sources table, the like-for-like line, and an INCLUDE entry that did not run).
+
+### 15.29 The app default: strict, sign by sign, a confirm tap before every word (QA plan "Recommended app default", critic 15, 27 Nov 2026)
+
+**Problem.** Since 15.25 and 15.26 the backend sends `certification` and `needs_confirm` with every word, but the live
+page did not read them. It added an accepted word to the sentence at once, and auto-speak could say it aloud. The
+default policy was balanced. The certified floors (strict 0.95, balanced 0.90, lenient 0.85) are below the owner's
+"without any fail" goal of 0.98, so a word should never be spoken or sent before the user taps it (critic 15).
+
+**What the app does now** (`frontend/src/recognition/live.ts`, `useLiveRecognition.ts`, `components/ConfirmWord.tsx`,
+`components/SignResult.tsx`, `pages/LivePage.tsx`, `i18n/strings.ts`):
+1. **Default.** Sign by sign (segment mode), strict policy. Settings are saved under a new key (`live-settings-v2`).
+   Old v1 settings are carried over, except the policy: v1 saved "balanced" for everyone, so the new default is
+   strict. Continuous signing starts off.
+2. **A tap before every word.** A commit with `needs_confirm: true` (or `open_vocabulary: true`) is not added to the
+   sentence. It waits as a "pending" word. Only "Add" (or "Yes, add") puts it in the sentence, and only then can it
+   be spoken or copied. "Wrong word" / "No" never adds it and sends `reject` for that sign (logged as feedback).
+   The next recognised sign replaces a word that was never confirmed. A word the user picked from "did you mean"
+   (`chosen_by_user`) has had its tap and is added at once. ASL commits carry no certification and are added as
+   before.
+3. **Two looks.** "Recognised – add it?" (teal, a tick) only when the word's policy is certified, the word is in the
+   classifier, and, in continuous mode, sliding strict is certified. Everything else is "Did you mean this word?"
+   (amber, a question mark) with "Yes, add X" / "No, sign again" and the other guesses as small buttons. That
+   includes every word under a confirm-only policy (`suggest` / `confirm_only`) and every dictionary-only word
+   (`open_vocabulary`). A doubtful sign (`ambiguous`, `low_confidence`) keeps the usual five-chip list.
+4. **The certified precision, never the target.** Next to the word and under the policy setting the app shows the
+   certified worst-source precision of the active policy, rounded down: "Strict: right about 95 of 100 times when it
+   answers". A confirm-only policy says "not tested well enough yet, so every word is shown as 'Did you mean…?'". A
+   dictionary-only word shows no precision, because the policy's number does not cover it.
+5. **Policies.** The labels are Strict, Balanced and "Lenient – more mistakes" (Hindi: सख़्त, संतुलित, "ढीला –
+   ज़्यादा गलतियाँ"). The hint says the user always taps to add a word.
+6. **Continuous signing (sliding mode).** Off by default. The toggle appears only when the pack has a classifier.
+   With it on, the app sends `mode: "sliding"`. Words that are not certified are guesses the user can confirm.
+   A word is shown as recognised only when sliding strict is certified, and it still needs the tap.
+7. **Accessibility.** The confirm card is a labelled region with real buttons (keyboard: Tab and Enter). It stays on
+   screen while the next sign is in progress. The live region announces "Recognised, please confirm: water, पानी"
+   or "Did you mean: water", with the Hindi word marked `lang="hi"`. All new strings have Hindi versions. The
+   English and Hindi word output and the sentence builder are unchanged.
+
+**Backend** (`inference/engine.py`, `isl/recognizer.py`):
+* `describe()` of a language pack (so `hello` and `config_ack`) adds `certification_by_policy`: the certification of
+  each policy for `segment` and `sliding` mode. `sliding` is null when the pack has no classifier. The ASL
+  `describe()` is unchanged.
+* Each `segment_result` and `commit` of a language pack with a certification now also says `open_vocabulary` (the
+  word is outside the classifier; a "My signs" word never counts). Messages without a certification are unchanged.
+* `IslRecognizer.sliding_rule(policy)` is "certified" only when that policy **and strict** are certified for the
+  sliding replay on every major source. A certified balanced or lenient alone no longer lets sliding mode
+  auto-commit. The certification then says why (`reason`). E1's sliding `rule` column follows the same rule.
+
+**Old packs.** A fusion.json without a certification record gives confirm-only for every policy (15.25), so every word
+is "Did you mean this word?" and the precision line says it is not tested well enough. Nothing crashes. Today both
+shipped packs are in this state until they are refit (QA 0.6).
+
+**This closes** the frontend open items of 15.25 and 15.26.
+
+Tests: `backend/tests/isl/test_app_defaults.py` (sliding auto-commits only when sliding strict is certified;
+`certification_by_policy` for segment and sliding; no sliding without a classifier; old packs confirm-only; the ASL
+`describe()` is unchanged; `open_vocabulary` on results and commits), `frontend/src/recognition/live.test.ts`
+(defaults, the v1 to v2 migration, the sliding payload, the precision rounding, the two looks),
+`frontend/src/recognition/useLiveRecognition.test.tsx` (a fake socket: a pending word is added only after the tap;
+"wrong" sends `reject` and adds nothing; the next sign replaces it; continuous commits; ASL unchanged),
+`frontend/src/components/confirm.test.tsx` (both looks, the precision line, dictionary-only words, Hindi, keyboard
+buttons, axe-core, announcements) and a new step in `frontend/e2e/a11y.spec.ts` (not run here: no browser).

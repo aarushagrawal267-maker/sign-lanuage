@@ -180,5 +180,19 @@ test("live result states are visually distinct, announced, and pass axe", async 
   styles.push(await notSure.evaluate((e) => getComputedStyle(e).borderColor + getComputedStyle(e).borderStyle));
   expect(new Set(styles).size).toBe(3);
 
+  // docs/ISL_DESIGN.md 15.29: a certified word still waits for a tap (keyboard here) before it joins the sentence
+  const certified = { rule: "certified", certified_precision: 0.953, worst_source: "include", confirm_tap: true };
+  server!.send(state("recognized", { accepted: true, decision: "accept", reason: "ok", top: [water], confidence: 0.97, certification: certified, needs_confirm: true }, 4,
+    { gloss: "water", class_index: 1, score: 0.97, t: 0, concept_id: "isl.water", text: { en: "water", hi: "पानी" }, segment_id: 4, certification: certified, needs_confirm: true }));
+  await expect(page.locator('[data-state="confirm-recognised"]')).toBeVisible();
+  await expect(page.getByTestId("result-announcer")).toHaveText("Recognised, please confirm: water, पानी");
+  expect(await axe(page)).toEqual([]);
+  const words = page.getByTestId("transcript").getByTestId("bilingual-word");
+  const before = await words.count();
+  await page.getByRole("button", { name: "Add water" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(words).toHaveCount(before + 1);
+  await expect(page.getByTestId("resolved")).toBeFocused();
+
   await page.getByRole("button", { name: "Stop camera" }).click();
 });

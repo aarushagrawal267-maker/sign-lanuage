@@ -42,7 +42,11 @@ describe("RollingStat", () => {
   });
 });
 
-import { engineConfigPayload, segmentDecision, sentenceWords, transcriptFromCandidate, transcriptItem, wordText, DEFAULT_SETTINGS } from "./live";
+import {
+  engineConfigPayload, segmentDecision, sentenceWords, transcriptFromCandidate, transcriptItem, wordText, DEFAULT_SETTINGS,
+  SETTINGS_KEY, confirmKind, isConfirmOnlySuggestion, loadLiveSettings, needsConfirm, precisionOutOf100, segmentFromCommit,
+  slidingStrictCertified, type Certification, type CertificationByPolicy,
+} from "./live";
 import { shouldStopSign, takeSummary, trimTake } from "./useLandmarkRecorder";
 
 describe("segmentDecision", () => {
@@ -69,7 +73,87 @@ describe("engineConfigPayload", () => {
     expect(engineConfigPayload(e, { pack: true, spell: true }).mode).toBe("spell");
     // settings stored by an older version (no policy field) still work
     const old = { mode: "segment" as const, threshold: null, min_margin: 0.1, cooldown_ms: 700, end_absent_ms: 400 };
-    expect(engineConfigPayload(old, { pack: true })).toMatchObject({ policy: "balanced", use_my_signs: true });
+    expect(engineConfigPayload(old, { pack: true })).toMatchObject({ policy: "strict", use_my_signs: true });
+  });
+  it("ISL default (docs 15.29): strict, sign by sign; continuous only when opted in AND the pack offers it", () => {
+    expect(DEFAULT_SETTINGS.engine.policy).toBe("strict");
+    expect(DEFAULT_SETTINGS.engine.continuous).toBe(false);
+    expect(engineConfigPayload(DEFAULT_SETTINGS.engine, { pack: true, sliding: true }).mode).toBe("segment");
+    const on = { ...DEFAULT_SETTINGS.engine, continuous: true };
+    expect(engineConfigPayload(on, { pack: true, sliding: false }).mode).toBe("segment"); // no classifier: never sliding
+    expect(engineConfigPayload(on, { pack: true, sliding: true }).mode).toBe("sliding");
+    expect(engineConfigPayload(on, { pack: true, sliding: true, spell: true }).mode).toBe("spell");
+    // the ASL engine never sees the ISL fields
+    expect(engineConfigPayload(on)).toEqual({ mode: "segment", threshold: null, min_margin: 0.1, cooldown_ms: 700, end_absent_ms: 400 });
+  });
+});
+
+describe("saved settings (docs 15.29)", () => {
+  const store = (items: Record<string, unknown>) => ({ getItem: (k: string) => (k in items ? JSON.stringify(items[k]) : null) });
+  it("starts strict with continuous signing off", () => {
+    expect(loadLiveSettings(store({})).engine).toMatchObject({ policy: "strict", continuous: false, mode: "segment" });
+  });
+  it("carries v1 settings over, except the old balanced default", () => {
+    const v1 = { ...DEFAULT_SETTINGS, targetFps: 15, engine: { ...DEFAULT_SETTINGS.engine, policy: "balanced", cooldown_ms: 1200 } };
+    const s = loadLiveSettings(store({ "live-settings-v1": v1 }));
+    expect(s.targetFps).toBe(15);
+    expect(s.engine).toMatchObject({ policy: "strict", cooldown_ms: 1200, continuous: false });
+  });
+  it("keeps what the user chose in v2, and survives broken storage", () => {
+    const v2 = { ...DEFAULT_SETTINGS, engine: { ...DEFAULT_SETTINGS.engine, policy: "lenient", continuous: true } };
+    expect(loadLiveSettings(store({ [SETTINGS_KEY]: v2, "live-settings-v1": DEFAULT_SETTINGS })).engine).toMatchObject({ policy: "lenient", continuous: true });
+    expect(loadLiveSettings({ getItem: () => "{not json" })).toEqual(DEFAULT_SETTINGS);
+    expect(loadLiveSettings(null)).toEqual(DEFAULT_SETTINGS);
+  });
+});
+
+describe("certification helpers (docs 15.29)", () => {
+  const cert = (rule: Certification["rule"], p: number | null = null): Certification => ({ rule, certified_precision: p, confirm_tap: true });
+  it("shows the certified precision rounded down, never the target", () => {
+    expect(precisionOutOf100({ ...cert("certified", 0.9537), target: 0.98 })).toBe(95);
+    expect(precisionOutOf100(cert("certified", 0.95))).toBe(95);
+    expect(precisionOutOf100(cert("confirm_only", null))).toBeNull();
+    expect(precisionOutOf100({ ...cert("confirm_only"), target: 0.98 })).toBeNull();
+    expect(precisionOutOf100(undefined)).toBeNull();
+  });
+  it("a word is shown as recognised only when its policy is certified and it is in the classifier", () => {
+    expect(confirmKind({ certification: cert("certified", 0.96) })).toBe("recognised");
+    expect(confirmKind({ certification: cert("confirm_only") })).toBe("did_you_mean");
+    expect(confirmKind({})).toBe("did_you_mean"); // an old pack without a certification record
+    expect(confirmKind({ certification: cert("certified", 0.96), open_vocabulary: true })).toBe("did_you_mean");
+    expect(confirmKind({ certification: cert("ungated") })).toBe("recognised");
+  });
+  it("continuous mode: recognised only when sliding strict is certified", () => {
+    const c = { certification: cert("certified", 0.96) };
+    expect(confirmKind(c, { continuous: true, slidingStrict: false })).toBe("did_you_mean");
+    expect(confirmKind(c, { continuous: true, slidingStrict: true })).toBe("recognised");
+    const by = (strict: Certification["rule"]): CertificationByPolicy => ({
+      segment: { strict: cert("certified", 0.96), balanced: cert("certified", 0.93), lenient: cert("certified", 0.9) },
+      sliding: { strict: cert(strict), balanced: cert("certified", 0.92), lenient: cert("certified", 0.9) },
+    });
+    expect(slidingStrictCertified(by("confirm_only"))).toBe(false);
+    expect(slidingStrictCertified(by("certified"))).toBe(true);
+    expect(slidingStrictCertified({ ...by("certified"), sliding: null })).toBe(false);
+    expect(slidingStrictCertified(null)).toBe(false);
+  });
+  it("a commit needs a tap unless the user picked it; ASL commits never do", () => {
+    const base = { gloss: "water", class_index: 1, score: 0.97, t: 1 };
+    expect(needsConfirm({ ...base, needs_confirm: true })).toBe(true);
+    expect(needsConfirm({ ...base, open_vocabulary: true })).toBe(true);
+    expect(needsConfirm({ ...base, needs_confirm: true, chosen_by_user: true })).toBe(false);
+    expect(needsConfirm(base)).toBe(false);
+  });
+  it("rule-based 'did you mean' (confirm-only, dictionary-only) is told apart from doubt", () => {
+    const top = [{ class_index: 1, gloss: "water", prob: 0.9 }];
+    expect(isConfirmOnlySuggestion({ accepted: false, reason: "confirm_only", frames: 30, decision: "suggest", top })).toBe(true);
+    expect(isConfirmOnlySuggestion({ accepted: false, reason: "open_vocabulary", frames: 30, decision: "suggest", top })).toBe(true);
+    expect(isConfirmOnlySuggestion({ accepted: false, reason: "ambiguous", frames: 30, decision: "suggest", top })).toBe(false);
+    expect(isConfirmOnlySuggestion({ accepted: false, reason: "confirm_only", frames: 30, decision: "suggest", top: [] })).toBe(false);
+  });
+  it("a continuous-mode commit becomes a sign result for the confirm card", () => {
+    const s = segmentFromCommit({ gloss: "water", class_index: 1, score: 0.97, t: 5, concept_id: "isl.water", text: { en: "water", hi: "पानी" }, segment_id: null, needs_confirm: true });
+    expect(s).toMatchObject({ accepted: true, decision: "accept", needs_confirm: true, segment_id: undefined });
+    expect(s.top?.[0]).toMatchObject({ concept_id: "isl.water", prob: 0.97 });
   });
 });
 

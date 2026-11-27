@@ -10,10 +10,12 @@ export type EngineSettings = {
   min_margin: number;
   cooldown_ms: number;
   end_absent_ms: number;
-  /** Language packs (ISL): how readily a word is shown without asking (maps to the pack's fitted thresholds). */
+  /** Language packs (ISL): how sure the app must be to show a word as recognised (the pack's fitted thresholds). */
   policy?: Policy;
   /** Language packs (ISL): also search the user's own signs. */
   use_my_signs?: boolean;
+  /** Language packs (ISL): continuous signing (the engine's sliding mode). Off by default; opt-in (docs 15.29). */
+  continuous?: boolean;
 };
 
 export type LiveSettings = {
@@ -25,8 +27,13 @@ export type LiveSettings = {
   delegate: "auto" | "GPU" | "CPU";
 };
 
+/** Saved settings key. v2 (docs 15.29): the ISL policy default became strict; a v1 "balanced" is not carried over. */
+export const SETTINGS_KEY = "live-settings-v2";
+const OLD_SETTINGS_KEY = "live-settings-v1";
+
 export const DEFAULT_SETTINGS: LiveSettings = {
-  engine: { mode: "segment", threshold: null, min_margin: 0.1, cooldown_ms: 700, end_absent_ms: 400, policy: "balanced", use_my_signs: true },
+  // ISL default (docs/ISL_DESIGN.md 15.29): sign by sign, strict, a confirm tap before a word is added
+  engine: { mode: "segment", threshold: null, min_margin: 0.1, cooldown_ms: 700, end_absent_ms: 400, policy: "strict", use_my_signs: true, continuous: false },
   targetFps: 25,
   procWidth: 640,
   overlay: { pose: true, hands: true, face: false, trail: true },
@@ -53,11 +60,34 @@ export type ServerState = {
 
 export type Decision = "accept" | "suggest" | "abstain";
 
+/**
+ * What a language pack's validation certified for one policy (docs/ISL_DESIGN.md 15.25, 15.26). `certified_precision`
+ * is the 95 % lower bound on the worst major source, never the 0.98 target. "confirm_only": every word is a "did you
+ * mean"; "ungated": parameters built in code (tools, tests).
+ */
+export type Certification = {
+  rule: "certified" | "confirm_only" | "ungated";
+  certified_precision?: number | null;
+  worst_source?: string | null;
+  floor?: number | null;
+  target?: number | null;
+  open_vocabulary_rule?: string;
+  confirm_tap?: boolean;
+  reason?: string;
+};
+
+/** Every policy's certification for sign-by-sign (segment) and continuous (sliding) mode; sliding null = no classifier. */
+export type CertificationByPolicy = {
+  segment: Record<Policy, Certification>;
+  sliding: Record<Policy, Certification> | null;
+};
+
 export type SegmentResult = {
   accepted: boolean; reason: string; frames: number; duration_ms?: number; agreement?: string; top?: Candidate[];
   feature_ms?: number; inference_ms?: number;
   // language packs (ISL) only
   segment_id?: number; decision?: Decision; confidence?: number; candidates?: Candidate[]; spell?: SpellState;
+  certification?: Certification; needs_confirm?: boolean; open_vocabulary?: boolean;
 };
 
 export type Commit = {
@@ -65,6 +95,8 @@ export type Commit = {
   // language packs and ASL with a Hindi lexicon
   concept_id?: string; text?: { en?: string | null; hi?: string | null }; hi_review?: HiReview; source?: string;
   segment_id?: number | null; chosen_by_user?: boolean;
+  // language packs: the rule that applied, whether a tap must confirm it, and whether it is a dictionary-only word
+  certification?: Certification; needs_confirm?: boolean; open_vocabulary?: boolean;
 };
 
 export type SpellState = {
@@ -178,7 +210,7 @@ export type EngineMode = "segment" | "sliding" | "spell";
  * (ISL) gets its own decision policy instead of the ASL threshold sliders (its thresholds are fitted per pack), the
  * My signs switch, and "spell" when spelling mode is on.
  */
-export function engineConfigPayload(e: EngineSettings, opts: { pack?: boolean; spell?: boolean } = {}) {
+export function engineConfigPayload(e: EngineSettings, opts: { pack?: boolean; spell?: boolean; sliding?: boolean } = {}) {
   if (!opts.pack) {
     return {
       mode: e.mode,
@@ -188,13 +220,89 @@ export function engineConfigPayload(e: EngineSettings, opts: { pack?: boolean; s
       end_absent_ms: e.end_absent_ms,
     };
   }
-  const mode: EngineMode = opts.spell ? "spell" : "segment";
+  // continuous signing only when the user opted in and the pack offers it (sliding mode needs its classifier)
+  const mode: EngineMode = opts.spell ? "spell" : e.continuous && opts.sliding ? "sliding" : "segment";
   return {
     mode,
     threshold: null,
     cooldown_ms: e.cooldown_ms,
     end_absent_ms: e.end_absent_ms,
-    policy: e.policy ?? "balanced",
+    policy: e.policy ?? "strict",
     use_my_signs: e.use_my_signs ?? true,
+  };
+}
+
+/**
+ * Settings saved by this browser. v1 settings keep everything except the ISL policy: v1 saved "balanced" as the
+ * default for everyone, and the new default is strict (docs/ISL_DESIGN.md 15.29). Continuous signing starts off.
+ */
+export function loadLiveSettings(storage: Pick<Storage, "getItem"> | null = typeof window !== "undefined" ? window.localStorage : null): LiveSettings {
+  const read = (key: string): Partial<LiveSettings> | null => {
+    try {
+      const raw = storage?.getItem(key);
+      const v = raw ? JSON.parse(raw) : null;
+      return v && typeof v === "object" ? (v as Partial<LiveSettings>) : null;
+    } catch {
+      return null;
+    }
+  };
+  const cur = read(SETTINGS_KEY);
+  if (cur) return { ...DEFAULT_SETTINGS, ...cur, engine: { ...DEFAULT_SETTINGS.engine, ...(cur.engine ?? {}) } };
+  const old = read(OLD_SETTINGS_KEY);
+  if (!old) return DEFAULT_SETTINGS;
+  const { policy: _drop, ...engine } = (old.engine ?? {}) as EngineSettings; // eslint-disable-line @typescript-eslint/no-unused-vars
+  return { ...DEFAULT_SETTINGS, ...old, engine: { ...DEFAULT_SETTINGS.engine, ...engine, policy: "strict", continuous: false } };
+}
+
+/** "Right about N of 100 times when it answers", rounded down so it never overstates; null when not certified. */
+export function precisionOutOf100(c: Certification | null | undefined): number | null {
+  if (!c || c.rule !== "certified" || typeof c.certified_precision !== "number") return null;
+  return Math.max(0, Math.min(100, Math.floor(c.certified_precision * 100 + 1e-9)));
+}
+
+/** Sliding mode may auto-commit only when sliding strict is certified on every major source (docs 15.29). */
+export function slidingStrictCertified(by: CertificationByPolicy | null | undefined): boolean {
+  return by?.sliding?.strict?.rule === "certified";
+}
+
+/**
+ * How the app shows a word that waits for the user's tap. "recognised" only when the policy that produced it is
+ * certified (or ungated, in-code parameters), the word is in the classifier, and, in continuous mode, sliding strict
+ * is certified. Everything else is "did you mean" (docs/ISL_DESIGN.md 15.29). Either way nothing is added, spoken or
+ * sent before the tap.
+ */
+export function confirmKind(
+  w: { certification?: Certification; open_vocabulary?: boolean } | null | undefined,
+  opts: { continuous?: boolean; slidingStrict?: boolean } = {},
+): "recognised" | "did_you_mean" {
+  if (!w || w.open_vocabulary) return "did_you_mean";
+  const rule = w.certification?.rule;
+  if (rule !== "certified" && rule !== "ungated") return "did_you_mean";
+  if (opts.continuous && !opts.slidingStrict) return "did_you_mean";
+  return "recognised";
+}
+
+/** A word the server accepted that must not be added before the user confirms it (language packs, docs 15.26). */
+export function needsConfirm(c: Commit): boolean {
+  return !c.chosen_by_user && (!!c.needs_confirm || !!c.open_vocabulary);
+}
+
+/** A "did you mean" that comes from the rules, not from doubt: the policy is not certified (confirm_only) or the word
+ *  is dictionary-only (open_vocabulary). The app shows its top word as "Did you mean X?" with yes / no. */
+export function isConfirmOnlySuggestion(r: SegmentResult | null | undefined): boolean {
+  return !!r && segmentDecision(r) === "suggest" && (r.reason === "confirm_only" || r.reason === "open_vocabulary") && !!r.top?.length;
+}
+
+/** The word of a commit as a candidate (for the confirm card). */
+export function candidateFromCommit(c: Commit): Candidate {
+  return { concept_id: c.concept_id, class_index: c.class_index, gloss: c.gloss, prob: c.score, text: c.text, hi_review: c.hi_review ?? null, source: c.source };
+}
+
+/** The sign result a continuous-mode commit stands for (it arrives without one). */
+export function segmentFromCommit(c: Commit): SegmentResult {
+  const cand = candidateFromCommit(c);
+  return {
+    accepted: true, reason: "ok", frames: 0, decision: "accept", confidence: c.score, top: [cand], candidates: [cand],
+    segment_id: c.segment_id ?? undefined, certification: c.certification, needs_confirm: c.needs_confirm, open_vocabulary: c.open_vocabulary,
   };
 }

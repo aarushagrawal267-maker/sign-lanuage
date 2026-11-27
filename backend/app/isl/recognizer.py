@@ -225,17 +225,23 @@ class IslRecognizer:
     def sliding_rule(self, policy: str = "balanced") -> str:
         """May sliding mode auto-commit under ``policy`` (docs 15.25)? "certified" only when fusion.json's sliding
         thresholds were fitted for this very classifier on the real sliding mode (replay, not the segment proxy) and
-        that policy's worst major source reached its floor; "ungated" for in-code parameters; else "confirm_only"
-        (provisional words only, no auto-commit)."""
+        that policy's worst major source reached its floor, and so did strict's (docs 15.29); "ungated" for in-code
+        parameters; else "confirm_only" (provisional words only, no auto-commit)."""
         f = self.fusion
         if not f.gated:
             return "ungated"
         if self.classifier is None or not self._classifier_policy()["per_policy"]:
             return "confirm_only"
         fit = f.classifier_fit or {}
-        b = (fit.get("policies") or {}).get(policy) or {}
-        if (f.certification or {}).get("version") and fit.get("rule") == "sliding replay" \
-                and b.get("rule") == "certified" and isinstance(b.get("by_source"), dict):
+
+        def certified(pol: str) -> bool:
+            b = (fit.get("policies") or {}).get(pol) or {}
+            return bool((f.certification or {}).get("version")) and fit.get("rule") == "sliding replay" \
+                and b.get("rule") == "certified" and isinstance(b.get("by_source"), dict)
+
+        # the app default (docs 15.29): sliding mode auto-commits only when sliding STRICT is certified on every
+        # major source, whatever policy is chosen; a certified balanced or lenient alone is not enough
+        if certified(policy) and certified("strict"):
             return "certified"
         return "confirm_only"
 
@@ -245,11 +251,15 @@ class IslRecognizer:
         if mode != "sliding":
             return self.fusion.certification_info(policy)
         rule = self.sliding_rule(policy)
-        b = ((self.fusion.classifier_fit or {}).get("policies") or {}).get(policy) or {}
-        return {"rule": rule, "certified_precision": b.get("certified_precision") if rule == "certified" else None,
-                "worst_source": b.get("worst_source"), "floor": b.get("floor"), "target": b.get("target"),
-                "target_reached": bool(b.get("target_reached")) if rule != "ungated" else None,
-                "fitted": self.fusion.fitted, "confirm_tap": True}
+        pols = (self.fusion.classifier_fit or {}).get("policies") or {}
+        b = pols.get(policy) or {}
+        out = {"rule": rule, "certified_precision": b.get("certified_precision") if rule == "certified" else None,
+               "worst_source": b.get("worst_source"), "floor": b.get("floor"), "target": b.get("target"),
+               "target_reached": bool(b.get("target_reached")) if rule != "ungated" else None,
+               "fitted": self.fusion.fitted, "confirm_tap": True}
+        if rule == "confirm_only" and b.get("rule") == "certified" and (pols.get("strict") or {}).get("rule") != "certified":
+            out["reason"] = "sliding strict is not certified: sliding mode auto-commits only then (docs 15.29)"
+        return out
 
     def is_open_vocabulary(self, key: str) -> bool:
         """A word outside the classifier (retrieval only; every word when the pack has no classifier). User signs

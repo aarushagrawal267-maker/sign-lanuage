@@ -5,8 +5,9 @@ import { IS_STATIC, api, wsUrl, type Candidate, type FeatureSpec, type LanguageI
 import { DEFAULT_FACE_IDX, loadHolistic, toRawFrame } from "../mediapipe/holistic";
 import { drawFrame } from "../mediapipe/draw";
 import {
-  RollingStat, deriveStatus, engineConfigPayload, transcriptFromCandidate, transcriptItem,
-  type Commit, type LiveSettings, type SegmentResult, type ServerState, type SpellState, type TranscriptItem,
+  RollingStat, deriveStatus, engineConfigPayload, needsConfirm, segmentFromCommit, transcriptFromCandidate, transcriptItem,
+  type CertificationByPolicy, type Commit, type LiveSettings, type SegmentResult, type ServerState, type SpellState,
+  type TranscriptItem,
 } from "./live";
 
 type Metrics = { fps: number | null; mpMs: number | null; serverMs: number | null; inferenceMs: number | null; e2eMs: number | null; sendFps: number | null };
@@ -15,6 +16,13 @@ type Metrics = { fps: number | null; mpMs: number | null; serverMs: number | nul
 /** How a shown result was settled by the user: picked from "did you mean", "none of these", or "that word was wrong". */
 export type ResolvedHow = "chosen" | "dismissed" | "rejected";
 
+/**
+ * A word the server accepted that waits for the user's tap before it is added, spoken or sent (language packs,
+ * docs/ISL_DESIGN.md 15.29). `segment` is the result it came from; in continuous mode, where a commit has no result,
+ * it is made from the commit so the "added" / "sign again" message has something to refer to.
+ */
+export type PendingWord = { commit: Commit; segment: SegmentResult; continuous: boolean };
+
 export type HelloLanguage = Pick<LanguageInfo, "id" | "display_name" | "output_languages" | "capabilities" | "profile" | "status" | "sign_language">;
 
 /**
@@ -22,7 +30,7 @@ export type HelloLanguage = Pick<LanguageInfo, "id" | "display_name" | "output_l
  * language pack with a recogniser (ISL: accept / suggest / abstain, choose / reject, spelling) rather than the classic
  * ASL engine, whose messages are unchanged. `spell` switches a pack to spelling mode.
  */
-export function useLiveRecognition(settings: LiveSettings, language: string, opts: { pack: boolean; spell: boolean } = { pack: false, spell: false }) {
+export function useLiveRecognition(settings: LiveSettings, language: string, opts: { pack: boolean; spell: boolean; sliding?: boolean } = { pack: false, spell: false }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -45,6 +53,10 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
   const [helloLanguage, setHelloLanguage] = useState<HelloLanguage | null>(null);
   const [serverError, setServerError] = useState<string | null>(null);
   const [transcript, setTranscript] = useState<TranscriptItem[]>([]);
+  const [pending, setPending] = useState<PendingWord | null>(null);
+  const pendingRef = useRef<PendingWord | null>(null);
+  pendingRef.current = pending;
+  const [certs, setCerts] = useState<CertificationByPolicy | null>(null);
   const [detection, setDetection] = useState({ pose: false, left: false, right: false, face: false });
   const [metrics, setMetrics] = useState<Metrics>({ fps: null, mpMs: null, serverMs: null, inferenceMs: null, e2eMs: null, sendFps: null });
   const [videoSize, setVideoSize] = useState<{ w: number; h: number } | null>(null);
@@ -123,12 +135,14 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
         setModelAvailable(!!msg.model);
         setModelMessage(typeof msg.message === "string" ? msg.message : null);
         setHelloLanguage(msg.language ?? null);
+        setCerts(msg.engine?.certification_by_policy ?? null);
         setServerError(null);
         sendingRef.current = !!msg.model;
       } else if (msg.type === "error") {
         setServerError(typeof msg.message === "string" ? msg.message : "error");
       } else if (msg.type === "config_ack") {
         setServerError(null);
+        setCerts(msg.engine?.certification_by_policy ?? null);
       } else if (msg.type === "choice_ack") {
         // A repeated choice for the same segment (double tap) comes back marked duplicate: add the word once.
         if (msg.duplicate) return;
@@ -148,6 +162,8 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
         }
         if (st.spell) setSpell(st.spell);
         if (st.segment_result) {
+          // a new recognised sign replaces a word that was never confirmed (it is not added); a too-short movement does not
+          if (st.segment_result.segment_id !== undefined) setPending(null);
           setLastResult(st.segment_result);
           lastResultRef.current = st.segment_result;
           setResolved(null);
@@ -157,7 +173,13 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
         }
         if (st.commit) {
           const c = st.commit;
-          setTranscript((tr) => [...tr, transcriptItem(idRef.current++, c)]);
+          if (needsConfirm(c)) {
+            // docs/ISL_DESIGN.md 15.29: even a certified word waits for a tap before it joins the sentence
+            const continuous = !st.segment_result;
+            setPending({ commit: c, segment: st.segment_result ?? segmentFromCommit(c), continuous });
+          } else {
+            setTranscript((tr) => [...tr, transcriptItem(idRef.current++, c)]);
+          }
         }
       }
     };
@@ -168,7 +190,7 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "config", engine: engineConfigPayload(settings.engine, opts) }));
     setSpell(null);
-  }, [settings.engine, opts.pack, opts.spell]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [settings.engine, opts.pack, opts.spell, opts.sliding]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Switching the sign language: the open socket changes pack (the server answers with a new hello) and the
   // sentence starts again, because words of two sign languages do not form one sentence.
@@ -185,6 +207,8 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
     setResolved(null);
     setSpell(null);
     setTranscript([]);
+    setPending(null);
+    setCerts(null);
     setHelloLanguage(null);
     setModel(null);
     setModelMessage(null);
@@ -360,6 +384,7 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
     setServer(null);
     setProvisional(null);
     setSpell(null);
+    setPending(null);
   }, [closeSocket]);
   const resetSequence = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) wsRef.current.send(JSON.stringify({ type: "reset" }));
@@ -368,6 +393,7 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
     lastResultRef.current = null;
     setResolved(null);
     setSpell(null);
+    setPending(null);
     trail.current = [];
   }, []);
   const clearText = useCallback(() => setTranscript([]), []);
@@ -381,6 +407,12 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
     } else {
       setTranscript((tr) => [...tr, transcriptFromCandidate(idRef.current++, cand)]);
     }
+    if (pendingRef.current) { // another guess picked instead of the word waiting for a tap: that word is not added
+      pendingRef.current = null;
+      setPending(null);
+    }
+    setLastResult(segment);
+    lastResultRef.current = segment;
     setResolved({ segment, how: "chosen" });
   }, []);
   /** "None of these": hide the suggestions until the next sign. */
@@ -397,6 +429,32 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
     if (last && item.segment_id !== null && item.segment_id !== undefined && last.segment_id === item.segment_id) setResolved({ segment: last, how: "rejected" });
   }, []);
   const removeWord = useCallback((id: number) => setTranscript((tr) => tr.filter((t) => t.id !== id)), []);
+  /** The user tapped "add" on a word waiting for confirmation: only now does it join the sentence (and may be spoken). */
+  const confirmPending = useCallback(() => {
+    const p = pendingRef.current;
+    if (!p) return;
+    pendingRef.current = null;
+    setPending(null);
+    setTranscript((tr) => [...tr, transcriptItem(idRef.current++, { ...p.commit, needs_confirm: false })]);
+    setLastResult(p.segment);
+    lastResultRef.current = p.segment;
+    setResolved({ segment: p.segment, how: "chosen" });
+  }, []);
+  /** "Wrong word" / "No" on a word waiting for confirmation: it is never added; packs log the feedback. */
+  const rejectPending = useCallback(() => {
+    const p = pendingRef.current;
+    if (!p) return;
+    pendingRef.current = null;
+    setPending(null);
+    const ws = wsRef.current;
+    const sid = p.commit.segment_id;
+    if (sid !== null && sid !== undefined && ws && ws.readyState === WebSocket.OPEN && !IS_STATIC) {
+      ws.send(JSON.stringify({ type: "reject", segment_id: sid }));
+    }
+    setLastResult(p.segment);
+    lastResultRef.current = p.segment;
+    setResolved({ segment: p.segment, how: "dismissed" });
+  }, []);
 
   // Stop everything when the page unmounts (camera light must go off).
   useEffect(() => () => {
@@ -409,7 +467,7 @@ export function useLiveRecognition(settings: LiveSettings, language: string, opt
 
   return {
     videoRef, canvasRef, status, camera, cameraError, mediapipe, delegate, recognizing, paused, socket, model, modelAvailable, modelMessage,
-    server, provisional, lastResult, resolved, spell, transcript, detection, metrics, videoSize, helloLanguage, serverError,
-    actions: { startCamera, stopCamera, startRecognition, stopRecognition, pause, resume, resetSequence, clearText, choose, dismiss, rejectWord, removeWord },
+    server, provisional, lastResult, resolved, spell, transcript, detection, metrics, videoSize, helloLanguage, serverError, pending, certs,
+    actions: { startCamera, stopCamera, startRecognition, stopRecognition, pause, resume, resetSequence, clearText, choose, dismiss, rejectWord, removeWord, confirmPending, rejectPending },
   };
 }

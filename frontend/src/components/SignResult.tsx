@@ -5,10 +5,14 @@ import { useEffect, useRef, type ReactNode } from "react";
 import { Check, RotateCcw, SpellCheck, X } from "lucide-react";
 import type { Candidate } from "../api/client";
 import { useT } from "../i18n";
-import { segmentDecision, wordText, type SegmentResult, type SpellState, type TranscriptItem } from "../recognition/live";
-import type { ResolvedHow } from "../recognition/useLiveRecognition";
+import {
+  candidateFromCommit, confirmKind, isConfirmOnlySuggestion, segmentDecision, wordText,
+  type Certification, type SegmentResult, type SpellState, type TranscriptItem,
+} from "../recognition/live";
+import type { PendingWord, ResolvedHow } from "../recognition/useLiveRecognition";
 import { BilingualWord } from "./BilingualWord";
 import { CandidateList, NotSure, useOriginLabel } from "./CandidateList";
+import { ConfirmWord } from "./ConfirmWord";
 import { ConfidenceRing } from "./charts/ConfidenceRing";
 import { Badge, Button } from "./ui";
 
@@ -62,7 +66,28 @@ export type SignResultProps = {
   onDismiss: (segment: SegmentResult) => void;
   onReject: (item: TranscriptItem) => void;
   onSpell: () => void;
+  /** Language packs (docs/ISL_DESIGN.md 15.29): a word the server accepted that waits for the user's tap. */
+  pending?: PendingWord | null;
+  /** Continuous signing is on, and whether sliding strict is certified (only then a word is shown as recognised). */
+  continuous?: boolean;
+  slidingStrict?: boolean;
+  /** The active policy's certified precision in words, for the confirm card. */
+  precisionNote?: (c: Certification | undefined) => string | null;
+  onConfirmPending?: () => void;
+  onRejectPending?: () => void;
 };
+
+/** A small "sign in progress: WORD" line under a card that waits for a tap. */
+function ProgressLine({ top }: { top: Candidate | null }) {
+  const { t } = useT();
+  const w = top ? wordText(top) : null;
+  return (
+    <div className="flex items-baseline gap-2 text-xs text-fg-3">
+      <span className="font-medium uppercase tracking-[0.14em]">{top ? t("live.provisional") : t("live.collecting")}</span>
+      {w && <BilingualWord en={w.en} hi={w.hi} review={top!.hi_review} size="sm" inline tone="muted" showMark={false} />}
+    </div>
+  );
+}
 
 export function SignResult(p: SignResultProps) {
   const { t } = useT();
@@ -73,6 +98,35 @@ export function SignResult(p: SignResultProps) {
   const settledTop = lastResult?.top?.[0] ?? null;
 
   if (p.spellOn && (p.inProgress || !lastResult)) return <SpellPanel spell={p.spell} experimental={p.spellExperimental} />;
+
+  // A word waiting for the user's tap stays on show while the next sign is in progress (docs/ISL_DESIGN.md 15.29).
+  if (p.pending && p.onConfirmPending && p.onRejectPending) {
+    const c = p.pending.commit;
+    const seg = p.pending.segment;
+    const kind = confirmKind(c, { continuous: p.pending.continuous, slidingStrict: p.slidingStrict });
+    return (
+      <div className="flex flex-col gap-3">
+        <ConfirmWord word={candidateFromCommit(c)} kind={kind} note={c.open_vocabulary ? null : p.precisionNote?.(c.certification)}
+          dictionaryOnly={!!c.open_vocabulary} others={kind === "did_you_mean" ? seg.top : undefined}
+          onConfirm={p.onConfirmPending} onReject={p.onRejectPending} onChooseOther={(x) => p.onChoose(seg, x)} />
+        {p.inProgress && <ProgressLine top={p.provisionalTop} />}
+      </div>
+    );
+  }
+
+  // "Did you mean X?" because of the rules (an uncertified policy, a dictionary-only word), not because of doubt.
+  if (lastResult && isConfirmOnlySuggestion(lastResult) && !isResolved) {
+    const top = lastResult.top![0];
+    const ov = lastResult.reason === "open_vocabulary" || !!lastResult.open_vocabulary;
+    return (
+      <div className="flex flex-col gap-3">
+        <ConfirmWord word={top} kind="did_you_mean" note={ov ? null : p.precisionNote?.(lastResult.certification)} dictionaryOnly={ov}
+          others={lastResult.top} onConfirm={() => p.onChoose(lastResult, top)} onReject={() => p.onDismiss(lastResult)}
+          onChooseOther={(x) => p.onChoose(lastResult, x)} />
+        {p.inProgress && <ProgressLine top={p.provisionalTop} />}
+      </div>
+    );
+  }
 
   if (p.inProgress) {
     const w = p.provisionalTop ? wordText(p.provisionalTop) : null;
@@ -165,24 +219,35 @@ function ResolvedMessage({ how }: { how: ResolvedHow }) {
  * Always mounted (a live region must exist before its text changes); the key forces a fresh announcement even when
  * the same word is signed twice. The Hindi word sits in a lang="hi" span so the reader switches voice or braille table.
  */
-export function ResultAnnouncer({ lastResult, resolved, inProgress }: {
+export function ResultAnnouncer({ lastResult, resolved, inProgress, pending, slidingStrict }: {
   lastResult: SegmentResult | null; resolved: { segment: SegmentResult; how: ResolvedHow } | null; inProgress: boolean;
+  pending?: PendingWord | null; slidingStrict?: boolean;
 }) {
   const { t } = useT();
   let msg: ReactNode = null;
   const decision = segmentDecision(lastResult);
   const top = lastResult?.top?.[0] ?? null;
-  if (lastResult && !inProgress && !(resolved && resolved.segment === lastResult)) {
+  const word = (en: string, hi: string | null) => <><span lang="en">{en}</span>{hi && <>, <span lang="hi">{hi}</span></>}</>;
+  let key = `${lastResult?.segment_id ?? ""}-${lastResult ? "r" : "n"}-${decision ?? ""}`;
+  if (pending) {
+    // a word waiting for a tap: announced once, never as "recognised" alone (docs/ISL_DESIGN.md 15.29)
+    const w = wordText(candidateFromCommit(pending.commit));
+    const kind = confirmKind(pending.commit, { continuous: pending.continuous, slidingStrict });
+    msg = <>{kind === "recognised" ? t("live.announceConfirm") : t("live.announceDidYouMeanOne")} {word(w.en, w.hi)}</>;
+    key = `p-${pending.commit.segment_id ?? ""}-${pending.commit.t}`;
+  } else if (lastResult && isConfirmOnlySuggestion(lastResult) && !(resolved && resolved.segment === lastResult)) {
+    const w = wordText(top!);
+    msg = <>{t("live.announceDidYouMeanOne")} {word(w.en, w.hi)}</>;
+  } else if (lastResult && !inProgress && !(resolved && resolved.segment === lastResult)) {
     if (decision === "accept" && top) {
       const w = wordText(top);
-      msg = <>{t("live.announceAccepted")} <span lang="en">{w.en}</span>{w.hi && <>, <span lang="hi">{w.hi}</span></>}</>;
+      msg = <>{t("live.announceAccepted")} {word(w.en, w.hi)}</>;
     } else if (decision === "suggest" && lastResult.top?.length) {
       msg = t("live.announceSuggest", { n: Math.min(5, lastResult.top.length) });
     } else if (decision === "abstain" || decision === "suggest") {
       msg = t("live.notSure");
     }
   }
-  const key = `${lastResult?.segment_id ?? ""}-${lastResult ? "r" : "n"}-${decision ?? ""}`;
   return (
     <div role="log" aria-live="polite" aria-label={t("live.resultLog")} className="sr-only" data-testid="result-announcer">
       {msg && <p key={key}>{msg}</p>}
