@@ -4531,3 +4531,92 @@ Tests (`backend/tests/isl/test_encoder_bridge.py`): the ignored-option refusals 
 gives a paired result against a matching bar and `warning_bar_mismatch` against a bar of another per-signer value or
 an old bar; McNemar and the paired counts; per-query hits in the metrics; the probe in the evaluation report and
 `stale`; the driver's encoder / oneshot stamp warning (research on, commercial-safe quiet) and `ENC_BAR`.
+
+### 15.42 More calibration signers (signer split v2) and out-of-fold INCLUDE calibration (QA plan 1.6, critics 8 and 10, 27 Nov 2026)
+
+**Problem 1: two ISL500 validation signers.** The signer split put 11 ISL500 signers in train, 2 in validation and 2
+in test. Two validation signers cannot estimate how much precision varies between signers. The two test signers then
+missed 0.98.
+
+**Fix 1: signer split v2** (`training/multisource.py`, `cli link-sources --signer-split`).
+* `signer_split` takes a per-source validation share. v2 = ISL500 0.27, every other source 0.1 as before.
+* On the real manifests (read-only check): v1 = 11 / 2 / 2 signers (59,463 / 12,261 / 8,432 clips); v2 = 9 / 4 / 2
+  (49,714 / 22,010 / 8,432 clips). Mendeley is the same in both.
+* The shuffle and the seed are unchanged. The first two signers are still test: user005 and user015. So test numbers
+  stay comparable. The two v1 validation signers (user002, user014) stay validation.
+* **Critic 10: v2 moves two ISL500 signers from train to validation** (user009 and user013). ISL500 training drops
+  from 11 to 9 signers (about 16 % fewer ISL500 training clips). So a v2 run differs from a v1 run in two ways at
+  once: more calibration signers and less signer diversity in training. A gate "no ISL500 test regression" can fail
+  because of v2 alone, and a 1a ablation on the v1 split does not measure this change. Run the ablation on v2, or read
+  gate (d) with this in mind.
+* Opt-in. The link step writes `signer_split: "v2"` (and its parameters) into `link_settings.json`. Every later step
+  reads the folder's settings. A folder without the key is v1, as before. For v1 the settings file is byte-identical
+  to before.
+* Driver: `SIGNER_SPLIT=v1|v2`, research default v2, commercial-safe v1. Only the link step gets it. When the link step
+  is not run, the start line shows the folder's split and warns when it differs. To change the split, run
+  `--from link`.
+* Resume signatures: the classifier and the encoder add `signer_split` to `LoopConfig.extra` only when it is not v1
+  (rule of 15.19). The data summary in checkpoint meta says `signer_split` only when not v1.
+* Pre-training. `pretrain_dedup` and `pretrain` read the split through `eval_clip_ids`, so after a v2 link step they
+  leave the new validation signers out. `--from link` re-runs both. If someone links v2 and keeps an old pre-training,
+  `train-encoder` and `train-oneshot` refuse the warm start `pretrained_encoder.pt` when `pretrain_clips.txt` holds a
+  v2 validation or test clip (exit 2; `--init none` skips it). The report's pre-training guard also reports the
+  overlap. v1 is not checked by the new refusal, exactly as before.
+* Variant links. An audit made on v1 recorded the v1 train signers. A v2 link step refuses it (two of its train
+  signers are now validation). Re-run `cli variant-audit --signer-split v2` first.
+
+**Problem 2 (critic 8): INCLUDE certified on the selection clips.** fit-fusion certified INCLUDE on the primary
+validation part: 856 clips in 4 pseudo-signer groups. These clips also chose the classifier's epoch, temperature and
+quota. And 856 clips could not reach a 0.95 lower bound.
+
+**Fix 2: out-of-fold calibration** (`training/oof_calibration.py`, `fit-fusion --oof-calibration`, driver
+`FUSION_OOF=1`).
+* The cv classifiers `cv/fold1-4/classifier.pt` never trained or selected on their own fold's test part. Those four
+  test parts together are exactly the primary train and validation INCLUDE clips. On the real data: 3,422 clips, 1,070
+  sessions, the 4 pseudo-signer groups. Fold 1's test part is the primary validation part; folds 2-4 are primary train.
+* Each clip is scored by ITS fold's classifier. Encoder, fusion weights, temperature and aliases are the primary
+  ones. The clips certify under source `include` with their own signer group. They replace the primary validation
+  INCLUDE clips they cover (fold 1), so no clip counts twice. The other sources certify on the primary validation
+  clips as before.
+* What still uses the primary validation clips: the weights, the temperature, the sliding-mode thresholds and the
+  "My signs" mode choice.
+* **Leak checks.** No out-of-fold clip, and no duplicate of one, may be in the primary split's test part (the E1b
+  test): `LeakageError`, before any work, in the cli and again in `fit_fusion`. Fold 0 itself is refused. Parts must
+  not overlap.
+* **Assumption: the fold classifiers are exchangeable.** The app uses the fold-0 classifier. A fold-K classifier is
+  the same code and settings on another 3/5 of the sessions, so we take its accuracy on unseen sessions to be the
+  same. `check_fold_classifier` refuses a fold classifier of another split, architecture, size, features, train
+  config, class grouping, source quota, selection or signer split. On the real research folder all four pass. The class
+  lists differ a little (fold 2: 4,352 of its 4,353 classes are classes of the 4,354-class fold-0 model).
+* **The encoder is not out of fold.** There is one encoder, trained on the primary train part, so it has seen the
+  clips of folds 2-4. Two defences:
+  1. Leave-fold-out gallery. Fold K is scored against the training-only index with every row built from a fold-K
+     clip (or a duplicate) removed. INCLUDE centroids are recomputed from their other clips. First the code rebuilds
+     every stored centroid from the clips and refuses when one does not match (cosine < 0.995). So no clip retrieves
+     itself.
+  2. In-sample screen. DiD = (retrieval top-1 on folds 2-4 minus fold 1) minus (fold-classifier top-1 on folds 2-4
+     minus fold 1). The classifier difference controls for fold difficulty, since every fold classifier is out of
+     sample. 95 % interval from a session-cluster bootstrap. When the DiD is above `--oof-max-encoder-gain` (0.03), the
+     in-sample folds are not used: only fold 1 certifies (then INCLUDE still gains an out-of-fold classifier, not more
+     clips). `--oof-keep-in-sample` (driver `FUSION_OOF_KEEP_IN_SAMPLE=1`) uses them anyway, recorded.
+  * The screen is not a proof. Passing means no advantage above 0.03 was seen. The interval says how large it could
+    still be. Fold 1 also chose the encoder's epoch and the fusion weights, which makes the out-of-sample arm a little
+    optimistic and the screen a little less sensitive. A per-fold encoder would remove this assumption.
+* Report and record. `fit-fusion` prints `oof_calibration`: per fold the classifier and its SHA-256, clips, groups,
+  classifier / retrieval / fused top-1, the gallery changes, the screen, the folds used and dropped, and the
+  certification clips per source. `fusion.json` `certification.calibration_sets` records the clips, the folds, the
+  assumption and the screen. `selection_note` then says INCLUDE was certified out of fold.
+* Cost: one extra evidence pass over about 3,400 clips plus about 2,600 INCLUDE embeddings for the centroids.
+* Opt-in for both profiles. Without the flag, fit-fusion is exactly as before. The fusion step needs the cv step
+  (fit-fusion exits 2 when a cv classifier is missing).
+
+Tests: `backend/tests/isl/test_signer_split_oof.py`. With the same seed, v1 and v2 have the same test signers (user005,
+user015 by name) and v2 has 4 val groups; other sources are unchanged; v1 link settings are unchanged; the resume
+signature names v2 only; `attach_all_sources` and `link-sources --signer-split v2` follow the settings; the report's
+pre-training guard and the encoder's warm-start check catch a v1 pre-training under v2; a v1 audit fails the v2 split
+check; the driver passes `--signer-split v2` for research and `--oof-calibration` only with `FUSION_OOF=1`. Out of fold:
+the parts never hold a fold-0 test clip or a duplicate of one; fold 0 and a missing classifier are refused; the
+leave-fold-out gallery holds no row of the fold and rebuilds the centroids; a fold classifier of other settings is
+refused; certification uses each out-of-fold clip with source `include` and its own group, replaces the primary
+validation INCLUDE clips, and leaves the weights unchanged; the screen drops in-sample folds when the encoder
+memorised them, not when a fold is just easier for every model.

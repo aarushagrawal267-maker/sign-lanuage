@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import numpy as np
 
@@ -178,8 +178,16 @@ def _nll(results, truths) -> float:
 
 def fit_fusion(rec, val_clips: list[Clip], profile: str, version: str = "fusion-1",
                data=None, weight_clips: int = WEIGHT_FIT_CLIPS, weight_seed: int = WEIGHT_FIT_SEED,
-               rescore: int = WEIGHT_FIT_RESCORE, aliases: dict | None = None) -> tuple[FusionParams, dict]:
+               rescore: int = WEIGHT_FIT_RESCORE, aliases: dict | None = None,
+               oof=None) -> tuple[FusionParams, dict]:
     """``data``: the run's ``IslData``, for the full index leak guard (split + training clips, docs 15.22).
+
+    ``oof`` (``oof_calibration.OofCalibration``, docs 15.42; None = as before): out-of-fold INCLUDE clips of the
+    cross-validation folds, each scored by its own fold's classifier against a leave-fold-out gallery and fused with
+    the parameters fitted here. They replace the primary validation INCLUDE clips they cover in the threshold fit
+    and the certification (source ``include``, their own signer group); the weights, the temperature, the sliding
+    thresholds and the "My signs" mode stay fitted on the primary validation clips. No clip of the primary split's
+    test part is ever used (``LeakageError``).
 
     ``aliases`` (alias -> root, docs 15.34; None = as before): the weights are fitted on strict keys as before; then
     the parameters get the alias map, every clip is fused once more with the groups summed, and the thresholds and
@@ -284,9 +292,16 @@ def fit_fusion(rec, val_clips: list[Clip], profile: str, version: str = "fusion-
         from app.isl.vocab.aliases import closed_with_aliases
 
         closed = closed_with_aliases(closed, params.aliases)
-    params, trep = fit_thresholds(results, truths, params, sources=[c.source for c in used],
-                                  groups=[getattr(c, "group", None) for c in used], closed_set=closed)
-    del results
+    c_res, c_tru = results, truths
+    c_src, c_grp = [c.source for c in used], [getattr(c, "group", None) for c in used]
+    oof_rep = None
+    if oof is not None:  # docs 15.42: out-of-fold INCLUDE clips certify INCLUDE
+        c_res, c_tru, c_src, c_grp, oof_rep = _with_oof(rec, oof, params, used, results, truths, c_src, c_grp)
+        rep["oof_calibration"] = oof_rep
+    params, trep = fit_thresholds(c_res, c_tru, params, sources=c_src, groups=c_grp, closed_set=closed)
+    if oof_rep is not None:
+        params = params.with_(certification=_oof_certification(params.certification, oof_rep, len(c_res)))
+    del results, c_res
     rep["thresholds"] = {"accept": params.accept, "s_min": params.s_min,
                          "suggest_min_top5_mass": params.suggest_min_top5_mass,
                          "suggest_min_top5_mass_by_policy": params.suggest_min_top5_mass_by_policy,
@@ -304,6 +319,50 @@ def fit_fusion(rec, val_clips: list[Clip], profile: str, version: str = "fusion-
     params, rep["my_signs"] = choose_user_mode(rec, val_clips, params, cache=e4_cache)
     rep["seconds"] = round(time.time() - t0, 1)
     return params, rep
+
+
+def _with_oof(rec, oof, params, used, results, truths, src, grp):
+    """The threshold-fit columns with out-of-fold INCLUDE clips (docs 15.42): the primary validation clips minus those
+    an out-of-fold part covers (fold 1's test part IS the primary validation INCLUDE part), plus the out-of-fold
+    clips of the folds the in-sample screen let through. Returns (results, truths, sources, groups, report)."""
+    from app.isl.training.oof_calibration import check_oof_clips, oof_evidence, select_rows
+
+    guard = check_oof_clips(oof.parts, oof.data)  # before any work: never a clip of the primary test part
+    ev = oof_evidence(rec, oof, params, progress=getattr(oof, "progress", None))
+    rows, orep = select_rows(ev, oof)
+    planned = {c.clip_id for p in oof.parts if p.fold in orep["folds_used"] for c in p.clips}
+    keep = [i for i, c in enumerate(used) if c.clip_id not in planned]
+    out_res = [results[i] for i in keep] + [x["result"] for x in rows]
+    out_tru = [truths[i] for i in keep] + [x["truth"] for x in rows]
+    out_src = [src[i] for i in keep] + [x["source"] for x in rows]
+    out_grp = [grp[i] for i in keep] + [x["group"] for x in rows]
+    by_src = Counter(out_src)
+    orep = {**orep, "leak_check": guard, "primary_val_clips": len(used),
+            "primary_val_clips_replaced": len(used) - len(keep),
+            "certification_clips": len(out_res), "certification_by_source": dict(sorted(by_src.items())),
+            "certification_groups_by_source": {s: len({g for s2, g in zip(out_src, out_grp) if s2 == s and g})
+                                               for s in sorted(by_src)}}
+    return out_res, out_tru, out_src, out_grp, orep
+
+
+def _oof_certification(cert: dict | None, orep: dict, n: int) -> dict:
+    """The certification record with the calibration sets it used (docs 15.42)."""
+    c = dict(cert or {})
+    if not c:  # no validation data: nothing was certified
+        return c
+    used = orep.get("folds_used") or []
+    c["calibration_sets"] = {
+        "version": orep.get("version"), "clips": n, "by_source": orep.get("certification_by_source"),
+        "groups_by_source": orep.get("certification_groups_by_source"),
+        "include": f"out-of-fold clips of folds {used}, each scored by its own fold's classifier",
+        "folds_dropped": orep.get("folds_dropped"), "assumption": orep.get("assumption"),
+        "encoder_in_sample_check": {k: v for k, v in (orep.get("in_sample_check") or {}).items()
+                                    if k in ("testable", "passed", "did_retrieval", "did_retrieval_ci95",
+                                             "did_fused", "did_fused_ci95", "max_gain")}}
+    c["selection_note"] = ("INCLUDE certified on out-of-fold cross-validation clips (no fold-0 test clip; each scored "
+                           "by a classifier that neither trained nor selected on it); the other sources on the "
+                           "primary validation clips, which also selected the models (docs 15.42)")
+    return c
 
 
 def sliding_windows(rec, raw, cfg=None) -> list[tuple]:

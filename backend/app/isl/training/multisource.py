@@ -417,20 +417,52 @@ def drop_leaking(train: list[Clip], held: Iterable[Clip], dedup: DedupIndex) -> 
 # the signer split of the other labelled sources (``attach_all_sources``); recorded by ``cli variant-audit`` so the
 # link step can check that the signers it audited as train still are (docs 15.37)
 SIGNER_SPLIT = {"val_frac": 0.1, "test_frac": 0.15, "min_groups": 6}
+# signer split versions (docs 15.42, QA plan 1.6, critic 10). v1 = SIGNER_SPLIT, every run before 15.42. v2 = a
+# per-source validation share, ISL500 0.27: of its 15 signers 9 train / 4 val / 2 test instead of 11 / 2 / 2. The
+# shuffle and test_frac are unchanged, so the test signers stay the same (user005, user015 with seed 0) and the two
+# v1 validation signers stay validation; two v1 TRAIN signers move to validation. Chosen by the link step
+# (``link-sources --signer-split``) and frozen into link_settings.json, so every later step splits the same way.
+SIGNER_SPLITS = {"v1": SIGNER_SPLIT,
+                 "v2": {"val_frac": {"isl500": 0.27, "*": 0.1}, "test_frac": 0.15, "min_groups": 6}}
+DEFAULT_SIGNER_SPLIT = "v1"
 
 
-def source_train_groups(paths: IslPaths, vocab, profile: str, source: str, seed: int = 0) -> set[str]:
-    """The signer groups of ``source`` that ``attach_all_sources`` puts in train with this ``seed`` (the split is
-    per source, so the source's clips alone give the same answer)."""
+def signer_split_params(version: str | None = None) -> dict:
+    """The :func:`signer_split` keyword arguments of a split version (None = v1, as before). Unknown: ValueError."""
+    v = version or DEFAULT_SIGNER_SPLIT
+    if v not in SIGNER_SPLITS:
+        raise ValueError(f"unknown signer split {v!r} (known: {', '.join(sorted(SIGNER_SPLITS))})")
+    return dict(SIGNER_SPLITS[v])
+
+
+def signer_split_version(link: dict | None) -> str:
+    """The signer split version a work folder's link settings froze (no key: v1, every folder linked before 15.42)."""
+    return str((link or {}).get("signer_split") or DEFAULT_SIGNER_SPLIT)
+
+
+def source_train_groups(paths: IslPaths, vocab, profile: str, source: str, seed: int = 0,
+                        version: str | None = None) -> set[str]:
+    """The signer groups of ``source`` that ``attach_all_sources`` puts in train with this ``seed`` and signer split
+    ``version`` (the split is per source, so the source's clips alone give the same answer)."""
     clips = read_clips([source], paths, vocab, profile)
-    assign = signer_split(clips, seed=seed, **SIGNER_SPLIT)
+    assign = signer_split(clips, seed=seed, **signer_split_params(version))
     return {c.group for c in clips if c.group and assign.get(c.clip_id) == "train"}
 
 
-def signer_split(clips: list[Clip], val_frac: float = 0.1, test_frac: float = 0.15, min_groups: int = 6,
-                 seed: int = 0) -> dict[str, str]:
+def _frac_of(frac, src: str) -> float:
+    """A split share: one number for every source, or a per-source map with ``"*"`` as the default (docs 15.42)."""
+    if isinstance(frac, dict):
+        return float(frac.get(src, frac.get("*", 0.1)))
+    return float(frac)
+
+
+def signer_split(clips: list[Clip], val_frac: float | dict = 0.1, test_frac: float | dict = 0.15,
+                 min_groups: int = 6, seed: int = 0) -> dict[str, str]:
     """clip id -> train | val | test with **whole signers** held out (sources with real signer ids). Sources
-    with fewer than ``min_groups`` signers stay in training."""
+    with fewer than ``min_groups`` signers stay in training. ``val_frac`` / ``test_frac``: one share, or a
+    per-source map (``{"isl500": 0.27, "*": 0.1}``, signer split v2, docs 15.42). Per source the signers are
+    shuffled with the same seed whatever the shares, the first ``n_test`` are test and the next ``n_val`` val, so a
+    larger ``val_frac`` keeps the test signers and moves train signers to val."""
     by_src: dict[str, set[str]] = defaultdict(set)
     for c in clips:
         if c.source in SIGNER_SOURCES and c.group:
@@ -441,8 +473,8 @@ def signer_split(clips: list[Clip], val_frac: float = 0.1, test_frac: float = 0.
         if len(g) < min_groups:
             continue
         random.Random(f"{seed}:{src}").shuffle(g)
-        n_test = max(1, round(test_frac * len(g)))
-        n_val = max(1, round(val_frac * len(g)))
+        n_test = max(1, round(_frac_of(test_frac, src) * len(g)))
+        n_val = max(1, round(_frac_of(val_frac, src) * len(g)))
         for i, x in enumerate(g):
             part_of_group[x] = "test" if i < n_test else ("val" if i < n_test + n_val else "train")
     return {c.clip_id: part_of_group.get(c.group or "", "train") for c in clips}
@@ -478,7 +510,8 @@ def attach_all_sources(data, paths: IslPaths, vocab, profile: str, *, seed: int 
     clips = linker.link_clips(clips)
     # clips of the core INCLUDE / ISLRTC sources that the vocabulary did not link get linked by gloss too
     data.linker = linker
-    assign = signer_split(clips, seed=seed, **SIGNER_SPLIT)
+    # the work folder's signer split version (docs 15.42; no key in the link settings = v1, as before)
+    assign = signer_split(clips, seed=seed, **signer_split_params(signer_split_version(link)))
     dedup = DedupIndex.build(data.include + data.islrtc + clips,
                              duplicates_file if duplicates_file is not None else paths.derived / "duplicates.jsonl",
                              hash_files=hash_files)
@@ -573,7 +606,8 @@ def read_pretrain_list(work: Path) -> set[str] | None:
 LINK_SETTINGS = "link_settings.json"
 
 
-def link_settings(link_aliases: bool = False, variants: dict | None = None, variant_meta: dict | None = None) -> dict:
+def link_settings(link_aliases: bool = False, variants: dict | None = None, variant_meta: dict | None = None,
+                  signer_split: str | None = None) -> dict:
     """What the link step decides for a whole work folder (docs 15.34). ``link_aliases``: strip WSLP's "(N)"
     numbering and use the twin alias table. Off: exactly the old linking. ``variants`` / ``variant_meta``: the
     relinks of a variant-links file and its file name and SHA-256 (``variant_audit.load_variant_links``, docs 15.36);
@@ -585,6 +619,11 @@ def link_settings(link_aliases: bool = False, variants: dict | None = None, vari
     if variants:
         d["variants"] = {s: dict(sorted(m.items())) for s, m in sorted(variants.items()) if m}
         d["variant_links"] = dict(variant_meta or {})
+    v = signer_split or DEFAULT_SIGNER_SPLIT
+    signer_split_params(v)  # refuses an unknown version
+    if v != DEFAULT_SIGNER_SPLIT:  # docs 15.42: only when not v1, so a v1 folder's settings are byte-identical
+        d["signer_split"] = v
+        d["signer_split_params"] = signer_split_params(v)
     return d
 
 

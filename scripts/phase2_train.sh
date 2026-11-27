@@ -83,6 +83,15 @@
 #   ENC_BAR=<probe.json>   after the encoder step, `cli encoder-probe --bar <probe.json>` measures the new encoder on
 #     the dictionary protocol into <work>/eval/encoder_probe.json (a warning in the log when below the bar or not
 #     comparable; never fails the step) and evaluate copies it into report.json (docs 15.41). Default: off.
+# SIGNER_SPLIT=v1|v2 (docs 15.42, QA plan 1.6, critic 10; research v2, commercial-safe v1): the signer split of the other
+#   labelled sources, passed to the link step only (link-sources --signer-split, frozen into link_settings.json; later
+#   steps read the folder's). v2 = ISL500 9 train / 4 val / 2 test signers (same test signers; 2 train signers move to
+#   val). After a change run --from link: pretrain_dedup and pretrain must run again (train-encoder refuses a v2 run's
+#   pretrained warm start that saw a v2 validation clip). A variant_links.json audited on v1 is refused by a v2 link
+#   step: re-run `cli variant-audit --signer-split v2` first.
+# FUSION_OOF=1 (docs 15.42, critic 8; default 0 for both profiles): the fusion step runs `fit-fusion --oof-calibration`:
+#   INCLUDE is certified on the out-of-fold test parts of cv/fold1-4 (each scored by its fold's classifier, never fold
+#   0's test part). Needs the cv step. FUSION_OOF_KEEP_IN_SAMPLE=1 adds --oof-keep-in-sample.
 # EVAL_COMPARE_TO=<report.json>: the evaluate step runs `evaluate --all --compare-to <report.json>` (E1b and E4 like
 # for like against that report, e.g. artifacts/isl/commercial-safe/eval/report.json; docs 15.27, 15.28, 15.31).
 # One profile per run (refused with --profile both); a missing file is refused before anything runs (exit 2).
@@ -278,6 +287,18 @@ if [[ -n "${ENC_BAR:-}" ]]; then
   ENC_BAR_FILE="$(realpath -m -- "$ENC_BAR")"
   [[ -f "$ENC_BAR_FILE" ]] || { echo "ENC_BAR: $ENC_BAR_FILE is not a file (an encoder-probe --out JSON)" >&2; exit 2; }
 fi
+# signer split (docs 15.42): research v2, commercial-safe v1; only the link step passes it
+SIGNER_SPLIT="${SIGNER_SPLIT:-$([[ "$PROFILE" == "research" ]] && echo v2 || echo v1)}"
+case "$SIGNER_SPLIT" in v1|v2) ;; *) echo "SIGNER_SPLIT must be v1 or v2" >&2; exit 2 ;; esac
+SS_ARG=""; [[ "$SIGNER_SPLIT" != v1 ]] && SS_ARG="--signer-split $SIGNER_SPLIT"
+# out-of-fold INCLUDE calibration in the fusion step (docs 15.42): opt-in for both profiles
+FUSION_OOF="${FUSION_OOF:-0}"
+case "$FUSION_OOF" in 0|1) ;; *) echo "FUSION_OOF must be 0 or 1" >&2; exit 2 ;; esac
+FO_ARG=""
+if [[ $FUSION_OOF == 1 ]]; then
+  FO_ARG="--oof-calibration"
+  [[ "${FUSION_OOF_KEEP_IN_SAMPLE:-0}" == 1 ]] && FO_ARG="$FO_ARG --oof-keep-in-sample"
+fi
 WSLP_TWINS="${INDEX_WSLP_TWINS:-$TW_DEFAULT}"
 # linker aliases (docs 15.34): research on, commercial-safe off; only the link step passes it (later steps read the
 # work folder's link_settings.json; the start line prints the folder's real state when link is not run, docs 15.35)
@@ -309,8 +330,10 @@ step_settings() {
     e1a) echo " dict_group=$DICT_GROUP" ;;
     encoder|oneshot) echo " enc_exclude=${ENC_XSRC:--} $ENC_SETTINGS" ;;
     index|index_final) echo " wslp_twins=$WSLP_TWINS" ;;
-    link) echo " link_aliases=$LINK_ALIASES variant_links=$VL_FILE" ;;
+    link) echo " link_aliases=$LINK_ALIASES variant_links=$VL_FILE signer_split=$SIGNER_SPLIT" ;;
+    fusion) [[ $FUSION_OOF == 1 ]] && echo " oof=1" ;;
   esac
+  return 0
 }
 # a skipped classifier / cv step whose stamp has other settings than this run's (e.g. a stamp from before the quota):
 # kept as it is (never refused), but said, so a plain resume does not silently keep an old classifier (docs 15.39)
@@ -459,7 +482,7 @@ run_step() {
       cli dedup --sources include islrtc cislr wslp isl500 mendeley_emergency mendeley_agri ;;
     vocab) cli vocab --no-trims --out "$VOCAB" ;;  # to the work folder (commit to models/packs/isl after review)
     splits) cli splits --vocab "$VOCAB" ;;  # fetches the official INCLUDE lists only when missing
-    link) cli link-sources $COMMON --all-sources $CAP $LA_ARG $VL_ARG ;;
+    link) cli link-sources $COMMON --all-sources $CAP $LA_ARG $VL_ARG $SS_ARG ;;
     bench) cli bench --threads "$THREADS" --steps $([[ $SMOKE == 1 ]] && echo 1 || echo 5) --hidden-sizes ${HIDDEN:-192} ;;
     pretrain_dedup) cli pretrain-dedup $COMMON --all-sources $CAP $PDD ;;  # Sign Library copies / eval-clip matches
     pretrain) train pretrain $COMMON $CAP $PRE ;;
@@ -488,7 +511,7 @@ run_step() {
     # so an older index_final (other data / row logic) is never shipped next to it
     index) cli build-index $COMMON --all-sources $CAP $TW_ARG --out "$WORK/index" \
         && rm -f "$STAMPS/fusion.done" "$STAMPS/evaluate.done" "$STAMPS/index_final.done" "$STAMPS/pack.done" ;;
-    fusion) cli fit-fusion $COMMON --all-sources $CAP ;;
+    fusion) cli fit-fusion $COMMON --all-sources $CAP $FO_ARG ;;
     trim_eval)  # E8: evaluate exactly the trimmer of the trim step (same learned-model choice) into the work folder
       # a new trim-eval makes an older report / pack stale: forget their stamps so they are rebuilt from it
       cli trim-eval --learned-model auto --out "$WORK/trim_eval.json" $([[ $SMOKE == 1 ]] && echo "--n ${SMOKE_TRIM_EVAL_N:-60}") \
@@ -515,6 +538,7 @@ if [[ $DRY_RUN == 1 ]]; then
   [[ -n "$ENC_BAR_FILE" ]] && echo "encoder probe after the encoder step: bar $ENC_BAR_FILE -> $WORK/eval/encoder_probe.json"
   [[ -n "$UNTIL" ]] && echo "until: $UNTIL (later steps are not run)"
   echo "variant links: VARIANT_LINKS=$VARIANT_LINKS, $WORK/variant_links.json: $VL_FILE (link step only)"
+  echo "signer split: SIGNER_SPLIT=$SIGNER_SPLIT (link step only); fusion out-of-fold calibration: FUSION_OOF=$FUSION_OOF"
 fi
 
 if [[ $LIST == 1 ]]; then
@@ -585,6 +609,20 @@ else
   VL_STATE="(link step not run; folder: $vl_folder)"
 fi
 WSLP_SETTINGS="$WSLP_SETTINGS variant_links=$VL_STATE"
+# signer split (docs 15.42): SIGNER_SPLIT acts only when the link step runs; otherwise the folder's link settings decide
+if in_list link "${RUN[@]}"; then
+  SS_STATE="$SIGNER_SPLIT"
+else
+  ss_dir="$WORK"; in_list link "${SEED[@]}" && ss_dir="$SEED_WORK"
+  ss_folder="v1"
+  if [[ ! -f "$ss_dir/link_settings.json" ]]; then ss_folder="v1 (no link settings)"
+  elif grep -q '"signer_split": *"v2"' "$ss_dir/link_settings.json"; then ss_folder="v2"; fi
+  SS_STATE="$SIGNER_SPLIT (link step not run; folder: $ss_folder)"
+  if [[ "${ss_folder%% *}" != "$SIGNER_SPLIT" ]]; then
+    SS_WARN="SIGNER_SPLIT=$SIGNER_SPLIT but the link step is not run and the work folder's signer split is $ss_folder: this run splits as the folder says (run --from link to change it)"
+  fi
+fi
+WSLP_SETTINGS="$WSLP_SETTINGS signer_split=$SS_STATE"
 # the classifier's source quota, checked in full before anything runs (docs 15.39): an unknown name, a word source of
 # the profile with no share or all shares 0 would otherwise fail only when the classifier step starts, hours into a
 # run. Checked against every word source of the profile (stricter than the sources a run really has: fine here).
@@ -610,7 +648,8 @@ if [[ "$ONLY" == link ]]; then
     exit 2
   fi
 fi
-[[ $DRY_RUN == 1 ]] && echo "linker this run: link_aliases=$LA_STATE variant_links=$VL_STATE"
+[[ $DRY_RUN == 1 ]] && echo "linker this run: link_aliases=$LA_STATE variant_links=$VL_STATE signer_split=$SS_STATE"
+[[ $DRY_RUN == 1 && -n "${SS_WARN:-}" ]] && echo "warning: $SS_WARN"
 # (not for --check-only, which runs no step)
 if [[ $SCRATCH == 1 && $ALLOW_SHARED == 0 && $CHECK_ONLY == 0 ]]; then
   for s in "${RUN[@]}"; do
@@ -677,8 +716,9 @@ mkdir -p "$WORK"
 free_gb=$(df -Pk "$REPO" | awk 'NR==2 {print int($4/1048576)}')
 if [[ "$free_gb" -lt 10 ]]; then log "only ${free_gb} GB free (< 10 GB floor): not starting"; exit 3; fi
 
-log "phase 2 driver: profile=$PROFILE smoke=$SMOKE tag=${RUN_TAG:--} allow_partial=$ALLOW_PARTIAL threads=$THREADS work=$WORK stamps=$STAMPS${COMPARE_TO:+ compare_to=$COMPARE_TO} $WSLP_SETTINGS cls_quota=$CLS_QUOTA cls_select=$CLS_SEL enc: $ENC_SETTINGS${UNTIL:+ until=$UNTIL} git=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+log "phase 2 driver: profile=$PROFILE smoke=$SMOKE tag=${RUN_TAG:--} allow_partial=$ALLOW_PARTIAL threads=$THREADS work=$WORK stamps=$STAMPS${COMPARE_TO:+ compare_to=$COMPARE_TO} $WSLP_SETTINGS cls_quota=$CLS_QUOTA cls_select=$CLS_SEL enc: $ENC_SETTINGS fusion_oof=$FUSION_OOF${UNTIL:+ until=$UNTIL} git=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
 [[ -n "${LA_WARN:-}" ]] && log "warning: $LA_WARN"
+[[ -n "${SS_WARN:-}" ]] && log "warning: $SS_WARN"
 if [[ ${#SEED[@]} -gt 0 ]]; then
   for s in "${SEED[@]}"; do seed_step "$s" || { log "seeding $s FAILED"; exit 2; }; done
   if [[ -f "$SEED_WORK/partial_data.json" && ! -f "$WORK/partial_data.json" ]]; then

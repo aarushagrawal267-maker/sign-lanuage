@@ -44,6 +44,7 @@ from torch import nn
 from app.features.spec import FeatureConfig
 from app.isl.models.encoder import SignEncoder, load_encoder_weights
 from app.isl.models.losses import SubCenterArcFace, SupConLoss
+from app.isl.training.common import signer_split_signature as _signer_split_sig  # docs 15.42
 from app.isl.training.common import (DICTIONARY_SOURCES, ClipDataset, IslData, LazyClipDataset, class_space_of,
                                      set_threads, signer_group_key)
 from app.isl.training.loop import (LoopConfig, atomic_save, bridge_plan, clips_digest, digest, expected_bridge_pairs,
@@ -546,7 +547,9 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
                               else {}),
                            **({"val_protocol": val_protocol,
                                "val_dict": [dict_val_per_signer, clips_digest(dq), clips_digest(dg)]}
-                              if val_protocol == "dictionary" else {})})
+                              if val_protocol == "dictionary" else {}),
+                           # signer split v2 (docs 15.42): only when not v1 (rule of 15.19)
+                           **_signer_split_sig(data)})
     select_key = DICT_SELECT_KEY if val_protocol == "dictionary" else "val_r1"
     res = run_loop(both, batches, loss_fn, lc, state_path or Path(str(out) + ".state"), val_fn=val_fn,
                    select_key=select_key, save_best=save_best, fresh=not resume,

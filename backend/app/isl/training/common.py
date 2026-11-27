@@ -196,6 +196,11 @@ class IslData:
         """INCLUDE clips of a split part plus the other labelled sources' clips of that part."""
         return self.include_part(part) + self.extra_part(part)
 
+    @property
+    def signer_split(self) -> str:
+        """The signer split version of the other sources (docs 15.42): the link settings' ``signer_split``, else v1."""
+        return str((self.link or {}).get("signer_split") or "v1")
+
     def summary(self) -> dict:
         parts = {p: len(self.include_part(p)) for p in ("train", "val", "test")}
         extra = {}
@@ -208,7 +213,9 @@ class IslData:
                 "islrtc_reextraction": dict(self.islrtc_stats),
                 "islrtc_trim_versions": dict(Counter(str(c.quality.get("trim_version")) for c in self.islrtc
                                                      if c.end is not None)),
-                "include_concepts": len({c.concept_id for c in self.include if c.concept_id})}
+                "include_concepts": len({c.concept_id for c in self.include if c.concept_id}),
+                # docs 15.42: only when not v1, so the summary of every older run is unchanged
+                **({"signer_split": self.signer_split} if self.signer_split != "v1" else {})}
 
 
 # ISLRTC rows re-extracted after the first pass (card-v2 title-card detector; ``scripts/ingest_isl.py
@@ -380,6 +387,13 @@ class LazyClipDataset:
         if len(xs) < 2:
             return None
         return torch.from_numpy(np.stack(xs).astype(np.float32)), torch.tensor(ys, dtype=torch.long)
+
+
+def signer_split_signature(data) -> dict:
+    """The resume-signature entry of the signer split (docs 15.19, 15.42): ``{"signer_split": "v2"}`` when the data's
+    link settings chose a split other than v1, else ``{}`` (so a state of a v1 run written before 15.42 resumes)."""
+    v = str((getattr(data, "link", None) or {}).get("signer_split") or "v1")
+    return {"signer_split": v} if v != "v1" else {}
 
 
 def signer_group_key(c: Clip, dictionary_group: bool = False) -> str:

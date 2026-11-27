@@ -652,6 +652,8 @@ def cmd_train_encoder(paths: IslPaths, args) -> int:
         print(f"train-encoder: {e}", file=sys.stderr)
         return 2
     profile, data, fcfg, work = _model_ctx(paths, args)
+    if not _pretrain_split_guard("train-encoder", args, work, data):
+        return 2
     _print({"data": data.summary()})
     out = Path(args.ckpt) if getattr(args, "ckpt", None) else work / "encoder.pt"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -835,6 +837,32 @@ def _fusion_fit_space(rec) -> dict:
                             idx.meta.row_filters if idx is not None else None)
 
 
+def _pretrain_split_guard(cmd: str, args, work: Path, data) -> bool:
+    """Signer split v2 (docs 15.42): the warm start ``<work>/pretrained_encoder.pt`` must not have seen an evaluation
+    clip of THIS split (a pre-training of the v1 split saw the two ISL500 signers v2 moves to validation). Checked
+    from ``<work>/pretrain_clips.txt``; prints the reason and returns False when refused. v1 (every run before
+    15.42): not checked here, exactly as before (the report's pre-training guard still reports it)."""
+    from app.isl.training.multisource import eval_clip_ids, read_pretrain_list, signer_split_version
+
+    ver = signer_split_version(getattr(data, "link", None))
+    init = _init_path(args, work)
+    if ver == "v1" or init is None or Path(init).resolve() != (work / "pretrained_encoder.pt").resolve():
+        return True
+    ids = read_pretrain_list(work)
+    if ids is None:
+        print(f"{cmd}: signer split {ver}: {work / 'pretrain_clips.txt'} is missing, so the warm start cannot be "
+              "shown to exclude this split's validation / test clips; re-run pretrain_dedup and pretrain "
+              "(scripts/phase2_train.sh --from link) or pass --init none", file=sys.stderr)
+        return False
+    hit = sorted(ids & eval_clip_ids(data))
+    if hit:
+        print(f"{cmd}: signer split {ver}: the pre-training saw {len(hit)} clips that are validation / test clips "
+              f"of this split (e.g. {hit[:3]}); re-run pretrain_dedup and pretrain after the link step "
+              "(scripts/phase2_train.sh --from link) or pass --init none", file=sys.stderr)
+        return False
+    return True
+
+
 def _init_path(args, work: Path) -> Path | None:
     v = getattr(args, "init", None)
     if not v or v == "none":
@@ -934,6 +962,8 @@ def cmd_train_oneshot(paths: IslPaths, args) -> int:
         print(f"train-oneshot: {e}", file=sys.stderr)
         return 2
     profile, data, fcfg, work = _model_ctx(paths, args)
+    if not _pretrain_split_guard("train-oneshot", args, work, data):
+        return 2
     one = paths.splits / "oneshot_concepts.json"
     if not one.exists():
         _print({"skipped": True, "reason": "no oneshot_concepts.json: run 'splits' with a vocabulary first"})
@@ -1104,11 +1134,29 @@ def cmd_fit_fusion(paths: IslPaths, args) -> int:
     from app.isl.training.pipeline import load_recognizer
 
     profile, data, fcfg, work = _model_ctx(paths, args)
+    oof = None
+    if getattr(args, "oof_calibration", False):
+        # docs 15.42 (critic 8): INCLUDE certified on out-of-fold clips of cv/fold1-4, never fold 0's test part
+        from app.isl.models.index import LeakageError
+        from app.isl.training.oof_calibration import (OofCalibration, OofError, check_oof_clips, load_sessions,
+                                                      oof_parts)
+
+        try:
+            parts = oof_parts(paths, data, work, folds=args.oof_folds or None)
+            check_oof_clips(parts, data)
+        except (OofError, LeakageError) as e:
+            print(f"fit-fusion --oof-calibration: {e}", file=sys.stderr)
+            return 2
+        oof = OofCalibration(parts, data, sessions=load_sessions(paths), max_encoder_gain=args.oof_max_encoder_gain,
+                             keep_in_sample=bool(args.oof_keep_in_sample), progress=lambda m: _log(f"  fusion {m}"))
+        _log(f"  fusion: out-of-fold calibration on folds {[p.fold for p in parts]} "
+             f"({sum(len(p.clips) for p in parts)} INCLUDE clips)")
     rec = load_recognizer(work, fcfg, _vocab_path(args), profile=profile)
     # data: the leak guard also checks the index's split and training clips against this run's (docs 15.22).
     # aliases: only when the link step turned them on (docs 15.34); the thresholds are then fitted on the summed
     # alias groups the app will use, and scored on strict labels
-    params, rep = fit_fusion(rec, data.labelled_part("val"), profile, data=data, aliases=data.alias_of or None)
+    params, rep = fit_fusion(rec, data.labelled_part("val"), profile, data=data, aliases=data.alias_of or None,
+                             oof=oof)
     assert set(params.accept) == {"strict", "balanced", "lenient"}, params.accept  # decide() needs all three
     # the class spaces it was fitted on (docs 15.33): evaluate flags, build-pack refuses another classifier / encoder
     params = params.with_(fitted_on=_fusion_fit_space(rec))
@@ -1229,7 +1277,8 @@ def cmd_link_sources(paths: IslPaths, args) -> int:
     if variants:
         # the signers the audit used as ISL500 train must still be train (no val / test signer decides labels)
         split = va.check_split(va.variant_links_doc_split(vf), source_train_groups(
-            paths, load_vocab(_vocab_path(args)), profile, va.VARIANT_SOURCE, seed=args.seed))
+            paths, load_vocab(_vocab_path(args)), profile, va.VARIANT_SOURCE, seed=args.seed,
+            version=getattr(args, "signer_split", None)))
         if not split["ok"]:
             if not getattr(args, "allow_split_change", False):
                 say(f"{vf}: {split['reason']} (--allow-split-change links with it anyway, recorded)")
@@ -1242,11 +1291,13 @@ def cmd_link_sources(paths: IslPaths, args) -> int:
             f"false-alarm rate on agreeing words {'-' if fa is None else f'{fa:.3f}'}, evidence "
             f"{vmeta.get('parts_used')}" + (" ACCEPTED NOISY" if vmeta.get("accepted_noisy") else ""))
     args.all_sources = True
-    args.link_settings_override = link_settings(bool(getattr(args, "link_aliases", False)), variants, vmeta)
+    args.link_settings_override = link_settings(bool(getattr(args, "link_aliases", False)), variants, vmeta,
+                                                signer_split=getattr(args, "signer_split", None))
     profile, data, fcfg, work = _model_ctx(paths, args)
     data.link = write_link_settings(work, args.link_settings_override, data.linker)
     _print({"data": data.summary(), "multisource": data.multisource, "work": str(work),
             "link": {k: v for k, v in data.link.items() if k not in ("alias_of", "variants")} | {
+                "signer_split": data.link.get("signer_split", "v1"),
                 "alias_groups": len(set(data.alias_of.values())),
                 "variant_relinks": sum(len(m) for m in (data.link.get("variants") or {}).values())}})
     return 0
@@ -1274,7 +1325,7 @@ def cmd_variant_audit(paths: IslPaths, args) -> int:
     from app.isl.profiles import WORD_SOURCES, get_profile
     from app.isl.training import variant_audit as va
     from app.isl.training.common import load_isl_data, load_vocab, set_threads
-    from app.isl.training.multisource import SIGNER_SPLIT, attach_all_sources, link_settings
+    from app.isl.training.multisource import attach_all_sources, link_settings, signer_split_params
     from app.isl.training.pipeline import workdir
     from app.isl.vocab.aliases import TWIN_ALIASES, resolve_aliases
     from app.models.checkpoint import Predictor
@@ -1321,8 +1372,11 @@ def cmd_variant_audit(paths: IslPaths, args) -> int:
     vocab = load_vocab(_vocab_path(args))
     data = load_isl_data(paths, vocab, profile, args.split, max_islrtc=args.max_islrtc or None, seed=args.seed)
     # the base linking (no twins, no variants): the audit judges the concepts the linker gives without it
+    # the signer split the link step will use (docs 15.42: audit on v2 before a v2 link, or the split check refuses)
+    ssv = getattr(args, "signer_split", None) or "v1"
     attach_all_sources(data, paths, vocab, profile, seed=args.seed,
-                       max_per_source=getattr(args, "max_per_source", 0) or None, link=link_settings(False))
+                       max_per_source=getattr(args, "max_per_source", 0) or None,
+                       link=link_settings(False, signer_split=ssv))
     twins = resolve_aliases(TWIN_ALIASES, data.linker.known | set(data.linker.new))
     rev_score = rev_names = None
     rev_clips = None
@@ -1358,8 +1412,9 @@ def cmd_variant_audit(paths: IslPaths, args) -> int:
                                   extra={"data": {"split": data.split.get("name"), "isl500_train_clips": len(isl500),
                                                   "include_train_clips": len(data.include_part("train"))},
                                          "parts_used": parts,
-                                         "isl500_split": va.split_record(args.seed, SIGNER_SPLIT,
-                                                                         {c.group for c in isl500}),
+                                         "isl500_split": va.split_record(args.seed, signer_split_params(ssv),
+                                                                         {c.group for c in isl500})
+                                         | ({"version": ssv} if ssv != "v1" else {}),
                                          "approval": f"a proposal: read the evidence, then copy it to "
                                                      f"{workdir(profile) / va.VARIANT_LINKS} (or name it with "
                                                      "link-sources --variant-links FILE)"})
@@ -1618,6 +1673,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="link with an audit whose dictionary rule is marked not usable (recorded)")
     lk.add_argument("--allow-split-change", action="store_true",
                     help="link with an audit whose ISL500 train signers are not all train now (recorded)")
+    lk.add_argument("--signer-split", choices=["v1", "v2"], default="v1",
+                    help="signer split of the other labelled sources (docs 15.42): v1 (default, as before) or v2 = "
+                         "ISL500 9 train / 4 val / 2 test signers (same test signers, 2 train signers move to val). "
+                         "Frozen into link_settings.json; pretrain_dedup and pretrain must run again after it")
     vau = sub.add_parser("variant-audit")
     _model_args(vau)
     vau.add_argument("--reference-work", help="work folder of the reference models (default: the commercial-safe "
@@ -1640,6 +1699,9 @@ def build_parser() -> argparse.ArgumentParser:
     vau.add_argument("--dict-include-max-rank", type=int, default=20)
     vau.add_argument("--reverse-min-agreement", type=float, default=0.3)
     vau.add_argument("--max-per-class", type=int, default=0, help="score at most N train clips per word (0 = all)")
+    vau.add_argument("--signer-split", choices=["v1", "v2"], default="v1",
+                     help="the signer split the link step will use (docs 15.42); the audit scores only that split's "
+                          "ISL500 train signers")
     ep = sub.add_parser("encoder-probe")
     _model_args(ep)
     ep.add_argument("--encoder", help="encoder checkpoint (default <work>/encoder.pt)")
@@ -1671,6 +1733,19 @@ def build_parser() -> argparse.ArgumentParser:
             sp2.add_argument("--all-include", action="store_true",
                              help="every reference incl. validation / test clips (the shipped index): writes "
                                   "<work>/index_final unless --out; never <work>/index (docs 15.21)")
+        if name == "fit-fusion":
+            sp2.add_argument("--oof-calibration", action="store_true",
+                             help="certify INCLUDE on out-of-fold clips (docs 15.42): the test parts of the other "
+                                  "folds of the primary split, each scored by <work>/cv/foldK/classifier.pt against a "
+                                  "leave-fold-out gallery; never fold 0's test part. Default: off (as before)")
+            sp2.add_argument("--oof-folds", type=int, nargs="+", default=None,
+                             help="folds to use (default: every fold of the primary split but the primary one)")
+            sp2.add_argument("--oof-max-encoder-gain", type=float, default=0.03,
+                             help="in-sample screen: folds whose clips the encoder trained on are used only when "
+                                  "their retrieval top-1 advantage (difference-in-differences against the fold "
+                                  "classifiers) is at most this (default 0.03)")
+            sp2.add_argument("--oof-keep-in-sample", action="store_true",
+                             help="use the in-sample folds even when the screen fails (recorded)")
         if name == "evaluate":
             sp2.add_argument("--part", default="test", choices=["val", "test"])
             sp2.add_argument("--all", action="store_true",

@@ -32,6 +32,7 @@ from torch import nn
 from app.evaluation.metrics import confidence_curve, pick_threshold
 from app.features.spec import FeatureConfig
 from app.isl.models.calibration import fit_temperature
+from app.isl.training.common import signer_split_signature as _signer_split_sig  # docs 15.42
 from app.isl.training.common import (SIGNER_GROUPING_DICTIONARY, SIGNER_GROUPING_SOURCE, IslData, LazyClipDataset,
                                      multi_signer_counts, set_threads)
 from app.isl.training.loop import (LoopConfig, atomic_save, balanced_batches, clips_digest, digest,
@@ -245,7 +246,9 @@ def train_classifier(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainCo
                            # 15.38, the same way: only when on
                            **({"source_quota": {"shares": shares, "groups": group_of}} if quota is not None else {}),
                            **({"select_on": select_on} if select_on != "macro_f1" else {}),
-                           **({"temperature_fit": temperature_fit} if temperature_fit != "auto" else {})})
+                           **({"temperature_fit": temperature_fit} if temperature_fit != "auto" else {}),
+                           # signer split v2 (docs 15.42): only when not v1, the same way
+                           **_signer_split_sig(data)})
     if progress:
         progress(None, f"draw share by source {draw_share}" + (f", quota {shares}" if quota is not None else "")
                  + f", selection {select_key}")
