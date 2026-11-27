@@ -4,7 +4,8 @@ Everything here is a small grid search over cached validation evidence (``Fusion
 seconds on CPU. Targets: accepted words >= 95 % correct for ``balanced`` (98 % ``strict``, 90 % ``lenient``);
 "did you mean" only when the true word is in the top 5 for >= 80 % of such cases (fitted per policy, on the worst
 major source). Certification (docs 15.25): a policy auto-accepts only when the design-effect-adjusted 95 % Wilson
-lower bound of accepted precision of EVERY major source (>= 30 accepts, >= 2 signer groups) is >= its floor
+lower bound of accepted precision of EVERY major source (>= 100 clips, >= 30 accepts, >= 2 signer groups; docs
+15.26) is >= its floor
 (0.95 / 0.90 / 0.85); otherwise it is confirm-only and its top candidate becomes "did you mean". The *measured*
 numbers - each policy's certified worst-source bound and its per-source rows - are stored in
 ``FusionParams.achieved`` (the UI shows those, never the target). The classifier alone (sliding mode) gets its own
@@ -176,10 +177,28 @@ THRESHOLD_GRID = np.unique(np.round(np.r_[np.round(np.arange(0.20, 0.991, 0.01),
 # even for a certified policy and shows the certified number, not the target.
 FLOORS = {"strict": 0.95, "balanced": 0.90, "lenient": 0.85}
 CERT_VERSION = "cert-1"
-MAJOR_MIN_ACCEPTS = 30  # a source is "major" with >= this many accepts at the lowest threshold of the scan ...
-MAJOR_MIN_GROUPS = 2  # ... and >= this many signer groups
+MAJOR_MIN_CLIPS = 100  # a source is "major" (judged) with >= this many calibration clips ...
+MAJOR_MIN_ACCEPTS = 30  # ... >= this many accepts at the lowest threshold of the scan ...
+MAJOR_MIN_GROUPS = 2  # ... and >= this many signer groups (docs 15.26)
+# A source of n clips can never have a bound above wilson_lower(n, n): 0.910 for 39 clips, 0.95 only from 73 clips.
+# A smaller source would block strict by construction (Mendeley, 39 clips, did so on research), so it is reported
+# (``major: False``, "too small to certify") but neither certifies nor blocks. 100 leaves room for a few errors.
+assert wilson_lower(MAJOR_MIN_CLIPS, MAJOR_MIN_CLIPS) >= FLOORS["strict"]
 DEFF_MIN_GROUPS = 3  # fewer groups with accepts: the dispersion cannot be estimated -> prior or DEFF_FALLBACK
+PHI_MIN_ERRORS = 10  # fewer accepted errors: no phi from that threshold (with 1 error it is ~1 by construction,
+#                      with 0 it is undefined); the source's phi comes from the thresholds that have them
 DEFF_FALLBACK = 5.0  # ISL500 with 4 signers measured about 5 (Model QA verify-wilson-cluster)
+TOO_SMALL_NOTE = (f"too small to certify (fewer than {MAJOR_MIN_CLIPS} clips, {MAJOR_MIN_ACCEPTS} accepts or "
+                  f"{MAJOR_MIN_GROUPS} signer groups): reported, not judged")
+
+
+def is_major_size(n_clips: int, n_groups: int | None, n_accepts: int | None = None) -> bool:
+    """The size part of the major-source rule (docs 15.26): enough clips that the source could be certified at the
+    strict floor at all, enough signer groups (None = groups unknown, every clip its own group) and, for a scan,
+    enough accepts at its lowest threshold."""
+    g = n_clips if n_groups is None else n_groups
+    return bool(n_clips >= MAJOR_MIN_CLIPS and g >= MAJOR_MIN_GROUPS
+                and (n_accepts is None or n_accepts >= MAJOR_MIN_ACCEPTS))
 
 
 def wilson_lower_deff(k: float, n: float, deff: float = 1.0, z: float = 1.96) -> float:
@@ -217,12 +236,19 @@ def _labels(n: int, sources, groups):
 
 def scan_by_source(acc: np.ndarray, ok: np.ndarray, sources=None, groups=None, phi_prior: dict | None = None,
                    major=None) -> dict:
-    """Per source, per scan row: accepts, correct accepts, the design effect DEFF = max(1, phi) and the
-    design-effect-adjusted Wilson lower bound. ``acc`` / ``ok`` are (thresholds, clips) booleans; ``sources`` /
+    """Per source, per scan row: accepts, correct accepts, the design effect DEFF and the design-effect-adjusted
+    Wilson lower bound. ``acc`` / ``ok`` are (thresholds, clips) booleans with ascending thresholds; ``sources`` /
     ``groups`` per clip (None: one source "all" / every clip its own group, DEFF 1 - the clip-level bound used before
-    docs 15.25). A source is major with >= ``MAJOR_MIN_ACCEPTS`` accepts in row 0 (the lowest threshold) and >=
-    ``MAJOR_MIN_GROUPS`` groups, unless ``major`` names the major sources. ``phi_prior`` (source -> phi, e.g. from
-    cross-validation groups) replaces the fallback 5.0 for a source with too few groups."""
+    docs 15.25). A source is major when ``is_major_size`` (>= ``MAJOR_MIN_CLIPS`` clips, >= ``MAJOR_MIN_ACCEPTS``
+    accepts in row 0, >= ``MAJOR_MIN_GROUPS`` groups), unless ``major`` names the major sources.
+
+    DEFF (docs 15.26) is one number per source: DEFF = max(1, phi_s), where phi_s is the median of the Pearson
+    dispersions of the rows with >= ``DEFF_MIN_GROUPS`` groups that have accepts and >= ``PHI_MIN_ERRORS`` accepted
+    errors. Accepts and errors only shrink as the threshold grows, so those are the low rows; the clustering they
+    measure is applied at the high thresholds too, where the errors run out (estimated row by row, phi fell to 1
+    exactly there and certified on that). The median keeps one noisy row from setting it. Without any such row (too
+    few groups or errors), ``phi_prior`` (source -> phi, e.g. from cross-validation groups) or the fallback 5.0 -
+    never 1."""
     acc, ok = np.atleast_2d(np.asarray(acc, bool)), np.atleast_2d(np.asarray(ok, bool))
     T, N = acc.shape
     src, gid = _labels(N, sources, groups)
@@ -237,28 +263,32 @@ def scan_by_source(acc: np.ndarray, ok: np.ndarray, sources=None, groups=None, p
         else:
             _, g_inv = np.unique(gid[m], return_inverse=True)
             G_all = int(g_inv.max()) + 1 if len(g_inv) else 0
-        is_major = (s in set(major)) if major is not None else bool(
-            n_acc[0] >= MAJOR_MIN_ACCEPTS and (G_all if G_all is not None else int(m.sum())) >= MAJOR_MIN_GROUPS)
-        deff, phi_from = np.ones(T), []
-        for t in range(T):
-            if g_inv is None:
-                phi_from.append("clips (no groups given)")
-                continue
-            phi = None
+        is_major = (s in set(major)) if major is not None else is_major_size(int(m.sum()), G_all, int(n_acc[0]))
+        phi_s, n_rows = None, 0
+        if g_inv is None:
+            deff, phi_from = np.ones(T), "clips (no groups given)"
+        else:
+            phis = []
             if G_all >= DEFF_MIN_GROUPS:
-                ng = np.bincount(g_inv, weights=a[t], minlength=G_all)
-                eg = np.bincount(g_inv, weights=a[t] & ~o[t], minlength=G_all)
-                phi = pearson_dispersion(ng, eg)
-            if phi is not None:
-                phi_from.append("validation")
+                for t in np.flatnonzero(n_acc - n_ok >= PHI_MIN_ERRORS):
+                    ng = np.bincount(g_inv, weights=a[t], minlength=G_all)
+                    eg = np.bincount(g_inv, weights=a[t] & ~o[t], minlength=G_all)
+                    ph = pearson_dispersion(ng, eg)
+                    if ph is not None:
+                        phis.append(ph)
+            n_rows = len(phis)
+            if phis:
+                phi_s, phi_from = float(np.median(phis)), "validation"
             elif phi_prior and s in phi_prior and phi_prior[s] is not None:
-                phi, _ = float(phi_prior[s]), phi_from.append("prior")
+                phi_s, phi_from = float(phi_prior[s]), "prior"
             else:
-                phi, _ = DEFF_FALLBACK, phi_from.append("fallback")
-            deff[t] = max(1.0, float(phi))
+                phi_s, phi_from = DEFF_FALLBACK, "fallback"
+            deff = np.full(T, max(1.0, phi_s))
         lb = np.array([wilson_lower_deff(int(k), int(n_), d) for k, n_, d in zip(n_ok, n_acc, deff)])
         out[s] = {"n": int(m.sum()), "n_groups": G_all, "major": is_major, "n_acc": n_acc, "n_ok": n_ok,
-                  "deff": deff, "phi_from": phi_from, "lb": lb}
+                  "deff": deff, "phi_from": [phi_from] * T, "lb": lb,
+                  "phi": None if phi_s is None else round(phi_s, 4), "phi_rows": n_rows,
+                  **({} if is_major else {"note": TOO_SMALL_NOTE if major is None else "not a listed major source"})}
     return out
 
 
@@ -267,7 +297,7 @@ def _source_row(b: dict, i: int) -> dict:
     return {"precision": round(no / na, 4) if na else None, "lower_bound": round(float(b["lb"][i]), 4),
             "coverage": round(na / b["n"], 4) if b.get("n") else None, "n_accepted": na, "n": b.get("n"),
             "n_groups": b.get("n_groups"), "deff": round(float(b["deff"][i]), 3), "phi_from": b["phi_from"][i],
-            "major": bool(b["major"])}
+            "major": bool(b["major"]), **({"note": b["note"]} if b.get("note") else {})}
 
 
 def choose_policy_thresholds(ts: np.ndarray, n_acc: np.ndarray, n_ok: np.ndarray, targets: dict,
@@ -301,7 +331,8 @@ def choose_policy_thresholds(ts: np.ndarray, n_acc: np.ndarray, n_ok: np.ndarray
     valid = n_acc >= min_accepted
     rep: dict = {"targets": dict(targets), "floors": floors, "min_accepted": min_accepted, "major_sources": majors,
                  "certification": "worst major source, design-effect-adjusted 95 % Wilson lower bound",
-                 "sources": {s: {"n": b.get("n"), "n_groups": b.get("n_groups"), "major": bool(b["major"])}
+                 "sources": {s: {"n": b.get("n"), "n_groups": b.get("n_groups"), "major": bool(b["major"]),
+                                 **({"note": b["note"]} if b.get("note") else {})}
                              for s, b in by_source.items()}}
     if not valid.any():
         rep["note"] = f"no threshold accepts >= {min_accepted} validation queries: defaults kept, nothing certified"
@@ -334,8 +365,8 @@ def choose_policy_thresholds(ts: np.ndarray, n_acc: np.ndarray, n_ok: np.ndarray
                      **({"coverage": round(float(n_acc[i] / n_total), 4)} if n_total else {}),
                      "by_source": {s: _source_row(b, i) for s, b in sorted(by_source.items())}}
         if not certified:
-            pols[pol]["reason"] = ("no major source (>= %d accepts and >= %d signer groups)"
-                                   % (MAJOR_MIN_ACCEPTS, MAJOR_MIN_GROUPS) if not majors else
+            pols[pol]["reason"] = ("no major source (>= %d clips, >= %d accepts and >= %d signer groups)"
+                                   % (MAJOR_MIN_CLIPS, MAJOR_MIN_ACCEPTS, MAJOR_MIN_GROUPS) if not majors else
                                    f"worst-source lower bound {worst[i]:.3f} ({worst_src[i]}) is below the {pol} "
                                    f"floor {fl:.2f}")
     rep["policies"] = pols
@@ -348,13 +379,14 @@ def choose_policy_thresholds(ts: np.ndarray, n_acc: np.ndarray, n_ok: np.ndarray
 
 def certify_scan(ts: np.ndarray, acc: np.ndarray, ok: np.ndarray, targets: dict, min_accepted: int = 5,
                  n_total: int | None = None, *, sources=None, groups=None, phi_prior: dict | None = None,
-                 floors: dict | None = None) -> tuple[dict | None, dict, dict | None]:
+                 floors: dict | None = None, major_sources=None) -> tuple[dict | None, dict, dict | None]:
     """``choose_policy_thresholds`` from per-clip (thresholds, clips) accept / correct matrices. Calibration clips
     are just columns with a source and a group, so extra calibration data (e.g. out-of-fold predictions of the
-    cross-validation folds, docs 15.25 TODO) can be added by appending columns. Returns (thresholds, report, the
-    per-source scan or None)."""
+    cross-validation folds, docs 15.25 TODO) can be added by appending columns. ``major_sources``: an explicit list
+    (e.g. from a profile) instead of the size rule. Returns (thresholds, report, the per-source scan or None)."""
     acc, ok = np.atleast_2d(np.asarray(acc, bool)), np.atleast_2d(np.asarray(ok, bool))
-    by = scan_by_source(acc, ok, sources, groups, phi_prior) if (sources is not None or groups is not None) else None
+    by = scan_by_source(acc, ok, sources, groups, phi_prior, major=major_sources) \
+        if (sources is not None or groups is not None) else None
     accept, rep = choose_policy_thresholds(ts, acc.sum(1), ok.sum(1), targets, min_accepted, n_total, by_source=by,
                                            floors=floors)
     return accept, rep, by
@@ -372,11 +404,13 @@ def _scan(p1: np.ndarray, base: np.ndarray, correct: np.ndarray, ts: np.ndarray 
     return acc.sum(1).astype(int), ok.sum(1).astype(int)
 
 
-def _fit_s_min(cos: np.ndarray, sources=None, groups=None, q: float = 0.05) -> tuple[float, dict]:
+def _fit_s_min(cos: np.ndarray, sources=None, groups=None, q: float = 0.05,
+               major_sources=None) -> tuple[float, dict]:
     """Out-of-vocabulary guard (docs 15.25): the minimum over major sources of each source's 5 % quantile of the best
     cosine, so >= 95 % of every major source's in-vocabulary queries pass. Pooled, a large source set the guard and a
-    smaller one lost 20.8 % of its in-vocabulary queries (INCLUDE on research). Without sources, or without a major
-    source (>= ``MAJOR_MIN_ACCEPTS`` queries with a cosine and >= ``MAJOR_MIN_GROUPS`` groups), the pooled quantile."""
+    smaller one lost 20.8 % of its in-vocabulary queries (INCLUDE on research). Major: ``is_major_size`` on the
+    queries with a cosine (docs 15.26: a source too small to certify does not set the guard either), or the listed
+    ``major_sources``. Without sources, or without a major source, the pooled quantile."""
     have = cos > -1
     if not have.any():
         return -1.0, {"rule": "no retrieval: guard off"}
@@ -394,9 +428,11 @@ def _fit_s_min(cos: np.ndarray, sources=None, groups=None, q: float = 0.05) -> t
         ng = len(set(grp[m]))
         per[s] = {"n": int(m.sum()), "n_groups": ng,
                   "q05": round(float(np.quantile(cos[m], q)), 4) if m.any() else None}
-        if m.sum() >= MAJOR_MIN_ACCEPTS and ng >= MAJOR_MIN_GROUPS:
+        if m.any() and (s in set(major_sources) if major_sources is not None else is_major_size(int(m.sum()), ng)):
             qs[s] = float(np.quantile(cos[m], q))
             per[s]["major"] = True
+        elif major_sources is None:
+            per[s]["note"] = TOO_SMALL_NOTE
     s_min = min(qs.values()) if qs else pooled
     for s, b in per.items():
         m = (src == s) & have
@@ -492,12 +528,14 @@ def _open_vocabulary_check(results, acc_row: np.ndarray, ok_row: np.ndarray, clo
 
 def fit_thresholds(results: list[FusionResult], truths: list[str], params: FusionParams,
                    targets: dict | None = None, min_accepted: int = 5, *, sources=None, groups=None,
-                   closed_set=None, phi_prior: dict | None = None) -> tuple[FusionParams, dict]:
+                   closed_set=None, phi_prior: dict | None = None,
+                   major_sources=None) -> tuple[FusionParams, dict]:
     """Accept thresholds, their certification, the out-of-vocabulary guard and the "did you mean" masses on
     validation (docs 15.25). ``sources`` / ``groups``: per result, its source and signer group (fit-fusion passes
     them; without them one pooled source with the clip-level bound). ``closed_set``: the classifier's classes, for the
     open-vocabulary check (None = not checked: open-vocabulary words stay confirm-only). ``phi_prior``: per-source
-    dispersion for sources with too few groups. The returned parameters are a pack's record (gated): uncertified
+    dispersion for sources with too few groups. ``major_sources``: an explicit list instead of the size rule
+    (docs 15.26). The returned parameters are a pack's record (gated): uncertified
     policies are confirm-only. ``achieved`` holds what each policy's THRESHOLD does on validation (the top candidate
     the user confirms), with ``rule``, the certified worst-source precision and ``by_source``."""
     # every policy always gets a threshold (a missing one made decide() raise): unknown targets are ignored and
@@ -514,7 +552,7 @@ def fit_thresholds(results: list[FusionResult], truths: list[str], params: Fusio
         raise ValueError("sources / groups must have one entry per validation result")
     # out-of-vocabulary guard: >= 95 % of every major source's in-vocabulary queries pass
     cos = np.array([r.best_cos for r in results])
-    s_min, s_rep = _fit_s_min(cos, src_l, grp_l)
+    s_min, s_rep = _fit_s_min(cos, src_l, grp_l, major_sources=major_sources)
     rep["s_min_fit"] = s_rep
     params = params.with_(s_min=s_min)
     p1 = np.array([r.probs[0] if len(r.probs) else 0.0 for r in results])
@@ -524,8 +562,8 @@ def fit_thresholds(results: list[FusionResult], truths: list[str], params: Fusio
     correct = np.array([bool(r.keys) and r.keys[0] == t for r, t in zip(results, truths)])
     base = (p1 - p2 >= params.margin) & (agree >= np.minimum(params.min_agree, crops)) & (cos >= s_min)
     acc_m, ok_m = _scan_matrix(p1, base, correct)
-    accept, trep, _ = certify_scan(THRESHOLD_GRID, acc_m, ok_m, targets, min_accepted, n, sources=src_l,
-                                   groups=grp_l, phi_prior=phi_prior)
+    accept, trep, by_scan = certify_scan(THRESHOLD_GRID, acc_m, ok_m, targets, min_accepted, n, sources=src_l,
+                                         groups=grp_l, phi_prior=phi_prior, major_sources=major_sources)
     for pol in POLICIES:
         rep[f"{pol}_target_reached"] = bool(trep["policies"][pol]["target_reached"])
     rep["accept_fit"] = trep
@@ -551,8 +589,11 @@ def fit_thresholds(results: list[FusionResult], truths: list[str], params: Fusio
             if i is None:  # a default threshold off the grid: nothing to certify
                 ov["policies"][pol] = {"rule": "confirm_only", "reason": "threshold not fitted"}
                 continue
+            # the open-vocabulary subset rarely has enough errors for its own phi: each source's DEFF at this
+            # threshold from the full scan is its prior (never 1 for want of errors, docs 15.26)
+            ov_prior = ({s_: float(b["deff"][i]) for s_, b in by_scan.items()} if by_scan is not None else phi_prior)
             ov["policies"][pol] = _open_vocabulary_check(results, acc_m[i], ok_m[i], closed_set, src_l, grp_l,
-                                                         majors, phi_prior, rules[pol] == "certified")
+                                                         majors, ov_prior, rules[pol] == "certified")
     else:
         ov["note"] = "no classifier class list given: words outside the classifier stay confirm-only"
     rep["open_vocabulary"] = ov
@@ -573,10 +614,13 @@ def fit_thresholds(results: list[FusionResult], truths: list[str], params: Fusio
             "rule": "a policy auto-accepts only when the design-effect-adjusted 95 % Wilson lower bound of accepted "
                     "precision of EVERY major source is >= its floor; otherwise it is confirm-only (docs 15.25)",
             "targets": targets, "floors": {pol: FLOORS[pol] for pol in POLICIES},
-            "major_sources": majors, "major_rule": f">= {MAJOR_MIN_ACCEPTS} accepts at the lowest threshold and >= "
-                                                   f"{MAJOR_MIN_GROUPS} signer groups",
-            "deff": f"max(1, Pearson dispersion of accepted errors over the source's groups); fewer than "
-                    f"{DEFF_MIN_GROUPS} groups -> the prior or {DEFF_FALLBACK}",
+            "major_sources": majors,
+            "major_rule": ("listed: " + ", ".join(sorted(major_sources))) if major_sources is not None else
+                          f">= {MAJOR_MIN_CLIPS} clips, >= {MAJOR_MIN_ACCEPTS} accepts at the lowest threshold and >= "
+                          f"{MAJOR_MIN_GROUPS} signer groups; smaller sources are reported, not judged",
+            "deff": f"one per source: max(1, the median Pearson dispersion of accepted errors over the source's "
+                    f"groups, over the thresholds with >= {DEFF_MIN_GROUPS} groups and >= {PHI_MIN_ERRORS} accepted "
+                    f"errors); no such threshold -> the prior or {DEFF_FALLBACK}",
             "groups_known": grp_l is not None, "sources_known": src_l is not None, "calibration_clips": n,
             "policies": rules, "open_vocabulary": ov,
             "selection_note": "certified on the same validation clips that selected the models (docs 15.25 TODO: "
@@ -637,7 +681,7 @@ def _summary_parts(rows: list[ClassifierSummary], margin: float, min_agree: int 
 def fit_classifier_thresholds(per_crop: list, class_names: list[str], truths: list[str], margin: float,
                               min_agree: int = 2, targets: dict | None = None,
                               min_accepted: int = 5, *, sources=None, groups=None,
-                              phi_prior: dict | None = None) -> tuple[dict | None, dict]:
+                              phi_prior: dict | None = None, major_sources=None) -> tuple[dict | None, dict]:
     """Per-policy thresholds of the classifier ALONE (sliding mode) on validation: ``per_crop`` are the
     temperature-scaled (crops, C) probabilities the engine sees, or their ``classifier_summary`` (the same result).
     Every validation query counts; a query whose word is not one of the classifier's classes can only be a wrong
@@ -656,7 +700,7 @@ def fit_classifier_thresholds(per_crop: list, class_names: list[str], truths: li
     rep["n_in_classes"] = int(sum(t in set(class_names) for t in truths))
     acc, ok = _scan_matrix(p1, base, correct)
     accept, trep, _ = certify_scan(THRESHOLD_GRID, acc, ok, targets, min_accepted, len(per_crop), sources=sources,
-                                   groups=groups, phi_prior=phi_prior)
+                                   groups=groups, phi_prior=phi_prior, major_sources=major_sources)
     return (normalize_accept(accept) if accept is not None else None), {**rep, **trep}
 
 
@@ -750,7 +794,7 @@ def sliding_commit_counts(windows: list[list[SlidingWindow]], truths: list[int],
 def fit_sliding_thresholds(windows: list[list[SlidingWindow]], truths: list[int], margin: float, agree_n: int,
                            cooldown_ms: float, targets: dict | None = None,
                            min_accepted: int = 5, *, sources=None, groups=None,
-                           phi_prior: dict | None = None) -> tuple[dict | None, dict]:
+                           phi_prior: dict | None = None, major_sources=None) -> tuple[dict | None, dict]:
     """Per-policy sliding-mode thresholds of the classifier alone from validation clips replayed through the app's
     sliding mode (docs 15.18). A clip counts as accepted when sliding mode commits anything during it, and as correct
     when every commit is the clip's word; a clip whose word is not a classifier class can only be wrong. Same
@@ -766,7 +810,7 @@ def fit_sliding_thresholds(windows: list[list[SlidingWindow]], truths: list[int]
         return None, {**rep, "note": "no replayed validation clips"}
     acc, ok, com = sliding_commit_matrix(windows, truths, THRESHOLD_GRID, margin, agree_n, cooldown_ms)
     accept, trep, _ = certify_scan(THRESHOLD_GRID, acc, ok, targets, min_accepted, len(windows), sources=sources,
-                                   groups=groups, phi_prior=phi_prior)
+                                   groups=groups, phi_prior=phi_prior, major_sources=major_sources)
     if accept is not None:
         n_com = com.sum(1)
         for pol, b in trep["policies"].items():

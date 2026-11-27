@@ -3426,11 +3426,13 @@ let every policy auto-accept. Nothing in the app read `target_reached`.
 `inference/engine.py`, `evaluation/runners.py`, `packs/isl.py`, `training/pipeline.py`):
 
 1. **Per-source certification.** Every fit gets each clip's `source` and signer `group`. A source is *major* when it
-   has at least 30 accepts at the lowest threshold and at least 2 groups (INCLUDE and ISL500 today). At each threshold,
-   the bound is the **worst major source's** Wilson lower bound on `n / DEFF`. `DEFF = max(1, phi)`, where phi is the
-   Pearson dispersion of accepted errors over that source's groups. With fewer than 3 groups, phi comes from
-   `phi_prior` (for example cross-validation groups) or is 5.0 (the ISL500 4-signer value). Phi is 1 when the error
-   rate is 0. No cross-fitting and no Bonferroni: threshold selection bias was measured at 0.0001-0.0008.
+   has at least 100 clips, at least 30 accepts at the lowest threshold and at least 2 groups (15.26; on research
+   validation that is INCLUDE and ISL500, not Mendeley with 39 clips). At each threshold, the bound is the **worst
+   major source's** Wilson lower bound on `n / DEFF`. `DEFF = max(1, phi)`, one value per source: phi is the median
+   Pearson dispersion of accepted errors over that source's groups, over the thresholds with at least 3 groups and 10
+   errors (15.26). Without such a threshold, phi comes from `phi_prior` (for example cross-validation groups) or is
+   5.0 (the ISL500 4-signer value), never 1. No cross-fitting and no Bonferroni: threshold selection bias was measured
+   at 0.0001-0.0008.
 2. **Finer grid.** `THRESHOLD_GRID` is 0.20-0.99 by 0.01, then 0.991-0.999 by 0.001 (fused and sliding). Strict can
    now sit above balanced when only the top 1 % is precise enough.
 3. **Floors and the confirm-only rule.** Each policy aims at `min(target, best worst-source bound)` and takes the
@@ -3438,12 +3440,12 @@ let every policy auto-accept. Nothing in the app read `target_reached`.
    balanced 0.90, lenient 0.85. Otherwise it is `confirm_only`. This replaces the graded fallback of 15.17.
    * `decide()` never returns `accept` for a confirm-only policy. A query that passes the accept rule becomes
      "did you mean" (`suggest` / `confirm_only`), whatever its top-5 mass.
-   * A direct "My signs" match (7.3) keeps its own per-sign rule. It is the user's own enrolled sign, checked
-     against its enrolment self-test, not a dictionary word.
+   * A direct "My signs" match (7.3) is a "did you mean" too under a confirm-only policy (15.26). Under a certified
+     policy it keeps its own per-sign rule.
    * The rule lives in `fusion.json` `achieved.<policy>.rule` (with `by_source`) plus a `certification` record
      (version `cert-1`). `FusionParams.policy_rule()` reads it; the recogniser and the engine use it.
-   * Sliding mode: the engine never auto-commits with a confirm-only policy (`reason: confirm_only`, provisional words
-     only). It is certified only when `classifier_fit.rule` is "sliding replay" for this very classifier and that
+   * Sliding mode: the engine never auto-commits with a confirm-only policy. The word becomes a "did you mean"
+     `segment_result` the user can choose (15.26). It is certified only when `classifier_fit.rule` is "sliding replay" for this very classifier and that
      policy's worst source reached its floor. The segment proxy is never certified.
 4. **Out-of-vocabulary guard.** `s_min` is the minimum over major sources of each source's 5 % quantile of the best
    cosine (it was pooled). So at least 95 % of each major source's in-vocabulary queries pass. E2 now also measures
@@ -3466,8 +3468,10 @@ let every policy auto-accept. Nothing in the app read `target_reached`.
 * The recogniser's `detail.certification` (and `engine.describe()["certification"]`, and the pack info
   `components.fusion.certification`) gives the rule, the certified worst-source precision (never the target), the
   worst source, the floor, the target and `confirm_tap: true`.
-* The app should keep a confirm tap before a word is spoken or sent, even when strict is certified. The frontend
-  change is not part of this fix.
+* The app should keep a confirm tap before a word is spoken or sent, even when strict is certified. Since 15.26
+  every `segment_result` and `commit` of a language pack carries `certification` and `needs_confirm`.
+* **Open item (frontend follow-up).** The frontend does not read these fields yet. It should show the certified
+  precision next to a word and require a tap before a committed word with `needs_confirm: true` is spoken or sent.
 
 **Old packs.** A `fusion.json` without the `certification` record loads as `{}`: uncertified, every policy
 confirm-only, never a crash. That includes the commercial-safe file with accept 0.96 x 3 and no classifier
@@ -3493,3 +3497,58 @@ the recogniser exposes the certified precision; E3 per-source rows and the headl
 `test_sliding_replay_thresholds.py` (sliding thresholds certified on the worst source; sliding mode never
 auto-commits with a confirm-only policy, an old pack or a proxy fit; fit-fusion certifies the replay per source; E1
 reports the rule and per-source sliding rows).
+
+### 15.26 Calibration review fixes: which sources count, a DEFF that does not vanish, confirmable sliding words (review of 15.25, 27 Nov 2026)
+
+**Problems found in review of 15.25.**
+* A source counted as major with only 30 accepts. On research validation Mendeley (39 clips, 3 signers) was major.
+  A source of n clips can never have a bound above `wilson(n, n)`, which is 0.91 for 39 clips. So strict could
+  never be certified, every policy landed on 0.96 with Mendeley as the worst source, and it also set `s_min`
+  (0.734 instead of INCLUDE's 0.756).
+* DEFF was re-estimated at each threshold. With 0 accepted errors it was set to 1, and with 1 error it is about 1 by
+  construction. INCLUDE's DEFF was 2.1-2.8 at 0.80-0.98 but 1.0 from 0.993 up, and balanced and lenient were
+  certified only because of that drop.
+* In sliding mode a confirm-only word was only a provisional list. It had no `segment_id`, so the user could not
+  confirm it. With both shipped packs uncertified, sliding mode could never produce text.
+* `segment_result` and `commit` did not say which rule applied. A direct "My signs" match was still accepted under
+  a confirm-only policy.
+
+**What changed** (`models/calibration.py`, `inference/engine.py`, `isl/recognizer.py`, `evaluation/runners.py`):
+1. **Major sources.** A source is major only with at least 100 clips (`MAJOR_MIN_CLIPS`), 30 accepts at the lowest
+   threshold and 2 signer groups (`is_major_size`). 100 is above the 73 clips that `wilson(n, n) >= 0.95` needs, so
+   a major source can reach the strict floor. A smaller source is still reported in `by_source`, with
+   `major: false` and the note "too small to certify". It does not block or certify a policy, does not set `s_min`,
+   is not judged for the "did you mean" mass and is not the E1/E3 worst-source headline. A caller can pass an
+   explicit `major_sources` list (for example from a profile) instead of the size rule.
+2. **One DEFF per source.** phi is computed at every threshold that has at least 3 groups with accepts and at
+   least 10 accepted errors (`PHI_MIN_ERRORS`). Accepts and errors only shrink as the threshold rises, so these are
+   the low thresholds. The source's phi is the median of those values, and `DEFF = max(1, phi)` at every
+   threshold. So the clustering measured where errors exist also applies where they run out. The median keeps one
+   noisy threshold from setting it. Without any such threshold: the prior, else 5.0. Never 1 for lack of errors.
+   The open-vocabulary check uses each source's DEFF from the full scan as its prior.
+3. **Sliding mode, confirm-only.** The word becomes a `segment_result` with `decision: suggest`,
+   `reason: confirm_only` and a `segment_id`. The candidates are stored, so the existing `choose` message commits
+   it. The repeat and cooldown rules apply, so one held sign gives one suggestion.
+4. **Certification on every word** (critic 15). For a language pack, each `segment_result` and `commit` carries
+   `certification` (rule, certified precision, worst source, floor) and `needs_confirm`. `needs_confirm` is true
+   for a word the app accepted by itself, and false for a word the user picked. The ASL path is unchanged.
+5. **My signs.** Under a confirm-only policy a direct "My signs" match is `suggest` / `confirm_only`, with the user
+   sign on top. Under a certified policy, or with in-code parameters, it keeps its own rule.
+
+**Effect on research validation** (evidence from the Model QA run, current research models, train-only index):
+Mendeley is no longer major and `s_min` is INCLUDE's 0.756. INCLUDE's DEFF is 3.45 (median of 2.1-5.4). The best
+INCLUDE bound is 0.818 at 0.97, so all three policies are confirm-only. That is the honest result: 52 of 52 at 0.994
+was certified before only because DEFF dropped to 1 there.
+
+**Open items.**
+* Frontend: show `certification.certified_precision` next to a word, and require a tap before a word with
+  `needs_confirm: true` is spoken or sent (see 15.25).
+* Out-of-fold CV calibration (15.25 TODO) would add INCLUDE groups and clips, and is the main way to certify
+  INCLUDE at all.
+
+Tests: `test_policy_thresholds.py` (a 39-clip, 3-group source at 0.6 precision next to two strong sources is
+reported but not major, strict certifies, it sets neither `s_min` nor the mass, and an explicit list overrides; DEFF
+stays at the low-threshold phi where errors vanish, stays 1 for homogeneous errors, and is 5.0 with no errors; a
+user sign is never auto-accepted under a confirm-only policy), `test_sliding_replay_thresholds.py` (a sliding
+confirm-only word is a suggestion that `choose` commits; a certified commit has `needs_confirm`) and
+`test_engine_recognizer.py` (segment results and commits carry the certification).

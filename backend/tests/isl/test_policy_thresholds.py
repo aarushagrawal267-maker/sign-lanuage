@@ -541,7 +541,8 @@ def test_old_fusion_json_is_uncertified_confirm_only(tmp_path):
 
 
 def test_open_vocabulary_words_stay_confirm_only_unless_certified():
-    res, tr, src, grp = _two_source_set(prec_b=0.995)
+    # B: about 7 errors in 1,500, too few to estimate its dispersion, so DEFF is the 5.0 fallback (docs 15.26)
+    res, tr, src, grp = _two_source_set(prec_b=0.995, n_b=1500)
     closed = {f"w{i}" for i in range(7)} | {"other"}  # every top-1 here is a classifier class
     p, rep = fit_thresholds(res, tr, FusionParams(), sources=src, groups=grp, closed_set=closed)
     assert p.policy_rule("strict") == "certified"
@@ -590,7 +591,7 @@ def test_e3_per_source_rows_and_the_headline(monkeypatch):
 
     names = ["a", "b", "c"]
     inputs, truths, used = [], [], []
-    for i, p1 in enumerate(np.linspace(0.5, 0.99, 120)):
+    for i, p1 in enumerate(np.linspace(0.5, 0.99, 240)):  # 120 per source: big enough for the headline (15.26)
         row = np.full(3, (1 - p1) / 2)
         row[i % 3] = p1
         inputs.append(FusionInputs(cls_logp=np.log(np.tile(row, (3, 1))), cls_ids=names))
@@ -634,3 +635,109 @@ def test_oov_false_accepts_count_every_accept_as_wrong():
     assert o["strict"]["out_of_vocabulary_rate"] == 0.25
     pooled = e2_pool([{"run": True, "oov_false_accept": o}, {"run": True, "oov_false_accept": o}])
     assert pooled["oov_false_accept"]["n"] == 8 and pooled["oov_false_accept"]["strict"]["threshold_false_accept_rate"] == 0.75
+
+
+# ------------------------------------------------------------------- review of 15.25: major sources, DEFF (15.26)
+
+def _renamed(results, sources, groups, name, best_cos=None):
+    from dataclasses import replace
+
+    res = [replace(r, best_cos=best_cos, best_global_cos=best_cos) if best_cos is not None else r for r in results]
+    return res, [name] * len(sources), [f"{name}-{g}" for g in groups]
+
+
+def test_a_39_clip_source_is_reported_but_never_major():
+    """Mendeley on research: 39 clips, 3 signers, poor precision. wilson(39, 39) = 0.91 < 0.95, so as a major source
+    it made strict uncertifiable by construction and set every threshold and s_min (review of 15.25)."""
+    from app.isl.models.calibration import MAJOR_MIN_CLIPS, is_major_size
+
+    assert wilson_lower(39, 39) < FLOORS["strict"] <= wilson_lower(MAJOR_MIN_CLIPS, MAJOR_MIN_CLIPS)
+    assert not is_major_size(39, 3, 35) and is_major_size(100, 2, 30) and not is_major_size(500, 1, 400)
+    res, tr, src, grp = _two_source_set(prec_b=0.995, n_b=1500)  # A = include-like, B = isl500-like: both strong
+    m_res, m_tr, m_src, m_grp = _two_source_set(prec_a=0.6, n_a=39, groups_a=3, n_b=0)
+    m_res, m_src, m_grp = _renamed(m_res, m_src, m_grp, "mendeley", best_cos=0.3)  # far below the others' cosines
+    p, rep = fit_thresholds(res + m_res, tr + m_tr, FusionParams(), sources=src + m_src, groups=grp + m_grp)
+    af = rep["accept_fit"]
+    assert af["major_sources"] == ["A", "B"] and af["sources"]["mendeley"]["major"] is False
+    assert "too small to certify" in af["sources"]["mendeley"]["note"]
+    row = p.achieved["strict"]["by_source"]["mendeley"]
+    assert row["major"] is False and row["n"] == 39 and row["n_groups"] == 3 and "too small" in row["note"]
+    assert p.policy_rule("strict") == "certified" and p.achieved["strict"]["worst_source"] in ("A", "B")
+    # it does not set the out-of-vocabulary guard either: s_min stays at the major sources' 5 % quantile
+    assert p.s_min == pytest.approx(0.9) and rep["s_min_fit"]["by_source"]["mendeley"]["pass_rate"] == 0.0
+    # nor is it judged for the "did you mean" mass
+    for pol in POLICIES:
+        assert "mendeley" not in (rep["suggest_fit"][pol].get("worst_source") or "")
+    # an explicit list (e.g. from a profile) overrides the size rule
+    q, qrep = fit_thresholds(res + m_res, tr + m_tr, FusionParams(), sources=src + m_src, groups=grp + m_grp,
+                             major_sources=["A", "mendeley"])
+    assert qrep["accept_fit"]["major_sources"] == ["A", "mendeley"] and q.policy_rule("strict") == "confirm_only"
+    assert q.achieved["strict"]["worst_source"] == "mendeley" and "listed" in q.certification["major_rule"]
+
+
+def test_deff_is_carried_up_to_thresholds_where_the_errors_run_out():
+    """Errors clustered in three of six signers at a low threshold and none at a high one: before, phi was
+    re-estimated per row and fell to 1 at the high row, which certified on clip-level counts (review of 15.25)."""
+    from app.isl.models.calibration import PHI_MIN_ERRORS, pearson_dispersion, scan_by_source, wilson_lower_deff
+
+    def matrix(errors_per_group, n_per_group=100):
+        acc, ok, grp = [[], [], []], [[], [], []], []
+        for g, e in enumerate(errors_per_group):
+            for j in range(n_per_group):
+                wrong = j < e
+                acc[0].append(True)  # low threshold: everything accepted
+                acc[1].append(not wrong or j < 1)  # mid: one error per erring group left (3 < PHI_MIN_ERRORS)
+                acc[2].append(not wrong)  # high: error-free
+                for row in ok:
+                    row.append(not wrong)
+                grp.append(f"g{g}")
+        a = np.array(acc)
+        return a, a & np.array(ok), grp
+
+    acc, ok, grp = matrix([0, 0, 0, 20, 20, 20])
+    b = scan_by_source(acc, ok, sources=["s"] * 600, groups=grp)["s"]
+    phi_low = pearson_dispersion(np.full(6, 100), np.array([0, 0, 0, 20, 20, 20]))
+    assert phi_low > 2 and (b["n_acc"] - b["n_ok"]).tolist() == [60, 3, 0] and 3 < PHI_MIN_ERRORS
+    assert b["phi_rows"] == 1 and b["phi"] == pytest.approx(phi_low, abs=1e-4)
+    assert all(d >= phi_low - 1e-9 for d in b["deff"])  # carried up: never back to 1 at the high rows
+    assert b["lb"][2] == pytest.approx(wilson_lower_deff(540, 540, phi_low))
+    assert b["lb"][2] < wilson_lower(540, 540) - 0.01
+    # homogeneous errors at the low threshold: the same scan keeps DEFF 1 everywhere (nothing to penalise)
+    acc, ok, grp = matrix([10] * 6)
+    h = scan_by_source(acc, ok, sources=["s"] * 600, groups=grp)["s"]
+    assert list(h["deff"]) == [1.0, 1.0, 1.0] and h["lb"][2] == pytest.approx(wilson_lower(540, 540))
+    # never an error at all: nothing to estimate, so the prior or the 5.0 fallback, never 1
+    acc, ok, grp = matrix([0] * 6)
+    z = scan_by_source(acc, ok, sources=["s"] * 600, groups=grp)["s"]
+    assert z["phi_from"][0] == "fallback" and z["deff"][2] == 5.0
+
+
+def test_a_user_sign_is_never_auto_accepted_under_a_confirm_only_policy(monkeypatch):
+    """A direct "My signs" match was accepted after decide() even when the policy was confirm-only (review of
+    15.25). Now it stays the top "did you mean" candidate; in-code parameters (ungated) keep the old rule."""
+    from app.isl import recognizer as R
+    from app.isl.recognizer import IslRecognizer
+    from app.packs.vocabulary import Vocabulary
+
+    vocab = Vocabulary([{"concept_id": "a", "headword": "a", "display": {"en": "a"}}])
+    ukey = "mysign:x"
+    fused = FusionResult([ukey, "a"], np.array([0.6, 0.4]), [ukey] * 3, 3, 0.95, 0.5, (ukey, 0.95), {})
+    monkeypatch.setattr(R, "fuse", lambda inp, p: fused)
+
+    def make(fusion):
+        rec = IslRecognizer("isl", FeatureConfig(canonical_hand=True), vocab, fusion=fusion)
+        rec._features = lambda crops: np.zeros((3, 4, 2), np.float32)
+        rec.evidence = lambda feats, use=True: (FusionInputs(user=np.full((3, 1), 0.95), user_ids=[ukey]), {"z": None})
+        rec._user_theta = lambda key: 0.8
+        rec._candidates = lambda keys, probs, comps, z, top_k: []
+        return rec
+
+    ungated = make(FusionParams()).recognize([None] * 3, policy="balanced")
+    assert (ungated.decision, ungated.reason) == ("accept", "my_signs")
+    for fusion in (FusionParams(certification={}),  # a pack without a certification record (old fusion.json)
+                   FusionParams.from_json(OLD_PACK)):
+        rec = make(fusion)
+        for pol in POLICIES:
+            r = rec.recognize([None] * 3, policy=pol)
+            assert (r.decision, r.reason) == ("suggest", "confirm_only")
+            assert r.detail["certification"]["rule"] == "confirm_only"

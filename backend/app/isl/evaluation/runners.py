@@ -41,8 +41,8 @@ import numpy as np
 from app.features.build import FeatureError, build_features
 from app.isl.evaluation.report import (PARTIAL_DATA_LABEL, format_interval, git_commit, grouped_bootstrap,
                                        interval_fields, interval_reason)
-from app.isl.models.calibration import (MAJOR_MIN_ACCEPTS, MAJOR_MIN_GROUPS, _decisions, classifier_alone_decisions,
-                                        fit_thresholds, summarize)
+from app.isl.models.calibration import (_decisions, classifier_alone_decisions, fit_thresholds, is_major_size,
+                                        summarize)
 from app.isl.models.fusion import POLICIES, USER_PREFIX, FusionInputs, FusionParams, decide, fuse
 from app.isl.models.index import LeakageError  # noqa: F401  (one class for every leak guard; re-exported here)
 from app.isl.training.common import engine_crops
@@ -62,8 +62,8 @@ def _rate(mask, sel=None):
 def source_rows(dec: list[str], udec: list[str], hit1: list[float], sources: list, groups: list) -> tuple[dict, str | None]:
     """Per source (docs 15.25): what the app does (``dec``: accept / suggest / abstain with the pack's gates) and what
     the threshold rule alone does (``udec``, the top candidate a confirm tap shows). The worst source is the one with
-    the lowest threshold-rule precision among sources with >= MAJOR_MIN_ACCEPTS queries and >= MAJOR_MIN_GROUPS
-    groups (None when no source qualifies)."""
+    the lowest threshold-rule precision among sources big enough to be certified (``is_major_size``: >= 100 queries
+    and >= 2 groups, docs 15.26; None when no source qualifies). Smaller sources get rows, not the headline."""
     src = np.array([str(x) if x not in (None, "") else "unknown" for x in sources], dtype=object)
     grp = np.array([str(g) for g in groups], dtype=object)
     h = np.asarray(hit1, float) > 0.5
@@ -81,8 +81,10 @@ def source_rows(dec: list[str], udec: list[str], hit1: list[float], sources: lis
                     "threshold_coverage": _rate(u, m),
                     "threshold_precision": _rate(h[m & u]) if (m & u).any() else None,
                     "threshold_wrong_accept_rate": _rate(u & ~h, m), "threshold_n_accepted": int((m & u).sum())}
-        if n >= MAJOR_MIN_ACCEPTS and ng >= MAJOR_MIN_GROUPS:
+        if is_major_size(n, ng):
             cands.append(s_)
+        else:
+            rows[s_]["note"] = "too small to certify: not the worst-source headline"
     worst = min(cands, key=lambda x: (rows[x]["threshold_precision"] if rows[x]["threshold_precision"] is not None
                                       else 2.0, x), default=None)
     return rows, worst

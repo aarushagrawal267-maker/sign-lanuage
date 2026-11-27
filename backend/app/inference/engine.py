@@ -389,7 +389,10 @@ class RecognitionEngine:
                "feature_ms": rec.feature_ms, "inference_ms": rec.inference_ms}
         if "spell" in rec.detail:
             res["spell"] = rec.detail["spell"]
-        self.recent[sid] = {"candidates": top, "t": t, "committed": None}
+        cert = rec.detail.get("certification")
+        if cert:  # language packs: the rule and certified precision per word (docs/ISL_DESIGN.md 15.25, 15.26)
+            res["certification"], res["needs_confirm"] = cert, bool(cert.get("confirm_tap"))
+        self.recent[sid] = {"candidates": top, "t": t, "committed": None, "certification": cert}
         for old in [k for k in self.recent if k <= sid - 32]:
             self.recent.pop(old, None)
         out: dict = {"segment_result": res}
@@ -397,7 +400,7 @@ class RecognitionEngine:
             self.last_commit_t = t
             self.last_commit_class = top[0]["class_index"]
             self.status = "recognized"
-            out["commit"] = self._commit_from(top[0], sid, t, chosen=False)
+            out["commit"] = self._commit_from(top[0], sid, t, chosen=False, certification=cert)
             self.recent[sid]["committed"] = top[0]["concept_id"]
         else:
             self.status = "uncertain" if decision == "suggest" else "not_sure"
@@ -405,10 +408,16 @@ class RecognitionEngine:
         return out
 
     @staticmethod
-    def _commit_from(cand: dict, sid: int, t: float, chosen: bool) -> dict:
-        return {"gloss": cand["gloss"], "class_index": cand["class_index"], "score": cand["prob"], "t": t,
-                "concept_id": cand["concept_id"], "text": cand.get("text"), "hi_review": cand.get("hi_review"),
-                "source": cand.get("source"), "segment_id": sid, "chosen_by_user": chosen}
+    def _commit_from(cand: dict, sid: int | None, t: float, chosen: bool, certification: dict | None = None) -> dict:
+        out = {"gloss": cand["gloss"], "class_index": cand["class_index"], "score": cand["prob"], "t": t,
+               "concept_id": cand["concept_id"], "text": cand.get("text"), "hi_review": cand.get("hi_review"),
+               "source": cand.get("source"), "segment_id": sid, "chosen_by_user": chosen}
+        if certification:
+            # docs/ISL_DESIGN.md 15.26: the certified precision is below the 0.98 goal, so a word the app accepted by
+            # itself still needs a tap before it is spoken or sent; a word the user picked already had one
+            out["certification"] = certification
+            out["needs_confirm"] = bool(certification.get("confirm_tap")) and not chosen
+        return out
 
     def choose(self, segment_id: int, concept_id: str) -> dict:
         """The user picked a candidate from "did you mean". Returns the commit (``chosen_by_user: true``)."""
@@ -418,7 +427,7 @@ class RecognitionEngine:
         cand = next((x for x in seg["candidates"] if x["concept_id"] == concept_id), None)
         if cand is None:
             raise ValueError(f"{concept_id!r} was not offered for segment {segment_id}")
-        commit = self._commit_from(cand, int(segment_id), seg["t"], chosen=True)
+        commit = self._commit_from(cand, int(segment_id), seg["t"], chosen=True, certification=seg.get("certification"))
         if seg["committed"] == concept_id:  # a repeated tap / resend: the word is already in the text
             commit["duplicate"] = True
             return commit
@@ -500,10 +509,11 @@ class RecognitionEngine:
             ok, reason = False, "repeat_suppressed"
         if ok and f.t - self.last_commit_t < c.cooldown_ms:
             ok, reason = False, "cooldown"
+        confirm = False
         if ok and self.predictor is None and self._sliding_confirm_only():
             # language pack whose sliding thresholds are not certified for this policy (docs/ISL_DESIGN.md 15.25):
-            # provisional words only, never an auto-commit
-            ok, reason = False, "confirm_only"
+            # never an auto-commit; the word becomes a "did you mean" the user can confirm (docs 15.26)
+            ok, reason, confirm = False, "confirm_only", True
         out["provisional"] = {"top": top, "feature_ms": r["feature_ms"], "inference_ms": r["inference_ms"],
                               "streak": self.streak, "reason": reason}
         if ok:
@@ -513,6 +523,14 @@ class RecognitionEngine:
             if "concept_id" in top[0]:  # language-pack classifier: same extra fields as segment-mode commits
                 out["commit"].update({k: top[0][k] for k in ("concept_id", "text", "hi_review", "source")},
                                      segment_id=None, chosen_by_user=False)
+                cert = self._sliding_certification()
+                if cert:
+                    out["commit"].update(certification=cert, needs_confirm=bool(cert.get("confirm_tap")))
+        elif confirm:
+            # the same repeat / cooldown rule as a commit, so one held sign gives one suggestion, not one per window
+            self.last_commit_t, self.last_commit_class = f.t, cls
+            out.update(self._sliding_suggestion(top, window, f.t, reason))
+            self.status = "uncertain"
         else:
             self.status = "analyzing" if reason in ("unstable",) else "uncertain"
         return out
@@ -520,6 +538,28 @@ class RecognitionEngine:
     def _sliding_confirm_only(self) -> bool:
         rule = getattr(self.recognizer, "sliding_rule", None)
         return callable(rule) and rule(self.cfg.policy) == "confirm_only"
+
+    def _sliding_certification(self) -> dict | None:
+        info = getattr(self.recognizer, "certification_info", None)
+        return info(self.cfg.policy, "sliding") if callable(info) else None
+
+    def _sliding_suggestion(self, top: list[dict], window: list[_Frame], t: float, reason: str) -> dict:
+        """A sliding-mode word under a confirm-only policy as a "did you mean" (docs/ISL_DESIGN.md 15.26): the same
+        ``segment_result`` as segment mode (``decision: suggest``, a ``segment_id``), so ``choose`` commits it."""
+        self.segment_seq += 1
+        sid = self.segment_seq
+        cert = self._sliding_certification()
+        self.recent[sid] = {"candidates": top, "t": t, "committed": None, "certification": cert}
+        for old in [k for k in self.recent if k <= sid - 32]:
+            self.recent.pop(old, None)
+        res = {"segment_id": sid, "accepted": False, "decision": "suggest", "reason": reason,
+               "confidence": top[0]["prob"], "frames": len(window),
+               "duration_ms": (window[-1].t - window[0].t) if window else 0.0,
+               "agreement": f"{self.streak}/{self.cfg.agree_n}", "top": top, "candidates": top}
+        if cert:
+            res["certification"], res["needs_confirm"] = cert, bool(cert.get("confirm_tap"))
+        self.last_prediction = res
+        return {"segment_result": res}
 
     def flush(self) -> dict:
         """End of stream (offline video): finalize any open segment."""

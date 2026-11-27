@@ -295,6 +295,10 @@ class IslRecognizer:
                 keys.insert(0, keys.pop(j))
                 probs = np.concatenate([[probs[j]], np.delete(probs, j)])
                 decision, reason, override = "accept", "my_signs", True
+                if p.confirm_only(policy):
+                    # never auto-accept under a confirm-only policy, a user sign included (docs/ISL_DESIGN.md 15.26):
+                    # it stays the top "did you mean" candidate
+                    decision, reason = "suggest", "confirm_only"
         if not override and keys and keys[0].startswith(USER_PREFIX) and decision == "accept":
             # a user sign is never accepted below its own calibrated similarity (enrolment self-test)
             decision, reason = "suggest", "low_confidence"

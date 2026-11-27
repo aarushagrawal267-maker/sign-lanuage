@@ -147,3 +147,29 @@ def test_repeated_choice_is_marked_duplicate():
     assert eng.choose(sid, "isl.pen")["duplicate"] is True  # double tap: the word is added once
     eng.reject(sid)
     assert "duplicate" not in eng.choose(sid, "isl.pen")  # chosen again after "wrong word"
+
+
+def test_segment_results_and_commits_carry_the_certification():
+    """Review of 15.25 (critic 15): every word message says which rule applied and the certified precision, and a
+    word the app accepted by itself still needs a confirm tap; a word the user picked does not."""
+    cert = {"rule": "certified", "certified_precision": 0.951, "worst_source": "include", "confirm_tap": True}
+
+    class CertRecognizer(FakeRecognizer):
+        def recognize(self, crops, top_k=5, policy="balanced", use_my_signs=True):
+            r = super().recognize(crops, top_k, policy, use_my_signs)
+            r.detail["certification"] = dict(cert)
+            return r
+
+    eng = RecognitionEngine(None, recognizer=CertRecognizer("accept"))
+    states = _run(eng)
+    seg = next(s["segment_result"] for s in states if "segment_result" in s and "decision" in s["segment_result"])
+    commit = next(s["commit"] for s in states if "commit" in s)
+    assert seg["certification"] == cert and seg["needs_confirm"] is True
+    assert commit["certification"] == cert and commit["needs_confirm"] is True and commit["chosen_by_user"] is False
+    chosen = eng.choose(seg["segment_id"], "isl.pen")
+    assert chosen["needs_confirm"] is False and chosen["certification"] == cert
+    # a recogniser without certification (spelling, older fakes): the messages are as before
+    plain = RecognitionEngine(None, recognizer=FakeRecognizer("accept"))
+    st = _run(plain)
+    assert not any("needs_confirm" in s.get("segment_result", {}) or "needs_confirm" in s.get("commit", {})
+                   for s in st)

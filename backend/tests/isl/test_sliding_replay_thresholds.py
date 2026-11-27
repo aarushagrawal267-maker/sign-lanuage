@@ -305,7 +305,7 @@ def test_sliding_mode_never_auto_commits_with_a_confirm_only_policy():
         r = rec(fusion)
         assert r.sliding_rule("balanced") == "confirm_only"
         eng, commits, reasons = _commits(r, clf)
-        assert commits == [] and "confirm_only" in reasons  # provisional words only
+        assert commits == [] and "confirm_only" in reasons  # no auto-commit: a "did you mean" instead (docs 15.26)
         assert eng.describe()["certification"]["rule"] == "confirm_only"
     # in-code parameters are not gated (tools, tests): unchanged behaviour
     _, commits, _ = _commits(rec(FusionParams(fitted=True)), clf)
@@ -323,13 +323,16 @@ def test_fit_classifier_alone_certifies_the_replay_per_source():
         return _raw(gap=None)
 
     clips = [SimpleNamespace(clip_id=f"c{i}", concept_id="a", load=load, source="include", group=f"g{i % 4}")
-             for i in range(40)]
-    p, rep = fit_classifier_alone(rec, _inputs(clf, 40), ["a"] * 40, FusionParams(), clips=clips)
+             for i in range(120)]  # >= 100 clips: big enough to be a major source (docs 15.26)
+    p, rep = fit_classifier_alone(rec, _inputs(clf, 120), ["a"] * 120, FusionParams(), clips=clips)
     assert rep["rule"] == "sliding replay" and rep["major_sources"] == ["include"]
     b = p.classifier_fit["policies"]["lenient"]
-    assert b["by_source"]["include"]["n_groups"] == 4 and b["by_source"]["include"]["n_accepted"] == 40
-    # 40 of 40 right: bound 0.91 >= lenient / balanced floors, below strict's 0.95
-    assert b["rule"] == "certified" and p.classifier_fit["policies"]["strict"]["rule"] == "confirm_only"
+    assert b["by_source"]["include"]["n_groups"] == 4 and b["by_source"]["include"]["n_accepted"] == 120
+    # 120 of 120 right, no error to estimate the dispersion: DEFF is the 5.0 fallback, never 1 (docs 15.26), so
+    # the bound is wilson(24, 24) = 0.86 >= the lenient floor, below balanced's 0.90 and strict's 0.95
+    assert b["by_source"]["include"]["deff"] == 5.0
+    assert b["rule"] == "certified" and b["certified_precision"] == pytest.approx(0.862, abs=0.002)
+    assert all(p.classifier_fit["policies"][pol]["rule"] == "confirm_only" for pol in ("strict", "balanced"))
 
 
 def test_e1_reports_the_rule_and_per_source_sliding_rows():
@@ -352,3 +355,36 @@ def test_e1_reports_the_rule_and_per_source_sliding_rows():
     md = runners.markdown_report({"profile": "x", "label": "x", "created": "now", "smoke": False,
                                   "protocols": {"E1b": out}, "leakage_guards": {"pretraining_check": {}}})
     assert "## Headline: INCLUDE and the worst source" in md
+
+
+def test_sliding_confirm_only_word_is_a_did_you_mean_that_choose_commits():
+    """Review of 15.25: a confirm-only sliding word was only a provisional list (no segment_id, nothing to choose),
+    so sliding mode with an old pack could never produce text. Now it is a "did you mean" (docs 15.26)."""
+    from app.inference.engine import EngineConfig, RecognitionEngine
+    from app.isl.recognizer import IslRecognizer
+    from app.packs.vocabulary import Vocabulary
+
+    clf = _ScriptedClf([[0.95, 0.03, 0.02]])
+    vocab = Vocabulary([{"concept_id": n, "headword": n, "display": {"en": n}} for n in NAMES])
+    old = FusionParams.from_json({"accept": {"balanced": 0.9}, "fitted": True})  # a pre-15.25 fusion.json
+    rec = IslRecognizer("isl", clf.feature_config, vocab, classifier=clf, fusion=old)
+    clf.k = 0
+    raw = _raw(gap=None)
+    eng = RecognitionEngine(None, recognizer=rec, config=EngineConfig(mode="sliding", policy="balanced"))
+    eng.set_size(raw.width, raw.height)
+    msgs = [eng.push(raw.frame_to_json(i)) for i in range(len(raw.t_ms))]
+    assert not any("commit" in m for m in msgs)
+    sugg = [m["segment_result"] for m in msgs if "segment_result" in m]
+    assert len(sugg) == 1  # one held sign, one suggestion (the repeat rule), not one per window
+    s = sugg[0]
+    assert s["decision"] == "suggest" and s["reason"] == "confirm_only" and s["accepted"] is False
+    assert s["candidates"][0]["concept_id"] == "a" and s["needs_confirm"] is True
+    assert s["certification"]["rule"] == "confirm_only" and s["certification"]["certified_precision"] is None
+    commit = eng.choose(s["segment_id"], "a")
+    assert commit["chosen_by_user"] is True and commit["concept_id"] == "a" and commit["needs_confirm"] is False
+    assert eng.choose(s["segment_id"], "a")["duplicate"] is True
+    # a certified pack still auto-commits, and the commit says it needs a confirm tap and what was certified
+    cert = IslRecognizer("isl", clf.feature_config, vocab, classifier=clf, fusion=_certified_sliding_pack(clf))
+    _, commits, _ = _commits(cert, clf)
+    c = commits[0]["commit"]
+    assert c["needs_confirm"] is True and c["certification"]["certified_precision"] == 0.97
