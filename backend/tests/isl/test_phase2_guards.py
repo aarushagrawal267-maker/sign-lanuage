@@ -771,7 +771,11 @@ def test_profile_both_passes_tag_and_dry_run_to_both_children(tmp_path):
         assert f"dry run: profile={p} smoke=0 tag=t1 work={tmp_path / 'scratch' / p}" in r.stdout
         assert f"stamps: {tmp_path / 'scratch' / p / 'driver' / f'phase2_{p}_t1.stamps'}" in r.stdout
     assert r.stdout.count("would seed trim") == 2 and "would run trim\n" not in r.stdout
-    assert not (tmp_path / "scratch").exists() and not _calls(tmp_path)
+    # nothing but research's read-only source-quota pre-flight (docs 15.39)
+    calls = _calls(tmp_path)
+    assert not (tmp_path / "scratch").exists() and all(c.startswith("-c ") and "check_source_quota" in c
+                                                       for c in calls), calls
+    assert len(calls) == 1
 
 
 def test_option_values_must_not_be_empty(tmp_path):

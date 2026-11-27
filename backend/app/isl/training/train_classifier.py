@@ -13,8 +13,9 @@ temperature scaling on validation. Runs in the resumable loop (``loop.py``).
 Options of QA plan 1.4 (docs/ISL_DESIGN.md 15.38), both off by default (the draws, the selection and the temperature
 are then exactly as before): ``source_quota`` draws a source group by quota first, then a class inside it, then a
 clip (``loop.balanced_batches``); ``select_on="worst_source"`` selects the epoch on the lowest validation macro F1 of
-the major sources (INCLUDE, ISL500; those present) and fits the temperature on source-balanced validation. The
-per-source validation numbers are logged in every history row either way.
+the major sources (INCLUDE, ISL500; those present) and, unless ``temperature_fit`` says otherwise, fits the
+temperature on source-balanced validation (quota groups weighted by their quota shares, docs 15.39). The per-source
+validation numbers are logged in every history row either way.
 """
 
 from __future__ import annotations
@@ -36,7 +37,8 @@ from app.isl.training.common import (SIGNER_GROUPING_DICTIONARY, SIGNER_GROUPING
 from app.isl.training.loop import (LoopConfig, atomic_save, balanced_batches, clips_digest, digest,
                                    expected_draw_shares, run_loop, train_config_signature)
 from app.isl.training.multisource import SAMPLE_WEIGHTS
-from app.isl.training.source_quota import MAJOR_SOURCES, parse_source_quota, resolve_source_quota
+from app.isl.training.source_quota import (DEFAULT_SOURCE_QUOTA, MAJOR_SOURCES, parse_source_quota, quota_group,
+                                           resolve_source_quota)
 from app.models.checkpoint import frame_mask
 from app.models.networks import build_model
 from app.training.trainer import TrainConfig, set_seed
@@ -60,8 +62,10 @@ def classifier_classes(data: IslData, min_clips: int = 2, min_signers: int = 2, 
 
 
 SELECT_MODES = ("macro_f1", "worst_source")
-# a source's share of the source-balanced temperature fit is min(1, clips / BALANCE_FULL_CLIPS): a source with a
-# handful of validation clips does not weigh as much as INCLUDE or ISL500
+# temperature fit: auto = source_balanced with select_on=worst_source, else all (all validation rows alike, as before)
+TEMPERATURE_FITS = ("auto", "all", "source_balanced")
+# in the source-balanced temperature fit a quota group with fewer than BALANCE_FULL_CLIPS validation clips gets
+# min(1, clips / BALANCE_FULL_CLIPS) of its share: a handful of clips never weighs like INCLUDE or ISL500
 BALANCE_FULL_CLIPS = 20
 
 
@@ -81,15 +85,41 @@ def per_source_metrics(y: np.ndarray, pred: np.ndarray, src: np.ndarray) -> dict
     return out
 
 
-def source_balanced_weights(src: np.ndarray, full: int = BALANCE_FULL_CLIPS) -> np.ndarray:
-    """Per-row weights: every source weighs the same in total (``min(1, n / full)`` for a source with fewer than
-    ``full`` clips), whatever its number of validation clips."""
+def validation_row(y: np.ndarray, pred: np.ndarray, src: np.ndarray) -> dict:
+    """One history row: ``val_acc``, ``val_macro_f1`` over all clips, the per-source numbers and
+    ``val_worst_major_f1``, which falls back to ``val_macro_f1`` when no major source has a validation clip."""
+    from sklearn.metrics import f1_score
+
+    row = {"val_acc": float((pred == y).mean()),
+           "val_macro_f1": float(f1_score(y, pred, labels=sorted(set(y.tolist())), average="macro", zero_division=0))}
+    row.update(per_source_metrics(y, pred, src))  # logged in every mode (docs 15.38)
+    if row["val_worst_major_f1"] is None:  # no INCLUDE / ISL500 validation clip: the overall number
+        row["val_worst_major_f1"] = row["val_macro_f1"]
+    return row
+
+
+def source_balanced_weights(src: np.ndarray, quota: dict | None = None, full: int = BALANCE_FULL_CLIPS) -> np.ndarray:
+    """Per-row weights of the source-balanced temperature fit (docs 15.38, 15.39). The units are quota groups (the
+    dictionary family and the Mendeley family count once each), each unit weighs its quota share (``quota``, else the
+    research default :data:`DEFAULT_SOURCE_QUOTA`; a source of no group weighs the smallest share), times
+    ``min(1, n / full)`` for a unit with fewer than ``full`` validation clips. Rows of a unit weigh the same. The
+    weights sum to 1; whatever its number of validation clips, ISL500 never outweighs INCLUDE."""
+    q = quota or DEFAULT_SOURCE_QUOTA
+    floor = min([v for v in q.values() if v > 0] or [1.0])
+    unit = np.array([quota_group(s, q) or s for s in src.tolist()], dtype=object)
     w = np.zeros(len(src), np.float64)
-    for s in set(src.tolist()):
-        m = src == s
+    for u in set(unit.tolist()):
+        m = unit == u
         n = int(m.sum())
-        w[m] = min(1.0, n / full) / n
-    return w
+        w[m] = float(q.get(u, floor)) * min(1.0, n / full) / n
+    if w.sum() <= 0:  # every group present has share 0: plain weights
+        w[:] = 1.0
+    return w / w.sum()
+
+
+def weight_by_source(src: np.ndarray, w: np.ndarray) -> dict[str, float]:
+    """The total weight of each source's rows (recorded in the meta next to the temperature)."""
+    return {s: round(float(w[src == s].sum()), 6) for s in sorted(set(src.tolist()))}
 
 
 def train_classifier(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfig, *, min_clips: int = 2,
@@ -98,11 +128,14 @@ def train_classifier(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainCo
                      source_weights: dict | None = None, steps_per_epoch: int | None = None, resume: bool = False,
                      max_minutes: float = 0.0, state_path: Path | None = None, cache_items: int = 12000,
                      dictionary_group: bool = False, source_quota: dict | str | None = None,
-                     select_on: str = "macro_f1") -> dict:
+                     select_on: str = "macro_f1", temperature_fit: str = "auto") -> dict:
     """``source_quota``: quota groups -> share (``source_quota.parse_source_quota``; None = the old sampler).
-    ``select_on``: ``macro_f1`` (as before) or ``worst_source`` (docs 15.38)."""
+    ``select_on``: ``macro_f1`` (as before) or ``worst_source`` (docs 15.38). ``temperature_fit``: ``auto``
+    (source_balanced with worst_source, else all), ``all`` or ``source_balanced`` (docs 15.39)."""
     if select_on not in SELECT_MODES:
         raise ValueError(f"select_on must be one of {SELECT_MODES}, got {select_on!r}")
+    if temperature_fit not in TEMPERATURE_FITS:
+        raise ValueError(f"temperature_fit must be one of {TEMPERATURE_FITS}, got {temperature_fit!r}")
     quota = parse_source_quota(source_quota)
     set_threads(threads)
     set_seed(cfg.seed)
@@ -166,17 +199,7 @@ def train_classifier(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainCo
         return np.concatenate([m(VX[a:a + 256], frame_mask(VX[a:a + 256], fcfg)).numpy() for a in range(0, len(VX), 256)])
 
     def val_fn(m) -> dict:
-        from sklearn.metrics import f1_score
-
-        lg = logits_of(m)
-        pred = lg.argmax(1)
-        row = {"val_acc": float((pred == VY).mean()),
-               "val_macro_f1": float(f1_score(VY, pred, labels=sorted(set(VY.tolist())), average="macro",
-                                              zero_division=0))}
-        row.update(per_source_metrics(VY, pred, VS))  # logged in every mode (docs 15.38)
-        if row["val_worst_major_f1"] is None:  # no INCLUDE / ISL500 validation clip: the overall number
-            row["val_worst_major_f1"] = row["val_macro_f1"]
-        return row
+        return validation_row(VY, logits_of(m).argmax(1), VS)
 
     select_key = "val_worst_major_f1" if select_on == "worst_source" else "val_macro_f1"
 
@@ -221,7 +244,8 @@ def train_classifier(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainCo
                            **({"dictionary_group": True} if dictionary_group else {}),
                            # 15.38, the same way: only when on
                            **({"source_quota": {"shares": shares, "groups": group_of}} if quota is not None else {}),
-                           **({"select_on": select_on} if select_on != "macro_f1" else {})})
+                           **({"select_on": select_on} if select_on != "macro_f1" else {}),
+                           **({"temperature_fit": temperature_fit} if temperature_fit != "auto" else {})})
     if progress:
         progress(None, f"draw share by source {draw_share}" + (f", quota {shares}" if quota is not None else "")
                  + f", selection {select_key}")
@@ -232,8 +256,10 @@ def train_classifier(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainCo
     ck = torch.load(out, map_location="cpu", weights_only=False)
     model.load_state_dict(ck["state_dict"])
     logits = logits_of(model)
-    balanced = select_on == "worst_source"
-    T = fit_temperature(logits, VY, weights=source_balanced_weights(VS) if balanced else None)
+    tfit = temperature_fit if temperature_fit != "auto" else (
+        "source_balanced" if select_on == "worst_source" else "all")
+    tw = source_balanced_weights(VS, quota) if tfit == "source_balanced" else None
+    T = fit_temperature(logits, VY, weights=tw)
     z = logits / T
     probs = np.exp(z - z.max(1, keepdims=True))
     probs /= probs.sum(1, keepdims=True)
@@ -241,7 +267,9 @@ def train_classifier(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainCo
     pred = probs.argmax(1)
     by_source = {s: {"n": int((VS == s).sum()), "top1": float((pred[VS == s] == VY[VS == s]).mean())}
                  for s in sorted(set(VS.tolist()))}
-    ck["meta"].update(temperature_fit="source_balanced" if balanced else "all", val_by_source=by_source,
+    ck["meta"].update(temperature_fit=tfit, val_by_source=by_source,
+                      temperature_weight_by_source=weight_by_source(VS, tw if tw is not None
+                                                                    else np.full(len(VS), 1.0 / len(VS))),
                       temperature=T, recommended_threshold=pick_threshold(curve),
                       val_top1=float((probs.argmax(1) == VY).mean()),
                       val_top5=float(np.mean([y in np.argsort(-p)[:5] for p, y in zip(probs, VY)])),
@@ -253,4 +281,5 @@ def train_classifier(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainCo
             "train_items": len(train_clips), "val_items": len(vx), "train_sources": dict(src),
             "finished": res.finished, "step_seconds": res.step_seconds, "class_space": class_space,
             "source_quota": quota_meta, "select_key": select_key, "val_by_source": by_source,
+            "temperature_fit": tfit,
             "seconds": round(time.time() - t0, 1)}

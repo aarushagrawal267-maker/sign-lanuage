@@ -2,7 +2,7 @@
 
 A quota says which share of the training draws each *quota group* gets. A group is a source name (``include``,
 ``isl500``, ``islrtc``...) or one of two families: ``dictionary`` (ISLRTC and its second views WSLP and CISLR,
-:data:`~app.isl.training.common.DICTIONARY_SOURCES`) and ``mendeley`` (every ``mendeley_*`` source). A key that names
+:data:`DICTIONARY_FAMILY`) and ``mendeley`` (every ``mendeley_*`` source). A key that names
 a source exactly wins over its family. Groups that have no training clip are dropped and the rest renormalised, so
 the same quota works for every split and data cap. A training source whose group has no quota is refused (a new
 source must never silently get no draws).
@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import math
 
-from app.isl.training.common import DICTIONARY_SOURCES
+# = app.isl.training.common.DICTIONARY_SOURCES (a test checks it). Kept here so this module imports no torch: the
+# driver's pre-flight check (docs 15.39) imports it with any python
+DICTIONARY_FAMILY = ("islrtc", "wslp", "cislr")
 
 # research default (QA plan 1.4): INCLUDE first (the app's users sign like INCLUDE), ISL500 for signer variety, the
 # dictionary and Mendeley small
@@ -70,7 +72,7 @@ def quota_group(source: str, quota: dict[str, float]) -> str | None:
     """The quota group of a source: its own name when the quota names it, else its family, else None."""
     if source in quota:
         return source
-    if source in DICTIONARY_SOURCES and "dictionary" in quota:
+    if source in DICTIONARY_FAMILY and "dictionary" in quota:
         return "dictionary"
     if source.startswith("mendeley") and "mendeley" in quota:
         return "mendeley"
@@ -92,3 +94,15 @@ def resolve_source_quota(quota: dict[str, float], sources) -> tuple[dict[str, st
     if total <= 0:
         raise ValueError(f"source quota {quota}: every source present ({present}) has share 0")
     return group_of, {g: quota[g] / total for g in groups}
+
+
+def check_source_quota(spec: str | None, sources) -> str | None:
+    """The driver's pre-flight (docs 15.39): None when ``spec`` parses and covers ``sources`` (a profile's word
+    sources), else the reason. ``sys.exit(check_source_quota(...))`` exits 0 or prints the reason and exits 1."""
+    try:
+        q = parse_source_quota(spec)
+        if q is not None:
+            resolve_source_quota(q, sources)
+    except ValueError as e:
+        return f"CLS_SOURCE_QUOTA: {e}"
+    return None

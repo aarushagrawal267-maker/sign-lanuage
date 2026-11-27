@@ -1874,7 +1874,9 @@ data loading of ~5 ms per clip; the driver logs `bench` first so the budget can 
 | encoder | 40 x 400, P=32 K=2 (early stop, patience 10) | <= 16,000 | 3-4 h |
 | oneshot | 2 folds x 20 x 300 | <= 12,000 | 2.5-3 h |
 | classifier | 40 x 300 x 32 (patience 10) | <= 12,000 | 1-1.5 h |
+| classifier, research (15.38) | 40 x 800 x 32 (patience 8), quota + worst_source | <= 32,000 | about 2.2 h |
 | cv | 4 more folds of the classifier | <= 48,000 | 4-6 h (skip with `CV_FOLDS=""`) |
+| cv, research (15.38) | 4 folds x 40 x 800, quota + worst_source | <= 128,000 | about 9.2 h (skip with `CV_FOLDS=""`) |
 | e1a | 40 x 120 | <= 4,800 | 0.5 h |
 | fingerspell | MLP, 40 epochs + 2-3 leave-one-signer-out refits | - | < 0.5 h (feature extraction dominates) |
 | index, fusion, evaluate, index_final, pack | all references | - | 1.5-2.5 h |
@@ -4257,7 +4259,8 @@ are dropped and the rest renormalised, so one quota fits every split. A training
 * `worst_source`: the epoch with the highest `val_worst_major_f1`, the lowest validation macro F1 of INCLUDE and
   ISL500 (those present). With neither present it falls back to the pooled number. The temperature is then fitted on
   source-balanced validation: every source weighs the same in total, a source with fewer than 20 clips weighs
-  `clips / 20` (`fit_temperature(weights=...)`; without weights the fit is unchanged).
+  `clips / 20` (`fit_temperature(weights=...)`; without weights the fit is unchanged). Changed in 15.39: the
+  weights now follow the quota groups and their shares.
 * Every history row now has `val_f1_<source>` and `val_acc_<source>` per validation source and `val_worst_major_f1`,
   in both modes.
 
@@ -4277,9 +4280,9 @@ settings is refused and an old default state still resumes.
 * The classifier and cv stamps record `quota=` and `select=`; the start line and `--dry-run` print them.
 
 **How to read the results (critics 2, 9, 10).**
-* Run the quota ablation alone first (critic 2), in a tagged scratch run, for example
-  `PHASE2_TAG=q30 CLS_SOURCE_QUOTA=include=0.30,isl500=0.50,dictionary=0.12,mendeley=0.08 scripts/phase2_train.sh
-  --profile research --from classifier`. Credit an E1b gain to 1.4 only from that run.
+* Run the quota ablation alone first (critic 2), at the plan's 1a setting (primary split, 300 steps, about 0.75 h
+  per arm). Use the direct command, not the driver (see 15.39 for the exact command and why).
+  Credit an E1b gain to 1.4 only from that run.
 * Choose the quota on INCLUDE validation, never on test (critic 9). The per-source history makes that possible
   without a test pass.
 * QA plan 1.6 moves two ISL500 signers to validation. Selection then sees a different ISL500 validation set, and an
@@ -4294,3 +4297,71 @@ renormalisation and refusals; the CLI refuses a bad quota; source-balanced weigh
 the classifier's `val_worst_major_f1` is the minimum of the INCLUDE and ISL500 F1 in every history row and picks the
 best epoch; meta records the quota; a changed quota or selection raises `StateMismatch`; the default run is unchanged
 but logs per-source rows; the driver's research and commercial-safe defaults; e1a gets no quota.
+
+### 15.39 Quota review fixes: checked before the run, a fair temperature, a cheap ablation (review of 15.38, 27 Nov 2026)
+
+**The driver checks the quota before anything runs.** Before, the driver only checked the syntax of
+`CLS_SOURCE_QUOTA`. A typo (`incldue=0.45`) or a quota without the dictionary failed only when the classifier step
+started, after link, bench, pretrain, encoder and oneshot. Now, when the classifier or cv step is in the run, the
+driver calls `parse_source_quota` and `resolve_source_quota` against every word source of the profile
+(`profiles.WORD_SOURCES`). A bad quota exits 2 and nothing runs, `--dry-run` included. This is a little stricter than
+the sources a run really has, which is fine for a pre-flight. The check is one `python -c` line calling
+`source_quota.check_source_quota`. That module now imports no torch (it keeps its own copy of the dictionary family,
+`DICTIONARY_FAMILY`, and a test checks it equals `common.DICTIONARY_SOURCES`), so the check takes well under a second.
+`CLS_SOURCE_QUOTA=default` now means the research default quota, as `--source-quota default` does.
+
+**A stamp of other settings is said, not hidden.** A resume without `--from` skips a classifier or cv step that has a
+stamp. If the stamp's settings (`dict_group`, `quota`, `select`) differ from this run's, the driver now logs
+`warning: classifier stamp settings differ from the current ones (...); use --from classifier to retrain` (also in
+`--dry-run`). It never refuses, so a running chain behaves as before. Every research stamp written before 15.38 gets
+this warning.
+
+**Temperature weights by quota group.** In 15.38 every validation source weighed the same. On the real research
+data that gave 46 Mendeley emergency clips the same weight as 856 INCLUDE clips, and WSLP plus CISLR would give the
+dictionary two votes. Now:
+* the units are quota groups: the dictionary family and the Mendeley family count once each;
+* each unit weighs its quota share (the run's quota, else the research default one; a source of no group gets the
+  smallest share);
+* a unit with fewer than 20 validation clips gets `clips / 20` of its share, as before.
+So INCLUDE weighs 0.45, ISL500 0.35, Mendeley 0.08 (renormalised over the groups present). The meta records the
+total weight per source in `temperature_weight_by_source` (in the plain fit: each source's share of the clips).
+
+**The temperature fit is its own option.** `train-classifier --temperature-fit auto|all|source_balanced`. `auto`
+(the default) keeps 15.38: source-balanced with `--select-on worst_source`, all rows alike otherwise. So a quota run
+with `macro_f1` selection can still ask for the balanced fit. A value other than `auto` goes into `LoopConfig.extra`
+(rule of 15.19). The driver passes nothing new.
+
+**Cost of the research defaults.** The research classifier now runs 40 x 800 steps (patience 8, about 2.2 h). The cv
+step inherits the quota, the selection and the 800 steps for all 4 folds: about 9.2 h, the largest new cost of 15.38
+(table in 15.2). For a cheaper run: `CLS_SOURCE_QUOTA=none`, `CLS_STEPS=300` or `CV_FOLDS=` (no cv).
+
+**The quota ablation (plan 1a), the cheap way.** The driver example of 15.38 ran a full chain per arm (800 steps,
+cv, index, fusion, evaluate, pack: over 12 h per arm). Use the classifier command alone, from `backend/`, with the
+same settings for all 3 arms and only the quota changed:
+
+    nice -n 10 ../.venv/bin/python -m app.isl.cli train-classifier --profile research --all-sources --threads 4 \
+      --vocab ../artifacts/isl/research/vocabulary.jsonl --hidden 192 --layers 2 --epochs 40 --batches 300 \
+      --patience 10 --dictionary-group --select-on worst_source \
+      --source-quota include=0.30,isl500=0.50,dictionary=0.12,mendeley=0.08 \
+      --ckpt ../artifacts/isl/runs/q30/classifier.pt
+
+* Arms: `include=0.30,isl500=0.50,...`, the default `0.45 / 0.35`, and `include=0.60,isl500=0.20,...`. Same
+  `--batches`, `--epochs`, `--patience` and split for all 3.
+* About 0.75 h per arm on 4 threads. It writes only the `--ckpt` file and its `.state`.
+* Record for each arm, from the checkpoint meta: `val_by_source.include.top1` and `val_f1_include` of the best
+  epoch's history row. Choose on those, never on test.
+* With the driver instead: `PHASE2_TAG=q30 CLS_STEPS=300 CLS_PATIENCE=10 CV_FOLDS= CLS_SOURCE_QUOTA=...
+  scripts/phase2_train.sh --profile research --from classifier`, and stop it after the classifier step.
+
+**Still open (critic 8, validation reuse).** With `worst_source`, INCLUDE validation (856 clips, 4 signer groups)
+now chooses the quota, the epoch and the temperature, and later certifies the 0.4 threshold. The selection bias is
+larger than the 0.0001-0.0008 the plan quotes for thresholds alone. Test data is never used. Follow-up for Batch 1:
+out-of-fold INCLUDE calibration from cv folds 1-4, or one INCLUDE session held out for calibration only, and a
+warning in the evaluation report when `meta.select_on` is `worst_source`.
+
+Tests (`test_source_quota.py`): the driver refuses `incldue=1`, `include=0.5,isl500=0.5` and all-zero shares under
+research in `--dry-run` (exit 2) and skips the check when neither classifier nor cv runs; `default` works;
+classifier and cv stamps of other settings give the warning, current ones do not; the weights follow the quota
+groups on the review's real counts; the classifier's temperature is the weighted fit of the best checkpoint's
+validation logits; `--temperature-fit` works with `macro_f1` and is in the resume signature; with only Mendeley
+validation clips `val_worst_major_f1` falls back to the pooled macro F1.

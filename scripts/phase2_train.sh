@@ -63,9 +63,10 @@
 #   pass --accept-noisy / --allow-split-change to the link step (recorded). --only link is refused when the file's
 #   state differs from the folder's frozen one (the later steps would pair new labels with old models: use --from link).
 # Classifier sampler and selection (docs 15.38, QA plan 1.4; research on, commercial-safe off):
-#   CLS_SOURCE_QUOTA=include=0.45,isl500=0.35,dictionary=0.12,mendeley=0.08 | none   classifier and cv draw a source
-#     group by these shares, then a class inside it, then a clip (--source-quota; renormalised over the sources present;
-#     e1a never gets it). Research default: the shares shown; commercial-safe default: none.
+#   CLS_SOURCE_QUOTA=include=0.45,isl500=0.35,dictionary=0.12,mendeley=0.08 | default | none   classifier and cv draw
+#     a source group by these shares, then a class inside it, then a clip (--source-quota; renormalised over the sources
+#     present; e1a never gets it). Research default: the shares shown (= default); commercial-safe default: none. The
+#     quota is checked against the profile's word sources before anything runs (exit 2; docs 15.39).
 #   CLS_SELECT=worst_source|macro_f1   classifier and cv select the epoch on the lowest validation macro F1 of INCLUDE and
 #     ISL500 and fit the temperature on source-balanced validation (--select-on). Research worst_source, else macro_f1.
 #   Full research runs also default to CLS_STEPS=800 and CLS_PATIENCE=8 (commercial-safe 300 and 10; e1a keeps 10).
@@ -221,17 +222,19 @@ else
 fi
 DICT_GROUP="${CLS_DICTIONARY_GROUP:-$DG_DEFAULT}"
 # classifier source quota and selection (docs 15.38): research on, commercial-safe off; "" or none = off
+CQ_RESEARCH="include=0.45,isl500=0.35,dictionary=0.12,mendeley=0.08"  # = source_quota.DEFAULT_SOURCE_QUOTA
 if [[ "$PROFILE" == "research" ]]; then
-  CQ_DEFAULT="include=0.45,isl500=0.35,dictionary=0.12,mendeley=0.08"; CSEL_DEFAULT="worst_source"
+  CQ_DEFAULT="$CQ_RESEARCH"; CSEL_DEFAULT="worst_source"
 else
   CQ_DEFAULT="none"; CSEL_DEFAULT="macro_f1"
 fi
 CLS_QUOTA="${CLS_SOURCE_QUOTA-$CQ_DEFAULT}"
 [[ -z "$CLS_QUOTA" ]] && CLS_QUOTA="none"
+[[ "$CLS_QUOTA" == default ]] && CLS_QUOTA="$CQ_RESEARCH"  # as the cli's --source-quota default
 CLS_SEL="${CLS_SELECT:-$CSEL_DEFAULT}"
 case "$CLS_SEL" in macro_f1|worst_source) ;; *) echo "CLS_SELECT must be macro_f1 or worst_source" >&2; exit 2 ;; esac
 if [[ "$CLS_QUOTA" != none && ! "$CLS_QUOTA" =~ ^[a-z0-9_]+=[0-9.]+(,[a-z0-9_]+=[0-9.]+)*$ ]]; then
-  echo "CLS_SOURCE_QUOTA: name=share,... (e.g. $CQ_DEFAULT) or none" >&2; exit 2
+  echo "CLS_SOURCE_QUOTA: name=share,... (e.g. $CQ_RESEARCH), default or none" >&2; exit 2
 fi
 CQ_ARG=""; [[ "$CLS_QUOTA" != none ]] && CQ_ARG="--source-quota $CLS_QUOTA"
 [[ "$CLS_SEL" != macro_f1 ]] && CQ_ARG="$CQ_ARG --select-on $CLS_SEL"
@@ -269,6 +272,15 @@ step_settings() {
     index|index_final) echo " wslp_twins=$WSLP_TWINS" ;;
     link) echo " link_aliases=$LINK_ALIASES variant_links=$VL_FILE" ;;
   esac
+}
+# a skipped classifier / cv step whose stamp has other settings than this run's (e.g. a stamp from before the quota):
+# kept as it is (never refused), but said, so a plain resume does not silently keep an old classifier (docs 15.39)
+stamp_warn() {
+  case "$1" in classifier|cv) ;; *) return 0 ;; esac
+  local want
+  want="$(step_settings "$1")"
+  [[ "$(cat "$STAMPS/$1.done" 2>/dev/null)" == *"$want" ]] && return 0
+  log "warning: $1 stamp settings differ from the current ones (${want# }); use --from $1 to retrain"
 }
 # a scratch run: a full run with a tag or its own work folder (smoke runs have their own private ISL root). It must
 # not rewrite the shared data under data/isl (docs 15.20): the steps in SHARED_STEPS are refused there unless
@@ -487,6 +499,16 @@ else
   VL_STATE="(link step not run; folder: $vl_folder)"
 fi
 WSLP_SETTINGS="$WSLP_SETTINGS variant_links=$VL_STATE"
+# the classifier's source quota, checked in full before anything runs (docs 15.39): an unknown name, a word source of
+# the profile with no share or all shares 0 would otherwise fail only when the classifier step starts, hours into a
+# run. Checked against every word source of the profile (stricter than the sources a run really has: fine here).
+if [[ "$CLS_QUOTA" != none ]] && { in_list classifier "${RUN[@]}" || in_list cv "${RUN[@]}"; }; then
+  # (one line, torch-free imports: quick, and any python the tests put in $PY can run it)
+  if ! "$PY" -c 'import sys; from app.isl.profiles import WORD_SOURCES as W; from app.isl.training.source_quota import check_source_quota as c; sys.exit(c(sys.argv[1], W[sys.argv[2]]))' "$CLS_QUOTA" "$PROFILE"; then
+    echo "CLS_SOURCE_QUOTA=$CLS_QUOTA refused for profile $PROFILE (nothing was run)" >&2
+    exit 2
+  fi
+fi
 # --only link with another variant-links state than the folder's frozen one would leave the later steps' stamps on
 # models trained with the old labels (docs 15.37): refused, use --from link
 if [[ "$ONLY" == link ]]; then
@@ -533,7 +555,9 @@ if [[ $DRY_RUN == 1 ]]; then
   for s in "${SEED[@]}"; do seed_step "$s" || exit $?; done
   for s in "${STEPS[@]}"; do
     if in_list "$s" "${RUN[@]}"; then echo "would run $s"
-    elif [[ -z "$ONLY" ]] && ! in_list "$s" "${SEED[@]}"; then echo "would skip $s (done $(cat "$STAMPS/$s.done"))"; fi
+    elif [[ -z "$ONLY" ]] && ! in_list "$s" "${SEED[@]}"; then
+      echo "would skip $s (done $(cat "$STAMPS/$s.done"))"; stamp_warn "$s"
+    fi
   done
   exit 0
 fi
@@ -575,7 +599,7 @@ fi
 for s in "${FORGET[@]}"; do forget "$s"; done  # eager: STEP and every later step at once (see the plan above)
 for s in "${STEPS[@]}"; do
   if [[ -n "$ONLY" && "$s" != "$ONLY" ]]; then continue; fi
-  if [[ -z "$ONLY" && -f "$STAMPS/$s.done" ]]; then log "skip $s (done $(cat "$STAMPS/$s.done"))"; continue; fi
+  if [[ -z "$ONLY" && -f "$STAMPS/$s.done" ]]; then log "skip $s (done $(cat "$STAMPS/$s.done"))"; stamp_warn "$s"; continue; fi
   if [[ $SCRATCH == 1 && $ALLOW_SHARED == 0 ]] && in_list "$s" "${SHARED_STEPS[@]}"; then
     log "step $s refused: a scratch run must not rewrite the shared data (--allow-shared-data)"; exit 2
   fi

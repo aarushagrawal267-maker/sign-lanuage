@@ -630,7 +630,8 @@ def cmd_train_classifier(paths: IslPaths, args) -> int:
                            max_minutes=args.max_minutes, steps_per_epoch=args.batches,
                            dictionary_group=bool(getattr(args, "dictionary_group", False)),
                            source_quota=getattr(args, "source_quota", None),
-                           select_on=getattr(args, "select_on", None) or "macro_f1")
+                           select_on=getattr(args, "select_on", None) or "macro_f1",
+                           temperature_fit=getattr(args, "temperature_fit", None) or "auto")
     _print(res)
     return 0 if res.get("finished", True) else EX_PARTIAL
 
@@ -1419,8 +1420,14 @@ def build_parser() -> argparse.ArgumentParser:
                                   "sources present), 'default' (that one) or 'none'. Default: none (the old sampler)")
             spx.add_argument("--select-on", choices=["macro_f1", "worst_source"], default="macro_f1",
                              help="epoch selection: macro_f1 over all validation clips (default, as before) or "
-                                  "worst_source = the lowest macro F1 of INCLUDE and ISL500 (those present), with the "
-                                  "temperature fitted on source-balanced validation (docs 15.38)")
+                                  "worst_source = the lowest macro F1 of INCLUDE and ISL500 (those present). With "
+                                  "--temperature-fit auto, worst_source also fits the temperature on source-balanced "
+                                  "validation (docs 15.38)")
+            spx.add_argument("--temperature-fit", choices=["auto", "all", "source_balanced"], default="auto",
+                             help="validation rows of the temperature fit: all alike, or source_balanced (quota "
+                                  "groups weighted by their --source-quota shares, else the research default ones; "
+                                  "docs 15.39). auto (default) = source_balanced with --select-on worst_source, "
+                                  "else all (as before)")
         if name in ("train-encoder", "train-oneshot"):
             spx.add_argument("--exclude-sources", default="", type=_exclude_sources_arg,
                              help="comma-separated sources left out of encoder supervision, e.g. wslp (docs 15.32)")
