@@ -69,6 +69,12 @@ class FusionParams:
     # source-stratified subsample of the validation clips ("subsample", "seed", "n_full", "nll_subsample",
     # "nll_full"). Empty in packs fitted before 15.23 (grid on every validation clip).
     weight_fit: dict = field(default_factory=dict)
+    # certification of the accept rule (docs 15.25). None = parameters built in code (unit tests, toy tools): no
+    # gate. A dict = a pack's record: a policy auto-accepts only when ``achieved[policy]["rule"]`` is "certified"
+    # (with its per-source numbers in ``achieved[policy]["by_source"]``); every other policy is confirm-only (the
+    # top candidate becomes "did you mean"). A fusion.json written before 15.25 has no such record and loads as {}:
+    # UNCERTIFIED, every policy confirm-only.
+    certification: dict | None = None
 
     def __post_init__(self):
         # Every policy must always have a threshold: a fusion.json written with only some policies (or none) made
@@ -90,6 +96,8 @@ class FusionParams:
         object.__setattr__(self, "classifier_fit", dict(self.classifier_fit or {}))
         if self.user_cls_mode not in USER_CLS_MODES:
             raise ValueError(f"user_cls_mode must be one of {USER_CLS_MODES}, not {self.user_cls_mode!r}")
+        if self.certification is not None:
+            object.__setattr__(self, "certification", dict(self.certification))
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -97,6 +105,9 @@ class FusionParams:
     @classmethod
     def from_json(cls, d: dict | None) -> FusionParams:
         d = dict(d or {})
+        # a file without a certification record (fitted before docs 15.25) is uncertified: every policy confirm-only
+        cert = d.get("certification")
+        d["certification"] = dict(cert) if isinstance(cert, dict) else {}
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
     @classmethod
@@ -112,6 +123,51 @@ class FusionParams:
     def suggest_mass(self, policy: str) -> float:
         """Smallest top-5 mass for a "did you mean" under ``policy`` (the single value in packs before 15.17)."""
         return float(self.suggest_min_top5_mass_by_policy.get(policy, self.suggest_min_top5_mass))
+
+    # ------------------------------------------------------------ certification (docs 15.25)
+    @property
+    def gated(self) -> bool:
+        """True when this is a pack's record (loaded or fitted): uncertified policies are then confirm-only."""
+        return self.certification is not None
+
+    def policy_rule(self, policy: str) -> str:
+        """"certified" (may auto-accept), "confirm_only" (never auto-accepts) or "ungated" (in-code parameters)."""
+        if self.certification is None:
+            return "ungated"
+        a = (self.achieved or {}).get(policy) or {}
+        if self.certification.get("version") and a.get("rule") == "certified" and isinstance(a.get("by_source"), dict):
+            return "certified"
+        return "confirm_only"
+
+    def confirm_only(self, policy: str) -> bool:
+        return self.policy_rule(policy) == "confirm_only"
+
+    def open_vocabulary_confirm_only(self, policy: str) -> bool:
+        """Words outside the classifier (retrieval only) auto-accept only when the policy is certified AND the
+        open-vocabulary check certified them at the strict floor (docs 15.25)."""
+        if self.certification is None:
+            return False
+        if self.confirm_only(policy):
+            return True
+        ov = ((self.certification.get("open_vocabulary") or {}).get("policies") or {}).get(policy) or {}
+        return ov.get("rule") != "certified"
+
+    def certification_info(self, policy: str) -> dict:
+        """What the app shows next to a word (docs 15.25): the rule, the CERTIFIED worst-source precision (the 95 %
+        lower bound on the worst major source, never the target), that source, the floor and the target.
+        ``confirm_tap`` is always True: even a certified policy is below the 0.98 goal, so the app asks the user to
+        confirm before a word is spoken or sent."""
+        rule = self.policy_rule(policy)
+        a = (self.achieved or {}).get(policy) or {}
+        ov = ((((self.certification or {}).get("open_vocabulary") or {}).get("policies") or {}).get(policy) or {})
+        return {"rule": rule, "certified_precision": a.get("certified_precision") if rule == "certified" else None,
+                "worst_source": a.get("worst_source"), "floor": a.get("floor"), "target": a.get("target"),
+                "target_reached": bool(a.get("target_reached")) if rule != "ungated" else None,
+                "open_vocabulary_rule": ("ungated" if rule == "ungated" else
+                                         "confirm_only" if self.open_vocabulary_confirm_only(policy) else "certified"),
+                "fitted": self.fitted, "confirm_tap": True,
+                **({"reason": "fusion.json has no certification record (fitted before docs 15.25 or not fitted): "
+                              "every word needs a confirm tap"} if rule != "ungated" and not self.certification else {})}
 
 
 DEFAULT_ACCEPT = {"strict": 0.85, "balanced": 0.7, "lenient": 0.55}
@@ -456,11 +512,16 @@ def fuse(inp: FusionInputs, p: FusionParams) -> FusionResult:
 
 
 def decide(p_sorted: np.ndarray, agree: int, crops: int, params: FusionParams, policy: str = "balanced",
-           best_cos: float | None = None) -> tuple[str, str]:
+           best_cos: float | None = None, open_vocabulary: bool = False) -> tuple[str, str]:
     """accept   if p1 >= accept[policy] and p1 - p2 >= margin and enough crops agree
        suggest  elif sum(top5) >= suggest_min_top5_mass (per policy when fitted so, ``FusionParams.suggest_mass``)
        abstain  otherwise ("Not sure - please sign again, or spell it").
-    With ``best_cos`` below ``s_min`` the result is always ``abstain`` / ``out_of_vocabulary``."""
+    With ``best_cos`` below ``s_min`` the result is always ``abstain`` / ``out_of_vocabulary``.
+
+    Certification (docs 15.25): for a confirm-only policy (``FusionParams.confirm_only``) a query that passes the
+    accept rule is never accepted: its top candidate becomes "did you mean" (``suggest`` / ``confirm_only``).
+    ``open_vocabulary``: the top candidate is a word outside the classifier (retrieval only); it is accepted only
+    when the open-vocabulary check certified the policy, else ``suggest`` / ``open_vocabulary``."""
     if policy not in params.accept:
         raise ValueError(f"unknown policy {policy!r}; choose one of {sorted(params.accept)}")
     if len(p_sorted) == 0:
@@ -471,6 +532,10 @@ def decide(p_sorted: np.ndarray, agree: int, crops: int, params: FusionParams, p
     p2 = float(p_sorted[1]) if len(p_sorted) > 1 else 0.0
     need = min(params.min_agree, crops)
     if p1 >= params.accept[policy] and p1 - p2 >= params.margin and agree >= need:
+        if params.confirm_only(policy):
+            return "suggest", "confirm_only"
+        if open_vocabulary and params.open_vocabulary_confirm_only(policy):
+            return "suggest", "open_vocabulary"
         return "accept", "ok"
     if p1 < params.accept[policy]:
         reason = "low_confidence"

@@ -109,7 +109,8 @@ class IslRecognizer:
         self.encoder = encoder
         self.index = index if encoder is not None else None
         self.speller = speller
-        self.fusion = fusion or FusionParams()
+        # no fusion.json: uncalibrated defaults, gated (uncertified: every policy confirm-only, docs 15.25)
+        self.fusion = fusion if fusion is not None else FusionParams(certification={})
         self.my_signs = my_signs
         self.profile = profile
         for name, comp in (("classifier", classifier), ("encoder", encoder)):
@@ -126,6 +127,8 @@ class IslRecognizer:
             caps.add("spelling")
         self.capabilities = frozenset(caps)
         self._prior = None  # ConceptPrior of self.vocab, shared by every segment's FusionInputs (docs 15.23)
+        self._cls_cal = None  # (classifier, fusion, classifier_policy_thresholds result): computed once per pair
+        self._class_set = None  # (classifier, frozenset of its class names): the open-vocabulary test (docs 15.25)
 
     # ------------------------------------------------------------------ helpers
     @property
@@ -155,13 +158,63 @@ class IslRecognizer:
         sliding-mode threshold of packs fitted before docs 15.17; see :meth:`classifier_threshold_for`)."""
         return classifier_calibration(self.classifier)[1] if self.classifier is not None else None
 
+    def _classifier_policy(self) -> dict:
+        """``classifier_policy_thresholds`` of the current classifier and fusion, cached per (classifier, fusion)
+        pair: the engine asks for it on every frame, and the fingerprint hashes the whole class list."""
+        c = self._cls_cal
+        if c is None or c[0] is not self.classifier or c[1] is not self.fusion:
+            c = self._cls_cal = (self.classifier, self.fusion,
+                                 classifier_policy_thresholds(self.classifier, self.fusion))
+        return c[2]
+
     def classifier_threshold_for(self, policy: str = "balanced") -> float | None:
         """Sliding-mode accept threshold for ``policy``: fitted per policy when this pack's fusion.json has it for
         this classifier, else the checkpoint's single threshold (:func:`classifier_policy_thresholds`)."""
         if self.classifier is None:
             return None
-        th = classifier_policy_thresholds(self.classifier, self.fusion)["thresholds"]
+        th = self._classifier_policy()["thresholds"]
         return float(th.get(policy, th["balanced"]))
+
+    def sliding_rule(self, policy: str = "balanced") -> str:
+        """May sliding mode auto-commit under ``policy`` (docs 15.25)? "certified" only when fusion.json's sliding
+        thresholds were fitted for this very classifier on the real sliding mode (replay, not the segment proxy) and
+        that policy's worst major source reached its floor; "ungated" for in-code parameters; else "confirm_only"
+        (provisional words only, no auto-commit)."""
+        f = self.fusion
+        if not f.gated:
+            return "ungated"
+        if self.classifier is None or not self._classifier_policy()["per_policy"]:
+            return "confirm_only"
+        fit = f.classifier_fit or {}
+        b = (fit.get("policies") or {}).get(policy) or {}
+        if (f.certification or {}).get("version") and fit.get("rule") == "sliding replay" \
+                and b.get("rule") == "certified" and isinstance(b.get("by_source"), dict):
+            return "certified"
+        return "confirm_only"
+
+    def certification_info(self, policy: str = "balanced", mode: str = "segment") -> dict:
+        """What the UI shows for ``policy`` (docs 15.25): the rule, the certified worst-source precision (never the
+        target), the floor and ``confirm_tap`` (always True: the app asks before a word is spoken or sent)."""
+        if mode != "sliding":
+            return self.fusion.certification_info(policy)
+        rule = self.sliding_rule(policy)
+        b = ((self.fusion.classifier_fit or {}).get("policies") or {}).get(policy) or {}
+        return {"rule": rule, "certified_precision": b.get("certified_precision") if rule == "certified" else None,
+                "worst_source": b.get("worst_source"), "floor": b.get("floor"), "target": b.get("target"),
+                "target_reached": bool(b.get("target_reached")) if rule != "ungated" else None,
+                "fitted": self.fusion.fitted, "confirm_tap": True}
+
+    def is_open_vocabulary(self, key: str) -> bool:
+        """A word outside the classifier (retrieval only; every word when the pack has no classifier). User signs
+        have their own rule and never count."""
+        if not key or key.startswith(USER_PREFIX):
+            return False
+        if self.classifier is None:
+            return True
+        c = self._class_set
+        if c is None or c[0] is not self.classifier:
+            c = self._class_set = (self.classifier, frozenset(self.classifier.class_names))
+        return key not in c[1]
 
     def class_probs(self, crops: list[RawSequence]):
         """Closed-set probabilities of the classifier alone (sliding mode), temperature-scaled with the
@@ -227,7 +280,8 @@ class IslRecognizer:
         z = info.pop("z")
         res = fuse(inp, self.fusion)
         p = self.fusion
-        decision, reason = decide(res.probs, res.agree, len(crops), p, policy, res.best_cos if res.best_cos > -1 else None)
+        decision, reason = decide(res.probs, res.agree, len(crops), p, policy, res.best_cos if res.best_cos > -1 else None,
+                                  open_vocabulary=bool(res.keys) and self.is_open_vocabulary(res.keys[0]))
         keys, probs = list(res.keys), np.array(res.probs)
         # My signs searched first (7.3): a confident user match that beats the dictionary is taken directly
         override = False
@@ -254,7 +308,9 @@ class IslRecognizer:
         conf = cands[0].prob if cands else 0.0
         return Recognition(cands, decision, reason, float(conf), res.agree, len(crops), feat_ms, inf_ms,
                            detail={**{k: round(v, 3) for k, v in info.items()}, "best_cos": round(res.best_cos, 4),
-                                   "policy": policy, "fusion_fitted": p.fitted})
+                                   "policy": policy, "fusion_fitted": p.fitted,
+                                   # the certified worst-source precision the UI shows, never the target (docs 15.25)
+                                   "certification": p.certification_info(policy)})
 
     def _user_theta(self, key: str) -> float:
         p = self.fusion

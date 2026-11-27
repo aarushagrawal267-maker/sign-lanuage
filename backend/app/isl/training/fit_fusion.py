@@ -206,7 +206,8 @@ def fit_fusion(rec, val_clips: list[Clip], profile: str, version: str = "fusion-
     if guard is not None:
         rep["index_guard"] = guard
     if not inputs:
-        return base, {**rep, "note": "no validation clips: default (uncalibrated) fusion parameters"}
+        return base.with_(certification={}), {**rep, "note": "no validation clips: default (uncalibrated) fusion "
+                                                             "parameters, every policy confirm-only"}
     if inputs[0].cls_logp is not None:
         if inputs[0].compact_cls:
             # crop 0's temperature terms, computed clip by clip from the full rows (docs 15.24)
@@ -260,7 +261,11 @@ def fit_fusion(rec, val_clips: list[Clip], profile: str, version: str = "fusion-
     params = params.with_(weight_fit=wfit)
     rep["weights"] = {k: getattr(params, k) for k in ("alpha", "beta", "gamma", "tau_r", "t_c")} | {
         "nll": nll_full, "fit": wfit}
-    params, trep = fit_thresholds(results, truths, params)
+    # per-source certification (docs 15.25): every clip's source and signer group; the classifier's classes for the
+    # open-vocabulary check (no classifier: every word is retrieval only)
+    closed = set(stats.get("cls_names") or (list(clf.class_names) if clf is not None else []))
+    params, trep = fit_thresholds(results, truths, params, sources=[c.source for c in used],
+                                  groups=[getattr(c, "group", None) for c in used], closed_set=closed)
     del results
     rep["thresholds"] = {"accept": params.accept, "s_min": params.s_min,
                          "suggest_min_top5_mass": params.suggest_min_top5_mass,
@@ -268,6 +273,9 @@ def fit_fusion(rec, val_clips: list[Clip], profile: str, version: str = "fusion-
                          **{k: v for k, v in trep.items() if k.endswith("reached")},
                          "per_policy": trep.get("accept_fit", {}).get("policies"),
                          "best_lower_bound": trep.get("accept_fit", {}).get("best_lower_bound"),
+                         "major_sources": trep.get("accept_fit", {}).get("major_sources"),
+                         "rules": {pol: (params.achieved.get(pol) or {}).get("rule") for pol in params.accept},
+                         "s_min_fit": trep.get("s_min_fit"), "open_vocabulary": trep.get("open_vocabulary"),
                          "note": trep.get("accept_fit", {}).get("note")}
     rep["achieved"] = params.achieved
     params, rep["classifier_alone"] = fit_classifier_alone(rec, inputs, truths, params, clips=used,
@@ -390,11 +398,12 @@ def batched_sliding_windows(rec, raw, cfg=None, grid=None, margin: float | None 
 
 
 def replay_sliding(rec, clips: list[Clip], cfg=None, batched: bool = True,
-                   counts: dict | None = None) -> tuple[list, list[int], int]:
+                   counts: dict | None = None, used: list | None = None) -> tuple[list, list[int], int]:
     """``sliding_windows`` for every clip: (windows per replayed clip, classifier class index of its word or -1,
     clips that could not be replayed). ``batched`` (default) classifies each clip's windows in one call
     (``batched_sliding_windows``, docs 15.24); False replays window by window, the reference. ``counts`` (a dict)
-    gets "batched" and "reference": clips replayed each way."""
+    gets "batched" and "reference": clips replayed each way. ``used`` (a list) gets the replayed clips, aligned with
+    the windows (their source and signer group certify the sliding thresholds, docs 15.25)."""
     counts = {} if counts is None else counts
     counts.setdefault("batched", 0)
     counts.setdefault("reference", 0)
@@ -412,6 +421,8 @@ def replay_sliding(rec, clips: list[Clip], cfg=None, batched: bool = True,
             continue
         windows.append(prepare_windows(w))  # what the commit rule reads, not ~10 EMA vectors (docs 15.23)
         truths.append(pos.get(c.concept_id, -1))
+        if used is not None:
+            used.append(c)
         counts["reference" if by_ref else "batched"] += 1
     return windows, truths, failed
 
@@ -441,11 +452,14 @@ def fit_classifier_alone(rec, inputs: list[FusionInputs], truths: list[str], par
     temp, ck_thr, _ = classifier_calibration(clf)
     ecfg = EngineConfig()
     margin = ecfg.min_margin
-    windows, failed, counts = [], 0, {}
+    windows, failed, counts, wclips = [], 0, {}, []
     if clips:
-        windows, wtruths, failed = replay_sliding(rec, clips, ecfg, counts=counts)
+        windows, wtruths, failed = replay_sliding(rec, clips, ecfg, counts=counts, used=wclips)
     if windows:
-        accept, rep = fit_sliding_thresholds(windows, wtruths, margin, ecfg.agree_n, ecfg.cooldown_ms)
+        # per-source certification on the replayed clips (docs 15.25)
+        accept, rep = fit_sliding_thresholds(windows, wtruths, margin, ecfg.agree_n, ecfg.cooldown_ms,
+                                             sources=[getattr(c, "source", None) for c in wclips],
+                                             groups=[getattr(c, "group", None) for c in wclips])
         rule = "sliding replay"
         extra = {"engine": {k: getattr(ecfg, k) for k in ("window_ms", "interval_ms", "min_frames", "min_hand_ratio",
                                                           "ema_alpha", "agree_n", "cooldown_ms", "end_absent_ms",
@@ -462,6 +476,11 @@ def fit_classifier_alone(rec, inputs: list[FusionInputs], truths: list[str], par
             per_crop = [calibrated_probs(np.exp(np.atleast_2d(i.cls_logp)), temp) for i in inputs]
         accept, rep = fit_classifier_thresholds(per_crop, names, truths, margin, min_agree=params.min_agree)
         rule = "segment proxy"
+        # the proxy overstated sliding-mode precision by 4-11 points (docs 15.18): never certified for the app
+        for b in (rep.get("policies") or {}).values():
+            if b.get("rule") == "certified":
+                b.update(rule="confirm_only", certified_precision=None,
+                         reason="segment proxy, not the sliding-mode rule: never certified (docs 15.25)")
         extra = {"min_agree": params.min_agree, "replay_failed": failed,
                  "proxy_note": "three-crop segment proxy, not the sliding-mode rule: its lower bounds overstate "
                                "sliding mode (docs 15.18)"}

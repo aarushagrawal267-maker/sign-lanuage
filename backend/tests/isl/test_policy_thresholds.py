@@ -14,8 +14,8 @@ import numpy as np
 import pytest
 
 from app.features.spec import FeatureConfig
-from app.isl.models.calibration import (TARGETS, _fit_suggest_mass, choose_policy_thresholds, fit_thresholds,
-                                        wilson_lower)
+from app.isl.models.calibration import (FLOORS, TARGETS, _fit_suggest_mass, choose_policy_thresholds,
+                                        fit_thresholds, wilson_lower)
 from app.isl.models.fusion import POLICIES, FusionInputs, FusionParams, FusionResult, decide
 
 # the commercial-safe fusion.json as written before 15.17 (``achieved`` left out)
@@ -46,44 +46,41 @@ def _ceiling_set(n: int = 2000, ceiling: float = 0.9):
 
 # ------------------------------------------------------------------------------- fused thresholds
 
-def test_unreachable_targets_give_distinct_ordered_thresholds_and_say_so():
+def test_unreachable_targets_are_confirm_only_and_say_so():
+    """Precision capped at 0.9 (best bound 0.859): strict and balanced miss their floors (0.95 / 0.90) and are
+    confirm-only; lenient (floor 0.85) is certified at the best bound (docs 15.25; before: graded fallback)."""
     results, truths = _ceiling_set()
     p, rep = fit_thresholds(results, truths, FusionParams())
     a = p.accept
-    assert a["strict"] > a["balanced"] > a["lenient"], a  # before 15.17: all three equal
+    assert a["strict"] >= a["balanced"] >= a["lenient"], a
     best = rep["accept_fit"]["best_lower_bound"]
     assert best < TARGETS["lenient"]
     pols = rep["accept_fit"]["policies"]
     for pol in POLICIES:
-        assert rep[f"{pol}_target_reached"] is False and pols[pol]["rule"] == "fallback"
-        assert pols[pol]["precision_lower_bound"] >= pols[pol]["effective_target"] - 1e-9
-        # the report and the stored params both carry the bound each policy actually achieves
-        assert p.achieved[pol]["target_reached"] is False and p.achieved[pol]["rule"] == "fallback"
+        assert rep[f"{pol}_target_reached"] is False
+        certified = pols[pol]["precision_lower_bound"] >= FLOORS[pol]
+        assert pols[pol]["rule"] == ("certified" if certified else "confirm_only")
+        assert p.achieved[pol]["rule"] == pols[pol]["rule"] and p.achieved[pol]["floor"] == FLOORS[pol]
         assert p.achieved[pol]["precision_lower_bound"] == pols[pol]["precision_lower_bound"]
         assert p.achieved[pol]["threshold"] == a[pol]
-    # the targets' spacing below the best bound: 0 / 0.03 / 0.08
-    assert pols["strict"]["effective_target"] == pytest.approx(best, abs=1e-4)
-    assert pols["balanced"]["effective_target"] == pytest.approx(best - 0.03, abs=1e-4)
-    assert pols["lenient"]["effective_target"] == pytest.approx(best - 0.08, abs=1e-4)
-    assert pols["strict"]["threshold"] == rep["accept_fit"]["best_threshold"]  # strictest: the best bound itself
-    assert "not reachable" in rep["accept_fit"]["note"] and "lenient" in rep["accept_fit"]["note"]
-    # more lenient = more accepted, lower precision
-    n = [p.achieved[pol]["n_accepted"] for pol in POLICIES]
-    assert n[0] < n[1] < n[2]
+        assert p.policy_rule(pol) == pols[pol]["rule"]  # fitted parameters are gated
+    assert [pols[pol]["rule"] for pol in POLICIES] == ["confirm_only", "confirm_only", "certified"]
+    assert p.achieved["lenient"]["certified_precision"] == pytest.approx(best, abs=1e-4)
+    assert p.achieved["strict"]["certified_precision"] is None
+    assert "confirm-only" in rep["accept_fit"]["note"] and "strict" in rep["accept_fit"]["note"]
 
 
-def test_flat_precision_cannot_be_split_and_ties_are_not_invented():
-    # precision does not depend on p1 at all: every threshold has the same precision, so the best bound is at the
-    # lowest threshold (most data) and nothing is gained by being stricter. One threshold for all is honest here.
+def test_flat_precision_is_confirm_only_everywhere():
+    # precision does not depend on p1 at all (0.8): the best bound is below every floor
     ts = np.round(np.arange(0.2, 0.991, 0.01), 2)
     n_acc = np.linspace(1000, 100, len(ts)).astype(int)
     n_ok = (0.8 * n_acc).astype(int)
     acc, rep = choose_policy_thresholds(ts, n_acc, n_ok, dict(TARGETS))
     assert acc["strict"] == acc["balanced"] == acc["lenient"] == 0.2
-    assert all(rep["policies"][p]["rule"] == "fallback" for p in POLICIES)
+    assert all(rep["policies"][p]["rule"] == "confirm_only" for p in POLICIES)
 
 
-def test_partly_reachable_targets_keep_the_reached_rule_and_spread_the_others():
+def test_partly_reachable_targets_certify_what_reaches_its_floor():
     ts = np.round(np.arange(0.2, 0.991, 0.01), 2)
     n_acc = np.linspace(2000, 600, len(ts)).astype(int)
     prec = np.linspace(0.80, 0.955, len(ts))  # lenient (0.90) reachable, balanced (0.95) and strict not
@@ -91,11 +88,13 @@ def test_partly_reachable_targets_keep_the_reached_rule_and_spread_the_others():
     lbs = np.array([wilson_lower(int(k), int(m)) for k, m in zip(n_ok, n_acc)])
     acc, rep = choose_policy_thresholds(ts, n_acc, n_ok, dict(TARGETS))
     pols = rep["policies"]
-    assert pols["lenient"]["rule"] == "target" and pols["lenient"]["target_reached"]
-    assert acc["lenient"] == float(ts[np.flatnonzero(lbs >= 0.90)[0]])  # the pre-15.17 rule for a reached target
-    assert pols["balanced"]["rule"] == pols["strict"]["rule"] == "fallback"
-    assert 0.90 < pols["balanced"]["effective_target"] < pols["strict"]["effective_target"] == pytest.approx(lbs.max(), abs=1e-4)
-    assert acc["strict"] > acc["balanced"] > acc["lenient"]
+    assert pols["lenient"]["rule"] == "certified" and pols["lenient"]["target_reached"]
+    assert acc["lenient"] == float(ts[np.flatnonzero(lbs >= 0.90)[0]])  # the smallest threshold at the target
+    # balanced: target 0.95 out of reach, best bound 0.935 >= its floor 0.90 -> certified at the best bound
+    assert pols["balanced"]["rule"] == "certified" and not pols["balanced"]["target_reached"]
+    assert pols["balanced"]["certified_precision"] == pytest.approx(lbs.max(), abs=1e-4)
+    assert pols["strict"]["rule"] == "confirm_only" and "floor" in pols["strict"]["reason"]
+    assert acc["strict"] >= acc["balanced"] > acc["lenient"]
 
 
 def test_reachable_targets_unchanged_from_the_old_rule():
@@ -105,18 +104,21 @@ def test_reachable_targets_unchanged_from_the_old_rule():
     lbs = np.array([wilson_lower(int(k), int(m)) for k, m in zip(n_ok, n_acc)])
     acc, rep = choose_policy_thresholds(ts, n_acc, n_ok, dict(TARGETS))
     for pol, tg in TARGETS.items():
-        assert rep["policies"][pol]["rule"] == "target"
+        assert rep["policies"][pol]["rule"] == "certified" and rep["policies"][pol]["target_reached"]
         assert acc[pol] == float(ts[np.flatnonzero(lbs >= tg)[0]])
     assert "note" not in rep
 
 
-def test_too_little_data_keeps_defaults():
+def test_too_little_data_keeps_defaults_and_certifies_nothing():
     p0 = FusionParams()
     acc, rep = choose_policy_thresholds(np.array([0.5, 0.6]), np.array([2, 1]), np.array([2, 1]), dict(TARGETS))
-    assert acc is None and all(v["rule"] == "default" for v in rep["policies"].values())
+    assert acc is None and all(v["rule"] == "confirm_only" for v in rep["policies"].values())
     res, tr = _ceiling_set(3)
     p, rep2 = fit_thresholds(res, tr, p0)
     assert p.accept == p0.accept and rep2["strict_target_reached"] is False
+    assert all(p.confirm_only(pol) for pol in POLICIES)
+    p_empty, _ = fit_thresholds([], [], p0)
+    assert p_empty.gated and all(p_empty.confirm_only(pol) for pol in POLICIES)
 
 
 # ------------------------------------------------------------------------------- "did you mean"
@@ -171,7 +173,7 @@ def test_old_pack_loads_and_behaves_as_before(tmp_path):
 def test_new_fields_roundtrip_and_bad_values_are_dropped(tmp_path):
     p = FusionParams(suggest_min_top5_mass_by_policy={"strict": 0.0, "lenient": 0.65, "yolo": 1.0, "balanced": "x"},
                      classifier_accept={"strict": 0.96, "lenient": 0.46},
-                     classifier_fit={"fingerprint": "abc", "temperature": 0.72})
+                     classifier_fit={"fingerprint": "abc", "temperature": 0.72}, certification={"version": "cert-1"})
     assert p.suggest_min_top5_mass_by_policy == {"strict": 0.0, "lenient": 0.65}
     assert p.suggest_mass("balanced") == p.suggest_min_top5_mass  # missing policy: the single value
     assert p.classifier_accept == {"strict": 0.96, "balanced": 0.96, "lenient": 0.46}  # filled and ordered
@@ -217,10 +219,13 @@ def test_fit_fusion_fits_per_policy_classifier_thresholds_for_this_classifier():
     inputs, truths = _cls_inputs()
     p, rep = fit_classifier_alone(SimpleNamespace(classifier=clf), inputs, truths, FusionParams())
     a = p.classifier_accept
-    assert a["strict"] > a["balanced"] > a["lenient"]
+    assert a["strict"] >= a["balanced"] >= a["lenient"]
     assert p.classifier_fit["fingerprint"] == classifier_fingerprint(clf) and p.classifier_fit["temperature"] == 1.0
     assert rep["n"] == len(inputs) and rep["n_in_classes"] == len(inputs) - 1
-    assert all(rep["policies"][pol]["target_reached"] is False for pol in POLICIES) and "not reachable" in rep["note"]
+    assert all(rep["policies"][pol]["target_reached"] is False for pol in POLICIES) and "confirm-only" in rep["note"]
+    # the segment proxy is never certified for the app's sliding mode (docs 15.25), even where it reaches a floor
+    assert rep["rule"] == "segment proxy" and rep["best_lower_bound"] >= FLOORS["lenient"]
+    assert all(rep["policies"][pol]["rule"] == "confirm_only" for pol in POLICIES)
     # no classifier: nothing stored, the engine keeps the checkpoint threshold
     p2, rep2 = fit_classifier_alone(SimpleNamespace(classifier=None), inputs, truths, p)
     assert p2.classifier_accept == {} and p2.classifier_fit == {} and "no classifier" in rep2["note"]
@@ -349,3 +354,283 @@ def test_e3_and_report_show_each_policy(monkeypatch):
     assert any("| E1b | strict | 0.960 | 0.300 |" in r for r in rows)
     header = next(ln for ln in md.splitlines() if ln.startswith("| Protocol | policy"))
     assert all(r.count("|") == header.count("|") for r in rows)
+
+
+# ------------------------------------------------------------------------------- per-source certification (15.25)
+
+def _two_source_set(prec_a=0.99, prec_b=0.90, n_a=3000, n_b=300, groups_a=6, groups_b=4):
+    """Fused results of two sources whose precision does not depend on p1: A right ``prec_a`` of the time, B
+    ``prec_b``. Errors are spread evenly over each source's signer groups (homogeneous: DEFF about 1)."""
+    results, truths, sources, groups = [], [], [], []
+    for src, n, prec, ng in (("A", n_a, prec_a, groups_a), ("B", n_b, prec_b, groups_b)):
+        for i in range(n):
+            p1 = 0.5 + 0.49 * ((i * 0.618034) % 1.0)
+            ok = ((i // ng) * PHI) % 1.0 < prec
+            truth = f"w{i % 7}"
+            top = truth if ok else "other"
+            rest = [k for k in (truth, "x1", "x2", "x3", "x4", "x5") if k != top][:5]
+            results.append(FusionResult([top, *rest], np.array([p1] + [(1 - p1) / 5] * 5), [top] * 3, 3, 0.9, 0.9,
+                                        None, {}))
+            truths.append(truth)
+            sources.append(src)
+            groups.append(f"{src}{i % ng}")
+    return results, truths, sources, groups
+
+
+def test_pooled_rule_passes_but_the_worst_source_fails():
+    res, tr, src, grp = _two_source_set()
+    pooled, prep = fit_thresholds(res, tr, FusionParams())  # no sources: the pre-15.25 pooled clip-level bound
+    assert pooled.policy_rule("strict") == "certified"  # 3,240 of 3,300 right: pooled bound about 0.977
+    p, rep = fit_thresholds(res, tr, FusionParams(), sources=src, groups=grp)
+    af = rep["accept_fit"]
+    assert af["major_sources"] == ["A", "B"]
+    for pol in ("strict", "balanced"):
+        assert p.policy_rule(pol) == "confirm_only" and p.achieved[pol]["worst_source"] == "B"
+        assert p.achieved[pol]["precision_lower_bound"] < FLOORS[pol] <= p.achieved[pol]["pooled_lower_bound"]
+    by = p.achieved["strict"]["by_source"]
+    assert set(by) == {"A", "B"} and by["A"]["lower_bound"] > 0.98 > by["B"]["lower_bound"]
+    for row in by.values():  # what fusion.json reports per source
+        assert {"precision", "lower_bound", "coverage", "n_groups", "deff"} <= set(row)
+    assert by["B"]["n_groups"] == 4 and by["B"]["deff"] == pytest.approx(1.0)
+    # B alone (0.90, n=300) has a bound of about 0.86: lenient (floor 0.85) is certified on the worst source
+    assert p.policy_rule("lenient") == "certified" and p.achieved["lenient"]["certified_precision"] >= 0.85
+    # the stored parameters gate decide(): a confident query is a "did you mean" under strict, accepted under lenient
+    probs = np.array([0.999, 0.0005, 0.0005])
+    assert decide(probs, 3, 3, p, "strict", 0.95) == ("suggest", "confirm_only")
+    assert decide(probs, 3, 3, p, "lenient", 0.95) == ("accept", "ok")
+    assert p.certification["version"] and p.certification["policies"]["strict"] == "confirm_only"
+
+
+def test_a_source_too_small_to_be_major_cannot_hide_the_others_but_is_not_certified_on():
+    res, tr, src, grp = _two_source_set(n_b=20)  # B: 20 queries, not a major source (needs >= 30 accepts)
+    p, rep = fit_thresholds(res, tr, FusionParams(), sources=src, groups=grp)
+    assert rep["accept_fit"]["major_sources"] == ["A"] and p.achieved["strict"]["by_source"]["B"]["major"] is False
+    assert p.policy_rule("strict") == "certified"
+    res1, tr1, src1, grp1 = _two_source_set(n_b=0, groups_a=1)  # one source, one signer group: nothing to certify
+    q, _ = fit_thresholds(res1, tr1, FusionParams(), sources=src1, groups=grp1)
+    assert all(q.policy_rule(pol) == "confirm_only" for pol in POLICIES)
+    assert "no major source" in q.achieved["strict"]["reason"]
+
+
+def test_design_effect_lowers_the_bound_only_for_heterogeneous_groups():
+    from app.isl.models.calibration import DEFF_FALLBACK, pearson_dispersion, scan_by_source, wilson_lower_deff
+
+    def matrix(errors_per_group, n_per_group=100):
+        acc, ok, grp = [], [], []
+        for g, e in enumerate(errors_per_group):
+            for j in range(n_per_group):
+                acc.append(True)
+                ok.append(j >= e)
+                grp.append(f"g{g}")
+        return np.array([acc]), np.array([ok]), grp
+
+    homo = matrix([10] * 6)
+    hetero = matrix([0, 0, 0, 20, 20, 20])  # the same 60 errors in 600, all from three signers
+    bh = scan_by_source(*homo[:2], sources=["s"] * 600, groups=homo[2])["s"]
+    bx = scan_by_source(*hetero[:2], sources=["s"] * 600, groups=hetero[2])["s"]
+    assert bh["deff"][0] == 1.0 and bh["lb"][0] == pytest.approx(wilson_lower(540, 600))
+    assert bx["deff"][0] > 2.0 and bx["lb"][0] < bh["lb"][0] - 0.01
+    assert bx["lb"][0] == pytest.approx(wilson_lower_deff(540, 600, bx["deff"][0]))
+    assert pearson_dispersion(np.array([100, 100]), np.array([0, 20])) is None  # < 3 groups: not estimable
+    # fewer than 3 groups: the prior (e.g. from cross-validation groups) or the 5.0 fallback
+    two = matrix([10, 10])
+    b2 = scan_by_source(*two[:2], sources=["s"] * 200, groups=two[2])["s"]
+    assert b2["deff"][0] == DEFF_FALLBACK and b2["phi_from"][0] == "fallback"
+    b3 = scan_by_source(*two[:2], sources=["s"] * 200, groups=two[2], phi_prior={"s": 2.0})["s"]
+    assert b3["deff"][0] == 2.0 and b3["phi_from"][0] == "prior"
+
+
+def test_a_weak_scan_is_confirm_only_everywhere_and_decide_never_accepts():
+    res, tr = _ceiling_set(ceiling=0.6)  # best bound about 0.58
+    src = ["include" if i % 2 else "isl500" for i in range(len(res))]
+    grp = [f"{s}-{i % 5}" for i, s in enumerate(src)]
+    p, rep = fit_thresholds(res, tr, FusionParams(), sources=src, groups=grp)
+    assert rep["accept_fit"]["best_lower_bound"] < 0.62
+    assert all(p.policy_rule(pol) == "confirm_only" for pol in POLICIES)
+    rng = np.random.default_rng(0)
+    for _ in range(300):
+        probs = np.sort(rng.dirichlet(np.full(6, rng.uniform(0.02, 2.0))))[::-1]
+        for pol in POLICIES:
+            assert decide(probs, 3, 3, p, pol, best_cos=0.99)[0] != "accept"
+    for pol in POLICIES:
+        assert p.achieved[pol]["auto_accept"] is False
+        from app.isl.models.calibration import summarize
+        assert summarize(res, tr, p, pol)["n_accepted"] == 0  # what the app does
+        assert p.achieved[pol]["n_accepted"] > 0  # what the threshold alone would accept (the confirm tap)
+
+
+def test_the_fine_grid_above_099_lets_strict_differ_from_balanced():
+    from app.isl.models.calibration import THRESHOLD_GRID
+
+    assert {0.991, 0.995, 0.999} <= set(np.round(THRESHOLD_GRID, 3)) and THRESHOLD_GRID.max() == 0.999
+    results, truths = [], []
+
+    def add(n, lo, hi, prec):
+        for i in range(n):
+            p1 = lo + (hi - lo) * i / n
+            ok = (i * PHI) % 1.0 < prec
+            top = "w" if ok else "o"
+            results.append(FusionResult([top, "x1", "x2"], np.array([p1, (1 - p1) / 2, (1 - p1) / 2]), [top] * 3, 3,
+                                        0.9, 0.9, None, {}))
+            truths.append("w")
+
+    add(2000, 0.995, 0.9999, 1.0)  # very confident: always right
+    add(2000, 0.99, 0.995, 0.93)
+    add(4000, 0.5, 0.99, 0.70)
+    p, rep = fit_thresholds(results, truths, FusionParams())
+    a = p.accept
+    assert a["strict"] > 0.99 and a["strict"] > a["balanced"], a
+    assert p.policy_rule("strict") == "certified" and p.achieved["strict"]["target_reached"]
+    assert p.policy_rule("balanced") == "certified"
+
+
+def test_s_min_is_the_minimum_over_major_sources():
+    from app.isl.models.calibration import _fit_s_min
+
+    rng = np.random.default_rng(1)
+    cos = np.r_[rng.uniform(0.8, 1.0, 200), rng.uniform(0.5, 0.9, 100), np.full(25, 0.1)]
+    src = ["isl500"] * 200 + ["include"] * 100 + ["tiny"] * 25  # tiny: < 30 queries, not a major source
+    grp = [f"g{i % 4}" for i in range(len(cos))]
+    s_min, rep = _fit_s_min(cos, src, grp)
+    q_inc = float(np.quantile(cos[200:300], 0.05))
+    assert s_min == pytest.approx(q_inc) and s_min < float(np.quantile(cos[:200], 0.05))
+    assert s_min > float(np.quantile(cos, 0.05))  # the pooled quantile is pulled down by the tiny source
+    assert rep["by_source"]["include"]["pass_rate"] >= 0.95 and "major" not in rep["by_source"]["tiny"]
+    pooled, prep = _fit_s_min(cos)  # no sources: the pooled quantile, as before
+    assert pooled == pytest.approx(float(np.quantile(cos, 0.05))) and "pooled" in prep["rule"]
+    # fit_thresholds stores the per-source guard
+    res = [FusionResult(["w"], np.array([0.9]), ["w"] * 3, 3, float(c), float(c), None, {}) for c in cos]
+    p, frep = fit_thresholds(res, ["w"] * len(res), FusionParams(), sources=src, groups=grp)
+    assert p.s_min == pytest.approx(q_inc) and frep["s_min_fit"]["s_min"] == pytest.approx(q_inc, abs=1e-4)
+
+
+def test_suggest_mass_is_chosen_on_the_worst_source():
+    p = FusionParams(accept={"strict": 0.9, "balanced": 0.7, "lenient": 0.5}, s_min=-1.0)
+    res = ([_res(0.3, 0.5, True)] * 30 + [_res(0.3, 0.95, True)] * 30  # A: always in the top 5
+           + [_res(0.3, 0.5, False)] * 20 + [_res(0.3, 0.9, True)] * 20)  # B: only the confident ones
+    src = ["A"] * 60 + ["B"] * 40
+    truths = ["t"] * len(res)
+    m_pooled, r_pooled = _fit_suggest_mass(res, truths, p, "balanced", 0.25)
+    assert m_pooled == 0.0 and r_pooled["top5_hit"] == pytest.approx(0.8)  # pooled: 80 % at mass 0
+    m, rep = _fit_suggest_mass(res, truths, p, "balanced", 0.25, sources=src, major=["A", "B"])
+    assert 0.45 < m <= 0.9 and rep["target_reached"] and rep["worst_top5_hit"] >= 0.8 and rep["worst_source"]
+    assert rep["by_source"]["B"]["top5_hit"] == 1.0 and rep["by_source"]["B"]["shown"] == 20
+
+
+def test_old_fusion_json_is_uncertified_confirm_only(tmp_path):
+    import json
+
+    (tmp_path / "fusion.json").write_text(json.dumps(OLD_PACK))
+    p = FusionParams.load(tmp_path / "fusion.json")
+    assert p.gated and p.certification == {}
+    probs = np.array([0.99, 0.005, 0.005])  # above the old 0.96: was accepted before 15.25
+    for pol in POLICIES:
+        assert p.policy_rule(pol) == "confirm_only"
+        assert decide(probs, 3, 3, p, pol, best_cos=0.9) == ("suggest", "confirm_only")
+        info = p.certification_info(pol)
+        assert info["rule"] == "confirm_only" and info["certified_precision"] is None and info["confirm_tap"]
+        assert "no certification record" in info["reason"]
+    # a pre-15.25 achieved block (rule "fallback", no by_source) is not a certification either
+    old = dict(OLD_PACK, achieved={pol: {"rule": "target", "target_reached": True} for pol in POLICIES},
+               certification={"version": "cert-1"})
+    q = FusionParams.from_json(old)
+    assert all(q.confirm_only(pol) for pol in POLICIES)
+    # in-code parameters (tests, toy tools) are not gated
+    assert FusionParams().policy_rule("strict") == "ungated"
+    assert decide(probs, 3, 3, FusionParams(), "strict") == ("accept", "ok")
+
+
+def test_open_vocabulary_words_stay_confirm_only_unless_certified():
+    res, tr, src, grp = _two_source_set(prec_b=0.995)
+    closed = {f"w{i}" for i in range(7)} | {"other"}  # every top-1 here is a classifier class
+    p, rep = fit_thresholds(res, tr, FusionParams(), sources=src, groups=grp, closed_set=closed)
+    assert p.policy_rule("strict") == "certified"
+    ov = rep["open_vocabulary"]["policies"]["strict"]
+    assert ov["rule"] == "confirm_only" and ov["n_accepted"] == 0  # no open-vocabulary accept to certify on
+    probs = np.array([0.999, 0.0005, 0.0005])
+    assert decide(probs, 3, 3, p, "strict", 0.95) == ("accept", "ok")
+    assert decide(probs, 3, 3, p, "strict", 0.95, open_vocabulary=True) == ("suggest", "open_vocabulary")
+    # retrieval only (no classifier): every word is open vocabulary, certified only at the strict floor
+    q, qrep = fit_thresholds(res, tr, FusionParams(), sources=src, groups=grp, closed_set=set())
+    for pol in POLICIES:
+        o = qrep["open_vocabulary"]["policies"][pol]
+        assert o["rule"] == ("certified" if q.policy_rule(pol) == "certified" and o["worst_lower_bound"] >= 0.95
+                             else "confirm_only")
+    assert q.achieved["strict"]["open_vocabulary_rule"] == "certified"
+    # no class list given: open-vocabulary words are never auto-accepted
+    r, _ = fit_thresholds(res, tr, FusionParams(), sources=src, groups=grp)
+    assert decide(probs, 3, 3, r, "strict", 0.95, open_vocabulary=True) == ("suggest", "open_vocabulary")
+
+
+def test_recognizer_exposes_the_certified_worst_source_precision():
+    from app.isl.recognizer import IslRecognizer
+    from app.packs.vocabulary import Vocabulary
+
+    res, tr, src, grp = _two_source_set()
+    p, _ = fit_thresholds(res, tr, FusionParams(), sources=src, groups=grp)
+    clf = _Clf([[0.98, 0.01, 0.01]] * 3, {"temperature": 1.0, "recommended_threshold": 0.6})
+    rec = IslRecognizer("isl", clf.feature_config, Vocabulary([]), classifier=clf, fusion=p)
+    info = rec.certification_info("lenient")
+    assert info["rule"] == "certified" and info["certified_precision"] == p.achieved["lenient"]["certified_precision"]
+    assert info["worst_source"] == "B" and info["floor"] == 0.85 and info["target"] == 0.90 and info["confirm_tap"]
+    assert rec.certification_info("strict")["rule"] == "confirm_only"
+    assert rec.is_open_vocabulary("isl.not_a_class") and not rec.is_open_vocabulary("a")
+    assert not rec.is_open_vocabulary("mysign:abc")
+    # no fusion.json: the recogniser's own defaults are gated and uncertified
+    bare = IslRecognizer("isl", clf.feature_config, Vocabulary([]), classifier=clf)
+    assert bare.fusion.gated and all(bare.fusion.confirm_only(pol) for pol in POLICIES)
+    # the sliding rule: the old pack's per-policy classifier thresholds carry no certification
+    assert _rec(clf, _fitted_pack(clf)).sliding_rule("lenient") == "confirm_only"
+    assert _rec(clf, FusionParams(fitted=True)).sliding_rule("lenient") == "ungated"
+
+
+def test_e3_per_source_rows_and_the_headline(monkeypatch):
+    from app.isl.evaluation import runners
+    from app.isl.training import fit_fusion as ff
+
+    names = ["a", "b", "c"]
+    inputs, truths, used = [], [], []
+    for i, p1 in enumerate(np.linspace(0.5, 0.99, 120)):
+        row = np.full(3, (1 - p1) / 2)
+        row[i % 3] = p1
+        inputs.append(FusionInputs(cls_logp=np.log(np.tile(row, (3, 1))), cls_ids=names))
+        src = "include" if i % 2 else "isl500"
+        wrong = (i % 7 == 0) if src == "include" else (i % 3 == 0)  # isl500 is the worse source here
+        truths.append(names[(i + 1) % 3] if wrong else names[i % 3])
+        used.append(SimpleNamespace(clip_id=f"c{i}", group=f"{src}{i % 3}", source=src))
+    monkeypatch.setattr(ff, "collect_evidence", lambda rec, clips: (inputs, truths, used))
+    ach = {pol: {"rule": "certified" if pol == "lenient" else "confirm_only", "by_source": {},
+                 "certified_precision": 0.9 if pol == "lenient" else None, "target": TARGETS[pol],
+                 "floor": FLOORS[pol]} for pol in POLICIES}
+    fusion = FusionParams(gamma=0.0, accept={"strict": 0.9, "balanced": 0.8, "lenient": 0.5}, fitted=True,
+                          achieved=ach, certification={"version": "cert-1"})
+    rec = SimpleNamespace(fusion=fusion, classifier=SimpleNamespace(class_names=names))
+    out = runners.e3_fused(rec, used, "E3")
+    pols = out["policies"]
+    for pol in ("strict", "balanced"):  # confirm-only: nothing auto-accepted, the threshold rule still measured
+        assert pols[pol]["rule"] == "confirm_only" and pols[pol]["coverage"] == 0.0
+        assert pols[pol]["threshold_rule"]["coverage"] > 0
+    assert pols["lenient"]["rule"] == "certified" and pols["lenient"]["coverage"] > 0
+    by = pols["lenient"]["by_source"]
+    assert set(by) == {"include", "isl500"} and by["isl500"]["n_groups"] == 3
+    assert pols["lenient"]["worst_source"] == "isl500"
+    assert pols["lenient"]["val_certified_precision"] == 0.9 and pols["strict"]["certification"]["confirm_tap"]
+    md = runners.markdown_report({"profile": "research", "label": "x", "created": "now", "smoke": False,
+                                  "protocols": {"E3": out}, "leakage_guards": {"pretraining_check": {}}})
+    head = [ln for ln in md.splitlines() if ln.startswith("| E3 fused")]
+    assert any("INCLUDE: include" in ln for ln in head) and any("worst source: isl500" in ln for ln in head)
+    assert md.index("## Headline") < md.index("| Protocol | n |")  # the headline comes first
+
+
+def test_oov_false_accepts_count_every_accept_as_wrong():
+    from app.isl.evaluation.runners import e2_pool, oov_false_accepts
+
+    res = [FusionResult(["x", "y"], np.array([0.97, 0.01]), ["x"] * 3, 3, 0.9, 0.9, None, {})] * 3 + \
+          [FusionResult(["x", "y"], np.array([0.4, 0.3]), ["x"] * 3, 3, 0.2, 0.2, None, {})]
+    gated = FusionParams(accept={"strict": 0.95, "balanced": 0.9, "lenient": 0.5}, s_min=0.5,
+                         certification={"version": "cert-1"})
+    o = oov_false_accepts(res, gated)
+    assert o["strict"]["threshold_false_accept_rate"] == 0.75 and o["strict"]["false_accept_rate"] == 0.0
+    assert o["strict"]["out_of_vocabulary_rate"] == 0.25
+    pooled = e2_pool([{"run": True, "oov_false_accept": o}, {"run": True, "oov_false_accept": o}])
+    assert pooled["oov_false_accept"]["n"] == 8 and pooled["oov_false_accept"]["strict"]["threshold_false_accept_rate"] == 0.75

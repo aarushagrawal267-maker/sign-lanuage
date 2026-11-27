@@ -197,9 +197,16 @@ def test_decide_accept_suggest_abstain_oov():
 
 
 def test_fusion_params_json_roundtrip(tmp_path):
-    p = FusionParams(alpha=0.5, accept={"strict": 0.99, "balanced": 0.9, "lenient": 0.6}, fitted=True)
+    p = FusionParams(alpha=0.5, accept={"strict": 0.99, "balanced": 0.9, "lenient": 0.6}, fitted=True,
+                     certification={"version": "cert-1", "policies": {"strict": "confirm_only"}})
     p.save(tmp_path / "f.json")
     assert FusionParams.load(tmp_path / "f.json") == p
+    # in-code parameters (no certification record) saved to a file load as a pack: gated, uncertified (docs 15.25)
+    q = p.with_(certification=None)
+    q.save(tmp_path / "g.json")
+    loaded = FusionParams.load(tmp_path / "g.json")
+    assert loaded.certification == {} and loaded.with_(certification=None) == q
+    assert all(loaded.policy_rule(pol) == "confirm_only" for pol in ("strict", "balanced", "lenient"))
 
 
 # ----------------------------------------------------------------------------------- calibration

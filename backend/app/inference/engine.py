@@ -500,6 +500,10 @@ class RecognitionEngine:
             ok, reason = False, "repeat_suppressed"
         if ok and f.t - self.last_commit_t < c.cooldown_ms:
             ok, reason = False, "cooldown"
+        if ok and self.predictor is None and self._sliding_confirm_only():
+            # language pack whose sliding thresholds are not certified for this policy (docs/ISL_DESIGN.md 15.25):
+            # provisional words only, never an auto-commit
+            ok, reason = False, "confirm_only"
         out["provisional"] = {"top": top, "feature_ms": r["feature_ms"], "inference_ms": r["inference_ms"],
                               "streak": self.streak, "reason": reason}
         if ok:
@@ -512,6 +516,10 @@ class RecognitionEngine:
         else:
             self.status = "analyzing" if reason in ("unstable",) else "uncertain"
         return out
+
+    def _sliding_confirm_only(self) -> bool:
+        rule = getattr(self.recognizer, "sliding_rule", None)
+        return callable(rule) and rule(self.cfg.policy) == "confirm_only"
 
     def flush(self) -> dict:
         """End of stream (offline video): finalize any open segment."""
@@ -526,4 +534,8 @@ class RecognitionEngine:
         if self.recognizer is None:
             for k in RECOGNIZER_FIELDS:
                 cfg.pop(k, None)
-        return {"config": cfg, "threshold": self.threshold}
+        out = {"config": cfg, "threshold": self.threshold}
+        info = getattr(self.recognizer, "certification_info", None) if self.recognizer is not None else None
+        if callable(info):  # language packs only: what the UI shows next to words (docs/ISL_DESIGN.md 15.25)
+            out["certification"] = info(self.cfg.policy, self.cfg.mode)
+        return out

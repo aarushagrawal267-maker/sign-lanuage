@@ -41,7 +41,8 @@ import numpy as np
 from app.features.build import FeatureError, build_features
 from app.isl.evaluation.report import (PARTIAL_DATA_LABEL, format_interval, git_commit, grouped_bootstrap,
                                        interval_fields, interval_reason)
-from app.isl.models.calibration import classifier_alone_decisions, fit_thresholds, summarize
+from app.isl.models.calibration import (MAJOR_MIN_ACCEPTS, MAJOR_MIN_GROUPS, _decisions, classifier_alone_decisions,
+                                        fit_thresholds, summarize)
 from app.isl.models.fusion import POLICIES, USER_PREFIX, FusionInputs, FusionParams, decide, fuse
 from app.isl.models.index import LeakageError  # noqa: F401  (one class for every leak guard; re-exported here)
 from app.isl.training.common import engine_crops
@@ -53,18 +54,67 @@ DECISION_KEYS = ("top1", "top5", "coverage", "accepted_precision", "not_sure_rat
 
 # --------------------------------------------------------------------------------------------- helpers
 
-def decision_block(results, truths: list[str], params: FusionParams, groups: list) -> dict:
-    """Per policy: accuracy with coverage, not-sure (abstain) and wrong-accept rates; grouped intervals."""
+def _rate(mask, sel=None):
+    m = np.asarray(mask, bool) if sel is None else np.asarray(mask, bool)[sel]
+    return float(m.mean()) if len(m) else None
+
+
+def source_rows(dec: list[str], udec: list[str], hit1: list[float], sources: list, groups: list) -> tuple[dict, str | None]:
+    """Per source (docs 15.25): what the app does (``dec``: accept / suggest / abstain with the pack's gates) and what
+    the threshold rule alone does (``udec``, the top candidate a confirm tap shows). The worst source is the one with
+    the lowest threshold-rule precision among sources with >= MAJOR_MIN_ACCEPTS queries and >= MAJOR_MIN_GROUPS
+    groups (None when no source qualifies)."""
+    src = np.array([str(x) if x not in (None, "") else "unknown" for x in sources], dtype=object)
+    grp = np.array([str(g) for g in groups], dtype=object)
+    h = np.asarray(hit1, float) > 0.5
+    a = np.array([d == "accept" for d in dec], bool)
+    u = np.array([d == "accept" for d in udec], bool)
+    rows, cands = {}, []
+    for s_ in sorted(set(src)):
+        m = src == s_
+        n, ng = int(m.sum()), len(set(grp[m]))
+        rows[s_] = {"n": n, "n_groups": ng, "top1": _rate(h, m), "coverage": _rate(a, m),
+                    "accepted_precision": _rate(h[m & a]) if (m & a).any() else None,
+                    "wrong_accept_rate": _rate(a & ~h, m),
+                    "not_sure_rate": _rate(np.array([d == "abstain" for d in dec], bool), m),
+                    "suggest_rate": _rate(np.array([d == "suggest" for d in dec], bool), m),
+                    "threshold_coverage": _rate(u, m),
+                    "threshold_precision": _rate(h[m & u]) if (m & u).any() else None,
+                    "threshold_wrong_accept_rate": _rate(u & ~h, m), "threshold_n_accepted": int((m & u).sum())}
+        if n >= MAJOR_MIN_ACCEPTS and ng >= MAJOR_MIN_GROUPS:
+            cands.append(s_)
+    worst = min(cands, key=lambda x: (rows[x]["threshold_precision"] if rows[x]["threshold_precision"] is not None
+                                      else 2.0, x), default=None)
+    return rows, worst
+
+
+def decision_block(results, truths: list[str], params: FusionParams, groups: list, sources: list | None = None,
+                   closed_set=None) -> dict:
+    """Per policy: accuracy with coverage, not-sure (abstain) and wrong-accept rates; grouped intervals. With a
+    pack's (gated) parameters a confirm-only policy accepts nothing (docs 15.25): ``rule`` says which, and
+    ``threshold_rule`` gives what its threshold alone does (the top candidate the user is asked to confirm).
+    ``sources``: per-source rows (``by_source``) and the worst source per policy. ``closed_set``: the classifier's
+    classes, for the open-vocabulary gate."""
     out = {}
     hit1 = [float(bool(r.keys) and r.keys[0] == t) for r, t in zip(results, truths)]
     hit5 = [float(t in r.keys[:5]) for r, t in zip(results, truths)]
+    ungated = params.with_(certification=None)
     for pol in POLICIES:
-        s = summarize(results, truths, params, pol)
-        dec = [decide(r.probs, r.agree, len(r.per_crop_top1), params, pol, r.best_cos) for r in results]
-        wrong_acc = [float(d == "accept" and not h) for (d, _), h in zip(dec, hit1)]
-        not_sure = [float(d == "abstain") for d, _ in dec]
+        s = summarize(results, truths, params, pol, closed_set)
+        dec = [d for d, _ in _decisions(results, params, pol, closed_set)]
+        udec = [d for d, _ in _decisions(results, ungated, pol)] if params.gated else dec
+        wrong_acc = [float(d == "accept" and not h) for d, h in zip(dec, hit1)]
+        not_sure = [float(d == "abstain") for d in dec]
+        ua = np.array([d == "accept" for d in udec], bool)
+        hh = np.asarray(hit1, float) > 0.5
         out[pol] = {**s, "not_sure_rate": s.get("abstain_rate"), "wrong_accept_rate": s.get("silent_error_rate"),
+                    "rule": params.policy_rule(pol),
+                    "threshold_rule": {"coverage": _rate(ua), "n_accepted": int(ua.sum()),
+                                       "accepted_precision": _rate(hh[ua]) if ua.any() else None,
+                                       "wrong_accept_rate": _rate(ua & ~hh)},
                     **interval_fields({"wrong_accept_rate": (wrong_acc, groups), "not_sure_rate": (not_sure, groups)})}
+        if sources is not None:
+            out[pol]["by_source"], out[pol]["worst_source"] = source_rows(dec, udec, hit1, sources, groups)
     return {"policies": out, **interval_fields({"top1": (hit1, groups), "top5": (hit5, groups)})}
 
 
@@ -167,6 +217,9 @@ def e1_closed_set(rec, clips, label: str, split_name: str, kind: str) -> dict:
     sliding = _e1_sliding_replay(rec, used, cal["thresholds"], kind)
     for pol in POLICIES if sliding else ():
         policies[pol]["sliding_replay"] = sliding[pol]
+    srule = getattr(rec, "sliding_rule", None)
+    for pol in POLICIES:  # may sliding mode auto-commit with this policy (docs 15.25)
+        policies[pol]["rule"] = srule(pol) if callable(srule) else None
     src_note = ("fitted per policy on validation (fusion.json)" if cal["per_policy"] else
                 "the checkpoint's validation threshold, the same for every policy"
                 + ("" if thr_fitted else " (checkpoint has none: Predictor default)"))
@@ -215,20 +268,30 @@ def _e1_sliding_replay(rec, clips, thresholds: dict, kind: str) -> dict | None:
             or not all(hasattr(c, "load") for c in clips):
         return None
     from app.inference.engine import EngineConfig
-    from app.isl.models.calibration import sliding_commit_counts
+    from app.isl.models.calibration import sliding_commit_matrix
     from app.isl.training.fit_fusion import replay_sliding
 
     ecfg = EngineConfig()
-    windows, truths, failed = replay_sliding(rec, clips, ecfg)
+    rclips: list = []
+    windows, truths, failed = replay_sliding(rec, clips, ecfg, used=rclips)
     if not windows:
         return None
     n, out = len(windows), {}
+    srcs = [getattr(c, "source", None) for c in rclips]
+    grps = _groups(rclips)
     for pol in POLICIES:
-        a, o, k = (int(x[0]) for x in sliding_commit_counts(windows, truths, [thresholds[pol]], ecfg.min_margin,
-                                                             ecfg.agree_n, ecfg.cooldown_ms))
+        A, O, K = sliding_commit_matrix(windows, truths, [thresholds[pol]], ecfg.min_margin, ecfg.agree_n,
+                                        ecfg.cooldown_ms)
+        a, o, k = int(A[0].sum()), int(O[0].sum()), int(K[0].sum())
         out[pol] = {"threshold": thresholds[pol], "n": n, "replay_failed": failed, "coverage": a / n,
                     "not_sure_rate": 1 - a / n, "wrong_accept_rate": (a - o) / n,
                     "accepted_precision": o / a if a else None, "n_accepted": a, "commits_per_clip": k / n}
+        # per source: the threshold rule (what sliding mode would commit when the policy is certified)
+        dec = ["accept" if x else "abstain" for x in A[0]]
+        rows, worst = source_rows(dec, dec, [float(x) for x in O[0]], srcs, grps)
+        for r in rows.values():
+            r.pop("top1", None)  # "correct" here is "every commit is the clip's word", only meaningful when accepted
+        out[pol]["by_source"], out[pol]["worst_source"] = rows, worst
     return out
 
 
@@ -240,7 +303,11 @@ def e3_fused(rec, clips, label: str) -> dict:
         return {"label": label, "run": False, "n": 0, "reason": "no usable clips"}
     results = [fuse(i, rec.fusion) for i in inputs]
     groups = _groups(used)
-    block = decision_block(results, truths, rec.fusion, groups)
+    clf = getattr(rec, "classifier", None)
+    # the open-vocabulary gate needs the classifier's classes (a pack without a classifier: every word is open)
+    closed = set(clf.class_names) if clf is not None else (set() if hasattr(rec, "classifier") else None)
+    block = decision_block(results, truths, rec.fusion, groups, sources=[getattr(c, "source", None) for c in used],
+                           closed_set=closed)
     p1 = np.array([r.probs[0] if len(r.probs) else 0.0 for r in results])
     ok = np.array([bool(r.keys) and r.keys[0] == t for r, t in zip(results, truths)])
     order = np.argsort(-p1)
@@ -256,7 +323,10 @@ def e3_fused(rec, clips, label: str) -> dict:
         a = ach.get(pol) or {}
         b.update(threshold=rec.fusion.accept[pol], suggest_min_top5_mass=rec.fusion.suggest_mass(pol),
                  val_target=a.get("target"), val_target_reached=a.get("target_reached"),
-                 val_precision_lower_bound=a.get("precision_lower_bound"), val_rule=a.get("rule"))
+                 val_precision_lower_bound=a.get("precision_lower_bound"), val_rule=a.get("rule"),
+                 val_certified_precision=a.get("certified_precision"), val_worst_source=a.get("worst_source"),
+                 val_floor=a.get("floor"), val_by_source=a.get("by_source"),
+                 certification=rec.fusion.certification_info(pol))
     return {"label": label, "run": True, "n": len(used), "n_groups": len(set(groups)),
             "n_classes": len(set(truths)), "fusion_fitted": rec.fusion.fitted, "metrics_policy": "balanced",
             "metrics": _metrics_from(block), **block, "risk_coverage": curve,
@@ -334,10 +404,15 @@ def e2_oneshot_fold(enc, fold: dict, data, linker, fcfg, base_params: FusionPara
             inputs = _retrieval_inputs(enc, feats, G, g_ids)
         return inputs, [c.concept_id for c in used], used
 
-    ci, ct, _ = run(calib)
-    params = base_params.with_(alpha=0.0, gamma=0.0, beta=1.0)
+    ci, ct, cu = run(calib)
+    # retrieval only; the fused system's certification does not carry over: uncertified until fitted here
+    params = base_params.with_(alpha=0.0, gamma=0.0, beta=1.0, achieved={}, certification={})
     if ci:
-        params, _ = fit_thresholds([fuse(i, params) for i in ci], ct, params)
+        # per-source certification on seen-class validation queries; every word here is open vocabulary
+        # (retrieval only), so the strict-floor open-vocabulary check applies (docs 15.25)
+        params, _ = fit_thresholds([fuse(i, params) for i in ci], ct, params,
+                                   sources=[getattr(c, "source", None) for c in cu],
+                                   groups=[getattr(c, "group", None) for c in cu], closed_set=set())
     out = {"fold": fold["fold"], "run": True, "held_out_concepts": len(fold["held_out_concepts"]),
            "held_out_expanded": len(held), "gallery_rows": len(g_ids), "gallery_concepts": len(gal_concepts),
            "dropped_duplicate_queries": dropped, "calibration_queries": len(ci)}
@@ -349,7 +424,16 @@ def e2_oneshot_fold(enc, fold: dict, data, linker, fcfg, base_params: FusionPara
         res = [fuse(i, params) for i in qi]
         groups = _groups(qu)
         hits = {k: [float(t in r.keys[:k]) for r, t in zip(res, qt)] for k in (1, 5, 10)}
-        block = decision_block(res, qt, params, groups)
+        block = decision_block(res, qt, params, groups, sources=[getattr(c, "source", None) for c in qu],
+                               closed_set=set())
+        if name == "full":
+            # held-out-concept false accepts (docs 15.25): the same queries against the gallery WITHOUT their
+            # concepts (and synonyms), so every accept is wrong; pairs with the per-source out-of-vocabulary guard
+            keep = [j for j, cid in enumerate(qi[0].ret_ids) if cid not in held]
+            if keep:
+                ids_k = [qi[0].ret_ids[j] for j in keep]
+                oov = [fuse(FusionInputs(ret=x.ret[:, keep], ret_ids=ids_k), params) for x in qi]
+                out["oov_false_accept"] = oov_false_accepts(oov, params)
         out[name] = {"n": len(qi), "n_groups": len(set(groups)), "n_classes": len(set(qt)),
                      "gallery_concepts": len(ids) if ids is not None else len(gal_concepts),
                      "metrics": _metrics_from(block, {f"top{k}": float(np.mean(v)) for k, v in hits.items()}),
@@ -364,8 +448,31 @@ def e2_oneshot_fold(enc, fold: dict, data, linker, fcfg, base_params: FusionPara
     return out
 
 
+def oov_false_accepts(results, params: FusionParams) -> dict:
+    """Per policy, on queries whose word is NOT in the gallery: false-accept rate with the pack's gates (what the
+    app auto-accepts), with the threshold rule alone, and the out-of-vocabulary abstain rate (docs 15.25)."""
+    out = {"n": len(results)}
+    ungated = params.with_(certification=None)
+    for pol in POLICIES:
+        dec = _decisions(results, params, pol, set())
+        udec = _decisions(results, ungated, pol)
+        n = max(1, len(results))
+        out[pol] = {"false_accept_rate": sum(d == "accept" for d, _ in dec) / n,
+                    "threshold_false_accept_rate": sum(d == "accept" for d, _ in udec) / n,
+                    "out_of_vocabulary_rate": sum(r == "out_of_vocabulary" for _, r in dec) / n,
+                    "suggest_rate": sum(d == "suggest" for d, _ in dec) / n}
+    return out
+
+
 def e2_pool(folds: list[dict]) -> dict:
     out = {}
+    oov = [f["oov_false_accept"] for f in folds if f.get("run") and (f.get("oov_false_accept") or {}).get("n")]
+    if oov:
+        n = sum(o["n"] for o in oov)
+        out["oov_false_accept"] = {"n": n, **{pol: {k: sum(o[pol][k] * o["n"] for o in oov) / n
+                                                    for k in oov[0][pol]} for pol in POLICIES},
+                                   "label": "held-out-concept queries against a gallery without their concepts: "
+                                            "every accept is a false accept"}
     for name in ("full", "restricted"):
         parts = [f[name] for f in folds if f.get("run") and f.get(name, {}).get("n")]
         if not parts:
@@ -759,7 +866,8 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
                       "metrics": full.get("metrics", {}), "intervals": full.get("intervals", {}),
                       "interval_reasons": full.get("interval_reasons", {}),
                       "interval_groups": full.get("interval_groups", {}),
-                      "restricted_gallery": pooled.get("restricted"), "folds": folds}
+                      "restricted_gallery": pooled.get("restricted"),
+                      "oov_false_accept": pooled.get("oov_false_accept"), "folds": folds}
     else:
         prot["E2"] = {"run": False, "reason": "no held-out-concept encoders (work/oneshot/fold*/encoder.pt) or no "
                       "oneshot_concepts.json; the seen-class retrieval number is in E2_seen"}
@@ -876,6 +984,8 @@ def _policy_lines(doc: dict) -> list[str]:
             if b.get("val_target") is not None:
                 val = (f"target {b['val_target']:.2f} {'reached' if b.get('val_target_reached') else 'NOT reached'}"
                        f", val lower bound {_fmt(b.get('val_precision_lower_bound'))}")
+            if b.get("rule") or b.get("val_rule"):
+                val = (val + "; " if val else "") + f"rule {b.get('rule') or b.get('val_rule')}"
             rows.append(f"| {pid} | {pol} | {_fmt(b.get('threshold'))} | {_fmt(b.get('coverage'))} | "
                         f"{_fmt(b.get('accepted_precision'))} | {_fmt(b.get('not_sure_rate'))} | "
                         f"{_fmt(b.get('wrong_accept_rate'))} | {_fmt(b.get('suggest_rate'))} | {how}"
@@ -890,12 +1000,60 @@ def _policy_lines(doc: dict) -> list[str]:
         return []
     return ["", "## Decision policies (strict / balanced / lenient)", "",
             "The table above shows the balanced policy (the app's default). E1 = the classifier alone (sliding mode), "
-            "E3 = the fused decision (segment mode). A policy whose validation target (95 % lower bound of accepted "
-            "precision) was not reachable uses a graded fallback below the best achievable bound (docs 15.17). "
+            "E3 = the fused decision (segment mode). A policy whose worst-source validation bound is below its "
+            "floor is confirm-only: it accepts nothing by itself (docs 15.25). "
             "E1 rows are the three-crop segment proxy; 'sliding replay' rows are the same clips through the real "
             "sliding mode (docs 15.18).", "",
             "| Protocol | policy | threshold | accepted | accepted precision | not sure | wrong accept | suggest | "
             "thresholds from |", "|---|---|---|---|---|---|---|---|---|", *rows]
+
+
+def _headline_lines(doc: dict) -> list[str]:
+    """The headline (docs 15.25): per policy, the INCLUDE row and the worst-source row of the fused system (E3) and
+    of sliding mode (E1b INCLUDE, E1c the other sources), with the validation certification. "auto" = what the app
+    accepts without asking; "threshold" = the top candidate at the policy's threshold (what a confirm tap shows)."""
+    rows = []
+    for pid in ("E3", "E1b", "E1c"):
+        p = doc["protocols"].get(pid) or {}
+        pols = p.get("policies") if p.get("run") else None
+        if not isinstance(pols, dict):
+            continue
+        for pol in ("strict", "balanced", "lenient"):
+            b = pols.get(pol) or {}
+            if pid == "E3":
+                by, worst = b.get("by_source") or {}, b.get("worst_source")
+                rule = b.get("val_rule") or b.get("rule")
+                cert = b.get("val_certified_precision")
+                kind = "fused (segment mode)"
+            else:
+                sr = b.get("sliding_replay") or {}
+                by, worst = sr.get("by_source") or {}, sr.get("worst_source")
+                rule, cert, kind = b.get("rule"), None, "sliding mode"
+            if not by:
+                continue
+            show = [("INCLUDE", "include")] if "include" in by else []
+            if worst and worst != "include":
+                show.append(("worst source", worst))
+            elif worst == "include":
+                show = [("INCLUDE = worst source", "include")]
+            for tag, src in show:
+                r = by.get(src) or {}
+                rows.append(f"| {pid} {kind} | {pol} | {rule or '-'} | {_fmt(cert)} | {tag}: {src} | {r.get('n', '-')} | "
+                            f"{r.get('n_groups', '-')} | {_fmt(r.get('coverage'))} | {_fmt(r.get('accepted_precision'))} "
+                            f"| {_fmt(r.get('wrong_accept_rate'))} | {_fmt(r.get('threshold_coverage'))} | "
+                            f"{_fmt(r.get('threshold_precision'))} |")
+    if not rows:
+        return []
+    return ["## Headline: INCLUDE and the worst source", "",
+            "Rule = the validation certification (docs 15.25): 'certified' policies may accept without asking; "
+            "'confirm_only' policies never do (their top candidate is a 'did you mean'). Certified = the 95 % lower "
+            "bound of accepted precision on the WORST major source, adjusted for signer clustering, at least 0.95 / "
+            "0.90 / 0.85 (strict / balanced / lenient). The app shows that certified number, never the 0.98 target, "
+            "and keeps a confirm tap. 'auto' columns = what the app accepts by itself; 'threshold' columns = the top "
+            "candidate at the policy's threshold (what the user is asked to confirm).", "",
+            "| Headline | policy | rule (val) | certified worst-source LB (val) | row | n | groups | auto accepted | "
+            "auto precision | auto wrong accept | threshold accepted | threshold precision |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|", *rows, ""]
 
 
 def markdown_report(doc: dict) -> str:
@@ -908,6 +1066,7 @@ def markdown_report(doc: dict) -> str:
              "sure: E1a/E1b/E1c = 1 - accepted (the classifier alone, as in the app's sliding mode, at the "
              "classifier's own validation temperature and threshold; it has no 'did you mean' step); E2/E3 = abstain "
              "rate only (the rest, 1 - accepted - not sure, are 'did you mean' suggestions).", "",
+             *_headline_lines(doc),
              "| Protocol | n | groups | top-1 | 95% CI | top-5 | accepted | not sure | wrong accept | label |",
              "|---|---|---|---|---|---|---|---|---|---|"]
     for pid, p in doc["protocols"].items():
@@ -931,6 +1090,13 @@ def markdown_report(doc: dict) -> str:
                   f"{cvb['top1_sd']:.3f}); pooled over {cvb['pooled_groups']} held-out signer groups: "
                   f"{cvb['pooled_top1']:.3f} (95% CI " + format_interval(ci, cvb['pooled_groups'],
                                                                        cvb.get('pooled_top1_interval_reason')) + ")"]
+    oov = (doc["protocols"].get("E2") or {}).get("oov_false_accept")
+    if oov:
+        lines += ["", f"E2 held-out concepts against a gallery WITHOUT them (n {oov.get('n')}; every accept is wrong): "
+                  + "; ".join(f"{pol} false accept {_fmt((oov.get(pol) or {}).get('false_accept_rate'))} (threshold "
+                              f"rule {_fmt((oov.get(pol) or {}).get('threshold_false_accept_rate'))}), out of "
+                              f"vocabulary {_fmt((oov.get(pol) or {}).get('out_of_vocabulary_rate'))}"
+                              for pol in ("strict", "balanced", "lenient"))]
     lines += _policy_lines(doc)
     e4 = doc["protocols"].get("E4", {})
     if e4.get("run"):

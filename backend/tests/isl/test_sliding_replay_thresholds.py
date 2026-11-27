@@ -230,3 +230,125 @@ def test_e1_reports_the_sliding_replay_for_the_main_classifier_only():
     assert any(ln.startswith("| E1b sliding replay | balanced |") for ln in md)
     header = next(ln for ln in md if ln.startswith("| Protocol"))
     assert all(ln.count("|") == header.count("|") for ln in md if ln.startswith("| E1b"))
+
+
+# ------------------------------------------------------------------------------- certification (docs 15.25)
+
+def _one_window_clips(n, prec, y=0, start=0):
+    """One-window clips whose top class is right ``prec`` of the time (deterministic), confidence 0.97."""
+    windows, truths = [], []
+    for i in range(n):
+        ok = ((start + i) * 0.6180339887) % 1.0 < prec
+        ema = np.array([0.015, 0.015, 0.015])
+        ema[y if ok else (y + 1) % 3] = 0.97
+        windows.append([(0.0, ema, 3, False)])
+        truths.append(y)
+    return windows, truths
+
+
+def test_sliding_thresholds_are_certified_on_the_worst_source():
+    wa, ta = _one_window_clips(3000, 0.995)
+    wb, tb = _one_window_clips(300, 0.90, start=7)
+    windows, truths = wa + wb, ta + tb
+    src = ["include"] * 3000 + ["isl500"] * 300
+    grp = [f"i{i % 6}" for i in range(3000)] + [f"s{i % 4}" for i in range(300)]
+    acc0, rep0 = fit_sliding_thresholds(windows, truths, 0.1, 3, 700.0)  # pooled clip-level bound
+    assert rep0["policies"]["strict"]["rule"] == "certified"
+    acc, rep = fit_sliding_thresholds(windows, truths, 0.1, 3, 700.0, sources=src, groups=grp)
+    pols = rep["policies"]
+    assert rep["major_sources"] == ["include", "isl500"]
+    assert pols["strict"]["rule"] == pols["balanced"]["rule"] == "confirm_only"
+    assert pols["strict"]["worst_source"] == "isl500" and pols["strict"]["by_source"]["isl500"]["n_groups"] == 4
+    assert pols["lenient"]["rule"] == "certified"  # isl500 alone: about 0.86 >= 0.85
+
+
+def _certified_sliding_pack(clf, rule="certified"):
+    from app.isl.recognizer import classifier_fingerprint
+
+    pol = {"rule": rule, "by_source": {"include": {"lower_bound": 0.97}}, "certified_precision": 0.97,
+           "worst_source": "include", "floor": 0.90, "target": 0.95}
+    return FusionParams(fitted=True, certification={"version": "cert-1"},
+                        classifier_accept={"strict": 0.9, "balanced": 0.9, "lenient": 0.9},
+                        classifier_fit={"fingerprint": classifier_fingerprint(clf), "temperature": 1.0,
+                                        "rule": "sliding replay", "policies": {p: dict(pol) for p in POLICIES}})
+
+
+def _commits(rec, clf, policy="balanced"):
+    from app.inference.engine import EngineConfig, RecognitionEngine
+
+    clf.k = 0
+    raw = _raw(gap=None)
+    eng = RecognitionEngine(None, recognizer=rec, config=EngineConfig(mode="sliding", policy=policy))
+    eng.set_size(raw.width, raw.height)
+    msgs = [eng.push(raw.frame_to_json(i)) for i in range(len(raw.t_ms))]
+    return eng, [m for m in msgs if "commit" in m], [m["provisional"]["reason"] for m in msgs if "provisional" in m]
+
+
+def test_sliding_mode_never_auto_commits_with_a_confirm_only_policy():
+    from app.isl.recognizer import IslRecognizer
+    from app.packs.vocabulary import Vocabulary
+
+    clf = _ScriptedClf([[0.95, 0.03, 0.02]])
+    vocab = Vocabulary([{"concept_id": n, "headword": n, "display": {"en": n}} for n in NAMES])
+
+    def rec(fusion):
+        return IslRecognizer("isl", clf.feature_config, vocab, classifier=clf, fusion=fusion)
+
+    certified = rec(_certified_sliding_pack(clf))
+    assert certified.sliding_rule("balanced") == "certified"
+    _, commits, _ = _commits(certified, clf)
+    assert commits and commits[0]["commit"]["concept_id"] == "a"
+    for fusion in (_certified_sliding_pack(clf, rule="confirm_only"),  # validation did not certify it
+                   FusionParams.from_json({"accept": {"balanced": 0.9}, "fitted": True}),  # a pre-15.25 fusion.json
+                   _certified_sliding_pack(clf).with_(classifier_fit={  # fitted on the segment proxy
+                       **_certified_sliding_pack(clf).classifier_fit, "rule": "segment proxy"})):
+        r = rec(fusion)
+        assert r.sliding_rule("balanced") == "confirm_only"
+        eng, commits, reasons = _commits(r, clf)
+        assert commits == [] and "confirm_only" in reasons  # provisional words only
+        assert eng.describe()["certification"]["rule"] == "confirm_only"
+    # in-code parameters are not gated (tools, tests): unchanged behaviour
+    _, commits, _ = _commits(rec(FusionParams(fitted=True)), clf)
+    assert commits
+
+
+def test_fit_classifier_alone_certifies_the_replay_per_source():
+    from app.isl.training.fit_fusion import fit_classifier_alone
+
+    clf = _ScriptedClf([[0.95, 0.03, 0.02]])
+    rec = _rec(clf)
+
+    def load():
+        clf.k = 0
+        return _raw(gap=None)
+
+    clips = [SimpleNamespace(clip_id=f"c{i}", concept_id="a", load=load, source="include", group=f"g{i % 4}")
+             for i in range(40)]
+    p, rep = fit_classifier_alone(rec, _inputs(clf, 40), ["a"] * 40, FusionParams(), clips=clips)
+    assert rep["rule"] == "sliding replay" and rep["major_sources"] == ["include"]
+    b = p.classifier_fit["policies"]["lenient"]
+    assert b["by_source"]["include"]["n_groups"] == 4 and b["by_source"]["include"]["n_accepted"] == 40
+    # 40 of 40 right: bound 0.91 >= lenient / balanced floors, below strict's 0.95
+    assert b["rule"] == "certified" and p.classifier_fit["policies"]["strict"]["rule"] == "confirm_only"
+
+
+def test_e1_reports_the_rule_and_per_source_sliding_rows():
+    from app.isl.evaluation import runners
+
+    clf = _ScriptedClf([[0.95, 0.03, 0.02]])
+    rec = _rec(clf)
+    clips = [SimpleNamespace(clip_id=f"c{i}", concept_id=c, group=f"g{i % 2}", category=None, source="include",
+                             load=lambda: _raw(gap=None)) for i, c in enumerate(["a", "a", "b"])]
+    orig = runners._features
+    runners._features = lambda clip, fcfg: np.zeros((3, 4, 2), np.float32)
+    try:
+        out = runners.e1_closed_set(rec, clips, "E1b", "s", "primary")
+    finally:
+        runners._features = orig
+    b = out["policies"]["balanced"]
+    assert b["rule"] == "ungated"  # in-code FusionParams
+    row = b["sliding_replay"]["by_source"]["include"]
+    assert row["n"] == 3 and row["threshold_precision"] == pytest.approx(2 / 3) and "top1" not in row
+    md = runners.markdown_report({"profile": "x", "label": "x", "created": "now", "smoke": False,
+                                  "protocols": {"E1b": out}, "leakage_guards": {"pretraining_check": {}}})
+    assert "## Headline: INCLUDE and the worst source" in md

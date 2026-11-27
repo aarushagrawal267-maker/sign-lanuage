@@ -155,7 +155,8 @@ class IslPack:
         p = self.component_paths()["fusion"]
         if p is not None and p.exists():
             return FusionParams.load(p)
-        return FusionParams(profile=self.manifest.profile)
+        # no fusion.json: uncalibrated defaults, uncertified (every policy confirm-only, docs/ISL_DESIGN.md 15.25)
+        return FusionParams(profile=self.manifest.profile, certification={})
 
     # ----------------------------------------------------------- recogniser
     def _key(self) -> tuple:
@@ -223,7 +224,10 @@ class IslPack:
                                "index": None if index is None else {"rows": len(index), "concepts": len(index.concepts)},
                                "spelling": None if speller is None else {"experimental": speller.experimental,
                                                                          "lexicon": len(speller.decoder.trie)},
-                               "fusion": {"fitted": fusion.fitted, "version": fusion.version}},
+                               "fusion": {"fitted": fusion.fitted, "version": fusion.version,
+                                          # per policy: rule, certified worst-source precision, floor (docs 15.25)
+                                          "certification": {pol: fusion.certification_info(pol)
+                                                            for pol in ("strict", "balanced", "lenient")}}},
                 "is_synthetic": False}
         return rec, info
 

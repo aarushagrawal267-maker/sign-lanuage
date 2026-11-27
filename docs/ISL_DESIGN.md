@@ -3414,3 +3414,82 @@ gives exactly the engine's windows on synthetic clips (with a sign boundary) and
 batch-dependent rounding the sliding counts and thresholds equal the reference; the subsample with many 1-clip
 sources has exactly `n` clips and balanced signers; a subsampled fit records the re-scored points and keeps the best
 full-set NLL.
+
+### 15.25 Honest calibration: per-source certification and confirm-only policies (Model QA fix 0.4, 27 Nov 2026)
+
+**Problem.** Thresholds were fitted on all validation clips pooled, with a Wilson bound that counts every clip as
+independent. Research validation is 93 % ISL500 from 2 signers. The pooled bound said "strict", but INCLUDE got 0.918
+(val) / 0.938 (test), and new ISL500 signers 0.969. When no target was reachable, the graded fallback (15.17) still
+let every policy auto-accept. Nothing in the app read `target_reached`.
+
+**What changed** (`models/calibration.py`, `models/fusion.py`, `training/fit_fusion.py`, `recognizer.py`,
+`inference/engine.py`, `evaluation/runners.py`, `packs/isl.py`, `training/pipeline.py`):
+
+1. **Per-source certification.** Every fit gets each clip's `source` and signer `group`. A source is *major* when it
+   has at least 30 accepts at the lowest threshold and at least 2 groups (INCLUDE and ISL500 today). At each threshold,
+   the bound is the **worst major source's** Wilson lower bound on `n / DEFF`. `DEFF = max(1, phi)`, where phi is the
+   Pearson dispersion of accepted errors over that source's groups. With fewer than 3 groups, phi comes from
+   `phi_prior` (for example cross-validation groups) or is 5.0 (the ISL500 4-signer value). Phi is 1 when the error
+   rate is 0. No cross-fitting and no Bonferroni: threshold selection bias was measured at 0.0001-0.0008.
+2. **Finer grid.** `THRESHOLD_GRID` is 0.20-0.99 by 0.01, then 0.991-0.999 by 0.001 (fused and sliding). Strict can
+   now sit above balanced when only the top 1 % is precise enough.
+3. **Floors and the confirm-only rule.** Each policy aims at `min(target, best worst-source bound)` and takes the
+   smallest threshold that reaches it. It is `certified` only when that bound is at least its floor: strict 0.95,
+   balanced 0.90, lenient 0.85. Otherwise it is `confirm_only`. This replaces the graded fallback of 15.17.
+   * `decide()` never returns `accept` for a confirm-only policy. A query that passes the accept rule becomes
+     "did you mean" (`suggest` / `confirm_only`), whatever its top-5 mass.
+   * A direct "My signs" match (7.3) keeps its own per-sign rule. It is the user's own enrolled sign, checked
+     against its enrolment self-test, not a dictionary word.
+   * The rule lives in `fusion.json` `achieved.<policy>.rule` (with `by_source`) plus a `certification` record
+     (version `cert-1`). `FusionParams.policy_rule()` reads it; the recogniser and the engine use it.
+   * Sliding mode: the engine never auto-commits with a confirm-only policy (`reason: confirm_only`, provisional words
+     only). It is certified only when `classifier_fit.rule` is "sliding replay" for this very classifier and that
+     policy's worst source reached its floor. The segment proxy is never certified.
+4. **Out-of-vocabulary guard.** `s_min` is the minimum over major sources of each source's 5 % quantile of the best
+   cosine (it was pooled). So at least 95 % of each major source's in-vocabulary queries pass. E2 now also measures
+   held-out-concept false accepts: the held-out queries against the gallery **without** their concepts, where every
+   accept is wrong (`E2.oov_false_accept`, per policy, with the gate and with the threshold alone).
+5. **"Did you mean" mass.** The smallest mass at which the **worst** major source's top-5 hit rate in that policy's
+   pool is at least 0.80. No mass may cut a major source below 20 % of its pool. Sources with fewer than 3 suggestions
+   are not judged.
+6. **Open-vocabulary words** (outside the classifier, retrieval only; every word in a pack without a classifier) are
+   always confirm-only unless the policy is certified **and** their own accepts reach the strict floor (0.95) on every
+   major source (`certification.open_vocabulary`). `decide(..., open_vocabulary=True)` returns `suggest` /
+   `open_vocabulary` otherwise. The recogniser and E3 pass the flag.
+7. **Reporting.** `achieved.<policy>` holds `rule`, `certified_precision` (the worst-source bound when certified),
+   `worst_source`, `floor`, `pooled_lower_bound` and `by_source` (precision, lower bound, coverage, n, n_groups, DEFF).
+   E1 and E3 emit per-source rows (`by_source`, `worst_source`), what the app accepts by itself, and `threshold_rule`
+   (what the threshold alone accepts, that is the candidate a confirm tap shows). `report.md` opens with a headline
+   table: the INCLUDE row and the worst-source row per policy, for E3 and sliding mode.
+
+**What the app shows** (critic point 15). The floors are below the 0.98 goal. So:
+* The recogniser's `detail.certification` (and `engine.describe()["certification"]`, and the pack info
+  `components.fusion.certification`) gives the rule, the certified worst-source precision (never the target), the
+  worst source, the floor, the target and `confirm_tap: true`.
+* The app should keep a confirm tap before a word is spoken or sent, even when strict is certified. The frontend
+  change is not part of this fix.
+
+**Old packs.** A `fusion.json` without the `certification` record loads as `{}`: uncertified, every policy
+confirm-only, never a crash. That includes the commercial-safe file with accept 0.96 x 3 and no classifier
+thresholds, and the research file. An old `achieved` block (rule "target" or "fallback", no `by_source`) is not a
+certification. A pack without `fusion.json` gets uncertified defaults too. Parameters built in code (tests, tools)
+have `certification=None` and are not gated. The ASL path is unchanged (the engine gate needs a language-pack
+recogniser and no predictor).
+
+**TODO (critic point 8, not done here).** The clips that certify are the validation clips that also selected the
+models (early stopping, temperature). The cheaper and stronger fix is to calibrate INCLUDE on out-of-fold predictions
+of the cross-validation folds (about 4k clips over all sessions), or to hold one INCLUDE session out for calibration
+only. The API is ready: calibration clips are columns with a source and a group (`certify_scan`), and a per-source
+`phi_prior` can come from the CV groups. `certification.selection_note` says this in every `fusion.json`.
+
+**Next step.** Refit commercial-safe and research with this code (plan 0.6). Until then both packs load as
+confirm-only.
+
+Tests: `test_policy_thresholds.py` (pooled passes but the worst source fails; a small source is not major; DEFF lowers
+the bound only for heterogeneous groups, the 5.0 fallback and the prior; a weak scan is confirm-only everywhere and
+`decide()` never accepts; the fine grid lets strict sit above balanced; `s_min` is the per-source minimum; the suggest
+mass is chosen on the worst source; an old `fusion.json` is confirm-only; open-vocabulary words stay confirm-only;
+the recogniser exposes the certified precision; E3 per-source rows and the headline; E2 held-out false accepts) and
+`test_sliding_replay_thresholds.py` (sliding thresholds certified on the worst source; sliding mode never
+auto-commits with a confirm-only policy, an old pack or a proxy fit; fit-fusion certifies the replay per source; E1
+reports the rule and per-source sliding rows).

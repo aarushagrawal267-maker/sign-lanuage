@@ -105,7 +105,9 @@ def load_recognizer(work: Path, fcfg: FeatureConfig, vocab_path: Path | None = N
             idx = EmbeddingIndex.load(folder, expect_encoder_version=enc.version)
             idx.check_for_evaluation(enc.path, where=str(folder))
     if fusion is None:
-        fusion = FusionParams.load(work / "fusion.json") if (work / "fusion.json").exists() else FusionParams(profile=profile)
+        # no fusion.json: uncalibrated defaults, uncertified (every policy confirm-only, docs 15.25)
+        fusion = (FusionParams.load(work / "fusion.json") if (work / "fusion.json").exists()
+                  else FusionParams(profile=profile, certification={}))
     return IslRecognizer("isl", fcfg, vocab, classifier=clf, encoder=enc, index=idx, fusion=fusion, profile=profile)
 
 
