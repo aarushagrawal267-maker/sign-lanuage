@@ -1403,6 +1403,9 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
            "label": label, "data": data_doc, "leakage_guards": leak, "protocols": prot,
            "aliases": {k: v for k, v in aliases.items() if k != "alias_of"},
            "seconds": round(time.time() - t0, 1)}
+    ep = encoder_probe_summary(work)
+    if ep is not None:  # only when the driver ran encoder-probe (ENC_BAR, docs 15.41): no new key otherwise
+        doc["encoder_probe"] = ep
     md = markdown_report(doc)
     for d in [work / "eval", *(out_dirs or [])]:
         d.mkdir(parents=True, exist_ok=True)
@@ -1679,6 +1682,54 @@ def _e4_like_for_like_lines(lf: dict | None) -> list[str]:
             *[f"* note: {n}" for n in lf.get("notes") or []]]
 
 
+ENCODER_PROBE = "encoder_probe.json"
+
+
+def encoder_probe_summary(work: Path) -> dict | None:
+    """``<work>/eval/encoder_probe.json`` (written by the driver's ENC_BAR probe, docs 15.41) for report.json: the
+    INCLUDE -> ISLRTC numbers, the bar and its warnings; ``stale`` when the probed encoder is not
+    ``<work>/encoder.pt`` any more. None when there is no probe file."""
+    from app.isl.training.loop import file_digest
+
+    f = Path(work) / "eval" / ENCODER_PROBE
+    if not f.is_file():
+        return None
+    try:
+        p = json.loads(f.read_text())
+    except (OSError, ValueError) as e:
+        return {"file": str(f), "error": f"unreadable: {e}"}
+    enc = Path(work) / "encoder.pt"
+    cur = file_digest(enc) if enc.is_file() else None
+    keep = ("include_r1", "r1", "select", "by_source", "bar", "warning_bar", "warning_bar_mismatch", "warnings",
+            "note_selection", "encoder_sha256", "per_signer", "split", "profile")
+    return {"file": str(f), **{k: p[k] for k in keep if k in p}, "stale": cur != p.get("encoder_sha256")}
+
+
+def _encoder_probe_lines(doc: dict) -> list[str]:
+    ep = doc.get("encoder_probe")
+    if not ep:
+        return []
+    out = ["", "## Encoder probe (INCLUDE -> ISLRTC dictionary rows)", ""]
+    if ep.get("error"):
+        return out + [f"* {ep['error']}"]
+    out.append(f"* INCLUDE r1 {_fmt(ep.get('include_r1'))}, all sources r1 {_fmt(ep.get('r1'))}"
+               + (" (STALE: probe of another encoder.pt)" if ep.get("stale") else ""))
+    b = ep.get("bar") or {}
+    if b:
+        pr = b.get("paired") or {}
+        out.append(f"* bar {_fmt(b.get('include_r1'))} ({b.get('source')}): clears bar + {b.get('margin')}: "
+                   f"{b.get('clears')}" + (f"; paired on {pr.get('common')} INCLUDE queries: {pr.get('new_only')} "
+                                           f"new-only vs {pr.get('bar_only')} bar-only hits, McNemar p "
+                                           f"{pr.get('p_mcnemar')}" if pr else ""))
+    for k in ("warning_bar", "warning_bar_mismatch"):
+        if ep.get(k):
+            out.append(f"* **warning: {ep[k]}**")
+    out += [f"* warning: {w}" for w in ep.get("warnings") or []]
+    if ep.get("note_selection"):
+        out.append(f"* note: {ep['note_selection']}")
+    return out
+
+
 def markdown_report(doc: dict) -> str:
     partial = bool(doc.get("partial_data")) and not doc.get("smoke")
     title = f"# ISL evaluation report ({doc['profile']})" + (" - PARTIAL DATA" if partial else "")
@@ -1729,6 +1780,7 @@ def markdown_report(doc: dict) -> str:
                               f"vocabulary {_fmt((oov.get(pol) or {}).get('out_of_vocabulary_rate'))}"
                               for pol in ("strict", "balanced", "lenient"))]
     lines += _policy_lines(doc)
+    lines += _encoder_probe_lines(doc)
     lines += _e4_lines(doc.get("protocols", {}).get("E4") or {})
     guard = (doc.get("data") or {}).get("readiness")
     if guard:

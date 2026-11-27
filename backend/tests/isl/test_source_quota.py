@@ -466,10 +466,15 @@ def test_driver_warns_on_a_classifier_stamp_of_other_settings(tmp_path):
     assert any(ln.startswith("warning: classifier stamp settings differ") and "quota=include=0.45" in ln
                and "--from classifier" in ln for ln in warn), r.stdout
     assert any(ln.startswith("warning: cv stamp settings differ") for ln in warn)
-    assert not any(ln.startswith(("warning: e1a", "warning: encoder")) for ln in warn)
+    assert not any(ln.startswith("warning: e1a") for ln in warn)
+    # research asks for the bridge sampler: the old encoder / oneshot stamps are said too (docs 15.41)
+    assert any(ln.startswith("warning: encoder stamp settings differ") for ln in warn)
     cur = " dict_group=1 quota=include=0.45,isl500=0.35,dictionary=0.12,mendeley=0.08 select=worst_source"
     for s in ("classifier", "cv"):
         (stamps / f"{s}.done").write_text(f"2026-11-28T00:00:00Z 10s{cur}\n")
+    for s in ("encoder", "oneshot"):
+        (stamps / f"{s}.done").write_text("2026-11-28T00:00:00Z 10s enc_exclude=wslp bridge_p=12 "
+                                          "source_weights=default val=dictionary\n")
     r = _driver(tmp_path, "research", "--dry-run")
     assert r.returncode == 0 and "stamp settings differ" not in r.stdout, r.stdout
     # a real (non-dry) resume skips with the warning in the log and runs nothing

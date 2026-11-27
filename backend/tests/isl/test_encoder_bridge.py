@@ -8,7 +8,10 @@
   ISLRTC rows only, held-out concepts in neither, per-source recall in the history, the selection key;
 * ``cli encoder-probe`` measures any encoder on that protocol and writes nothing into the work folder;
 * the driver: research defaults (bridge 12, dictionary validation, 800 steps for encoder and oneshot), commercial-safe
-  unchanged, ``--until`` for a short probe run.
+  unchanged, ``--until`` for a short probe run;
+* review fixes (docs 15.41): a probe bar must measure the same thing (else ``warning_bar_mismatch``), a paired
+  McNemar comparison on the common INCLUDE queries, ignored options refused, ``train-oneshot --ckpt`` refused,
+  ``stamp_warn`` for encoder / oneshot, ``ENC_BAR`` in the driver and the probe in report.json.
 """
 
 from __future__ import annotations
@@ -202,6 +205,19 @@ def test_bridge_weights_parsing_and_refusals():
         with pytest.raises(SystemExit) as e:
             p.parse_args([cmd, "--source-weights", "islrtc=1"])
         assert e.value.code == 2
+    # options that would be ignored are refused (docs 15.41), before any data is loaded
+    from app.isl import cli
+    from app.isl.training.train_encoder import train_encoder
+
+    with pytest.raises(ValueError, match="bridge_p > 0"):
+        train_encoder(None, Path("x.pt"), None, None, bridge_weights={"include": 1.0})
+    with pytest.raises(ValueError, match="dict_val_per_signer"):
+        train_encoder(None, Path("x.pt"), None, None, val_protocol="dictionary", dict_val_per_signer=-1)
+    for cmd in ("train-encoder", "train-oneshot"):
+        assert cli.main([cmd, "--source-weights", "include=1"]) == 2
+        assert cli.main([cmd, "--bridge-p", "4", "--val-protocol", "dictionary", "--dict-val-per-signer", "-1"]) == 2
+        assert cli.main([cmd, "--dict-val-per-signer", "50"]) == 2  # mixed protocol: not used
+    assert cli.main(["train-oneshot", "--ckpt", "x.pt"]) == 2  # oneshot writes <work>/oneshot/foldK
 
 
 # ------------------------------------------------------------------------------------------- validation
@@ -437,10 +453,31 @@ def test_cli_encoder_probe_measures_any_encoder_read_only(cli_world, tmp_path, c
     assert set(doc["by_source"]) == {"include", "isl500"} and doc["by_source"]["include"]["n"] > 0
     assert doc["include_r1"] == doc["by_source"]["include"]["r1"]
     assert doc["bar"]["below"] is True and "below the bar" in err
-    # a previous probe as the bar: no warning when it is met
-    assert cli.main(root + ["encoder-probe", *common_args, "--encoder", str(enc), "--per-signer", "2",
-                            "--bar", str(probe)]) == 0
+    assert doc["bar"]["checked"] == [] and doc["per_signer"] == 2 and doc["data_seed"] == 0
+    assert doc["same_sets_as_training"] is True and "optimistic" in doc["note_selection"]
+    assert sum(1 for k in doc["hits"] if k.startswith("include|")) == doc["by_source"]["include"]["n"]
+    # a previous probe as the bar: no warning when it is met; the profile defaults to the encoder's (research)
+    probe2 = tmp_path / "probe2.json"
+    assert cli.main(root + ["encoder-probe", *cli_world["common"], "--encoder", str(enc), "--per-signer", "2",
+                            "--bar", str(probe), "--out", str(probe2)]) == 0
     assert "WARNING" not in capsys.readouterr().err
+    d2 = json.loads(probe2.read_text())
+    assert d2["profile"] == "research" and "warning_bar_mismatch" not in d2
+    pr = d2["bar"]["paired"]
+    assert pr["common"] == doc["by_source"]["include"]["n"] and pr["new_only"] == pr["bar_only"] == 0
+    assert pr["delta_r1"] == 0 and pr["p_mcnemar"] == 1.0
+    # a bar made with another per-signer value measured something else: said, not used silently (docs 15.41)
+    probe3 = tmp_path / "probe3.json"
+    assert cli.main(root + ["encoder-probe", *common_args, "--encoder", str(enc), "--per-signer", "0",
+                            "--bar", str(probe), "--out", str(probe3)]) == 0
+    assert "the bar measured something else" in capsys.readouterr().err
+    d3 = json.loads(probe3.read_text())
+    assert "per_signer 2 vs 0" in d3["warning_bar_mismatch"] and d3["same_sets_as_training"] is None
+    old_bar = tmp_path / "old_bar.json"  # a probe JSON without the new keys (e.g. a hand-written number)
+    old_bar.write_text(json.dumps({"include_r1": 0.0}))
+    assert cli.main(root + ["encoder-probe", *common_args, "--encoder", str(enc), "--per-signer", "2",
+                            "--bar", str(old_bar)]) == 0
+    assert "profile None vs 'research'" in capsys.readouterr().err
     # the probe numbers match the trained encoder's own best epoch on the same protocol and settings
     import torch
 
@@ -475,7 +512,7 @@ def _driver(tmp_path, profile, *args, env_extra=None):
 
     from tests.isl.test_phase2_guards import _run_driver
 
-    keys = ("ENC_BRIDGE_P", "ENC_SOURCE_WEIGHTS", "ENC_VAL", "ENC_STEPS", "ONESHOT_STEPS")
+    keys = ("ENC_BRIDGE_P", "ENC_SOURCE_WEIGHTS", "ENC_VAL", "ENC_STEPS", "ONESHOT_STEPS", "ENC_BAR")
     old = {k: os.environ.get(k) for k in keys}
     try:
         for k in keys:
@@ -557,3 +594,82 @@ def test_driver_until_runs_a_short_encoder_probe_only(tmp_path):
     bad = _driver(tmp_path, "research", "--from", "oneshot", "--until", "encoder", "--dry-run")
     assert bad.returncode == 2 and "after --until" in bad.stderr
     assert _driver(tmp_path, "research", "--until", "nostep", "--dry-run").returncode == 2
+
+
+# ------------------------------------------------------------------------------------- review fixes 15.41
+
+def test_paired_hits_and_mcnemar():
+    from app.isl.training.train_encoder import mcnemar_exact, paired_hits
+
+    assert mcnemar_exact(0, 0) == 1.0 and mcnemar_exact(3, 3) == 1.0
+    assert mcnemar_exact(10, 0) == pytest.approx(2 / 2 ** 10)
+    assert mcnemar_exact(7, 2) == pytest.approx(2 * (1 + 9 + 36) / 512)
+    new = {"include|a": 1, "include|b": 1, "include|c": 0, "include|d": 1, "isl500|x": 0, "include|only_new": 1}
+    old = {"include|a": 1, "include|b": 0, "include|c": 1, "include|d": 0, "isl500|x": 1, "include|only_old": 0}
+    r = paired_hits(new, old)
+    assert (r["common"], r["new_only"], r["bar_only"]) == (4, 2, 1)
+    assert r["new_r1"] == 0.75 and r["bar_r1"] == 0.5 and r["delta_r1"] == 0.25
+    assert paired_hits(new, old, None)["common"] == 5
+
+
+def test_dictionary_metrics_fill_per_query_hits():
+    q_clips = [_c("inc/a", "include", "isl.a"), _c("inc/b", "include", "isl.b"), _c("isl500/a", "isl500", "isl.a")]
+    g = np.eye(2, dtype=np.float32)
+    q = np.array([[1, 0], [1, 0], [1, 0]], np.float32)
+    hits: dict = {}
+    m = dictionary_val_metrics(q, q_clips, g, ["isl.a", "isl.b"], hits=hits)
+    assert hits == {"include|inc/a": 1, "include|inc/b": 0, "isl500|isl500/a": 1}
+    assert m["val_dict_r1_include"] == 0.5
+
+
+def test_encoder_probe_in_the_evaluation_report(tmp_path):
+    from app.isl.evaluation.runners import _encoder_probe_lines, encoder_probe_summary
+    from app.isl.training.loop import file_digest
+
+    work = tmp_path / "w"
+    (work / "eval").mkdir(parents=True)
+    assert encoder_probe_summary(work) is None  # no probe: no report key
+    (work / "encoder.pt").write_bytes(b"enc")
+    probe = {"include_r1": 0.4, "r1": 0.3, "encoder_sha256": file_digest(work / "encoder.pt"), "hits": {"x": 1},
+             "bar": {"include_r1": 0.45, "source": "cs.json", "below": True, "margin": 0.02, "clears": False,
+                     "paired": {"common": 10, "new_only": 1, "bar_only": 2, "p_mcnemar": 1.0}},
+             "warning_bar": "INCLUDE -> ISLRTC r1 0.4 is below the bar 0.45 (cs.json)"}
+    (work / "eval" / "encoder_probe.json").write_text(json.dumps(probe))
+    ep = encoder_probe_summary(work)
+    assert ep["stale"] is False and ep["include_r1"] == 0.4 and "hits" not in ep and "below the bar" in ep["warning_bar"]
+    md = "\n".join(_encoder_probe_lines({"encoder_probe": ep}))
+    assert "**warning: INCLUDE -> ISLRTC r1 0.4 is below the bar" in md and "1 new-only vs 2 bar-only" in md
+    (work / "encoder.pt").write_bytes(b"another encoder")
+    assert encoder_probe_summary(work)["stale"] is True
+
+
+def test_driver_encoder_stamp_warning_and_enc_bar(tmp_path):
+    stamps = _stamped(tmp_path, "research")
+    # research asks for the bridge sampler: an encoder / oneshot stamp of the old sampler is said (docs 15.41)
+    r = _driver(tmp_path, "research", "--dry-run")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "warning: encoder stamp settings differ" in r.stdout and "warning: oneshot stamp settings differ" in r.stdout
+    # the default settings match a stamp written before 15.40 (no warning), not a stamp with the bridge on
+    r = _driver(tmp_path, "research", "--dry-run", env_extra={"ENC_BRIDGE_P": "0", "ENC_VAL": "mixed"})
+    assert "warning: encoder stamp" not in r.stdout and "warning: oneshot stamp" not in r.stdout
+    (stamps / "encoder.done").write_text("t 1s enc_exclude=wslp bridge_p=12 source_weights=default val=dictionary\n")
+    r = _driver(tmp_path, "research", "--dry-run", env_extra={"ENC_BRIDGE_P": "0", "ENC_VAL": "mixed"})
+    assert "warning: encoder stamp settings differ" in r.stdout
+    r = _driver(tmp_path, "research", "--dry-run")  # same settings as the stamp: no warning for the encoder
+    assert "warning: encoder stamp" not in r.stdout
+    cs = _stamped(tmp_path, "commercial-safe")
+    r = _driver(tmp_path, "commercial-safe", "--dry-run")
+    assert "warning: encoder stamp" not in r.stdout and "warning: oneshot stamp" not in r.stdout
+    # ENC_BAR: refused when missing; else the encoder step runs encoder-probe after training
+    assert _driver(tmp_path, "research", "--dry-run", env_extra={"ENC_BAR": str(tmp_path / "nope.json")}).returncode == 2
+    bar = tmp_path / "cs_probe.json"
+    bar.write_text(json.dumps({"include_r1": 0.3}))
+    r = _driver(tmp_path, "research", "--from", "encoder", "--until", "encoder", env_extra={"ENC_BAR": str(bar)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    calls = (tmp_path / "fake_py.log").read_text().splitlines()
+    i = next(n for n, c in enumerate(calls) if " train-encoder " in f" {c} ")
+    pc = [c for c in calls[i:] if " encoder-probe " in f" {c} "]
+    work = tmp_path / "art" / "research"
+    assert len(pc) == 1 and f"--bar {bar}" in pc[0] and f"--out {work}/eval/encoder_probe.json" in pc[0]
+    assert f"--work {work}" in pc[0]
+    assert cs.is_dir()

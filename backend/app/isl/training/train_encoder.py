@@ -30,6 +30,7 @@ Sampler: the P x K sampler of ``loop.pk_batches``; with ``bridge_p`` > 0 (docs 1
 from __future__ import annotations
 
 import logging
+import math
 import random
 import time
 from collections import defaultdict
@@ -222,11 +223,13 @@ def _top5(q: np.ndarray, g: np.ndarray, g_lab: list) -> tuple[list, np.ndarray]:
     return labs, (np.concatenate(out) if out else np.zeros((0, 5), np.int64))
 
 
-def dictionary_val_metrics(q: np.ndarray, q_clips: list, g: np.ndarray, g_lab: list) -> dict:
+def dictionary_val_metrics(q: np.ndarray, q_clips: list, g: np.ndarray, g_lab: list,
+                           hits: dict | None = None) -> dict:
     """Per-source recall@1 / @5 of the dictionary protocol: ``val_dict_r1_<src>``, ``val_dict_r5_<src>``,
     ``val_dict_n_<src>`` for every query source family present, the pooled ``val_dict_r1`` / ``val_dict_r5`` and the
     selection key ``val_dict_select = 0.5 * r1_include + 0.5 * mean(r1 of the other sources)`` (only one side
-    present: that side; no query: 0)."""
+    present: that side; no query: 0). ``hits``: when a dict, filled with ``query_key(clip) -> 0/1`` (hit@1 of every
+    query), for a paired comparison of two encoders on the same queries (encoder-probe ``--bar``, docs 15.41)."""
     out: dict = {}
     if len(q) == 0 or len(g) == 0:
         out.update(val_dict_r1=0.0, val_dict_r5=0.0, val_dict_n=0)
@@ -240,8 +243,11 @@ def dictionary_val_metrics(q: np.ndarray, q_clips: list, g: np.ndarray, g_lab: l
         s = source_family(c.source)
         t = [labs[j] for j in top[b]]
         n[s] += 1
-        hit1[s] += int(t[0] == c.concept_id)
+        h = int(t[0] == c.concept_id)
+        hit1[s] += h
         hit5[s] += int(c.concept_id in t)
+        if hits is not None:
+            hits[query_key(c)] = h
     for s in sorted(n):
         out[f"val_dict_r1_{s}"] = hit1[s] / n[s]
         out[f"val_dict_r5_{s}"] = hit5[s] / n[s]
@@ -251,6 +257,35 @@ def dictionary_val_metrics(q: np.ndarray, q_clips: list, g: np.ndarray, g_lab: l
     out["val_dict_n"] = len(q_clips)
     out[DICT_SELECT_KEY] = dictionary_select(out)
     return out
+
+
+def query_key(c) -> str:
+    """The key of a probe query in ``hits``: ``<source>|<clip id>``."""
+    return f"{c.source}|{c.clip_id}"
+
+
+def mcnemar_exact(b: int, c: int) -> float:
+    """Two-sided exact McNemar p-value of ``b`` new-only and ``c`` old-only hits (binomial, p = 0.5)."""
+    n = b + c
+    if n == 0:
+        return 1.0
+    k = min(b, c)
+    tail = sum(math.comb(n, i) for i in range(k + 1)) / 2.0 ** n
+    return min(1.0, 2.0 * tail)
+
+
+def paired_hits(new: dict, old: dict, source: str | None = "include") -> dict:
+    """Paired hit@1 comparison of two probes on their common queries (only ``source`` when given): ``new_only`` /
+    ``bar_only`` = queries only one encoder gets right, ``delta_r1`` on the common queries and the exact McNemar
+    p-value. Clips of one signer session are not independent, so the p-value is optimistic (docs 15.41)."""
+    keys = sorted(k for k in set(new) & set(old) if source is None or k.split("|", 1)[0] == source)
+    b = sum(1 for k in keys if new[k] and not old[k])
+    c = sum(1 for k in keys if old[k] and not new[k])
+    n = len(keys)
+    return {"source": source, "common": n, "new_only": b, "bar_only": c,
+            "new_r1": round(sum(new[k] for k in keys) / n, 4) if n else None,
+            "bar_r1": round(sum(old[k] for k in keys) / n, 4) if n else None,
+            "delta_r1": round((b - c) / n, 4) if n else None, "p_mcnemar": round(mcnemar_exact(b, c), 4)}
 
 
 def dictionary_select(m: dict) -> float:
@@ -345,6 +380,10 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
         raise ValueError(f"val_protocol must be one of {VAL_PROTOCOLS}, not {val_protocol!r}")
     if bridge_p < 0:
         raise ValueError("bridge_p must be >= 0")
+    if bridge_p == 0 and parse_bridge_weights(bridge_weights) is not None:  # never ignored silently (docs 15.41)
+        raise ValueError("bridge_weights (--source-weights) need bridge_p > 0 (--bridge-p)")
+    if dict_val_per_signer < 0:
+        raise ValueError("dict_val_per_signer must be >= 0 (0 = every ISL500 validation clip)")
     set_threads(threads)
     set_seed(cfg.seed)
     t0 = time.time()
@@ -447,7 +486,9 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
         q_lab = [c.concept_id for c in vq]
         g_lab = [c.concept_id for c in gal]
         dg_lab = [c.concept_id for c in dg]
-        dict_info = {**dict_info, "queries_used": len(dq), "gallery_used": len(dg)}
+        dict_info = {**dict_info, "queries_used": len(dq), "gallery_used": len(dg),
+                     # what encoder-probe compares its own sets with (docs 15.41)
+                     "query_digest": clips_digest(dq), "gallery_digest": clips_digest(dg)}
 
         def val_fn(m) -> dict:
             z = bank.embed(m.enc, fcfg)
@@ -530,10 +571,14 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
 
 
 def probe_encoder(data: IslData, ckpt: Path, *, per_signer: int = DICT_VAL_PER_SIGNER, seed: int | None = None,
-                  threads: int = 2) -> dict:
+                  threads: int = 2, data_seed: int | None = None) -> dict:
     """Measure any encoder checkpoint on the ``dictionary`` validation protocol (docs 15.40, critic 3): the concepts
     it was trained without (``excluded_concepts``, one-shot folds) are left out of queries and gallery, and so are
-    the sources it was trained without. ``data`` must be loaded with the encoder's split (the caller checks)."""
+    the sources it was trained without. ``data`` must be loaded with the encoder's split (the caller checks).
+
+    The result names exactly what was measured (docs 15.41): digests of the queries (all, and INCLUDE alone) and of
+    the gallery, ``per_signer``, profile, split, ``data_seed`` (the seed the data was loaded with) and the link
+    settings; ``hits`` holds every query's hit@1 for a paired comparison with another probe."""
     from app.isl.models.encoder import encoder_kwargs
 
     set_threads(threads)
@@ -551,23 +596,32 @@ def probe_encoder(data: IslData, ckpt: Path, *, per_signer: int = DICT_VAL_PER_S
     dq, dg, info = dictionary_val_sets(data, excl, xsrc, per_signer, seed)
     bank = _FeatureBank({"dq": dq, "dg": dg}, fcfg)
     z = bank.embed(enc, fcfg)
+    hits: dict = {}
     m = dictionary_val_metrics(z[bank.rows["dq"]], bank.clips["dq"], z[bank.rows["dg"]],
-                               [c.concept_id for c in bank.clips["dg"]])
+                               [c.concept_id for c in bank.clips["dg"]], hits=hits)
     by = {s: {"n": m[f"val_dict_n_{s}"], "r1": round(m[f"val_dict_r1_{s}"], 4), "r5": round(m[f"val_dict_r5_{s}"], 4)}
           for s in sorted({k[len("val_dict_n_"):] for k in m if k.startswith("val_dict_n_")})}
+    qd, gd = clips_digest(bank.clips["dq"]), clips_digest(bank.clips["dg"])
+    tv = meta.get("val_dictionary_sets") or {}
+    # an encoder selected on the dictionary protocol: are these its own validation sets? (None = not recorded)
+    same = ((tv["query_digest"] == qd and tv["gallery_digest"] == gd) if tv.get("query_digest")
+            and tv.get("per_signer") == per_signer else None)
     return {"kind": "isl-encoder-probe", "protocol": "dictionary", "encoder": str(ckpt),
             "encoder_sha256": file_digest(ckpt), "encoder_version": meta.get("encoder_version"),
             "profile": data.profile, "split": data.split.get("name"), "encoder_split": (meta.get("data") or {}).get("split"),
-            "excluded_concepts": len(excl), "excluded_sources": xsrc, "seed": seed,
+            "excluded_concepts": len(excl), "excluded_sources": xsrc, "seed": seed, "data_seed": data_seed,
+            "per_signer": per_signer, "link": digest(data.link or {}),
+            "query_digest": qd, "gallery_digest": gd, "same_sets_as_training": same,
+            "include_query_digest": clips_digest([c for c in bank.clips["dq"] if source_family(c.source) == "include"]),
             "by_source": by, "r1": round(m["val_dict_r1"], 4), "r5": round(m["val_dict_r5"], 4),
             "select": round(m[DICT_SELECT_KEY], 4), "include_r1": by.get("include", {}).get("r1"),
             "queries_used": len(bank.clips["dq"]), "gallery_used": len(bank.clips["dg"]), "sets": info,
             "trained_val": {"val_protocol": meta.get("val_protocol", "mixed"), "val_r1": meta.get("val_r1"),
                             "val_dict": meta.get("val_dict")},
-            "seconds": round(time.time() - t0, 1)}
+            "seconds": round(time.time() - t0, 1), "hits": hits}
 
 
 __all__ = ["ENCODER_VERSION", "ClipDataset", "embed_items", "retrieval_metrics", "train_encoder",
            "encoder_training_clips", "encoder_excluded_sources", "check_exclude_sources", "dictionary_val_sets",
            "dictionary_val_metrics", "dictionary_select", "parse_bridge_weights", "probe_encoder",
-           "DEFAULT_BRIDGE_WEIGHTS", "DEFAULT_BRIDGE_P", "VAL_PROTOCOLS"]
+           "DEFAULT_BRIDGE_WEIGHTS", "DEFAULT_BRIDGE_P", "VAL_PROTOCOLS", "paired_hits", "mcnemar_exact", "query_key"]

@@ -4428,6 +4428,8 @@ measured too), from `backend/`:
       --encoder <new encoder.pt> --bar <scratch>/probe_cs.json --out <scratch>/probe_new.json
 
 Gate: `include_r1` of the new encoder >= `include_r1` of `probe_cs.json`, and `by_source.isl500.r1` >= 0.25 (plan).
+This gate is biased toward a dictionary-selected encoder and is a coin flip at parity; 15.41 makes it paired, with a
+margin, and confirmed on E2_seen.
 
 **A short encoder probe run first (critic 14).** The driver has a new `--until STEP`: stop after STEP; later steps are
 neither run nor forgotten. Two scratch arms of about 3 epochs, each logging INCLUDE -> ISLRTC r1 per epoch:
@@ -4472,3 +4474,60 @@ changed bridge or protocol on resume; the default run adds no resume key; `encod
 folder, matches the encoder's own best epoch, warns below a bar and leaves out a fold encoder's held-out concepts; the
 driver's research defaults, commercial-safe unchanged, bad values refused, and `--from encoder --until encoder` runs
 and forgets only the encoder.
+
+### 15.41 Encoder bridge review fixes: a bar that measures the same thing, a paired gate, no silent options (review of 15.40, 27 Nov 2026)
+
+**A probe bar must measure the same thing.** `encoder-probe` now records what it measured: `profile`, `split`,
+`per_signer`, `data_seed` (the `--seed` the data was loaded with; it sets the signer split of the extra sources),
+`link` (hash of the link settings), `query_digest`, `include_query_digest` and `gallery_digest`.
+* With `--bar FILE`, the probe compares `profile`, `split`, `per_signer`, `data_seed`, `link`, `include_query_digest`
+  and `gallery_digest` with the bar's. Any difference gives `warning_bar_mismatch` and a printed warning. A bar JSON
+  written before this change has none of the keys, so it is always flagged. A plain number is not checked
+  (`bar.checked = []`).
+* `--profile` now defaults to the encoder's own profile (its meta), then the settings default, as `_model_ctx` does.
+  So a commercial-safe encoder is probed on commercial-safe data unless `--profile research` is given. The gate in
+  15.40 passes `--profile research` to both probes, so both bars measure the same queries.
+* A new dictionary-validated encoder records the hashes of its own validation sets (meta `val_dictionary_sets`). The
+  probe reports `same_sets_as_training` (true / false; null when not recorded or another per-signer value) and warns
+  when they differ: another data seed, link settings or data.
+
+**The gate is paired and has a margin.** The research encoder's epoch is chosen on `val_dict_select`, half of which is
+INCLUDE r1 on these same INCLUDE validation clips, over up to 40 epochs. So its probe number is optimistic against
+the commercial-safe encoder, which was chosen on the mixed `val_r1`. The probe says so in `note_selection`. At parity
+the comparison is a coin flip: about 850 INCLUDE clips give a standard error of about 0.017, and they come from only
+4 session groups.
+* The probe JSON now holds `hits`: hit@1 of every query (`<source>|<clip id>` -> 0 / 1).
+* With a probe JSON bar that has `hits`, `bar.paired` compares the two encoders on their common INCLUDE queries:
+  `new_only`, `bar_only`, `delta_r1` and the exact McNemar p-value. Clips of one session are not independent, so the
+  p-value is optimistic too.
+* `bar.clears` = new INCLUDE r1 >= bar + `--bar-margin` (default 0.02, about one clip standard error).
+* Gate: `bar.clears` is true, `bar.paired.new_only > bar.paired.bar_only`, and no `warning_bar_mismatch`. Then confirm
+  once on E2_seen (test), after the selection is final. `warning_bar` (below the bar) keeps its meaning.
+
+**No silent options.** `train-encoder` and `train-oneshot` exit 2 before loading data, and `train_encoder` raises
+`ValueError`, when an option would be ignored: `--source-weights` without `--bridge-p`, a negative
+`--dict-val-per-signer`, or a non-default `--dict-val-per-signer` with `--val-protocol mixed`. `train-oneshot --ckpt`
+exits 2: oneshot always writes `<work>/oneshot/foldK/encoder.pt`; use a `--tag` scratch run for another folder.
+
+**Driver.**
+* `stamp_warn` now covers `encoder` and `oneshot`. It warns when this run asks for the bridge sampler, the dictionary
+  validation or source weights (or the stamp has them) and the stamp's settings differ. A stamp from before 15.40
+  matches the default settings, so commercial-safe stays quiet. A research resume that skips the old encoder now says
+  `warning: encoder stamp settings differ ...; use --from encoder to retrain`.
+* `ENC_BAR=<probe.json>` (default off): after the encoder step, the driver runs `encoder-probe --bar <probe.json>
+  --out <work>/eval/encoder_probe.json` with the run's profile, vocabulary and work folder. A warning goes to the log
+  when the probe is below the bar or not comparable. A probe failure never fails the encoder step. A missing file
+  exits 2 before anything runs. The encoder step deletes an old `encoder_probe.json` first.
+* `evaluate --all` copies `<work>/eval/encoder_probe.json` into `report.json` as `encoder_probe` (numbers, bar, paired
+  result, warnings, `stale` when the probed encoder is not the current `encoder.pt`) and adds an "Encoder probe"
+  section to `report.md`. Without the file, the report has no new key.
+
+**Not changed.** Defaults: no new resume key, no new flag in the commercial-safe commands, evaluate unchanged without
+the probe file. The running Batch 0.6 chain keeps its own copy of the driver (the file was replaced, not edited in
+place). ASL is untouched.
+
+Tests (`backend/tests/isl/test_encoder_bridge.py`): the ignored-option refusals (library and CLI) and
+`train-oneshot --ckpt`; the probe records per-signer, data seed and per-query hits, defaults to the encoder's profile,
+gives a paired result against a matching bar and `warning_bar_mismatch` against a bar of another per-signer value or
+an old bar; McNemar and the paired counts; per-query hits in the metrics; the probe in the evaluation report and
+`stale`; the driver's encoder / oneshot stamp warning (research on, commercial-safe quiet) and `ENC_BAR`.

@@ -646,6 +646,11 @@ def cmd_train_classifier(paths: IslPaths, args) -> int:
 def cmd_train_encoder(paths: IslPaths, args) -> int:
     from app.isl.training.train_encoder import train_encoder
 
+    try:
+        opts = _encoder_options(args)
+    except ValueError as e:
+        print(f"train-encoder: {e}", file=sys.stderr)
+        return 2
     profile, data, fcfg, work = _model_ctx(paths, args)
     _print({"data": data.summary()})
     out = Path(args.ckpt) if getattr(args, "ckpt", None) else work / "encoder.pt"
@@ -655,17 +660,28 @@ def cmd_train_encoder(paths: IslPaths, args) -> int:
                         threads=args.threads, batches_per_epoch=args.batches or (20 if args.smoke else None),
                         progress=lambda f, m: _log(f"  encoder {m}"), init_from=_init_path(args, work),
                         use_extra=args.all_sources, resume=args.resume, max_minutes=args.max_minutes,
-                        exclude_sources=_exclude_sources(args), **_encoder_options(args))
+                        exclude_sources=_exclude_sources(args), **opts)
     _print(res)
     return 0 if res.get("finished", True) else EX_PARTIAL
 
 
 def _encoder_options(args) -> dict:
     """The bridge sampler and validation options of train-encoder / train-oneshot (docs 15.40); none given = the
-    old sampler and validation, and no new key in the resume signature."""
-    return {"bridge_p": int(getattr(args, "bridge_p", 0) or 0), "bridge_weights": getattr(args, "source_weights", None),
-            "val_protocol": getattr(args, "val_protocol", None) or "mixed",
-            "dict_val_per_signer": int(getattr(args, "dict_val_per_signer", 300))}
+    old sampler and validation, and no new key in the resume signature. An option that would be ignored is refused
+    (ValueError; the commands exit 2, docs 15.41): --source-weights without --bridge-p, a negative or non-default
+    --dict-val-per-signer with --val-protocol mixed."""
+    o = {"bridge_p": int(getattr(args, "bridge_p", 0) or 0), "bridge_weights": getattr(args, "source_weights", None),
+         "val_protocol": getattr(args, "val_protocol", None) or "mixed",
+         "dict_val_per_signer": int(getattr(args, "dict_val_per_signer", 300))}
+    if o["bridge_p"] < 0:
+        raise ValueError("--bridge-p must be >= 0")
+    if o["bridge_weights"] is not None and o["bridge_p"] == 0:
+        raise ValueError("--source-weights needs --bridge-p > 0 (without it the plain sampler would ignore them)")
+    if o["dict_val_per_signer"] < 0:
+        raise ValueError("--dict-val-per-signer must be >= 0 (0 = every ISL500 validation clip)")
+    if o["val_protocol"] == "mixed" and o["dict_val_per_signer"] != 300:
+        raise ValueError("--dict-val-per-signer only applies to --val-protocol dictionary")
+    return o
 
 
 def _bridge_weights_arg(v: str) -> dict | None:
@@ -679,36 +695,55 @@ def _bridge_weights_arg(v: str) -> dict | None:
 
 
 def cmd_encoder_probe(paths: IslPaths, args) -> int:
-    """Any encoder checkpoint on the dictionary validation protocol (QA plan 1.5, critics 3 and 14; docs 15.40).
+    """Any encoder checkpoint on the dictionary validation protocol (QA plan 1.5, critics 3 and 14; docs 15.40-41).
 
     Read-only: loads the data like the training steps (``--all-sources``, the work folder's link settings) but
-    writes nothing into the work folder; the result goes to stdout and ``--out``. The split defaults to the
-    encoder's own. ``--bar`` (a probe JSON or a number) warns when the INCLUDE -> ISLRTC recall@1 is below it."""
+    writes nothing into the work folder; the result goes to stdout and ``--out`` (with every query's hit@1). The
+    profile defaults to the encoder's own, the split too. ``--bar`` (a probe JSON or a number) warns when the
+    INCLUDE -> ISLRTC recall@1 is below it; a probe JSON bar is also checked to measure the same thing (profile,
+    split, per-signer, data seed, link settings, INCLUDE queries, gallery: ``warning_bar_mismatch`` otherwise) and
+    compared query by query (``bar.paired``: McNemar on the common INCLUDE queries). ``bar.clears`` = at least
+    ``bar + --bar-margin``."""
     import torch
 
+    from app.core.config import get_settings
+    from app.isl.profiles import get_profile
     from app.isl.training.multisource import read_link_settings
-    from app.isl.training.train_encoder import probe_encoder
+    from app.isl.training.pipeline import workdir
+    from app.isl.training.train_encoder import paired_hits, probe_encoder
 
     def refuse(msg: str) -> int:
         print(f"encoder-probe: {msg}", file=sys.stderr)
         return 2
 
-    from app.isl.profiles import get_profile
-    from app.isl.training.pipeline import workdir
-
-    profile = get_profile(args.profile or "commercial-safe").name
-    enc = Path(args.encoder) if args.encoder else workdir(profile) / "encoder.pt"
-    if not enc.is_file():
-        return refuse(f"no encoder checkpoint {enc} (--encoder)")
-    meta = torch.load(enc, map_location="cpu", weights_only=False).get("meta") or {}
+    meta: dict = {}
+    if args.encoder:
+        enc = Path(args.encoder)
+        if not enc.is_file():
+            return refuse(f"no encoder checkpoint {enc} (--encoder)")
+        meta = torch.load(enc, map_location="cpu", weights_only=False).get("meta") or {}
+        # the encoder's own profile when none is given (docs 15.41): its queries, gallery and linker
+        profile = get_profile(args.profile or meta.get("profile") or get_settings().isl_profile).name
+    else:
+        profile = get_profile(args.profile or get_settings().isl_profile).name
+        enc = workdir(profile) / "encoder.pt"
+        if not enc.is_file():
+            return refuse(f"no encoder checkpoint {enc} (--encoder)")
+        meta = torch.load(enc, map_location="cpu", weights_only=False).get("meta") or {}
+    if args.per_signer < 0:
+        return refuse("--per-signer must be >= 0 (0 = all)")
     enc_split = (meta.get("data") or {}).get("split")
     if not args.split and enc_split:
         args.split = enc_split
-    bar = None
+    bar, bar_doc = None, None
     if args.bar:
         b = Path(args.bar)
         try:
-            bar = float(json.loads(b.read_text())["include_r1"]) if b.is_file() else float(args.bar)
+            if b.is_file():
+                bar_doc = json.loads(b.read_text())
+                bar = float(bar_doc["include_r1"])
+            else:
+                bar = float(args.bar)
         except (ValueError, KeyError, TypeError):
             return refuse(f"--bar {args.bar}: a probe JSON with include_r1, or a number")
     if args.work:
@@ -716,23 +751,53 @@ def cmd_encoder_probe(paths: IslPaths, args) -> int:
     args.all_sources = True
     args.profile = profile
     profile, data, _fcfg, _work = _model_ctx(paths, args, record=False)
-    res = probe_encoder(data, enc, per_signer=args.per_signer, threads=args.threads)
+    res = probe_encoder(data, enc, per_signer=args.per_signer, threads=args.threads, data_seed=args.seed)
     res["encoder_profile"] = meta.get("profile")
+    warns = []
+    if meta.get("profile") and meta.get("profile") != profile:
+        warns.append(f"probed on the {profile} profile's data, the encoder was trained on {meta.get('profile')}")
     if enc_split and data.split.get("name") != enc_split:
         res["warning_split"] = (f"probed on split {data.split.get('name')}, the encoder was selected on {enc_split}: "
                                 "its validation clips may be another split's training clips")
+    if res.get("same_sets_as_training") is False:
+        warns.append("the probe sets differ from the encoder's own dictionary validation sets (another data seed, "
+                     "link settings or data)")
+    if meta.get("val_protocol") == "dictionary":  # docs 15.41: the epoch was chosen on these very queries
+        res["note_selection"] = ("this encoder's epoch was selected on the dictionary protocol: its probe numbers are "
+                                 "optimistic against an encoder selected otherwise; confirm on E2_seen (test)")
     if bar is not None:
         inc = res.get("include_r1")
-        res["bar"] = {"include_r1": bar, "source": args.bar, "below": inc is None or inc < bar}
+        margin = float(args.bar_margin)
+        res["bar"] = {"include_r1": bar, "source": args.bar, "below": inc is None or inc < bar, "margin": margin,
+                      "clears": inc is not None and inc >= bar + margin}
+        if bar_doc is not None:
+            diff = [k for k in BAR_MATCH_KEYS if bar_doc.get(k) != res.get(k)]
+            res["bar"]["checked"] = list(BAR_MATCH_KEYS)
+            if diff:
+                res["warning_bar_mismatch"] = (
+                    "the bar measured something else: " + ", ".join(f"{k} {bar_doc.get(k)!r} vs {res.get(k)!r}"
+                                                                    for k in diff))
+            if bar_doc.get("hits"):
+                res["bar"]["paired"] = paired_hits(res["hits"], bar_doc["hits"], "include")
+        else:
+            res["bar"]["checked"] = []  # a plain number: nothing to check it against
         if res["bar"]["below"]:
             res["warning_bar"] = f"INCLUDE -> ISLRTC r1 {inc} is below the bar {bar} ({args.bar})"
-            print(f"encoder-probe: WARNING {res['warning_bar']}", file=sys.stderr)
+    for w in [res.get("warning_bar"), res.get("warning_bar_mismatch"), *warns]:
+        if w:
+            print(f"encoder-probe: WARNING {w}", file=sys.stderr)
+    if warns:
+        res["warnings"] = warns
     if args.out:
         o = Path(args.out)
         o.parent.mkdir(parents=True, exist_ok=True)
         o.write_text(json.dumps(res, indent=1, default=str))
-    _print(res)
+    _print({k: v for k, v in res.items() if k != "hits"})
     return 0
+
+
+# what a probe JSON bar must share with the new probe for the INCLUDE r1 comparison to mean anything (docs 15.41)
+BAR_MATCH_KEYS = ("profile", "split", "per_signer", "data_seed", "link", "include_query_digest", "gallery_digest")
 
 
 def _exclude_sources(args) -> tuple[str, ...]:
@@ -859,6 +924,15 @@ def cmd_train_oneshot(paths: IslPaths, args) -> int:
     from app.isl.evaluation.runners import heldout_set
     from app.isl.training.train_encoder import train_encoder
 
+    if getattr(args, "ckpt", None):
+        print("train-oneshot: --ckpt is not used (oneshot writes <work>/oneshot/foldK/encoder.pt); use a --tag "
+              "scratch run of the driver or SLR_ISL_WORKDIR for another folder", file=sys.stderr)
+        return 2
+    try:
+        opts = _encoder_options(args)
+    except ValueError as e:
+        print(f"train-oneshot: {e}", file=sys.stderr)
+        return 2
     profile, data, fcfg, work = _model_ctx(paths, args)
     one = paths.splits / "oneshot_concepts.json"
     if not one.exists():
@@ -881,7 +955,7 @@ def cmd_train_oneshot(paths: IslPaths, args) -> int:
                             progress=lambda f, m, _k=k: _log(f"  oneshot fold{_k} {m}"),
                             init_from=_init_path(args, work), use_extra=args.all_sources, resume=args.resume,
                             max_minutes=args.max_minutes, version=f"isl-enc-1-oneshot{k}",
-                            exclude_sources=_exclude_sources(args), **_encoder_options(args))
+                            exclude_sources=_exclude_sources(args), **opts)
         out[k] = {**res, "held_out": len(fd["held_out_concepts"]), "held_out_expanded": len(held)}
         if not res.get("finished", True):
             code = EX_PARTIAL
@@ -1433,7 +1507,7 @@ def _model_args(sp, train: bool = False) -> None:
         sp.add_argument("--init", default=None, help="encoder warm start: a checkpoint, 'auto' (pretrained) or 'none'")
         sp.add_argument("--min-signers", type=int, default=2, help="classifier: signer groups a class needs")
         sp.add_argument("--ckpt", help="classifier / train-encoder: checkpoint path (default <work>/classifier.pt, "
-                                        "<work>/encoder.pt)")
+                                        "<work>/encoder.pt); only these two use it, train-oneshot refuses it")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1572,6 +1646,8 @@ def build_parser() -> argparse.ArgumentParser:
     ep.add_argument("--work", help="work folder whose link_settings.json links the data (default: the profile's)")
     ep.add_argument("--per-signer", type=int, default=300, help="ISL500 validation clips per signer (0 = all)")
     ep.add_argument("--bar", help="a probe JSON (its include_r1) or a number: warn when INCLUDE r1 is below it")
+    ep.add_argument("--bar-margin", type=float, default=0.02,
+                    help="bar.clears = INCLUDE r1 >= bar + this (default 0.02, about one clip standard error)")
     pdd = sub.add_parser("pretrain-dedup")
     _model_args(pdd)
     pdd.add_argument("--max-chunks", type=int, default=0, help="smoke: check at most N Sign Library chunks")

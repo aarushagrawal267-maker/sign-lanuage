@@ -80,6 +80,9 @@
 #   ENC_VAL=dictionary|mixed   epoch selection on INCLUDE / ISL500 / Mendeley -> ISLRTC rows (--val-protocol)
 #   Full research runs also default to ENC_STEPS=800 for the encoder AND oneshot (ONESHOT_STEPS overrides oneshot
 #   alone); commercial-safe keeps 400 (encoder) and 300 (oneshot).
+#   ENC_BAR=<probe.json>   after the encoder step, `cli encoder-probe --bar <probe.json>` measures the new encoder on
+#     the dictionary protocol into <work>/eval/encoder_probe.json (a warning in the log when below the bar or not
+#     comparable; never fails the step) and evaluate copies it into report.json (docs 15.41). Default: off.
 # EVAL_COMPARE_TO=<report.json>: the evaluate step runs `evaluate --all --compare-to <report.json>` (E1b and E4 like
 # for like against that report, e.g. artifacts/isl/commercial-safe/eval/report.json; docs 15.27, 15.28, 15.31).
 # One profile per run (refused with --profile both); a missing file is refused before anything runs (exit 2).
@@ -270,6 +273,11 @@ EB_ARG=""
 [[ -n "$ENC_SW" ]] && EB_ARG="$EB_ARG --source-weights $ENC_SW"
 [[ "$ENC_VP" != mixed ]] && EB_ARG="$EB_ARG --val-protocol $ENC_VP"
 ENC_SETTINGS="bridge_p=$ENC_BP source_weights=${ENC_SW:-default} val=$ENC_VP"
+ENC_BAR_FILE=""  # absolute now: the steps run from backend/ (docs 15.41)
+if [[ -n "${ENC_BAR:-}" ]]; then
+  ENC_BAR_FILE="$(realpath -m -- "$ENC_BAR")"
+  [[ -f "$ENC_BAR_FILE" ]] || { echo "ENC_BAR: $ENC_BAR_FILE is not a file (an encoder-probe --out JSON)" >&2; exit 2; }
+fi
 WSLP_TWINS="${INDEX_WSLP_TWINS:-$TW_DEFAULT}"
 # linker aliases (docs 15.34): research on, commercial-safe off; only the link step passes it (later steps read the
 # work folder's link_settings.json; the start line prints the folder's real state when link is not run, docs 15.35)
@@ -306,8 +314,17 @@ step_settings() {
 }
 # a skipped classifier / cv step whose stamp has other settings than this run's (e.g. a stamp from before the quota):
 # kept as it is (never refused), but said, so a plain resume does not silently keep an old classifier (docs 15.39)
+# encoder / oneshot (docs 15.41): warned when this run asks for the bridge sampler, the dictionary validation or other
+# source weights, or the stamp has such settings, and they differ; a stamp written before 15.40 (no bridge_p) matches
+# the default settings, as before
 stamp_warn() {
-  case "$1" in classifier|cv) ;; *) return 0 ;; esac
+  case "$1" in
+    classifier|cv) ;;
+    encoder|oneshot)
+      [[ "$ENC_BP" == 0 && -z "$ENC_SW" && "$ENC_VP" == mixed \
+         && "$(cat "$STAMPS/$1.done" 2>/dev/null)" != *"bridge_p="* ]] && return 0 ;;
+    *) return 0 ;;
+  esac
   local want
   want="$(step_settings "$1")"
   [[ "$(cat "$STAMPS/$1.done" 2>/dev/null)" == *"$want" ]] && return 0
@@ -347,6 +364,22 @@ train() {
     n=$((n + 1)); [[ $n -ge $MAX_PARTS ]] && return 75
     log "  part $n done, continuing"
   done
+}
+
+# ENC_BAR (docs 15.41): the new encoder on the dictionary protocol against a previous probe; never fails the step
+enc_probe() {
+  local f="$WORK/eval/encoder_probe.json"
+  mkdir -p "$WORK/eval"
+  if cli encoder-probe $COMMON $CAP --encoder "$WORK/encoder.pt" --work "$WORK" --bar "$ENC_BAR_FILE" --out "$f"; then
+    if grep -q '"warning_bar' "$f"; then
+      log "warning: encoder probe below the bar or not comparable with it (see $f)"
+    else
+      log "  encoder probe: at or above the bar ($f)"
+    fi
+  else
+    log "warning: encoder-probe failed (the encoder is kept; see the log)"
+  fi
+  return 0
 }
 
 state_files() {  # training state files of a step that exist (removed by --from / --force)
@@ -430,7 +463,10 @@ run_step() {
     bench) cli bench --threads "$THREADS" --steps $([[ $SMOKE == 1 ]] && echo 1 || echo 5) --hidden-sizes ${HIDDEN:-192} ;;
     pretrain_dedup) cli pretrain-dedup $COMMON --all-sources $CAP $PDD ;;  # Sign Library copies / eval-clip matches
     pretrain) train pretrain $COMMON $CAP $PRE ;;
-    encoder) train train-encoder $COMMON --all-sources $CAP $ENC --init auto $XS_ARG $EB_ARG ;;
+    encoder)
+      rm -f "$WORK/eval/encoder_probe.json"  # a probe of the old encoder (docs 15.41)
+      train train-encoder $COMMON --all-sources $CAP $ENC --init auto $XS_ARG $EB_ARG || return $?
+      [[ -z "$ENC_BAR_FILE" ]] || enc_probe ;;
     oneshot) train train-oneshot $COMMON --all-sources $CAP $ONE --init auto $XS_ARG $EB_ARG ;;
     classifier) train train-classifier $COMMON --all-sources $CAP $CLS $DG_ARG $CQ_ARG ;;
     cv)  # classifiers for the other folds of the primary split: E1b mean / spread and a signer-grouped interval
@@ -476,6 +512,7 @@ if [[ $DRY_RUN == 1 ]]; then
   echo "linker: aliases and WSLP number stripping=$LINK_ALIASES (link step only)"
   echo "classifier: source quota=$CLS_QUOTA, selection=$CLS_SEL (classifier and cv), settings: $CLS"
   echo "encoder: $ENC_SETTINGS (encoder and oneshot), settings: $ENC; oneshot: $ONE"
+  [[ -n "$ENC_BAR_FILE" ]] && echo "encoder probe after the encoder step: bar $ENC_BAR_FILE -> $WORK/eval/encoder_probe.json"
   [[ -n "$UNTIL" ]] && echo "until: $UNTIL (later steps are not run)"
   echo "variant links: VARIANT_LINKS=$VARIANT_LINKS, $WORK/variant_links.json: $VL_FILE (link step only)"
 fi
