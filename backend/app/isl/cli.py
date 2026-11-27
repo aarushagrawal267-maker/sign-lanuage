@@ -912,7 +912,8 @@ def cmd_evaluate(paths: IslPaths, args) -> int:
 
         outs = [Path(args.out) / "eval"] if args.out else [pack_dir(profile) / "eval"]
         doc = evaluate_all(work, data, fcfg, profile=profile, smoke=args.smoke, vocab_path=_vocab_path(args),
-                           paths=paths, out_dirs=outs, progress=lambda m: _log(f"  evaluate {m}"))
+                           paths=paths, out_dirs=outs, progress=lambda m: _log(f"  evaluate {m}"),
+                           compare_to=Path(args.compare_to) if getattr(args, "compare_to", None) else None)
         _print({"report": [str(work / "eval" / "report.json")] + [str(o / "report.json") for o in outs],
                 **{k: {"n": v.get("n"), "metrics": v.get("metrics"), "run": v.get("run", True)}
                    for k, v in doc["protocols"].items()}})
@@ -1189,6 +1190,10 @@ def build_parser() -> argparse.ArgumentParser:
             sp2.add_argument("--part", default="test", choices=["val", "test"])
             sp2.add_argument("--all", action="store_true",
                              help="every protocol (E1a-E8) -> <work>/eval and <pack>/eval report.json + report.md")
+            sp2.add_argument("--compare-to", dest="compare_to", default=None,
+                             help="with --all: another report.json (e.g. artifacts/isl/commercial-safe/eval/"
+                                  "report.json); E1b also reports top-1/top-5 on its class set and on the clips both "
+                                  "evaluated (docs 15.27)")
     hi = sub.add_parser("hindi")
     hi.add_argument("--translate", action="store_true", help="run IndicTrans2 on CPU for concepts not in the cache")
     hi.add_argument("--limit", type=int, default=0, help="translate at most N new inputs (0 = all)")

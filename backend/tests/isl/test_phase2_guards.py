@@ -441,8 +441,10 @@ def test_fit_fusion_chooses_user_mode_on_validation_e4(monkeypatch):
     def fake_e4(rec, clips, ks, params, cache, **kw):
         calls.append(params.user_cls_mode)
         good = params.user_cls_mode == "neutral"
+        hits = [1.0] * (36 if good else 24) + [0.0] * (4 if good else 16)  # paired: neutral adds 12 takes
         return {"run": True, "by_k": {"k3": {"n": 40, "n_groups": 3, "top1_with_enrolment": 0.9 if good else 0.6,
-                                             "gain": 0.3, "user_sign_false_accept_rate": 0.02, "n_other_words": 50}}}
+                                             "gain": 0.3, "user_sign_false_accept_rate": 0.02, "n_other_words": 50,
+                                             "_with": hits}}}
 
     import app.isl.evaluation.runners as runners
 

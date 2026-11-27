@@ -236,13 +236,23 @@ def test_evaluate_all_writes_report_with_rates_and_groups(phase2, tmp_path):
         m = p[k]["metrics"]
         assert m["top1"] is not None and m["not_sure_rate"] is not None and m["wrong_accept_rate"] is not None
     assert p["E1c"]["n_groups"] >= 1 and "signer" in p["E1c"]["label"]
+    # which clips and classes E1b measured (docs 15.27): a later report can compare on the same clips
+    e1 = p["E1b"]
+    assert len(e1["clip_ids"]) == e1["n"] == len(e1["per_clip"]["hit1"]) and e1["split"] == data.split["name"]
+    assert set(e1["class_ids"]) >= {c.concept_id for c in data.include_part("test")} and "class_ids" not in p["E1c"]
     assert set(p["E3"]["policies"]) == set(POLICIES)
     # E2: only fold 0 has an encoder; queries = val/test INCLUDE clips of the held-out concept (never pre-trained on)
     assert p["E2"]["run"] and len(p["E2"]["folds"]) == 1 and p["E2"]["n"] == 2
     f0 = p["E2"]["folds"][0]
     assert f0["full"]["metrics"]["not_sure_rate"] is not None and "seen_class" in f0
-    assert p["E4"]["run"] and p["E4"]["by_k"]["k1"]["n"] > 0
-    assert p["E4"]["by_k"]["k1"]["user_sign_false_accept_rate"] is not None
+    # E4 headline = INCLUDE test signers only (one take per word in this world: not run); the pooled population
+    # with the ISL500-like signers runs (docs 15.27)
+    assert "INCLUDE" in p["E4"]["population"] and p["E4"]["run"] is False and "repeated takes" in p["E4"]["reason"]
+    e4 = p["E4"]["all_sources"]
+    assert e4["run"] and e4["by_k"]["k1"]["n"] > 0
+    assert e4["by_k"]["k1"]["user_sign_false_accept_rate"] is not None
+    assert e4["by_k"]["k1"]["user_sign_false_accept_rate_threshold_rule"] is not None
+    assert "FALSE ACCEPT" in (out / "report.md").read_text()
     assert p["E1a"]["run"] is False and p["E5"]["run"] is False
     assert "| E2 |" in (out / "report.md").read_text()
     # E2 says that unlabelled pre-training saw the dictionary clips it retrieves against
@@ -422,3 +432,187 @@ def test_e3_and_e4_are_refused_with_a_classifier_from_another_split(phase2, tmp_
         assert "some-other-split" in p[k]["leakage"]
     assert doc["leakage_guards"]["classifier_refused"]
     assert "REFUSED" in (work / "eval" / "report.md").read_text()
+
+
+def _repeat_takes(root: Path, users: int = 3, takes: int = 5) -> list[Clip]:
+    """Held-out signers with ``takes`` repeated takes of every CORE word (the app enrols 3 to 5)."""
+    d = root / "e4_takes"
+    d.mkdir(parents=True, exist_ok=True)
+    out = []
+    for ci, w in enumerate(CORE):
+        for u in range(users):
+            for t in range(takes):
+                raw = make_sequence(ci, signer=300 + u, n_frames=40, fps=12.0, n_classes=6,
+                                    rng=np.random.default_rng(7000 + 100 * ci + 10 * u + t))
+                p = d / f"{w}_{u}_{t}.npz"
+                raw.save(p)
+                out.append(Clip(f"e4/user{u}/{w}_{t}", "isl500", w, f"isl.{w}", None, None, p, group=f"e4-user{u}",
+                                quality={"n_frames": 40}))
+    return out
+
+
+@pytest.mark.parametrize("gated", [True, False])
+def test_e4_matches_the_recognizer_clip_for_clip(phase2, tmp_path, gated):
+    """QA plan 0.5 (docs 15.27): E4 takes the app's decisions. Every E4 test take, enrolled into a real MySignsStore
+    with the same takes, gets the same decision and the same top word from ``IslRecognizer.recognize`` (crop
+    agreement on the override, confirm-only demotion, a user sign on top without the override is a suggestion)."""
+    from app.isl.evaluation.runners import e4_my_signs
+    from app.isl.models.fusion import USER_PREFIX
+    from app.isl.mysigns.store import MySign, MySignsStore
+    from app.isl.training.common import ISL_FEATURES, engine_crops
+    from app.isl.training.pipeline import load_recognizer
+
+    w, work = phase2["world"], phase2["work"]
+    rec = load_recognizer(work, ISL_FEATURES, w["vocab"], profile="research")
+    # a user sign wins the override whenever it beats its theta and agrees across crops (the toy dictionary is
+    # otherwise too close to the held-out signers' takes for the user-sign rules to show up)
+    rec.fusion = rec.fusion.with_(user_margin=-1.0, user_bonus=3.0)
+    if not gated:  # in-code parameters: no certification gate, so the override can really accept
+        rec.fusion = rec.fusion.with_(certification=None)
+    clips = _repeat_takes(tmp_path)
+    by_id = {c.clip_id: c for c in clips}
+    trace: list = []
+    res = e4_my_signs(rec, clips, ks=(3,), trace=trace)
+    assert res["run"] and res["ks"] == [3] and trace and res["by_k"]["k3"]["n"] > 0
+    stores: dict = {}
+    seen = {"decisions": set(), "user_top": 0}
+    for i, t in enumerate(trace):
+        key = (t["k"], t["group"])
+        if key not in stores:  # one store per (k, signer): the words that signer enrolled, with those takes
+            st = MySignsStore(tmp_path / f"store{i}", "isl")
+            names = {}
+            for word, ids in sorted(t["enrolment"].items()):
+                s = st.save_sign(MySign(sign_id=f"00000000-0000-0000-0000-{len(names):012d}", pack="isl",
+                                        concept_id=None, text_en=word), [by_id[x].load() for x in ids])
+                names[f"{USER_PREFIX}{s.sign_id}"] = f"{USER_PREFIX}{word}"
+            stores[key] = (st, names)
+        st, names = stores[key]
+        rec.my_signs = st
+        r = rec.recognize(engine_crops(by_id[t["clip_id"]].load()), policy="balanced")
+        top = r.candidates[0].concept_id if r.candidates else ""
+        assert (r.decision, names.get(top, top)) == (t["decision"], t["top"]), t
+        seen["decisions"].add(t["decision"])
+        seen["user_top"] += t["top"].startswith(USER_PREFIX)
+    rec.my_signs = None
+    assert seen["user_top"] > 0  # the user-sign rules were exercised
+    if gated:  # the phase-2 world's fusion.json is a pack record: confirm-only policies never accept
+        assert rec.fusion.gated and (rec.fusion.policy_rule("balanced") == "certified" or "accept" not in seen["decisions"])
+        k3 = res["by_k"]["k3"]
+        assert k3["user_sign_false_accept_rate_threshold_rule"] >= k3["user_sign_false_accept_rate"]
+    else:
+        assert "accept" in seen["decisions"]
+
+
+def test_user_sign_decision_crop_agreement_and_demotions():
+    """The rules E4 used to skip (QA plan 0.5): the override needs the user sign to be the best one in >= 2 of 3
+    crops; a user sign on top of the fused list without the override is only a suggestion; a confirm-only policy
+    turns the override into a suggestion."""
+    from app.isl.models.fusion import USER_PREFIX
+    from app.isl.recognizer import user_sign_decision
+
+    ids = [f"{USER_PREFIX}a", f"{USER_PREFIX}b"]
+    ret = np.full((3, 2), 0.1, np.float32)
+    p = FusionParams(accept={"strict": 0.3, "balanced": 0.3, "lenient": 0.3}, margin=0.0, user_margin=0.05,
+                     user_bonus=5.0)
+
+    def run(user, params=p, theta=0.7):
+        inp = FusionInputs(ret=ret, ret_ids=["isl.x", "isl.y"], user=np.asarray(user, np.float32), user_ids=ids)
+        r = fuse(inp, params)
+        return user_sign_decision(r, inp, 3, params, "balanced", lambda k: theta)[:3]
+
+    # a: best by mean (0.863) but the best user sign in only 1 of 3 crops -> no override (the old E4 accepted it)
+    dec, why, keys = run([[0.99, 0.5], [0.80, 0.85], [0.80, 0.85]])
+    assert keys[0] == ids[0] and dec != "accept" and why != "my_signs"
+    # every crop agrees, the fused rule accepts a, but a is below its own theta: no override -> only a suggestion
+    dec, why, keys = run([[0.99, 0.5], [0.90, 0.5], [0.90, 0.5]], theta=0.999)
+    assert keys[0] == ids[0] and (dec, why) == ("suggest", "low_confidence")
+    # a in every crop -> override
+    dec, why, keys = run([[0.99, 0.5], [0.90, 0.85], [0.90, 0.85]])
+    assert (dec, why, keys[0]) == ("accept", "my_signs", ids[0])
+    # the same under an uncertified pack record: the top "did you mean", never an accept
+    dec, why, keys = run([[0.99, 0.5], [0.90, 0.85], [0.90, 0.85]], p.with_(certification={}))
+    assert (dec, why, keys[0]) == ("suggest", "confirm_only", ids[0])
+
+
+def test_measuring_recogniser_sees_the_pack_vocabulary_with_extra_concepts(tmp_path):
+    """QA plan 0.5 (docs 15.27): concepts only other sources know (the link step's extra_concepts.jsonl) are appended
+    to the pack's vocabulary by build_pack; fit-fusion and evaluation must load the same vocabulary (prior, index)."""
+    from app.isl.training.common import ISL_FEATURES
+    from app.isl.training.pipeline import extra_concept_rows, load_recognizer
+
+    vocab = tmp_path / "vocabulary.jsonl"
+    vocab.write_text("".join(json.dumps({"concept_id": c, "headword": c, "kind": "word", "in_classifier": True}) + "\n"
+                             for c in ("isl.a", "isl.b")))
+    work = tmp_path / "work"
+    work.mkdir()
+    rec = load_recognizer(work, ISL_FEATURES, vocab)  # no extra_concepts.jsonl: unchanged
+    assert len(rec.vocab) == 2
+    (work / "extra_concepts.jsonl").write_text(
+        json.dumps({"concept_id": "isl.b", "headword": "b", "kind": "word"}) + "\n"  # already known: skipped
+        + "not json\n"
+        + json.dumps({"concept_id": "isl.new-1", "headword": "new(1)", "kind": "word", "in_classifier": False}) + "\n")
+    assert [r["concept_id"] for r in extra_concept_rows(work, {"isl.a", "isl.b"})] == ["isl.new-1"]
+    rec = load_recognizer(work, ISL_FEATURES, vocab)
+    assert len(rec.vocab) == 3 and rec.vocab.index_of("isl.new-1") == 2
+    assert rec.prior["isl.new-1"] == 0.5  # was missing (0) while measuring, 0.5 in the app
+    rec = load_recognizer(work, ISL_FEATURES, vocab)
+    assert len(rec.vocab) == 3  # nothing written to disk: loading twice does not append twice
+    assert len(vocab.read_text().splitlines()) == 2
+
+
+def test_e1b_like_for_like_against_a_reference_report(phase2, tmp_path):
+    """QA plan 0.5 / critic 2 (docs 15.27): E1b of two packs differ in classes and clips (research 852 clips / 168
+    classes vs commercial-safe 792 / 160). With a reference report, E1b also reports top-1 / top-5 masked to the
+    reference's classes and on the clips both evaluated, with the reference's own numbers on those clips."""
+    import shutil
+
+    from app.isl.evaluation.runners import _like_for_like_lines, e1_closed_set, load_e1_reference
+    from app.isl.training.common import ISL_FEATURES
+    from app.isl.training.pipeline import load_recognizer
+
+    w, data, work = phase2["world"], phase2["data"], phase2["work"]
+    rec = load_recognizer(work, ISL_FEATURES, w["vocab"], profile="research")
+    test = data.include_part("test")
+    split = data.split["name"]
+    own = e1_closed_set(rec, test, "E1b", split, "primary")
+    keep_cls = sorted(own["class_ids"])[:2]
+    keep_clips = own["clip_ids"][1:]  # the reference evaluated all but the first clip
+    ref_hits = "".join("1" if i % 2 else "0" for i in range(len(keep_clips)))
+    ref_doc = {"profile": "commercial-safe", "leakage_guards": {"split": split},
+               "protocols": {"E1b": {"n": len(keep_clips), "split": split, "metrics": {"top1": 0.5, "top5": 0.9},
+                                     "clip_ids": keep_clips, "class_ids": keep_cls,
+                                     "per_clip": {"hit1": ref_hits, "hit5": "1" * len(keep_clips)}}}}
+    rp = tmp_path / "ref" / "eval" / "report.json"
+    rp.parent.mkdir(parents=True)
+    rp.write_text(json.dumps(ref_doc))
+    r = e1_closed_set(rec, test, "E1b", split, "primary", reference=load_e1_reference(rp))
+    lf = r["like_for_like"]
+    assert lf["run"] and lf["reference"]["profile"] == "commercial-safe"
+    truth = {c.clip_id: c.concept_id for c in test}
+    in_cls = [c for c in own["clip_ids"] if truth[c] in keep_cls]
+    assert lf["reference_classes"]["n"] == len(in_cls) and lf["reference_classes"]["n_shared_classes"] == 2
+    own_hit = dict(zip(own["clip_ids"], own["per_clip"]["hit1"]))
+    # masking can only help: a clip right among all classes is right among the reference's classes
+    assert lf["reference_classes"]["top1"] >= np.mean([own_hit[c] == "1" for c in in_cls])
+    cc = lf["common_clips"]
+    assert cc["n"] == len(keep_clips) and abs(cc["reference_top1"] - ref_hits.count("1") / len(keep_clips)) < 1e-9
+    assert abs(cc["top1"] - np.mean([own_hit[c] == "1" for c in keep_clips])) < 1e-9
+    assert cc["discordant_top1"]["only_this"] + cc["discordant_top1"]["only_reference"] <= cc["n"]
+    both = lf["reference_classes_common_clips"]
+    assert both["n"] == len([c for c in keep_clips if truth[c] in keep_cls]) and "reference_top1" in both
+    assert any("like for like" in x for x in _like_for_like_lines(lf))
+    # another split: no comparison
+    ref_doc["protocols"]["E1b"]["split"] = "other-split"
+    rp.write_text(json.dumps(ref_doc))
+    lf = e1_closed_set(rec, test, "E1b", split, "primary", reference=load_e1_reference(rp))["like_for_like"]
+    assert lf["run"] is False and "other-split" in lf["reason"]
+    # a report written before docs 15.27 (no clip / class ids): class ids from the classifier next to it
+    old = {"profile": "commercial-safe", "leakage_guards": {"split": split},
+           "protocols": {"E1b": {"n": 5, "metrics": {"top1": 0.7}}}}
+    rp.write_text(json.dumps(old))
+    shutil.copy2(work / "classifier.pt", rp.parent.parent / "classifier.pt")
+    ref = load_e1_reference(rp)
+    assert ref["class_ids"] == own["class_ids"] and any("no clip ids" in n for n in ref["notes"])
+    lf = e1_closed_set(rec, test, "E1b", split, "primary", reference=ref)["like_for_like"]
+    assert lf["run"] and lf["reference_classes"]["top1"] == own["metrics"]["top1"]  # same classes: nothing masked
+    assert lf["common_clips"]["run"] is False

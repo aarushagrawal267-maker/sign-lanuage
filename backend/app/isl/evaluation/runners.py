@@ -13,8 +13,9 @@ E2   open-vocabulary one-shot: per fold, an encoder trained with the fold's conc
      a headword / synonym with them) removed from **all** supervised training; INCLUDE clips of those concepts
      queried against the ISLRTC dictionary; decision thresholds fitted on seen-class validation queries only
 E3   fused system (classifier + retrieval + fusion) with accept / suggest / abstain per policy
-E4   My signs few-shot: enrol k takes of a test signer's word, test on their other takes; false accepts of user
-     signs on words they did not enrol
+E4   My signs few-shot: enrol k (3, 5) takes of a test signer's word, test on their other takes with the app's own
+     decision rule; false accepts of user signs on words they did not enrol. Headline: INCLUDE test signers only
+     (comparable across profiles); ``all_sources`` adds the other sources' held-out signers (docs 15.27)
 E5   fingerspelling, leave-one-group-out over signers and Mendeley age groups (computed with the letter model)
 E6   latency per segment
 E7   ASL regression: the bundled ASL model's results file is unchanged
@@ -172,7 +173,105 @@ def refused_entry(label: str, why: str, kind: str | None = None) -> dict:
             "reason": f"refused: {why}"}
 
 
-def e1_closed_set(rec, clips, label: str, split_name: str, kind: str) -> dict:
+def _bits(x) -> str:
+    """0/1 per clip as one compact string (report.json stays small and readable)."""
+    return "".join("1" if v else "0" for v in np.asarray(x, bool))
+
+
+def load_e1_reference(path: Path) -> dict:
+    """The E1b of another evaluation report (``--compare-to``, docs 15.27): its split, evaluated clip ids, per-clip
+    top-1 / top-5 hits and the classifier's class ids. Reports written before 15.27 have none of these: the class
+    ids then come from the classifier checkpoint next to the report (``<report dir>/../classifier.pt``, the layout of
+    a work folder and of a pack) and the clip-level rows are not possible (``reason`` says so)."""
+    path = Path(path)
+    doc = json.loads(path.read_text())
+    e1 = (doc.get("protocols") or {}).get("E1b") or {}
+    ref = {"path": str(path), "profile": doc.get("profile"), "split": e1.get("split")
+           or (doc.get("leakage_guards") or {}).get("split"), "n": e1.get("n"),
+           "top1": (e1.get("metrics") or {}).get("top1"), "top5": (e1.get("metrics") or {}).get("top5"),
+           "clip_ids": e1.get("clip_ids"), "hit1": (e1.get("per_clip") or {}).get("hit1"),
+           "hit5": (e1.get("per_clip") or {}).get("hit5"), "class_ids": e1.get("class_ids"), "notes": []}
+    if not ref["class_ids"]:
+        ck = path.parent.parent / "classifier.pt"
+        if ck.exists():
+            import torch
+
+            meta = (torch.load(ck, map_location="cpu", weights_only=False) or {}).get("meta") or {}
+            ref["class_ids"] = list(meta.get("class_names") or []) or None
+            ref["notes"].append(f"class ids read from {ck} (the report has none: written before docs 15.27)")
+        else:
+            ref["notes"].append("the report has no class ids and there is no classifier.pt next to it")
+    if not ref["clip_ids"]:
+        ref["notes"].append("the report has no clip ids (written before docs 15.27): re-run evaluate on the reference "
+                            "for the common-clip rows")
+    return ref
+
+
+def e1_like_for_like(P: np.ndarray, y: np.ndarray, ids: list[str], used, hit: np.ndarray, top5: np.ndarray,
+                     split_name: str, ref: dict) -> dict:
+    """E1b against a reference report (docs 15.27): top-1 / top-5 of THIS classifier restricted to the reference's
+    class set (scores of other classes masked, only clips whose word is a reference class) and to the clip ids both
+    reports evaluated, with the reference's own numbers on the same clips. No alias scoring: strict labels only."""
+    out = {"reference": {k: ref.get(k) for k in ("path", "profile", "split", "n", "top1", "top5")},
+           "notes": list(ref.get("notes") or []), "rule": "strict labels; masked = the reference's classes only"}
+    if ref.get("split") and ref["split"] != split_name:
+        out["run"] = False
+        out["reason"] = f"the reference was evaluated on split {ref['split']!r}, this run on {split_name!r}"
+        return out
+    out["run"] = True
+    clip_ids = [c.clip_id for c in used]
+
+    def rates(sel, hit_, top5_):
+        sel = np.asarray(sel, bool)
+        if not sel.any():
+            return {"n": 0, "top1": None, "top5": None}
+        return {"n": int(sel.sum()), "top1": float(hit_[sel].mean()), "top5": float(top5_[sel].mean())}
+
+    rc = set(ref.get("class_ids") or [])
+    m_hit = m_top5 = in_ref = None
+    if rc:
+        keep = np.array([c in rc for c in ids], bool)
+        in_ref = np.array([ids[t] in rc for t in y], bool)
+        Pm = np.where(keep[None, :], P, -np.inf)
+        order = np.argsort(-Pm, axis=1)
+        m_hit = (order[:, 0] == y).astype(float)
+        m_top5 = np.array([y[j] in order[j, :5] for j in range(len(y))], float)
+        out["reference_classes"] = {**rates(in_ref, m_hit, m_top5), "n_reference_classes": len(rc),
+                                    "n_shared_classes": int(keep.sum())}
+    else:
+        out["reference_classes"] = {"run": False, "reason": "no reference class ids"}
+    rid = ref.get("clip_ids") or []
+    if rid:
+        pos = {c: i for i, c in enumerate(rid)}
+        common = np.array([c in pos for c in clip_ids], bool)
+        row = rates(common, hit, top5)
+        h1, h5 = ref.get("hit1") or "", ref.get("hit5") or ""
+        ref_idx = [pos[c] for c, k in zip(clip_ids, common) if k]
+        if len(h1) == len(rid):
+            r1 = np.array([h1[i] == "1" for i in ref_idx], bool)
+            own = hit[common] > 0.5
+            row["reference_top1"] = float(r1.mean()) if len(r1) else None
+            row["discordant_top1"] = {"only_this": int((own & ~r1).sum()), "only_reference": int((~own & r1).sum())}
+        if len(h5) == len(rid):
+            r5 = np.array([h5[i] == "1" for i in ref_idx], bool)
+            row["reference_top5"] = float(r5.mean()) if len(r5) else None
+        out["common_clips"] = row
+        if m_hit is not None:
+            sel = common & in_ref
+            row2 = rates(sel, m_hit, m_top5)
+            if len(h1) == len(rid):
+                r1 = np.array([h1[pos[c]] == "1" for c, k in zip(clip_ids, sel) if k], bool)
+                row2["reference_top1"] = float(r1.mean()) if len(r1) else None
+            if len(h5) == len(rid):
+                r5 = np.array([h5[pos[c]] == "1" for c, k in zip(clip_ids, sel) if k], bool)
+                row2["reference_top5"] = float(r5.mean()) if len(r5) else None
+            out["reference_classes_common_clips"] = row2
+    else:
+        out["common_clips"] = {"run": False, "reason": "the reference report has no clip ids"}
+    return out
+
+
+def e1_closed_set(rec, clips, label: str, split_name: str, kind: str, reference: dict | None = None) -> dict:
     """Classifier alone on ``clips``. Decision columns: the classifier-alone rule of the app's sliding mode, with the
     classifier's own validation temperature and threshold, NOT the fused thresholds of ``fusion.json`` (another
     probability scale: the commercial-safe report of 2026-11-26 compared raw classifier probabilities with the fused
@@ -227,6 +326,18 @@ def e1_closed_set(rec, clips, label: str, split_name: str, kind: str) -> dict:
                 + ("" if thr_fitted else " (checkpoint has none: Predictor default)"))
     top5 = np.array([y[j] in np.argsort(-P[j])[:5] for j in range(len(y))], float)
     groups = _groups(used)
+    import hashlib as _h
+
+    # which clips and classes these numbers are on (docs 15.27): reports of two packs can then be compared on the
+    # same clips (``--compare-to``); the class list only for the main classifier (the reference of such a comparison)
+    record = {"split": split_name, "clip_ids": [c.clip_id for c in used],
+              "class_ids_sha256": _h.sha256("\n".join(ids).encode()).hexdigest()[:16]}
+    if kind in ("primary", "extra_signers"):
+        record["per_clip"] = {"hit1": _bits(hit > 0.5), "hit5": _bits(top5 > 0.5)}
+    if kind == "primary":
+        record["class_ids"] = ids
+    if reference is not None:
+        record["like_for_like"] = e1_like_for_like(P, y, ids, used, hit, top5, split_name, reference)
     per_cat = defaultdict(list)
     for c, h in zip(used, hit):
         per_cat[c.category or "other"].append(h)
@@ -258,7 +369,7 @@ def e1_closed_set(rec, clips, label: str, split_name: str, kind: str) -> dict:
             f"{interval_reason(hit.tolist(), groups)} in this test part: a signer-level interval needs more held-out "
             "signers (the cross-validation folds pool them)",
             "_hits": hit.tolist(), "_groups": groups,
-            "per_category_top1": {k: round(float(np.mean(v)), 4) for k, v in sorted(per_cat.items())}}
+            "per_category_top1": {k: round(float(np.mean(v)), 4) for k, v in sorted(per_cat.items())}, **record}
 
 
 def _e1_sliding_replay(rec, clips, thresholds: dict, kind: str) -> dict | None:
@@ -500,14 +611,34 @@ def e2_pool(folds: list[dict]) -> dict:
 
 # --------------------------------------------------------------------------------------------- E4
 
-def e4_my_signs(rec, clips, ks=(1, 3, 5), seed: int = 0, max_groups: int = 40, params: FusionParams | None = None,
-                cache: dict | None = None) -> dict:
+E4_KS = (3, 5)  # enrolled takes: the app enrols 3 to 5 (MySignsStore.add min_takes / max_takes, docs 15.27)
+E4_POLICY = "balanced"  # the app's default policy
+
+
+def e4_my_signs(rec, clips, ks=E4_KS, seed: int = 0, max_groups: int = 40, params: FusionParams | None = None,
+                cache: dict | None = None, policy: str = E4_POLICY, trace: list | None = None,
+                keep_hits: bool = False) -> dict:
     """Few-shot enrolment on held-out signers' own takes (no store or disk involved). ``params`` overrides the
     recogniser's fusion parameters (fit-fusion compares the user-sign classifier modes with it); ``cache`` shares
-    the per-clip evidence between such calls."""
+    the per-clip evidence between such calls.
+
+    The decision is the app's (docs 15.27): enrolment vectors are whole-take embeddings as ``MySignsStore`` makes
+    them, theta is ``theta_from_embeddings`` of those vectors (the store's rule), and every test take goes through
+    ``recognizer.user_sign_decision``, the function ``IslRecognizer.recognize`` uses (crop agreement on the
+    override, a confirm-only policy turns it into a suggestion, a user sign on top without the override is only a
+    suggestion). Two false-accept rates on the words a signer did NOT enrol: ``user_sign_false_accept_rate`` = what
+    the app accepts by itself (0 under a confirm-only policy), ``user_sign_false_accept_rate_threshold_rule`` = the
+    same rules without the certification gate (the user sign the app would put first and ask to confirm; with an
+    ungated ``params`` both are equal). ``trace``: a list that gets one dict per test take (tests).
+    ``keep_hits``: keep the per-take hit lists (``_with``, ``_fa``, ``_fa_threshold``) for paired comparisons."""
     from app.isl.models.encoder import FeatureStatsEmbedder
+    from app.isl.mysigns.store import theta_from_embeddings
+    from app.isl.recognizer import user_sign_decision
 
     fp = params or rec.fusion
+    ungated = fp.with_(certification=None) if fp.gated else None
+    is_ov = getattr(rec, "is_open_vocabulary", None)
+    has_global = bool(getattr(rec, "has_global_model", True))
 
     emb = rec.encoder if rec.encoder is not None else FeatureStatsEmbedder(rec.feature_config)
     by = defaultdict(lambda: defaultdict(list))
@@ -527,7 +658,7 @@ def e4_my_signs(rec, clips, ks=(1, 3, 5), seed: int = 0, max_groups: int = 40, p
 
     out = {}
     for k in ks:
-        rows = {"base": [], "with": [], "fa": [], "g_hit": [], "g_fa": []}
+        rows = {"base": [], "with": [], "fa": [], "fa_thr": [], "g_hit": [], "g_fa": [], "acc_ok": []}
         for g in groups:
             words = {w: v for w, v in by[g].items() if len(v) >= k + 1}
             if len(words) < 2:
@@ -540,66 +671,103 @@ def e4_my_signs(rec, clips, ks=(1, 3, 5), seed: int = 0, max_groups: int = 40, p
                 for w in sorted(enrolled):  # a set: its order (string hashing) changed per process
                     takes = list(words[w])
                     rng.shuffle(takes)
-                    E = np.stack([ev(t)[1].mean(0) for t in takes[:k]])
+                    # the whole take (crop 0), as MySignsStore.user_index embeds a recorded take
+                    E = np.stack([ev(t)[1][0] for t in takes[:k]]).astype(np.float32)
                     E /= np.maximum(np.linalg.norm(E, axis=1, keepdims=True), 1e-8)
-                    if k >= 2:
-                        sims = E @ E.T
-                        loo = [max(np.delete(sims[i], i)) for i in range(k)]
-                        theta = max(float(min(loo)) - 0.05, fp.user_theta_floor, fp.s_min)
-                    else:
-                        theta = 1.0
-                    signs[w] = (E, theta, takes[k:])
+                    th = theta_from_embeddings(E)  # the store's rule (None: < 2 takes or inconsistent)
+                    theta = max(th if th is not None else 1.0, fp.user_theta_floor, fp.s_min)
+                    signs[w] = (E, theta, takes[k:], [t.clip_id for t in takes[:k]])
                 tests = [(t, w, True) for w in enrolled for t in signs[w][2]]
                 tests += [(t, w, False) for w in names if w not in enrolled for t in words[w]]
             except (FeatureError, OSError, ValueError):
                 continue
-            uid = [f"{USER_PREFIX}{w}" for w in sorted(signs)]
+            order = sorted(signs)
+            uid = [f"{USER_PREFIX}{w}" for w in order]
+
+            def uth(key, _s=signs):
+                return _s[key.removeprefix(USER_PREFIX)][1]
+
             for t, w, is_enrolled in tests:
                 try:
                     inp, z = ev(t)
                 except (FeatureError, OSError, ValueError):
                     continue
                 zz = z / np.maximum(np.linalg.norm(z, axis=1, keepdims=True), 1e-8)
-                U = np.stack([(zz @ signs[s][0].T).max(1) for s in sorted(signs)], axis=1)
+                U = np.stack([(zz @ signs[s][0].T).max(1) for s in order], axis=1)
                 inp2 = dataclasses.replace(inp, user=U.astype(np.float32), user_ids=uid)  # keeps compact fields
                 base = fuse(inp, fp)
                 r = fuse(inp2, fp)
-                dec, _ = decide(r.probs, r.agree, len(r.per_crop_top1), fp, "balanced", r.best_cos)
-                top = r.keys[0] if r.keys else ""
-                if r.best_user is not None:  # direct "My signs" match (recogniser rule 7.3)
-                    uk, uc = r.best_user
-                    if uc >= signs[uk.removeprefix(USER_PREFIX)][1] and uc >= r.best_global_cos + fp.user_margin:
-                        top, dec = uk, "accept"
+                n_crops = len(r.per_crop_top1)
+                dec, why, keys, _ = user_sign_decision(r, inp2, n_crops, fp, policy, uth, open_vocabulary=is_ov,
+                                                       has_global_model=has_global)
+                dec_thr = dec if ungated is None else user_sign_decision(
+                    r, inp2, n_crops, ungated, policy, uth, open_vocabulary=is_ov, has_global_model=has_global)[0]
+                top = keys[0] if keys else ""
                 pred = top.removeprefix(USER_PREFIX)
+                if trace is not None:
+                    trace.append({"k": k, "group": g, "clip_id": t.clip_id, "word": w, "enrolled": is_enrolled,
+                                  "enrolment": {x: signs[x][3] for x in order}, "decision": dec, "reason": why,
+                                  "top": top, "decision_threshold_rule": dec_thr})
                 if is_enrolled:
                     rows["base"].append(float(bool(base.keys) and base.keys[0] == w))
                     rows["with"].append(float(pred == w))
+                    rows["acc_ok"].append(float(pred == w and dec == "accept"))
                     rows["g_hit"].append(g)
                 else:
                     rows["fa"].append(float(top.startswith(USER_PREFIX) and dec == "accept"))
+                    rows["fa_thr"].append(float(top.startswith(USER_PREFIX) and dec_thr == "accept"))
                     rows["g_fa"].append(g)
         if rows["with"]:
             out[f"k{k}"] = {"n": len(rows["with"]), "n_groups": len(set(rows["g_hit"])),
                             "top1_without_enrolment": float(np.mean(rows["base"])),
                             "top1_with_enrolment": float(np.mean(rows["with"])),
                             "gain": float(np.mean(rows["with"]) - np.mean(rows["base"])),
+                            "accepted_correct_rate": float(np.mean(rows["acc_ok"])),
                             "interval_with": grouped_bootstrap(rows["with"], rows["g_hit"]),
                             "interval_with_reason": interval_reason(rows["with"], rows["g_hit"]),
-                            "n_other_words": len(rows["fa"]),
+                            "n_other_words": len(rows["fa"]), "n_other_groups": len(set(rows["g_fa"])),
                             "user_sign_false_accept_rate": float(np.mean(rows["fa"])) if rows["fa"] else None,
+                            "user_sign_false_accepts": int(sum(rows["fa"])),
+                            "user_sign_false_accept_rate_threshold_rule":
+                                float(np.mean(rows["fa_thr"])) if rows["fa_thr"] else None,
+                            "user_sign_false_accepts_threshold_rule": int(sum(rows["fa_thr"])),
                             "interval_false_accept": grouped_bootstrap(rows["fa"], rows["g_fa"]),
+                            "interval_false_accept_threshold_rule": grouped_bootstrap(rows["fa_thr"], rows["g_fa"]),
                             "interval_false_accept_reason": interval_reason(rows["fa"], rows["g_fa"])}
-    label = ("My signs few-shot: a held-out signer enrols k takes of half of their words; tested on their other "
-             "takes (gain over no enrolment) and on the words they did not enrol (false accepts of user signs). "
-             "Groups are INCLUDE sessions / estimated signers, not verified identities.")
+            if keep_hits:
+                out[f"k{k}"].update(_with=rows["with"], _fa=rows["fa"], _fa_threshold=rows["fa_thr"])
+    label = ("My signs few-shot: a held-out signer enrols k takes (3 to 5, as the app) of half of their words; "
+             "tested on their other takes (gain over no enrolment) and on the words they did not enrol (false "
+             "accepts of user signs). The app's own decision rule (docs 15.27). Groups are INCLUDE sessions / "
+             "estimated signers, or other sources' signer ids, not verified identities.")
     if not out:
-        return {"label": label, "run": False, "reason": "no test signer has enough repeated takes", "n": 0}
+        return {"label": label, "run": False, "reason": "no test signer has enough repeated takes "
+                f"(needs >= 2 words with >= {min(ks) + 1} takes each)", "n": 0, "ks": list(ks)}
     best = out.get("k3") or next(iter(out.values()))
-    return {"label": label, "run": True, "n": best["n"], "n_groups": best["n_groups"],
-            "user_cls_mode": fp.user_cls_mode,
+    return {"label": label, "run": True, "n": best["n"], "n_groups": best["n_groups"], "ks": list(ks),
+            "policy": policy, "rule": fp.policy_rule(policy), "user_cls_mode": fp.user_cls_mode,
             "metrics": {"top1_with_enrolment_k3": best["top1_with_enrolment"], "gain_k3": best["gain"],
-                        "user_sign_false_accept_rate_k3": best["user_sign_false_accept_rate"]},
+                        "user_sign_false_accept_rate_k3": best["user_sign_false_accept_rate"],
+                        "user_sign_false_accept_rate_threshold_rule_k3":
+                            best["user_sign_false_accept_rate_threshold_rule"]},
             "by_k": out}
+
+
+def e4_populations(rec, include_test, extra_test, ks=E4_KS) -> dict:
+    """E4 on two populations (docs 15.27). The headline is INCLUDE test signers only: the same population for every
+    profile (commercial-safe has only INCLUDE), so packs compare like for like. ``all_sources`` adds the other
+    sources' held-out signers (ISL500 has many repeated takes, which a pooled number would be dominated by). The
+    evidence cache is shared, so the second run computes nothing new."""
+    cache: dict = {}
+    inc = e4_my_signs(rec, include_test, ks=ks, cache=cache)
+    inc["population"] = "INCLUDE test signers only (comparable across profiles)"
+    if not extra_test:
+        inc["all_sources"] = {"run": False, "reason": "no other source has held-out test signers"}
+        return inc
+    allp = e4_my_signs(rec, list(include_test) + list(extra_test), ks=ks, cache=cache)
+    allp["population"] = "INCLUDE test signers + other sources' held-out signers"
+    inc["all_sources"] = allp
+    return inc
 
 
 # --------------------------------------------------------------------------------------------- pre-training guard
@@ -724,9 +892,11 @@ def e8_trim(paths, artifacts_dir: Path, work: Path | None = None) -> dict:
 # --------------------------------------------------------------------------------------------- driver
 
 def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_path: Path | None = None,
-                 paths=None, out_dirs: list[Path] | None = None, e4_ks=(1, 3, 5), latency_n: int = 20,
-                 progress=None, partial_data: bool | None = None) -> dict:
-    """Run every protocol whose components exist in ``work`` and write ``eval/report.json`` + ``report.md``."""
+                 paths=None, out_dirs: list[Path] | None = None, e4_ks=E4_KS, latency_n: int = 20,
+                 progress=None, partial_data: bool | None = None, compare_to: Path | None = None) -> dict:
+    """Run every protocol whose components exist in ``work`` and write ``eval/report.json`` + ``report.md``.
+    ``compare_to``: another evaluation report.json (e.g. the commercial-safe pack's); E1b then also reports top-1 /
+    top-5 on that report's class set and on the clips both evaluated (``E1b.like_for_like``, docs 15.27)."""
     from app.core.config import REPO_ROOT, get_settings
     from app.isl.evaluation.protocols import e6_latency
     from app.isl.models.encoder import EncoderPredictor
@@ -752,8 +922,9 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     index_guard = check_index_for_fitting(rec, test_inc + data.extra_part("test") + data.labelled_part("val"), data)
     # E1b / E1c / E3 on the primary split's test part
     log("E1b")
+    reference = load_e1_reference(Path(compare_to)) if compare_to else None
     prot["E1b"] = e1_closed_set(rec, test_inc, f"E1b core words, closed set, INCLUDE test part of {split_name} ({lab}; "
-                                f"signer-independent: {si})", split_name, "primary")
+                                f"signer-independent: {si})", split_name, "primary", reference=reference)
     cv = sorted((work / "cv").glob("fold*/classifier.pt")) if (work / "cv").exists() else []
     if cv:
         from app.isl.training.common import load_split
@@ -881,7 +1052,7 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
         prot["E2_seen"] = e2s
     log("E4")
     prot["E4"] = (refused_entry("My signs few-shot (uses the word classifier)", cls_why) if cls_why else
-                  e4_my_signs(rec, test_inc + extra_test, ks=e4_ks))
+                  e4_populations(rec, test_inc, extra_test, ks=e4_ks))
     prot["E5"] = e5_from_letters(work / "letters.pt")
     log("E6")
     prot["E6"] = e6_latency(rec, test_inc + extra_test, n=latency_n)
@@ -1058,6 +1229,61 @@ def _headline_lines(doc: dict) -> list[str]:
             "|---|---|---|---|---|---|---|---|---|---|---|---|", *rows, ""]
 
 
+def _like_for_like_lines(lf: dict | None) -> list[str]:
+    if not lf:
+        return []
+    r = lf.get("reference") or {}
+    head = [f"E1b like for like against {r.get('profile') or '-'} ({r.get('path')}; its E1b top-1 {_fmt(r.get('top1'))}, "
+            f"n {r.get('n', '-')}), strict labels:"]
+    if not lf.get("run"):
+        return ["", *head, f"* not compared: {lf.get('reason')}"]
+    out = ["", *head]
+    for key, name in (("reference_classes", "masked to the reference's classes"),
+                      ("common_clips", "the clips both reports evaluated"),
+                      ("reference_classes_common_clips", "masked + common clips (like for like)")):
+        v = lf.get(key) or {}
+        if v.get("run") is False or not v.get("n"):
+            out.append(f"* {name}: {v.get('reason') or 'no clips'}")
+            continue
+        out.append(f"* {name}: n {v['n']}, top-1 {_fmt(v.get('top1'))}, top-5 {_fmt(v.get('top5'))}"
+                   + (f"; reference top-1 {_fmt(v.get('reference_top1'))}, top-5 {_fmt(v.get('reference_top5'))}"
+                      if "reference_top1" in v else "")
+                   + (f"; top-1 only this {v['discordant_top1']['only_this']}, only reference "
+                      f"{v['discordant_top1']['only_reference']}" if v.get("discordant_top1") else ""))
+    out += [f"* note: {n}" for n in lf.get("notes") or []]
+    return out
+
+
+def _e4_lines(e4: dict) -> list[str]:
+    """E4 with the user-sign FALSE-ACCEPT rate first (a precision number: a user sign accepted for a word the signer
+    did not enrol), per population; INCLUDE-only is the row to compare packs on (docs 15.27)."""
+    pops = [("INCLUDE only", e4)] + ([("all sources", e4["all_sources"])] if isinstance(e4.get("all_sources"), dict)
+                                     and e4["all_sources"].get("run") else [])
+    if not any(p.get("run") for _, p in pops):
+        return []
+    lines = ["", f"## E4 My signs (user-sign classifier term: {e4.get('user_cls_mode', 'penalty')}, policy "
+             f"{e4.get('policy', 'balanced')}: {e4.get('rule', '-')})", "",
+             "False accept = a user sign accepted on a word the signer did not enrol (lower is better). 'auto' = what "
+             "the app accepts by itself; 'threshold rule' = the same rule without the certification gate (the user "
+             "sign it would put first and ask to confirm). INCLUDE only is the row to compare packs on.", "",
+             "| population | k | n | groups | FALSE ACCEPT auto | FALSE ACCEPT threshold rule | other-word takes | "
+             "without | with | 95% CI (with) | gain |",
+             "|---|---|---|---|---|---|---|---|---|---|---|"]
+    for name, p in pops:
+        if not p.get("run"):
+            lines.append(f"| {name} | - | - | - | - | - | - | - | - | - | not run: {p.get('reason', '')} |")
+            continue
+        for k, v in p["by_k"].items():
+            lines.append(f"| {name} | {k} | {v['n']} | {v.get('n_groups', '-')} | "
+                         f"**{_fmt(v.get('user_sign_false_accept_rate'))}** | "
+                         f"**{_fmt(v.get('user_sign_false_accept_rate_threshold_rule'))}** | "
+                         f"{v.get('n_other_words', '-')} | {_fmt(v['top1_without_enrolment'])} | "
+                         f"{_fmt(v['top1_with_enrolment'])} | "
+                         f"{format_interval(v.get('interval_with'), v.get('n_groups'), v.get('interval_with_reason'))} | "
+                         f"{_fmt(v['gain'])} |")
+    return lines
+
+
 def markdown_report(doc: dict) -> str:
     partial = bool(doc.get("partial_data")) and not doc.get("smoke")
     title = f"# ISL evaluation report ({doc['profile']})" + (" - PARTIAL DATA" if partial else "")
@@ -1092,6 +1318,7 @@ def markdown_report(doc: dict) -> str:
                   f"{cvb['top1_sd']:.3f}); pooled over {cvb['pooled_groups']} held-out signer groups: "
                   f"{cvb['pooled_top1']:.3f} (95% CI " + format_interval(ci, cvb['pooled_groups'],
                                                                        cvb.get('pooled_top1_interval_reason')) + ")"]
+    lines += _like_for_like_lines((doc["protocols"].get("E1b") or {}).get("like_for_like"))
     oov = (doc["protocols"].get("E2") or {}).get("oov_false_accept")
     if oov:
         lines += ["", f"E2 held-out concepts against a gallery WITHOUT them (n {oov.get('n')}; every accept is wrong): "
@@ -1100,16 +1327,7 @@ def markdown_report(doc: dict) -> str:
                               f"vocabulary {_fmt((oov.get(pol) or {}).get('out_of_vocabulary_rate'))}"
                               for pol in ("strict", "balanced", "lenient"))]
     lines += _policy_lines(doc)
-    e4 = doc["protocols"].get("E4", {})
-    if e4.get("run"):
-        lines += ["", f"## E4 My signs (user-sign classifier term: {e4.get('user_cls_mode', 'penalty')})", "",
-                  "| k | n | groups | without | with | 95% CI (with) | gain | user-sign false accepts |",
-                  "|---|---|---|---|---|---|---|---|"]
-        for k, v in e4["by_k"].items():
-            lines.append(f"| {k} | {v['n']} | {v.get('n_groups', '-')} | {_fmt(v['top1_without_enrolment'])} | "
-                         f"{_fmt(v['top1_with_enrolment'])} | "
-                         f"{format_interval(v.get('interval_with'), v.get('n_groups'), v.get('interval_with_reason'))} | "
-                         f"{_fmt(v['gain'])} | {_fmt(v['user_sign_false_accept_rate'])} |")
+    lines += _e4_lines(doc.get("protocols", {}).get("E4") or {})
     guard = (doc.get("data") or {}).get("readiness")
     if guard:
         lines += ["", "## Data readiness", "",

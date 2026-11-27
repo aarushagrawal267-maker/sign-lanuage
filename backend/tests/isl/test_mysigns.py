@@ -292,3 +292,45 @@ def test_user_index_reembeds_when_the_encoder_changes_under_the_same_version(tmp
     assert len(list(st.dir.glob("emb_featstats-1-*.npy"))) == 1
     st.user_index(f1)
     assert len(list(st.dir.glob("emb_featstats-1-*.npy"))) == 2
+
+
+def test_theta_is_recomputed_when_the_takes_are_reembedded_for_a_new_encoder(tmp_path):
+    """QA plan 0.5 (docs 15.27): a sign's acceptance cosine is a cosine of the encoder that embedded its takes. After
+    a pack update the takes are re-embedded, so theta must be recomputed from the new vectors, not read from the
+    value stored at enrolment."""
+    import torch
+
+    from app.isl.mysigns.store import embedder_key, theta_from_embeddings
+    from app.isl.recognizer import IslRecognizer
+    from app.packs.vocabulary import Vocabulary
+
+    class _Spread:  # an encoder stand-in whose takes spread by ``scale`` (its "weights" give it its own key)
+        version, dim = "isl-enc-1", 4
+
+        def __init__(self, scale: float):
+            self.model = torch.nn.Linear(1, 1)
+            with torch.no_grad():
+                self.model.weight.fill_(scale)
+            self.scale, self.feature_config = scale, FCFG
+
+        def embed(self, feats):
+            s = feats.reshape(len(feats), -1).sum(1)
+            z = np.stack([np.ones_like(s)] + [self.scale * np.sin(s * (j + 1)) for j in range(3)], 1)
+            return (z / np.linalg.norm(z, axis=1, keepdims=True)).astype(np.float32), 0.0
+
+    st = MySignsStore(tmp_path, "isl")
+    sign = st.add("Poha", _takes(2), embedder=_emb()).sign
+    tight, wide = RawEmbedder(_Spread(0.05), FCFG), RawEmbedder(_Spread(0.6), FCFG)
+    assert embedder_key(tight) != embedder_key(wide)
+    t1, t2 = st.user_theta(sign.sign_id, tight), st.user_theta(sign.sign_id, wide)
+    assert t1 is not None and t2 is not None and t1 > t2 + 0.05
+    assert abs(t2 - theta_from_embeddings(wide.embed_raws(st.takes(sign.sign_id)))) < 1e-6
+    assert abs(t2 - sign.theta) > 0.01  # the stored (enrolment-time) value is not what the new encoder needs
+    # a restarted app with the new pack: computed again from the cached vectors
+    assert abs(MySignsStore(tmp_path, "isl").user_theta(sign.sign_id, wide) - t2) < 1e-6
+    # the recogniser reads the recomputed value (floors still apply)
+    rec = IslRecognizer("isl", FCFG, Vocabulary.from_class_names(["isl.x"]), my_signs=st)
+    rec.user_embedder = wide
+    assert abs(rec._user_theta(f"mysign:{sign.sign_id}") - max(t2, rec.fusion.user_theta_floor, rec.fusion.s_min)) < 1e-6
+    rec.user_embedder = tight
+    assert abs(rec._user_theta(f"mysign:{sign.sign_id}") - t1) < 1e-6

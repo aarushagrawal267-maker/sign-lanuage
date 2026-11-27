@@ -123,6 +123,18 @@ def loo_theta(z: np.ndarray, theta_margin: float = 0.05, s_min: float = -1.0) ->
     return loo, max(min(loo) - theta_margin, s_min)
 
 
+def theta_from_embeddings(z: np.ndarray, *, s_min: float = -1.0, c_min: float = 0.5,
+                          theta_margin: float = 0.05) -> float | None:
+    """Per-sign acceptance cosine from the takes' embeddings (``loo_theta``), or ``None`` (= never accepted without
+    asking) when there are fewer than 2 takes, a vector is not finite, or the takes are not consistent enough
+    (mean pairwise cosine below ``c_min``). The one rule for imported signs, re-embedded signs (``user_index``) and
+    the E4 protocol (docs/ISL_DESIGN.md 15.27)."""
+    z = np.asarray(z, np.float32)
+    if len(z) < 2 or not np.all(np.isfinite(z)) or _pairwise_mean(z) < c_min:
+        return None
+    return loo_theta(z, theta_margin, s_min)[1]
+
+
 def calibrate_theta(takes: list[RawSequence], embedder, *, s_min: float = -1.0, c_min: float = 0.5,
                     theta_margin: float = 0.05) -> float | None:
     """Per-sign acceptance cosine computed with *this* app's embedder (used for imported signs, whose stored
@@ -134,9 +146,7 @@ def calibrate_theta(takes: list[RawSequence], embedder, *, s_min: float = -1.0, 
         z = embedder.embed_raws(takes)
     except FeatureError:
         return None
-    if not np.all(np.isfinite(z)) or _pairwise_mean(z) < c_min:
-        return None
-    return loo_theta(z, theta_margin, s_min)[1]
+    return theta_from_embeddings(z, s_min=s_min, c_min=c_min, theta_margin=theta_margin)
 
 
 def _pairwise_mean(z: np.ndarray) -> float:
@@ -310,7 +320,11 @@ class MySignsStore:
     # ------------------------------------------------------------ embedding
     def user_index(self, embedder, include_disabled: bool = False) -> EmbeddingIndex | None:
         """Index over every take of every enabled sign; row ``concept_id`` = ``mysign:<sign_id>``.
-        Cached in memory and on disk per (``embedder_key``, signs.jsonl stamp)."""
+        Cached in memory and on disk per (``embedder_key``, signs.jsonl stamp).
+
+        Each sign's acceptance cosine is recomputed from the vectors of THIS embedder (``theta_from_embeddings``,
+        read with :meth:`user_theta`): the ``theta`` stored at enrolment is a cosine of the encoder of that day, and
+        after a pack update the takes are re-embedded, so the old value is on another scale (docs 15.27)."""
         ekey = embedder_key(embedder)
         key = (ekey, self.stamp(), include_disabled)
         with self._lock:
@@ -319,6 +333,7 @@ class MySignsStore:
             signs = self.list(include_disabled=include_disabled)
             signs = [s for s in signs if include_disabled or s.enabled]
             rows, _embs = [], []
+            sign_keys: dict[str, list[str]] = {}
             disk = self.dir / f"emb_{re.sub(r'[^A-Za-z0-9_.-]', '_', ekey)}.npy"
             disk_rows = disk.with_suffix(".rows.json")
             cached: dict[str, np.ndarray] = {}
@@ -343,6 +358,7 @@ class MySignsStore:
                     if k not in cached:
                         todo.append((k, RawSequence.load(p)))
                     keys.append(k)
+                    sign_keys.setdefault(s.sign_id, []).append(k)
                     rows.append({"variant_id": f"mysign:{s.sign_id}", "concept_id": f"mysign:{s.sign_id}",
                                  "linked_concept": s.concept_id, "source": "mysigns", "kind": "take", "weight": 1.0})
                 if todo:
@@ -363,8 +379,17 @@ class MySignsStore:
                     disk_rows.write_text(json.dumps(keys))
                 except OSError:
                     pass
-            self._cache = {"key": key, "index": idx}
+            thetas = {sid: theta_from_embeddings(np.stack([cached[k] for k in ks])) for sid, ks in sign_keys.items()}
+            self._cache = {"key": key, "index": idx, "thetas": thetas, "ekey": ekey}
             return idx
+
+    def user_theta(self, sign_id: str, embedder) -> float | None:
+        """The sign's acceptance cosine for ``embedder``'s vectors (recomputed by :meth:`user_index`); ``None`` when
+        it has fewer than 2 usable takes or they are not consistent under this embedder (never auto-accepted)."""
+        if self.user_index(embedder) is None:
+            return None
+        with self._lock:
+            return (self._cache.get("thetas") or {}).get(sign_id)
 
     # -------------------------------------------------------------- enrolment
     def add(self, text_en: str, takes: list[RawSequence], *, embedder=None, text_hi: str | None = None,

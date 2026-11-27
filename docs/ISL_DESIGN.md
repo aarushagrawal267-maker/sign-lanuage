@@ -2124,7 +2124,7 @@ stopped or fixed (one decision, below).** Nothing was trained at full settings; 
 | a public source with no rows and no item list was "not available" | the two HF alphabet sets, whose listings failed with 429 / 503 in the probe runs: if the queue gives up on them (5 tries) the guard would have passed silently | incomplete ("listing failed or never run"); only CISLR / iSign are "unavailable" |
 | any ingestion process blocked every profile | the OpenHands raw job (research only, days from its end, DATASETS 3.6) would have held back the commercial-safe run too | a job of one known source blocks only the profiles that read it; `ingest_isl.py`, the queue and unknown jobs still block all |
 | `build-pack` copied `<work>/results.json` | phase-2 work folders have no such file (the report is `eval/report.json`), so a phase-2 pack served no results to the app; and the full run reuses `artifacts/isl/commercial-safe/`, which still holds the **phase-1 smoke** `results.json` of 11:57 - the full pack would have shipped and served it | the pack's `results.json` is the phase-2 report when one exists (verified on both smoke packs: identical to `eval/report.json`) |
-| `choose_user_mode` picked `neutral` on any top-1 gain | one lucky take of 30 decided the mode | needs a gain >= 0.02 **and** >= 2 more correct enrolled takes |
+| `choose_user_mode` picked `neutral` on any top-1 gain | one lucky take of 30 decided the mode | needs a gain >= 0.02 **and** >= 2 more correct enrolled takes (replaced by a paired sign test in 15.27) |
 
 **Still open (not blocking the commercial-safe run):**
 * *(Closed 21:13 UTC, see 15.7 and DATASETS_ISL.md 3.7: the job now reads each member in one forward pass; the
@@ -3552,3 +3552,96 @@ stays at the low-threshold phi where errors vanish, stays 1 for homogeneous erro
 user sign is never auto-accepted under a confirm-only policy), `test_sliding_replay_thresholds.py` (a sliding
 confirm-only word is a suggestion that `choose` commits; a certified commit has `needs_confirm`) and
 `test_engine_recognizer.py` (segment results and commits carry the certification).
+
+### 15.27 Protocol and engine fixes: E4 measures the app, a paired test for the user-sign mode, like-for-like E1b (Model QA fix 0.5, 27 Nov 2026)
+
+**Problems found by the Model QA review.**
+* E4 (My signs) did not measure what the app does. It enrolled 1, 3 and 5 takes, but the app needs 3 to 5. Its
+  direct "My signs" match had no crop-agreement check. A user sign on top of the fused list was accepted even
+  without the direct match, while the app only suggests it. It enrolled the mean of three crop embeddings, while
+  the app's store embeds the whole take.
+* E4's real regression was precision, and no report showed it well. Research k3 has a user-sign false-accept rate of
+  0.0148, commercial-safe 0.0. The two packs also used different populations: research pooled INCLUDE and ISL500
+  test signers (n 2,808), commercial-safe had only INCLUDE (n 89).
+* `choose_user_mode` needed an absolute top-1 gain of 0.02. On research validation (4,689 takes) neutral won 84
+  takes and lost none, a gain of 0.018, so penalty stayed. With 30 takes, +3 of 30 passed.
+* Segment mode with a pack echoed `EngineConfig.threshold` in its messages, but the recogniser never reads it: it
+  uses the pack's fused threshold for the policy.
+* Sliding mode keyed its streak and repeat rule on the vocabulary index of the top class. Classifier classes that are
+  missing from the vocabulary all have index -1 (7 research classes), so two different such words formed one streak
+  and the second was suppressed as a repeat.
+* fit-fusion and evaluation loaded `work/vocabulary.jsonl` without the link step's `extra_concepts.jsonl`. The pack
+  appends those concepts, so while measuring they had prior 0 and index -1, and in the app prior 0.5.
+* A user sign's `theta` was stored at enrolment, as a cosine of that day's encoder. After a pack update the takes
+  are re-embedded but the old theta was still used.
+* E1b of the two packs is not like for like: commercial-safe has 792 clips and 270 classes, research 852 clips and
+  more classes. The report did not say which clips it measured.
+
+**What changed.**
+1. **One decision function.** `recognizer.user_sign_decision` holds the recogniser's decision after fusion: the
+   fused rule, the direct "My signs" match (theta, margin over the dictionary, and the user sign must be the best
+   user sign in at least min(min_agree, crops) crops), the confirm-only demotion, the "user sign on top without the
+   direct match is only a suggestion" rule, and the user-signs-only rule. `IslRecognizer.recognize` and E4 both
+   call it.
+2. **E4 = the app.** `runners.E4_KS = (3, 5)`, as the store's 3 to 5 takes. Enrolment vectors are whole-take
+   embeddings (crop 0), as `MySignsStore.user_index` makes them. Theta is `store.theta_from_embeddings` (lowest
+   leave-one-out cosine minus 0.05; none, so never auto-accepted, when the takes are inconsistent).
+3. **E4 false accepts first.** Each k reports `user_sign_false_accept_rate` (what the app accepts by itself; 0 under
+   a confirm-only policy) and `user_sign_false_accept_rate_threshold_rule` (the same rules without the
+   certification gate: the user sign the app puts first and asks to confirm), with counts and intervals. report.md
+   shows both in bold, before the top-1 columns.
+4. **E4 populations.** `evaluate --all` runs E4 on INCLUDE test signers only; that is the `E4` entry and the row to
+   compare packs on. `E4.all_sources` adds the other sources' held-out signers. The evidence cache is shared.
+   A gate for a new pack should be "INCLUDE-only false accept (threshold rule) <= commercial-safe's".
+5. **User-sign mode by a paired sign test.** On the paired enrolled takes, b = takes only neutral gets right and
+   c = takes only penalty gets right. Neutral is chosen when the one-sided exact sign test P(X >= b),
+   X ~ Binomial(b + c, 1/2), is below 0.05, and the threshold-rule false-accept rate rises by at most
+   `MAX_FA_INCREASE` (0.01). The threshold-rule rate is used because the app's own rate is 0 under a confirm-only
+   policy. k = 3 first, then 5. So: 4,689 takes with +84 and none lost gives neutral (p about 5e-26); 30 takes with
+   +1 gives penalty (p 0.5); +3 of 30 is still penalty (p 0.125); +84 net from 1,500 won and 1,416 lost is penalty
+   (p 0.06). The report's `my_signs.sign_test` has b, c and p.
+6. **Engine threshold.** In segment and spell mode with a pack, `threshold` in messages and `describe()` is the
+   pack's fused accept threshold for the policy. Sliding mode still uses `EngineConfig.threshold` when it is set.
+7. **Engine sliding key.** With a pack, the streak and the repeat rule use the classifier's own top class index.
+   Commits still carry the vocabulary index in `class_index`. The ASL path (a predictor) is unchanged. fit-fusion's
+   sliding replay records the engine's key, so it follows.
+8. **Classifier thresholds cached.** `classifier_policy_thresholds` is computed once per (classifier, fusion) pair
+   (`IslRecognizer._classifier_policy`, since 15.25); now tested.
+9. **Extra concepts while measuring.** `pipeline.load_recognizer` appends the rows of `<work>/extra_concepts.jsonl`
+   that the vocabulary does not have, in file order, exactly as `build_pack` does (`extra_concept_rows`). Nothing is
+   written to disk. We chose this over writing the rows into `work/vocabulary.jsonl` in the link step: that file is
+   the vocab step's output, and with the extra rows in it a second link run would link those glosses as "exact",
+   write an empty `extra_concepts.jsonl` and change the link report.
+10. **Theta follows the encoder.** `MySignsStore.user_index` recomputes every sign's theta from the vectors of the
+    current embedder (`theta_from_embeddings`). `MySignsStore.user_theta(sign_id, embedder)` returns it, and the
+    recogniser uses it (floors still apply). The stored `theta` is only a fallback for stores without this method.
+11. **E1b records its clips.** Every E1 entry has `split`, `clip_ids` and `class_ids_sha256`. E1b and E1c have
+    `per_clip.hit1` / `hit5` (one "0"/"1" per clip), and E1b has `class_ids`.
+12. **E1b like for like.** `cli evaluate --all --compare-to <report.json>` (for example
+    `artifacts/isl/commercial-safe/eval/report.json`) adds `E1b.like_for_like`: top-1 / top-5 with scores masked to
+    the reference's classes (clips of those classes only), on the clip ids both reports measured, and both
+    together. The reference's own top-1 / top-5 on those clips and the discordant counts are next to them. The
+    split must match. A report from before this change has no clip or class ids: the class ids are then read from
+    `classifier.pt` next to the report folder, and the common-clip rows say the reference must be re-run. Labels are
+    strict; alias scoring is not part of this change (QA Batch 1).
+
+**Backward compatibility.** Old fusion.json files load as before (an old one without a certification record is
+uncertified, so E4's app false-accept rate is 0 and the threshold-rule rate is the one to read). Old stores keep
+working: theta is recomputed from the takes. Old reports load in `--compare-to`. The ASL engine is unchanged.
+
+**Effect.** E4 numbers change: k1 is gone, the enrolment vector and theta follow the store, and the headline is
+INCLUDE only. Fit-fusion may now choose `neutral` for research. Re-run fit-fusion and evaluate (QA 0.6) to get the
+new numbers.
+
+**Open items.**
+* Frontend: the E4 card shows the INCLUDE-only entry; it does not yet show `all_sources` or the threshold-rule
+  false-accept rate.
+* `in_classifier` is false on extra concepts, so their prior is 0.5, not 1, even when the classifier has them.
+
+Tests: `test_eval_runners.py` (E4 and `IslRecognizer.recognize` with a real `MySignsStore` give the same decision
+and top word for every test take, gated and ungated; the crop-agreement, below-theta and confirm-only rules of
+`user_sign_decision`; E1b records clip and class ids and compares with a reference report, an other-split report
+and a pre-15.27 report; the measuring recogniser sees the extra concepts), `test_readiness_retry.py` and
+`test_phase2_guards.py` (the sign-test rule and its p-values), `test_mysigns.py` (an encoder change changes theta,
+and the recogniser uses it) and `test_engine_recognizer.py` (segment mode reports the pack's threshold; two classes
+with vocabulary index -1 commit as two words; the classifier thresholds are computed once per pair).

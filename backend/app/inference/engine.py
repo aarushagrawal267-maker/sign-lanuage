@@ -150,6 +150,14 @@ class RecognitionEngine:
 
     @property
     def threshold(self) -> float:
+        if self.predictor is None and self.recognizer is not None and self.cfg.mode != "sliding":
+            # segment (and spell) mode with a language pack: the recogniser decides with the pack's fused accept
+            # threshold for the policy and never reads cfg.threshold, so report that one (docs/ISL_DESIGN.md 15.27);
+            # before, a cfg.threshold was echoed although nothing used it
+            acc = getattr(getattr(self.recognizer, "fusion", None), "accept", None)
+            if isinstance(acc, dict) and self.cfg.policy in acc:
+                return float(acc[self.cfg.policy])
+            return float(self.recognizer.recommended_threshold)
         if self.cfg.threshold is not None:
             return float(self.cfg.threshold)
         if self.predictor is None and self.recognizer is not None:
@@ -501,7 +509,10 @@ class RecognitionEngine:
         p = r["probs"]
         self.ema = p if self.ema is None else c.ema_alpha * p + (1 - c.ema_alpha) * self.ema
         top = self._topk(self.ema)
-        cls = top[0]["class_index"]
+        # streak and repeat suppression key on the classifier's own top class. A pack's candidates carry the
+        # vocabulary index, which is -1 for every class missing from the vocabulary (7 research classes): two
+        # different such words counted as one streak and suppressed each other as "repeats" (docs 15.27)
+        cls = top[0]["class_index"] if self.predictor is not None else int(np.argmax(self.ema))
         self.streak = self.streak + 1 if cls == self.streak_class else 1
         self.streak_class = cls
         ok, reason = self._decision(self.ema, self.streak >= c.agree_n)
@@ -519,7 +530,8 @@ class RecognitionEngine:
         if ok:
             self.last_commit_t, self.last_commit_class = f.t, cls
             self.status = "recognized"
-            out["commit"] = {"gloss": top[0]["gloss"], "class_index": cls, "score": top[0]["prob"], "t": f.t}
+            out["commit"] = {"gloss": top[0]["gloss"], "class_index": top[0]["class_index"], "score": top[0]["prob"],
+                             "t": f.t}
             if "concept_id" in top[0]:  # language-pack classifier: same extra fields as segment-mode commits
                 out["commit"].update({k: top[0][k] for k in ("concept_id", "text", "hi_review", "source")},
                                      segment_id=None, chosen_by_user=False)

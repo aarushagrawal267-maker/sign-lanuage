@@ -96,6 +96,53 @@ def calibrated_probs(probs: np.ndarray, temperature: float) -> np.ndarray:
     return e / e.sum(-1, keepdims=True)
 
 
+def user_sign_decision(res, inp: FusionInputs, crops: int, p: FusionParams, policy: str, user_theta,
+                       open_vocabulary=None, has_global_model: bool = True) -> tuple[str, str, list, np.ndarray]:
+    """The recogniser's decision on one fused segment, "My signs" rules included (docs/ISL_DESIGN.md 7.3, 15.26,
+    15.27). One function for the app (``IslRecognizer.recognize``) and the E4 protocol (``runners.e4_my_signs``), so
+    E4 measures exactly what the app does. ``user_theta(key)`` gives a user sign's acceptance cosine (floors
+    applied); ``open_vocabulary(key)`` says whether a word is outside the classifier. Returns (decision, reason,
+    keys, probs), the keys and probabilities re-ordered when a user sign overrides the dictionary.
+
+    1. ``decide`` on the fused probabilities (with the open-vocabulary gate).
+    2. Override: the best user sign is taken directly when its cosine >= its theta, beats the best dictionary
+       cosine by ``user_margin``, AND it is the best user sign in >= min(min_agree, crops) crops (crop agreement).
+       Under a confirm-only policy it stays the top "did you mean" (``suggest`` / ``confirm_only``).
+    3. A user sign that tops the fused list without the override is never accepted (``suggest`` /
+       ``low_confidence``): below its own calibrated similarity.
+    4. Only user signs (no classifier, no index): ``suggest`` when the best one is within 0.1 of its theta, else
+       ``abstain``."""
+    ov = bool(res.keys) and open_vocabulary is not None and bool(open_vocabulary(res.keys[0]))
+    decision, reason = decide(res.probs, res.agree, crops, p, policy, res.best_cos if res.best_cos > -1 else None,
+                              open_vocabulary=ov)
+    keys, probs = list(res.keys), np.array(res.probs)
+    # My signs searched first (7.3): a confident user match that beats the dictionary is taken directly
+    override = False
+    if res.best_user is not None:
+        ukey, ucos = res.best_user
+        theta = user_theta(ukey)
+        u_agree = int(sum(inp.user_ids[int(j)] == ukey for j in np.asarray(inp.user).argmax(1)))
+        if (ucos >= theta and ucos >= res.best_global_cos + p.user_margin
+                and u_agree >= min(p.min_agree, crops)):
+            j = keys.index(ukey)
+            keys.insert(0, keys.pop(j))
+            probs = np.concatenate([[probs[j]], np.delete(probs, j)])
+            decision, reason, override = "accept", "my_signs", True
+            if p.confirm_only(policy):
+                # never auto-accept under a confirm-only policy, a user sign included (docs/ISL_DESIGN.md 15.26):
+                # it stays the top "did you mean" candidate
+                decision, reason = "suggest", "confirm_only"
+    if not override and keys and keys[0].startswith(USER_PREFIX) and decision == "accept":
+        # a user sign is never accepted below its own calibrated similarity (enrolment self-test)
+        decision, reason = "suggest", "low_confidence"
+    if not override and not has_global_model:
+        # only user signs: the softmax over a handful of signs says nothing about "none of them"
+        ucos = res.best_user[1] if res.best_user else -1.0
+        near = res.best_user is not None and ucos >= user_theta(res.best_user[0]) - 0.1
+        decision, reason = ("suggest", "low_confidence") if near else ("abstain", "out_of_vocabulary")
+    return decision, reason, keys, probs
+
+
 class IslRecognizer:
     def __init__(self, language: str, feature_config: FeatureConfig, vocab: Vocabulary, *, lexicon=None,
                  classifier: Predictor | None = None, encoder: EncoderPredictor | None = None,
@@ -280,33 +327,9 @@ class IslRecognizer:
         z = info.pop("z")
         res = fuse(inp, self.fusion)
         p = self.fusion
-        decision, reason = decide(res.probs, res.agree, len(crops), p, policy, res.best_cos if res.best_cos > -1 else None,
-                                  open_vocabulary=bool(res.keys) and self.is_open_vocabulary(res.keys[0]))
-        keys, probs = list(res.keys), np.array(res.probs)
-        # My signs searched first (7.3): a confident user match that beats the dictionary is taken directly
-        override = False
-        if res.best_user is not None:
-            ukey, ucos = res.best_user
-            theta = self._user_theta(ukey)
-            u_agree = int(sum(inp.user_ids[int(j)] == ukey for j in inp.user.argmax(1)))
-            if (ucos >= theta and ucos >= res.best_global_cos + p.user_margin
-                    and u_agree >= min(p.min_agree, len(crops))):
-                j = keys.index(ukey)
-                keys.insert(0, keys.pop(j))
-                probs = np.concatenate([[probs[j]], np.delete(probs, j)])
-                decision, reason, override = "accept", "my_signs", True
-                if p.confirm_only(policy):
-                    # never auto-accept under a confirm-only policy, a user sign included (docs/ISL_DESIGN.md 15.26):
-                    # it stays the top "did you mean" candidate
-                    decision, reason = "suggest", "confirm_only"
-        if not override and keys and keys[0].startswith(USER_PREFIX) and decision == "accept":
-            # a user sign is never accepted below its own calibrated similarity (enrolment self-test)
-            decision, reason = "suggest", "low_confidence"
-        if not override and not self.has_global_model:
-            # only user signs: the softmax over a handful of signs says nothing about "none of them"
-            ucos = res.best_user[1] if res.best_user else -1.0
-            near = res.best_user is not None and ucos >= self._user_theta(res.best_user[0]) - 0.1
-            decision, reason = ("suggest", "low_confidence") if near else ("abstain", "out_of_vocabulary")
+        decision, reason, keys, probs = user_sign_decision(res, inp, len(crops), p, policy, self._user_theta,
+                                                           open_vocabulary=self.is_open_vocabulary,
+                                                           has_global_model=self.has_global_model)
         cands = self._candidates(keys, probs, res.components, z, top_k)
         inf_ms = (time.perf_counter() - t1) * 1000
         conf = cands[0].prob if cands else 0.0
@@ -317,9 +340,18 @@ class IslRecognizer:
                                    "certification": p.certification_info(policy)})
 
     def _user_theta(self, key: str) -> float:
+        """A user sign's acceptance cosine: recomputed from the takes' vectors under this pack's embedder when the
+        store can (``MySignsStore.user_theta``, docs 15.27), else the value stored at enrolment; never below the
+        fusion floors. 1.0 (never auto-accepted) when there is none."""
         p = self.fusion
-        sign = self.my_signs.get(key.removeprefix(USER_PREFIX)) if self.my_signs else None
-        return max(sign.theta if sign and sign.theta is not None else 1.0, p.user_theta_floor, p.s_min)
+        sid = key.removeprefix(USER_PREFIX)
+        fn = getattr(self.my_signs, "user_theta", None) if self.my_signs is not None else None
+        if callable(fn):
+            th = fn(sid, self.user_embedder)
+        else:
+            sign = self.my_signs.get(sid) if self.my_signs else None
+            th = sign.theta if sign else None
+        return max(th if th is not None else 1.0, p.user_theta_floor, p.s_min)
 
     def _candidate(self, key: str, prob: float, comps: dict, row_scores) -> Candidate:
         if key.startswith(USER_PREFIX):

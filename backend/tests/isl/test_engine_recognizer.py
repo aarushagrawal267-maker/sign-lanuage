@@ -173,3 +173,102 @@ def test_segment_results_and_commits_carry_the_certification():
     st = _run(plain)
     assert not any("needs_confirm" in s.get("segment_result", {}) or "needs_confirm" in s.get("commit", {})
                    for s in st)
+
+
+# ------------------------------------------------------------------ QA plan 0.5 (docs/ISL_DESIGN.md 15.27)
+
+def test_segment_mode_reports_the_threshold_the_pack_uses():
+    """Segment mode with a language pack decides with the pack's fused accept threshold for the policy; a
+    ``threshold`` in the config is not used there, so the engine must not report it. Sliding mode still uses it."""
+    from app.isl.models.fusion import FusionParams
+
+    rec = FakeRecognizer("accept")
+    rec.fusion = FusionParams(accept={"strict": 0.93, "balanced": 0.8, "lenient": 0.6})
+    eng = RecognitionEngine(None, recognizer=rec, config=EngineConfig(threshold=0.1, policy="strict"))
+    assert eng.threshold == 0.93 and eng.describe()["threshold"] == 0.93
+    assert all(s["threshold"] == 0.93 for s in _run(eng))
+    eng.configure(EngineConfig(threshold=0.1, policy="lenient"))
+    assert eng.threshold == 0.6
+    rec.classifier = object()  # sliding mode needs a classifier
+    eng.configure(EngineConfig(mode="sliding", threshold=0.1))
+    assert eng.threshold == 0.1  # sliding mode's own decision reads cfg.threshold
+
+
+class _SlidingRecognizer(FakeRecognizer):
+    """A pack classifier whose two classes are missing from the vocabulary (vocabulary index -1 for both)."""
+
+    classifier = object()
+    classifier_threshold = 0.5
+
+    class _Vocab:
+        def english(self, cid):
+            return cid
+
+        def index_of(self, cid):
+            return -1
+
+    vocab = _Vocab()
+    lexicon = None
+
+    def __init__(self, script):
+        super().__init__()
+        self.script = list(script)  # top class per classified window
+        self.i = 0
+
+    def class_probs(self, crops):
+        import numpy as np
+
+        c = self.script[min(self.i, len(self.script) - 1)]
+        self.i += 1
+        p = np.full((len(crops), 2), 0.02, np.float32)
+        p[:, c] = 0.98
+        return p, ["isl.extra-a", "isl.extra-b"], 0.0, 0.0
+
+
+def _hands_stream(eng, n, t0=0.0):
+    from app.dataset.synthetic import make_sequence
+
+    seq = make_sequence(1, 2, n_frames=n)
+    return [eng.push(f) for f in frames_for_stream(seq, t0)]
+
+
+def test_sliding_streak_and_repeats_key_on_the_class_not_the_vocabulary_index():
+    """Two classifier classes outside the vocabulary both had vocabulary index -1: the engine counted them as one
+    streak and suppressed the second word as a "repeat" of the first."""
+    rec = _SlidingRecognizer([0] * 4 + [1] * 30)
+    cfg = EngineConfig(mode="sliding", agree_n=2, cooldown_ms=0, interval_ms=0, window_ms=400, min_frames=3,
+                       ema_alpha=1.0)
+    eng = RecognitionEngine(None, recognizer=rec, config=cfg)
+    commits = [s["commit"] for s in _hands_stream(eng, 30) if "commit" in s]
+    assert [c["concept_id"] for c in commits] == ["isl.extra-a", "isl.extra-b"]
+    assert all(c["class_index"] == -1 for c in commits)  # the commit still carries the vocabulary index
+    assert eng.streak_class == 1  # the classifier's class index
+
+
+def test_classifier_policy_thresholds_are_cached_per_classifier_and_fusion(monkeypatch):
+    """The engine asks for the sliding threshold on every frame; the fingerprint hashes the whole class list."""
+    import app.isl.recognizer as R
+    from app.isl.models.fusion import FusionParams
+    from app.isl.recognizer import IslRecognizer
+    from app.packs.vocabulary import Vocabulary
+
+    fcfg = FeatureConfig(canonical_hand=True)
+
+    class _Clf:
+        feature_config = fcfg
+        class_names = ["isl.a", "isl.b"]
+        meta = {"recommended_threshold": 0.4, "class_names": ["isl.a", "isl.b"]}
+
+    calls = []
+    real = R.classifier_policy_thresholds
+    monkeypatch.setattr(R, "classifier_policy_thresholds", lambda c, f: calls.append((c, f)) or real(c, f))
+    rec = IslRecognizer("isl", fcfg, Vocabulary.from_class_names(["isl.a", "isl.b"]), classifier=_Clf())
+    for _ in range(50):
+        assert rec.classifier_threshold_for("balanced") == 0.4
+    assert len(calls) == 1
+    rec.fusion = FusionParams()  # another fusion.json: computed again, once
+    for _ in range(5):
+        rec.classifier_threshold_for("strict")
+    rec.classifier = _Clf()  # another classifier
+    rec.classifier_threshold_for("strict")
+    assert len(calls) == 3

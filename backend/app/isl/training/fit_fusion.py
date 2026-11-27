@@ -498,20 +498,34 @@ def fit_classifier_alone(rec, inputs: list[FusionInputs], truths: list[str], par
 MIN_E4_TESTS = 30  # enrolled test takes needed before the user-sign classifier mode is chosen from data
 MIN_E4_GROUPS = 2
 MAX_FA_INCREASE = 0.01  # "neutral" may not raise the user-sign false-accept rate by more than this
-# "neutral" must beat "penalty" by more than noise: at least this top-1 gain AND at least MIN_EXTRA_CORRECT more
-# correct enrolled takes (with 30 takes one lucky take is a 0.033 gain)
-MIN_TOP1_GAIN = 0.02
-MIN_EXTRA_CORRECT = 2
+# "neutral" must beat "penalty" by more than noise (docs 15.27): a one-sided exact sign test on the PAIRED enrolled
+# takes (the same takes under both modes): b = takes only neutral gets right, c = takes only penalty gets right,
+# p = P(X >= b | X ~ Binomial(b + c, 1/2)) < SIGN_TEST_ALPHA. It replaces the absolute rule (top-1 gain >= 0.02 and
+# >= 2 more correct takes), which on research validation (4,689 takes, +84 correct, 0 lost) kept "penalty" and with
+# 30 takes let +3 of 30 through.
+SIGN_TEST_ALPHA = 0.05
 
 
-def choose_user_mode(rec, val_clips: list[Clip], params: FusionParams, ks=(3, 1),
+def sign_test_p(b: int, c: int) -> float:
+    """One-sided exact sign test: P(X >= b) for X ~ Binomial(b + c, 1/2). 1.0 when there is no discordant pair."""
+    from math import comb
+
+    n = int(b) + int(c)
+    if n == 0:
+        return 1.0
+    return float(sum(comb(n, i) for i in range(int(b), n + 1)) / (1 << n))  # exact big-int division
+
+
+def choose_user_mode(rec, val_clips: list[Clip], params: FusionParams, ks=(3, 5),
                      cache: dict | None = None) -> tuple[FusionParams, dict]:
     """Pick the classifier term of "My signs" keys (``user_cls_mode``) on validation few-shot data: the val part's
-    signer groups enrol ``k`` takes of half of their words (the E4 protocol, run on validation, never on test).
-    ``neutral`` is chosen only when it raises top-1 on the enrolled words by more than noise (``MIN_TOP1_GAIN`` and
-    ``MIN_EXTRA_CORRECT`` takes) and the false-accept rate of user signs on the other words rises by at most
-    ``MAX_FA_INCREASE``; with too little data the default ``penalty`` stays. ``cache``: per-clip evidence already
-    computed (fit-fusion passes its own, ``collect_evidence(e4_cache=...)``, so nothing is computed twice)."""
+    signer groups enrol ``k`` takes of half of their words (the E4 protocol, run on validation, never on test; k = 3
+    first, as the app's minimum enrolment). ``neutral`` is chosen only when (a) on the paired enrolled takes it is
+    better than ``penalty`` by a one-sided sign test at p < ``SIGN_TEST_ALPHA`` and (b) the user-sign false-accept
+    rate on the other words rises by at most ``MAX_FA_INCREASE`` (the threshold-rule rate: under a confirm-only
+    policy the app's own rate is always 0 and would hide a rise). With too little data the default ``penalty``
+    stays. ``cache``: per-clip evidence already computed (fit-fusion passes its own,
+    ``collect_evidence(e4_cache=...)``, so nothing is computed twice)."""
     from collections import Counter, defaultdict
 
     from app.isl.evaluation.runners import e4_my_signs
@@ -530,9 +544,11 @@ def choose_user_mode(rec, val_clips: list[Clip], params: FusionParams, ks=(3, 1)
                           f"need {MIN_E4_GROUPS}): kept {params.user_cls_mode!r}")
         return params, rep
     cache = {} if cache is None else cache
-    res = {"penalty": e4_my_signs(rec, val_clips, ks=ks, params=params.with_(user_cls_mode="penalty"), cache=cache)}
+    res = {"penalty": e4_my_signs(rec, val_clips, ks=ks, params=params.with_(user_cls_mode="penalty"), cache=cache,
+                                  keep_hits=True)}
     if any((res["penalty"].get("by_k") or {}).get(f"k{k}", {}).get("n", 0) >= MIN_E4_TESTS for k in ks):
-        res["neutral"] = e4_my_signs(rec, val_clips, ks=ks, params=params.with_(user_cls_mode="neutral"), cache=cache)
+        res["neutral"] = e4_my_signs(rec, val_clips, ks=ks, params=params.with_(user_cls_mode="neutral"), cache=cache,
+                                     keep_hits=True)
     k_used = None
     for k in ks:
         a = (res["penalty"].get("by_k") or {}).get(f"k{k}")
@@ -546,20 +562,40 @@ def choose_user_mode(rec, val_clips: list[Clip], params: FusionParams, ks=(3, 1)
                    reason=f"insufficient validation few-shot data ({best['n']} enrolled test takes, {best['n_groups']} "
                           f"groups; need {MIN_E4_TESTS} and {MIN_E4_GROUPS}): kept {params.user_cls_mode!r}")
         return params, rep
+    hits = {}
     for m in ("penalty", "neutral"):
         r = res[m]["by_k"][f"k{k_used}"]
+        hits[m] = r.get("_with")
         rep["modes"][m] = {x: r.get(x) for x in ("n", "n_groups", "top1_with_enrolment", "gain",
-                                                  "user_sign_false_accept_rate", "n_other_words")}
+                                                  "user_sign_false_accept_rate",
+                                                  "user_sign_false_accept_rate_threshold_rule", "n_other_words")}
     pen, neu = rep["modes"]["penalty"], rep["modes"]["neutral"]
     gain = neu["top1_with_enrolment"] - pen["top1_with_enrolment"]
-    fa_up = (neu["user_sign_false_accept_rate"] or 0.0) - (pen["user_sign_false_accept_rate"] or 0.0)
-    extra_correct = gain * (pen["n"] or 0)
-    clear_gain = gain >= MIN_TOP1_GAIN and extra_correct >= MIN_EXTRA_CORRECT - 1e-9
+
+    def fa(m):  # the threshold-rule rate when E4 gave it (see the docstring), else the app's rate
+        v = m.get("user_sign_false_accept_rate_threshold_rule")
+        return float(v if v is not None else (m.get("user_sign_false_accept_rate") or 0.0))
+
+    fa_up = fa(neu) - fa(pen)
+    hp, hn = hits["penalty"], hits["neutral"]
+    if hp is None or hn is None or len(hp) != len(hn):
+        rep.update(chosen=params.user_cls_mode, k=k_used, top1_gain_neutral=round(gain, 4),
+                   false_accept_increase_neutral=round(fa_up, 4),
+                   reason=f"no paired per-take results for the sign test: kept {params.user_cls_mode!r}")
+        return params, rep
+    hp, hn = np.asarray(hp) > 0.5, np.asarray(hn) > 0.5
+    b, c = int((hn & ~hp).sum()), int((hp & ~hn).sum())
+    p_val = sign_test_p(b, c)
+    clear_gain = p_val < SIGN_TEST_ALPHA
     choose = "neutral" if clear_gain and fa_up <= MAX_FA_INCREASE else "penalty"
     rep.update(chosen=choose, k=k_used, top1_gain_neutral=round(gain, 4), false_accept_increase_neutral=round(fa_up, 4),
-               extra_correct_neutral=round(extra_correct, 1),
-               reason=("neutral raises enrolled-word top-1 without more user-sign false accepts" if choose == "neutral"
-                       else (f"neutral's top-1 gain ({gain:+.3f}, {extra_correct:+.1f} takes) is within noise "
-                             f"(need >= {MIN_TOP1_GAIN} and >= {MIN_EXTRA_CORRECT} takes)" if not clear_gain
-                             else "neutral raised user-sign false accepts")))
+               extra_correct_neutral=b - c, sign_test={"neutral_only_correct": b, "penalty_only_correct": c,
+                                                       "p_one_sided": p_val, "alpha": SIGN_TEST_ALPHA},
+               rule=f"neutral when the one-sided paired sign test gives p < {SIGN_TEST_ALPHA} and the user-sign "
+                    f"false-accept rate (threshold rule) rises by <= {MAX_FA_INCREASE}",
+               reason=("neutral raises enrolled-word top-1 (sign test) without more user-sign false accepts"
+                       if choose == "neutral" else
+                       (f"neutral's top-1 gain ({gain:+.3f}; {b} takes won, {c} lost) is within noise "
+                        f"(one-sided sign test p = {p_val:.3g}, need < {SIGN_TEST_ALPHA})" if not clear_gain
+                        else f"neutral raised user-sign false accepts by {fa_up:+.4f} (> {MAX_FA_INCREASE})")))
     return params.with_(user_cls_mode=choose), rep

@@ -72,7 +72,8 @@ def test_public_source_with_nothing_ingested_is_incomplete(tmp_path):
 
 
 def test_user_mode_needs_more_than_a_noise_gain(monkeypatch):
-    """Review open item: ``choose_user_mode`` picked ``neutral`` on any top-1 gain (one lucky take of 30)."""
+    """Review open item: ``choose_user_mode`` picked ``neutral`` on any top-1 gain (one lucky take of 30). Since
+    docs 15.27 the rule is a one-sided paired sign test (p < 0.05) on the enrolled takes plus a false-accept cap."""
     from pathlib import Path
 
     import app.isl.evaluation.runners as runners
@@ -80,25 +81,58 @@ def test_user_mode_needs_more_than_a_noise_gain(monkeypatch):
     from app.isl.training import fit_fusion as ff
     from app.isl.training.common import Clip
 
-    def fake(top1_neutral, n=30):
+    def fake(won, lost=0, n=30, base=18, fa_neutral=0.0):
+        """penalty gets ``base`` takes right; neutral wins ``won`` of the others and loses ``lost`` of those."""
+        pen = [1.0] * base + [0.0] * (n - base)
+        neu = list(pen)
+        for i in range(won):
+            neu[base + i] = 1.0
+        for i in range(lost):
+            neu[i] = 0.0
+
         def e4(rec, clips, ks, params, cache, **kw):
-            t = top1_neutral if params.user_cls_mode == "neutral" else 0.6
-            return {"run": True, "by_k": {"k3": {"n": n, "n_groups": 3, "top1_with_enrolment": t, "gain": 0.1,
-                                                 "user_sign_false_accept_rate": 0.02, "n_other_words": 50}}}
+            h = neu if params.user_cls_mode == "neutral" else pen
+            fa = fa_neutral if params.user_cls_mode == "neutral" else 0.0
+            return {"run": True, "by_k": {"k3": {"n": n, "n_groups": 3, "top1_with_enrolment": sum(h) / n,
+                                                 "gain": 0.1, "user_sign_false_accept_rate": 0.0,
+                                                 "user_sign_false_accept_rate_threshold_rule": fa,
+                                                 "n_other_words": 50, "_with": h}}}
         return e4
 
     val = [Clip(f"v/{g}/{w}/{t}", "isl500", w, f"isl.{w}", None, None, Path("/x"), group=g)
            for g in ("u1", "u2") for w in ("a", "b") for t in range(4)]
-    monkeypatch.setattr(runners, "e4_my_signs", fake(0.6 + 1 / 30))  # one more correct take of 30
+    monkeypatch.setattr(runners, "e4_my_signs", fake(1))  # n = 30, one more correct take: p = 0.5
     p, rep = ff.choose_user_mode(None, val, FusionParams())
     assert p.user_cls_mode == "penalty" and "within noise" in rep["reason"]
-    monkeypatch.setattr(runners, "e4_my_signs", fake(0.6 + 3 / 30))  # three more: a real gain
+    assert rep["sign_test"]["neutral_only_correct"] == 1 and rep["sign_test"]["p_one_sided"] == 0.5
+    monkeypatch.setattr(runners, "e4_my_signs", fake(3))  # +3 of 30: p = 0.125, still noise
     p, rep = ff.choose_user_mode(None, val, FusionParams())
-    assert p.user_cls_mode == "neutral" and rep["extra_correct_neutral"] == 3.0
-    monkeypatch.setattr(runners, "e4_my_signs", fake(0.615, n=400))  # 6 takes but only +0.015
+    assert p.user_cls_mode == "penalty" and rep["extra_correct_neutral"] == 3
+    monkeypatch.setattr(runners, "e4_my_signs", fake(5))  # +5 of 30, none lost: p = 1/32 < 0.05
     p, rep = ff.choose_user_mode(None, val, FusionParams())
-    assert p.user_cls_mode == "penalty"
+    assert p.user_cls_mode == "neutral"
+    # research validation (QA plan 0.5): 4,689 takes, +84 correct, none lost, no false-accept change -> neutral.
+    # The old absolute rule (gain >= 0.02) kept penalty: 84 / 4689 = 0.018.
+    monkeypatch.setattr(runners, "e4_my_signs", fake(84, n=4689, base=3000))
+    p, rep = ff.choose_user_mode(None, val, FusionParams())
+    assert p.user_cls_mode == "neutral" and rep["top1_gain_neutral"] < 0.02 and rep["sign_test"]["p_one_sided"] < 1e-20
+    # the same net +84, but neutral wins 1,500 takes and loses 1,416: p = 0.06, no evidence -> penalty (the net
+    # gain alone cannot tell these two cases apart; the paired counts can)
+    monkeypatch.setattr(runners, "e4_my_signs", fake(1500, lost=1416, n=4689, base=3000))
+    p, rep = ff.choose_user_mode(None, val, FusionParams())
+    assert p.user_cls_mode == "penalty" and rep["extra_correct_neutral"] == 84
+    # a clear gain with more user-sign false accepts (threshold rule, the app's own rate is 0 when confirm-only)
+    monkeypatch.setattr(runners, "e4_my_signs", fake(84, n=4689, base=3000, fa_neutral=0.02))
+    p, rep = ff.choose_user_mode(None, val, FusionParams())
+    assert p.user_cls_mode == "penalty" and "false accepts" in rep["reason"]
 
+
+def test_sign_test_p_values():
+    from app.isl.training.fit_fusion import sign_test_p
+
+    assert sign_test_p(0, 0) == 1.0 and sign_test_p(1, 0) == 0.5 and sign_test_p(5, 0) == 1 / 32
+    assert abs(sign_test_p(5, 1) - 7 / 64) < 1e-12  # P(X >= 5), X ~ Bin(6, 1/2)
+    assert sign_test_p(0, 3) == 1.0
 
 def test_pack_serves_the_phase2_report_not_a_stale_results_json(tmp_path):
     """A full run reuses ``artifacts/isl/<profile>/``, which still held the phase-1 smoke ``results.json``

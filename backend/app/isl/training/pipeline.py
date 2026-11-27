@@ -62,6 +62,26 @@ def shipped_index(work: Path) -> tuple[Path | None, str | None]:
     return fin.parent, None
 
 
+def extra_concept_rows(work: Path, have: set[str]) -> list[dict]:
+    """Rows of ``<work>/extra_concepts.jsonl`` (concepts only other sources know, written by the link step) whose
+    concept id is not in ``have``, in file order: exactly the rows ``build_pack`` appends to the pack's vocabulary
+    (so the vocabulary indices match). Bad lines are skipped; no file = no rows."""
+    f = Path(work) / "extra_concepts.jsonl"
+    out: list[dict] = []
+    if not f.exists() or not f.stat().st_size:
+        return out
+    seen = set(have)
+    for ln in f.read_text(encoding="utf-8").splitlines():
+        try:
+            r = json.loads(ln) if ln.strip() else None
+        except json.JSONDecodeError:
+            continue
+        if isinstance(r, dict) and r.get("concept_id") and r["concept_id"] not in seen:
+            seen.add(r["concept_id"])
+            out.append(r)
+    return out
+
+
 def load_recognizer(work: Path, fcfg: FeatureConfig, vocab_path: Path | None = None, profile: str = "commercial-safe",
                     fusion: FusionParams | None = None, with_index: bool = True, for_app: bool = False):
     """An ``IslRecognizer`` over the components present in a work folder (no My signs).
@@ -80,6 +100,12 @@ def load_recognizer(work: Path, fcfg: FeatureConfig, vocab_path: Path | None = N
     from app.packs.vocabulary import Vocabulary
 
     vocab = Vocabulary.load(vocab_path or PACK_DIR / "vocabulary.jsonl")
+    extra = extra_concept_rows(work, {r["concept_id"] for r in vocab.rows})
+    if extra:
+        # the concepts only other sources know (link step's extra_concepts.jsonl) are in the shipped pack's
+        # vocabulary (build_pack appends them): fit-fusion and evaluation must see the same vocabulary, or those
+        # classes get prior 0 and vocabulary index -1 while measuring and prior 0.5 in the app (docs 15.27)
+        vocab = Vocabulary(vocab.rows + extra)
     clf = Predictor(work / "classifier.pt") if (work / "classifier.pt").exists() else None
     enc = EncoderPredictor(work / "encoder.pt") if (work / "encoder.pt").exists() else None
     idx = None
