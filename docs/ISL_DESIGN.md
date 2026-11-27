@@ -3968,8 +3968,9 @@ fusion fitted on another classifier is flagged by evaluate and refused by build-
 
 **Finding.** WSLP numbers repeated words: "Adult(1)". The linker kept the "(1)", so 26 WSLP words became new
 concepts (`isl.adult-1`, `isl.bank-1`, ...) next to the real ones. Some twins are also kept apart only because their
-source names differ: INCLUDE's `isl.female` and ISLRTC's `isl.woman-female`, `isl.big` and `isl.large`, `isl.mouse`
-and `isl.rat-mouse`, `isl.race~ethnicity` and `isl.race`. A model that picks the twin is not wrong for the user, and
+source names differ: `isl.female` and `isl.woman-female` (both hold an INCLUDE class: "female" and "Woman"; see
+15.35), `isl.big` and `isl.large`, `isl.mouse` and `isl.rat-mouse`. (`isl.race~ethnicity` and `isl.race` were in the
+first table; 15.35 took them out.) A model that picks the twin is not wrong for the user, and
 the fused probability of the word is split over two keys. The plan expects a small gain (+0.35 pp). The groups are
 also what 1.3 (variant forms) builds on.
 
@@ -4024,3 +4025,57 @@ crop votes use the groups; you / you~plural are refused; an old fusion.json has 
 number; fit-fusion keeps the strict weights and fits thresholds on the groups; `evaluate --all` keeps strict metrics,
 adds alias rows and flags a fusion fitted with another map; `link-sources` writes the settings and a later step reads
 them; the driver passes `--link-aliases` for research only.
+
+### 15.35 Alias review fixes: evidence for every pair, a frozen map, one gate per group (review of 15.34, 27 Nov 2026)
+
+**Race is not a twin.** ISLRTC has three "race" rows: Race, Race (Competition) and Race (Social Science). We checked
+which one INCLUDE's "Race (ethnicity)" matches, read-only, with the encoders and indexes of 27 Nov (train clips only:
+the INCLUDE centroid against the 13,461 ISLRTC dictionary rows). Research / commercial-safe ranks: Race 4813 / 781,
+Race (Competition) 766 / 1510, Race (Social Science) 10981 / 2469. None is close, so no race pair is aliased (the
+social-science row is not either). `ALIAS_VERSION` is now `isl-alias-2`.
+
+**Evidence next to every pair.** Each pair in `TWIN_ALIASES` has a comment with its numbers:
+* `isl.woman-female` -> `isl.female`: INCLUDE "Woman" ranks the Woman/Female row 62 / 2; ISL500 "Female" ranks it 1.
+* `isl.large` -> `isl.big`: INCLUDE "big / large" ranks Large 2 / 14 and Big 6 / 1; ISL500 "Large" ranks Large 2,
+  Big 5.
+* `isl.rat-mouse` -> `isl.mouse`: INCLUDE "Mouse" ranks Rat/Mouse 35 / 5; ISL500 "Mouse" ranks ISLRTC Mouse 1. These
+  are two forms of the one word "mouse", both used for the animal.
+
+**Woman and female are two INCLUDE classes.** 15.34 said the group joins INCLUDE's `isl.female` and ISLRTC's
+`isl.woman-female`. In fact `isl.woman-female` also holds INCLUDE's own "People/65. Woman" class (20 clips, in the
+classifier). So this group joins two INCLUDE classifier classes, and the word shown can be "woman / female" or
+"female". The alias numbers of E1b therefore count woman <-> female confusions as right. That is allowed (critic 12:
+reported, never a gate). E1b / E1c `alias_labels` now have `by_group`: per group, how many clips are right only on
+alias labels, so a reader sees how much of the gain comes from woman / female. report.md prints them.
+
+**Later steps use the frozen map.** `linker_options` takes `alias_of` from `<work>/link_settings.json` when the file
+has it. Only the link step itself reads `TWIN_ALIASES`. So when the table in the code changes (plan 1.3), every step
+of a work folder linked earlier still uses the same groups: the held-out guard and one-shot exclusions (`expand`),
+fit-fusion and evaluate.
+
+**Numbering only for WSLP.** `strip_sign_number` now runs only for sources in `STRIP_NUMBERING_SOURCES` (`wslp`).
+Today only WSLP has "(N)" glosses, so nothing changes. A future source with meaningful numbers is not merged silently.
+The count is also kept per source (`numbering_stripped:wslp`).
+
+**One open-vocabulary rule per group.** With aliases, the fused decision shows the group's best member. That member
+can be retrieval only (`isl.large`, `isl.rat-mouse`) while the summed mass holds the root's classifier probability.
+Before, such a group got the confirm-only open-vocabulary gate only when that member led. Now
+`aliases.closed_with_aliases` adds every member of a group that has a class to the closed set. fit-fusion, E3 and the
+app (`IslRecognizer.is_open_vocabulary`, so also the engine) use it. The group is a classifier word whichever member
+leads. We kept "show the best member" (not "always show the root"): showing the root would make every INCLUDE "Woman"
+clip strictly wrong.
+
+**Reports.** `report.json` `aliases` has `stale` (the link step turned aliases on, but fusion.json has none: run
+fit-fusion again) and the link step's `link_alias_version`. E3 `alias_labels` has `top5_strict`. report.md prints
+strict and alias top-5 and the stale warning.
+
+**Driver.** When the link step is not in this run, the start line shows the folder's real state, for example
+`link_aliases=1 (link step not run; folder: none)`. `none` / `off` / `on` come from `<work>/link_settings.json` (of
+the seed folder when link is seeded). A warning is logged when `LINK_ALIASES` and the folder disagree. The dry run
+prints the same. The script was replaced by a new file (not edited in place), so the running driver keeps its copy.
+
+Defaults are unchanged: with no `--link-aliases` and no link_settings.json, linking, fit-fusion, evaluate and the app
+behave as in Batch 0. Tests: `backend/tests/isl/test_linker_aliases.py` (the race pair is gone and every pair has a
+comment; WSLP-only stripping; a settings file whose map differs from the code's; a group with a class is closed;
+`fit_thresholds` sees the summed groups, roots, strict truths and the group-closed set; per-group counts, top5_strict,
+stale; the driver's start line).

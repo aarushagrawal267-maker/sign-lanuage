@@ -170,8 +170,9 @@ class GlossLinker:
     New concepts are written by :meth:`extra_concepts` so a pack can show them.
 
     Opt-in (docs 15.34, link step ``--link-aliases``): ``strip_numbering`` removes WSLP's trailing "(N)" before
-    linking, so "Adult(1)" links to ``isl.adult`` instead of a new ``isl.adult-1``; ``aliases`` (alias -> root,
-    e.g. ``app.isl.vocab.aliases.TWIN_ALIASES``) gives :attr:`alias_of`, the alias groups of known concepts.
+    linking (only for the sources in ``aliases.STRIP_NUMBERING_SOURCES``: WSLP), so "Adult(1)" links to
+    ``isl.adult`` instead of a new ``isl.adult-1``; ``aliases`` (alias -> root, e.g.
+    ``app.isl.vocab.aliases.TWIN_ALIASES``) gives :attr:`alias_of`, the alias groups of known concepts.
     Both off by default: links exactly as before."""
 
     LINKABLE_KINDS = {"word", "multiword", "synonym_list", "number", "phrase", "letter", None}
@@ -217,13 +218,14 @@ class GlossLinker:
         return resolve_aliases(self.alias_table, self.known | set(self.new))
 
     def link(self, gloss: str, source: str = "") -> tuple[str | None, str]:
-        from app.isl.vocab.aliases import strip_sign_number
+        from app.isl.vocab.aliases import STRIP_NUMBERING_SOURCES, strip_sign_number
         from app.isl.vocab.normalize import slugify
 
-        if self.strip_numbering and gloss:
+        if self.strip_numbering and gloss and source in STRIP_NUMBERING_SOURCES:  # WSLP only (docs 15.35)
             g = strip_sign_number(gloss)
             if g != gloss:
                 self.counts["numbering_stripped"] += 1
+                self.counts[f"numbering_stripped:{source}"] += 1
                 gloss = g
         k = _key(gloss)
         if not k:
@@ -526,11 +528,20 @@ def link_settings(link_aliases: bool = False) -> dict:
 
 
 def linker_options(settings: dict | None) -> dict:
-    """``GlossLinker`` keyword arguments of link settings (``{}`` or None: the old linking)."""
+    """``GlossLinker`` keyword arguments of link settings (``{}`` or None: the old linking). A settings FILE carries
+    the map the link step froze (``alias_of``): later steps use that map, never the table in the current code, so
+    every step of one work folder groups the same way after the table changes (docs 15.35). Only the link step itself
+    (settings from :func:`link_settings`, no ``alias_of`` yet) reads ``TWIN_ALIASES``."""
     from app.isl.vocab.aliases import TWIN_ALIASES
 
     s = settings or {}
-    return {"strip_numbering": bool(s.get("strip_sign_numbers")), "aliases": TWIN_ALIASES if s.get("aliases") else None}
+    if not s.get("aliases"):
+        al = None
+    elif "alias_of" in s:
+        al = dict(s.get("alias_of") or {})
+    else:
+        al = TWIN_ALIASES
+    return {"strip_numbering": bool(s.get("strip_sign_numbers")), "aliases": al}
 
 
 def read_link_settings(work: Path) -> dict:

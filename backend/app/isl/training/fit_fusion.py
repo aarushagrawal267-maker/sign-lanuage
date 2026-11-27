@@ -280,6 +280,10 @@ def fit_fusion(rec, val_clips: list[Clip], profile: str, version: str = "fusion-
     # per-source certification (docs 15.25): every clip's source and signer group; the classifier's classes for the
     # open-vocabulary check (no classifier: every word is retrieval only)
     closed = set(stats.get("cls_names") or (list(clf.class_names) if clf is not None else []))
+    if params.aliases:  # a group with a classifier class is a classifier word, whichever member leads (docs 15.35)
+        from app.isl.vocab.aliases import closed_with_aliases
+
+        closed = closed_with_aliases(closed, params.aliases)
     params, trep = fit_thresholds(results, truths, params, sources=[c.source for c in used],
                                   groups=[getattr(c, "group", None) for c in used], closed_set=closed)
     del results

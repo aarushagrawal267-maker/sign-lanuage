@@ -175,7 +175,9 @@ class IslRecognizer:
         self.capabilities = frozenset(caps)
         self._prior = None  # ConceptPrior of self.vocab, shared by every segment's FusionInputs (docs 15.23)
         self._cls_cal = None  # (classifier, fusion, classifier_policy_thresholds result): computed once per pair
-        self._class_set = None  # (classifier, frozenset of its class names): the open-vocabulary test (docs 15.25)
+        # (classifier, frozenset of its class names and their alias groups, fusion aliases): the open-vocabulary test
+        # (docs 15.25, 15.35)
+        self._class_set = None
 
     # ------------------------------------------------------------------ helpers
     @property
@@ -269,8 +271,13 @@ class IslRecognizer:
         if self.classifier is None:
             return True
         c = self._class_set
-        if c is None or c[0] is not self.classifier:
-            c = self._class_set = (self.classifier, frozenset(self.classifier.class_names))
+        al = getattr(self.fusion, "aliases", None)
+        if c is None or c[0] is not self.classifier or c[2] is not al:
+            from app.isl.vocab.aliases import closed_with_aliases
+
+            # an alias group with a classifier class counts as a classifier word, whichever member is shown (15.35)
+            c = self._class_set = (self.classifier, frozenset(closed_with_aliases(self.classifier.class_names, al)),
+                                   al)
         return key not in c[1]
 
     def class_probs(self, crops: list[RawSequence]):

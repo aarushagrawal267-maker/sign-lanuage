@@ -205,7 +205,8 @@ fi
 DICT_GROUP="${CLS_DICTIONARY_GROUP:-$DG_DEFAULT}"
 ENC_XSRC="${ENC_EXCLUDE_SOURCES-$XS_DEFAULT}"
 WSLP_TWINS="${INDEX_WSLP_TWINS:-$TW_DEFAULT}"
-# linker aliases (docs 15.34): research on, commercial-safe off; only the link step passes it
+# linker aliases (docs 15.34): research on, commercial-safe off; only the link step passes it (later steps read the
+# work folder's link_settings.json; the start line prints the folder's real state when link is not run, docs 15.35)
 LINK_ALIASES="${LINK_ALIASES:-$([[ "$PROFILE" == "research" ]] && echo 1 || echo 0)}"
 case "$LINK_ALIASES" in 0|1) ;; *) echo "LINK_ALIASES must be 0 or 1" >&2; exit 2 ;; esac
 LA_ARG=""; [[ $LINK_ALIASES == 1 ]] && LA_ARG="--link-aliases"
@@ -416,6 +417,22 @@ for s in "${STEPS[@]}"; do
   in_list "$s" "${SEED[@]}" && continue
   if in_list "$s" "${FORGET[@]}" || [[ ! -f "$STAMPS/$s.done" ]]; then RUN+=("$s"); fi
 done
+# the linker setting this run really has (docs 15.35): LINK_ALIASES acts only when the link step runs; otherwise the
+# work folder's link_settings.json (written by its link step) decides, and the start line says which
+if in_list link "${RUN[@]}"; then
+  LA_STATE="$LINK_ALIASES"
+else
+  la_dir="$WORK"; in_list link "${SEED[@]}" && la_dir="$SEED_WORK"
+  if [[ ! -f "$la_dir/link_settings.json" ]]; then la_folder="none"
+  elif grep -q '"aliases": true' "$la_dir/link_settings.json"; then la_folder="on"
+  else la_folder="off"; fi
+  LA_STATE="$LINK_ALIASES (link step not run; folder: $la_folder)"
+  if [[ $LINK_ALIASES == 1 && $la_folder != on ]] || [[ $LINK_ALIASES == 0 && $la_folder == on ]]; then
+    LA_WARN="LINK_ALIASES=$LINK_ALIASES but the link step is not run and the work folder's link settings are $la_folder: this run links as the folder says (run --from link to change it)"
+  fi
+fi
+WSLP_SETTINGS="${WSLP_SETTINGS% link_aliases=*} link_aliases=$LA_STATE"
+[[ $DRY_RUN == 1 ]] && echo "linker this run: link_aliases=$LA_STATE"
 # (not for --check-only, which runs no step)
 if [[ $SCRATCH == 1 && $ALLOW_SHARED == 0 && $CHECK_ONLY == 0 ]]; then
   for s in "${RUN[@]}"; do
@@ -478,6 +495,7 @@ free_gb=$(df -Pk "$REPO" | awk 'NR==2 {print int($4/1048576)}')
 if [[ "$free_gb" -lt 10 ]]; then log "only ${free_gb} GB free (< 10 GB floor): not starting"; exit 3; fi
 
 log "phase 2 driver: profile=$PROFILE smoke=$SMOKE tag=${RUN_TAG:--} allow_partial=$ALLOW_PARTIAL threads=$THREADS work=$WORK stamps=$STAMPS${COMPARE_TO:+ compare_to=$COMPARE_TO} $WSLP_SETTINGS git=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+[[ -n "${LA_WARN:-}" ]] && log "warning: $LA_WARN"
 if [[ ${#SEED[@]} -gt 0 ]]; then
   for s in "${SEED[@]}"; do seed_step "$s" || { log "seeding $s FAILED"; exit 2; }; done
   if [[ -f "$SEED_WORK/partial_data.json" && ! -f "$WORK/partial_data.json" ]]; then

@@ -318,10 +318,18 @@ def e1_alias_rates(P: np.ndarray, y: np.ndarray, ids: list[str], alias_of: dict,
     h1 = order[:, 0] == ry
     h5 = (order[:, :5] == ry[:, None]).any(1)
     strict1 = np.asarray(hit) > 0.5
+    # per group: how many clips of that group change (docs 15.35), so a reader sees where the alias gain comes from
+    yroot = [alias_root(ids[t], alias_of) for t in y]
+    by_group = {}
+    for g in sorted({alias_root(k, alias_of) for k in alias_of}):
+        m = np.array([r == g for r in yroot], bool)
+        if m.any():
+            by_group[g] = {"n": int(m.sum()), "top1_only_alias": int((h1 & ~strict1 & m).sum()),
+                           "top1_only_strict": int((~h1 & strict1 & m).sum())}
     return {"rule": ALIAS_RULE, "n": int(len(y)), "top1": float(h1.mean()), "top5": float(h5.mean()),
             "top1_strict": float(strict1.mean()), "top5_strict": float(np.mean(top5)),
             "top1_only_alias": int((h1 & ~strict1).sum()), "top1_only_strict": int((~h1 & strict1).sum()),
-            "groups_among_classes": int(len(ids) - len(roots))}
+            "groups_among_classes": int(len(ids) - len(roots)), "by_group": by_group}
 
 
 def e3_alias_rates(results, truths: list[str], params: FusionParams, alias_of: dict, closed_set=None) -> dict:
@@ -336,8 +344,10 @@ def e3_alias_rates(results, truths: list[str], params: FusionParams, alias_of: d
     h1 = np.array([bool(r.keys) and root(r.keys[0]) == t for r, t in zip(results, rt)], bool)
     s1 = np.array([bool(r.keys) and r.keys[0] == t for r, t in zip(results, truths)], bool)
     h5 = np.array([t in {root(k) for k in r.keys[:5]} for r, t in zip(results, rt)], bool)
+    s5 = np.array([t in r.keys[:5] for r, t in zip(results, truths)], bool)
     n = len(results)
     out = {"rule": ALIAS_RULE, "n": n, "top1": _rate(h1), "top5": _rate(h5), "top1_strict": _rate(s1),
+           "top5_strict": _rate(s5),
            "fusion_sums_groups": bool(getattr(params, "aliases", None)), "policies": {}}
     for pol in POLICIES:
         acc = np.array([d == "accept" for d, _ in _decisions(results, params, pol, closed_set)], bool)
@@ -500,6 +510,10 @@ def e3_fused(rec, clips, label: str, alias_of: dict | None = None) -> dict:
     clf = getattr(rec, "classifier", None)
     # the open-vocabulary gate needs the classifier's classes (a pack without a classifier: every word is open)
     closed = set(clf.class_names) if clf is not None else (set() if hasattr(rec, "classifier") else None)
+    if getattr(rec.fusion, "aliases", None):  # the app's rule: a group with a class is a classifier word (15.35)
+        from app.isl.vocab.aliases import closed_with_aliases
+
+        closed = closed_with_aliases(closed, rec.fusion.aliases)
     block = decision_block(results, truths, rec.fusion, groups, sources=[getattr(c, "source", None) for c in used],
                            closed_set=closed)
     p1 = np.array([r.probs[0] if len(r.probs) else 0.0 for r in results])
@@ -1045,7 +1059,8 @@ def e8_trim(paths, artifacts_dir: Path, work: Path | None = None) -> dict:
 def alias_summary(data, fusion) -> dict:
     """Which alias map the report scores with (docs 15.34): the link step's (``data.alias_of``), else the one
     fusion.json was fitted with. ``fusion_sums_groups``: the app's fused decision sums the groups. A fusion.json
-    fitted with another map than the link step's is flagged (``mismatch``: run fit-fusion again)."""
+    fitted with another map than the link step's is flagged (``mismatch``: run fit-fusion again), and so is a strict
+    fusion.json in a folder the link step linked with aliases (``stale``, docs 15.35)."""
     from app.isl.vocab.aliases import alias_groups, aliases_sha256
 
     link = dict(getattr(data, "alias_of", None) or {})
@@ -1055,7 +1070,8 @@ def alias_summary(data, fusion) -> dict:
         return {"used": False, "note": "no alias groups (the link step did not turn them on): strict labels only"}
     return {"used": True, "alias_of": al, "groups": alias_groups(al), "sha256": aliases_sha256(al),
             "source": "link step" if link else "fusion.json", "fusion_sums_groups": bool(fus),
-            "mismatch": bool(link and fus and link != fus), "rule": ALIAS_RULE}
+            "mismatch": bool(link and fus and link != fus), "stale": bool(link and not fus),
+            "link_alias_version": (getattr(data, "link", None) or {}).get("alias_version"), "rule": ALIAS_RULE}
 
 
 def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_path: Path | None = None,
@@ -1473,12 +1489,18 @@ def _alias_lines(doc: dict) -> list[str]:
                "every gate uses strict labels."]
     if al.get("mismatch"):
         out.append("* **fusion.json was fitted with another alias map than the link step's: run fit-fusion again**")
+    if al.get("stale"):
+        out.append("* **the link step turned aliases on but fusion.json has none (fitted before the link step, or "
+                   "strict): run fit-fusion again**")
     for pid in ("E1b", "E1c", "E3"):
         a = (doc["protocols"].get(pid) or {}).get("alias_labels")
         if not a:
             continue
         row = (f"* {pid}: n {a.get('n')}, top-1 strict {_fmt(a.get('top1_strict'))} / alias {_fmt(a.get('top1'))}, "
-               f"top-5 alias {_fmt(a.get('top5'))}")
+               f"top-5 strict {_fmt(a.get('top5_strict'))} / alias {_fmt(a.get('top5'))}")
+        bg = {g: v.get("top1_only_alias") for g, v in (a.get("by_group") or {}).items() if v.get("top1_only_alias")}
+        if bg:
+            row += "; clips right only on alias labels: " + ", ".join(f"{g} {v}" for g, v in bg.items())
         b = (a.get("policies") or {}).get("balanced")
         if b:
             row += (f"; balanced accepted precision strict {_fmt(b.get('accepted_precision_strict'))} / alias "

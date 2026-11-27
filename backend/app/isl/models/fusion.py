@@ -405,7 +405,9 @@ class FusionResult:
 def merge_alias_groups(keys: list[str], pf: np.ndarray, alias_of: dict, comps: dict):
     """Sum the per-crop fused probabilities ``pf`` (crops, K; columns sorted by mean, best first) over each alias
     group. Returns (keys, pf, mean, roots, comps): one column per group, named by its best member, sorted again by
-    the summed mean. User signs and keys without an alias are their own group (docs 15.34)."""
+    the summed mean. User signs and keys without an alias are their own group (docs 15.34). The shown member can be
+    retrieval only (``isl.large``); the open-vocabulary gate still treats the group as a classifier word when any
+    member is a class (``aliases.closed_with_aliases``, docs 15.35)."""
     from app.isl.vocab.aliases import merge_columns
 
     roots, idx = merge_columns(keys, alias_of)
