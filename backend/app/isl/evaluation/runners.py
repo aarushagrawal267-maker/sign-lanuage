@@ -300,14 +300,64 @@ def e1_like_for_like(P: np.ndarray, y: np.ndarray, ids: list[str], used, hit: np
     return out
 
 
-def e1_closed_set(rec, clips, label: str, split_name: str, kind: str, reference: dict | None = None) -> dict:
+ALIAS_RULE = ("alias labels: a prediction of another member of the clip's alias group counts as correct (classifier "
+              "probabilities summed over the group first). Reported next to the strict numbers; every gate, "
+              "headline and certification uses STRICT labels (docs 15.34, critic 12)")
+
+
+def e1_alias_rates(P: np.ndarray, y: np.ndarray, ids: list[str], alias_of: dict, hit: np.ndarray,
+                   top5: np.ndarray) -> dict:
+    """E1 top-1 / top-5 on alias labels (docs 15.34): the crop-mean probabilities ``P`` (n, classes) summed over each
+    alias group, then ranked by group. Strict numbers of the same clips next to them."""
+    from app.isl.vocab.aliases import alias_root, sum_by_alias
+
+    roots, Pr = sum_by_alias(P, ids, alias_of)
+    rpos = {r: i for i, r in enumerate(roots)}
+    ry = np.array([rpos[alias_root(ids[t], alias_of)] for t in y], int)
+    order = np.argsort(-np.asarray(Pr), axis=1, kind="stable")
+    h1 = order[:, 0] == ry
+    h5 = (order[:, :5] == ry[:, None]).any(1)
+    strict1 = np.asarray(hit) > 0.5
+    return {"rule": ALIAS_RULE, "n": int(len(y)), "top1": float(h1.mean()), "top5": float(h5.mean()),
+            "top1_strict": float(strict1.mean()), "top5_strict": float(np.mean(top5)),
+            "top1_only_alias": int((h1 & ~strict1).sum()), "top1_only_strict": int((~h1 & strict1).sum()),
+            "groups_among_classes": int(len(ids) - len(roots))}
+
+
+def e3_alias_rates(results, truths: list[str], params: FusionParams, alias_of: dict, closed_set=None) -> dict:
+    """E3 on alias labels (docs 15.34): the shown word counts as correct when it is in the clip's alias group. The
+    decisions are the app's (``params``; with ``params.aliases`` the groups were already summed by ``fuse``)."""
+    from app.isl.vocab.aliases import alias_root
+
+    def root(k):
+        return alias_root(k, alias_of)
+
+    rt = [root(t) for t in truths]
+    h1 = np.array([bool(r.keys) and root(r.keys[0]) == t for r, t in zip(results, rt)], bool)
+    s1 = np.array([bool(r.keys) and r.keys[0] == t for r, t in zip(results, truths)], bool)
+    h5 = np.array([t in {root(k) for k in r.keys[:5]} for r, t in zip(results, rt)], bool)
+    n = len(results)
+    out = {"rule": ALIAS_RULE, "n": n, "top1": _rate(h1), "top5": _rate(h5), "top1_strict": _rate(s1),
+           "fusion_sums_groups": bool(getattr(params, "aliases", None)), "policies": {}}
+    for pol in POLICIES:
+        acc = np.array([d == "accept" for d, _ in _decisions(results, params, pol, closed_set)], bool)
+        out["policies"][pol] = {"n_accepted": int(acc.sum()),
+                                "accepted_precision": _rate(h1[acc]) if acc.any() else None,
+                                "accepted_precision_strict": _rate(s1[acc]) if acc.any() else None,
+                                "wrong_accept_rate": _rate(acc & ~h1), "wrong_accept_rate_strict": _rate(acc & ~s1)}
+    return out
+
+
+def e1_closed_set(rec, clips, label: str, split_name: str, kind: str, reference: dict | None = None,
+                  alias_of: dict | None = None) -> dict:
     """Classifier alone on ``clips``. Decision columns: the classifier-alone rule of the app's sliding mode, with the
     classifier's own validation temperature and threshold, NOT the fused thresholds of ``fusion.json`` (another
     probability scale: the commercial-safe report of 2026-11-26 compared raw classifier probabilities with the fused
     0.96 and showed "not sure" 0.95-1.0; docs/ISL_DESIGN.md 15.16). The threshold is the sliding mode's for the
     app's default policy (``E1_POLICY``, balanced): fitted per policy by fit-fusion when the pack has it for this
     classifier, else the checkpoint's single threshold (``classifier_policy_thresholds``, docs 15.17). Every policy's
-    numbers are in ``policies``."""
+    numbers are in ``policies``. ``alias_of``: also the alias-label top-1 / top-5 in ``alias_labels`` (docs 15.34;
+    the strict numbers stay the metrics)."""
     from sklearn.metrics import f1_score
 
     from app.inference.engine import EngineConfig
@@ -367,6 +417,8 @@ def e1_closed_set(rec, clips, label: str, split_name: str, kind: str, reference:
         record["class_ids"] = ids
     if reference is not None:
         record["like_for_like"] = e1_like_for_like(P, y, ids, used, hit, top5, split_name, reference)
+    if alias_of:
+        record["alias_labels"] = e1_alias_rates(P, y, ids, alias_of, hit, top5)
     per_cat = defaultdict(list)
     for c, h in zip(used, hit):
         per_cat[c.category or "other"].append(h)
@@ -437,7 +489,7 @@ def _e1_sliding_replay(rec, clips, thresholds: dict, kind: str) -> dict | None:
     return out
 
 
-def e3_fused(rec, clips, label: str) -> dict:
+def e3_fused(rec, clips, label: str, alias_of: dict | None = None) -> dict:
     from app.isl.training.fit_fusion import collect_evidence
 
     inputs, truths, used = collect_evidence(rec, clips)
@@ -473,7 +525,8 @@ def e3_fused(rec, clips, label: str) -> dict:
             "n_classes": len(set(truths)), "fusion_fitted": rec.fusion.fitted, "metrics_policy": "balanced",
             "metrics": _metrics_from(block), **block, "risk_coverage": curve,
             "aurc": float(np.mean([c["risk"] for c in curve])),
-            "top1_by_source": {k: {"n": len(v), "top1": float(np.mean(v))} for k, v in sorted(by_src.items())}}
+            "top1_by_source": {k: {"n": len(v), "top1": float(np.mean(v))} for k, v in sorted(by_src.items())},
+            **({"alias_labels": e3_alias_rates(results, truths, rec.fusion, alias_of, closed)} if alias_of else {})}
 
 
 # --------------------------------------------------------------------------------------------- E2
@@ -989,6 +1042,22 @@ def e8_trim(paths, artifacts_dir: Path, work: Path | None = None) -> dict:
 
 # --------------------------------------------------------------------------------------------- driver
 
+def alias_summary(data, fusion) -> dict:
+    """Which alias map the report scores with (docs 15.34): the link step's (``data.alias_of``), else the one
+    fusion.json was fitted with. ``fusion_sums_groups``: the app's fused decision sums the groups. A fusion.json
+    fitted with another map than the link step's is flagged (``mismatch``: run fit-fusion again)."""
+    from app.isl.vocab.aliases import alias_groups, aliases_sha256
+
+    link = dict(getattr(data, "alias_of", None) or {})
+    fus = dict(getattr(fusion, "aliases", None) or {})
+    al = link or fus
+    if not al:
+        return {"used": False, "note": "no alias groups (the link step did not turn them on): strict labels only"}
+    return {"used": True, "alias_of": al, "groups": alias_groups(al), "sha256": aliases_sha256(al),
+            "source": "link step" if link else "fusion.json", "fusion_sums_groups": bool(fus),
+            "mismatch": bool(link and fus and link != fus), "rule": ALIAS_RULE}
+
+
 def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_path: Path | None = None,
                  paths=None, out_dirs: list[Path] | None = None, e4_ks=E4_KS, latency_n: int = 20,
                  progress=None, partial_data: bool | None = None, compare_to: Path | None = None) -> dict:
@@ -1024,8 +1093,11 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     # E1b / E1c / E3 on the primary split's test part
     log("E1b")
     reference = load_e1_reference(Path(compare_to)) if compare_to else None
+    aliases = alias_summary(data, rec.fusion)
+    alias_of = aliases.get("alias_of") or None
     prot["E1b"] = e1_closed_set(rec, test_inc, f"E1b core words, closed set, INCLUDE test part of {split_name} ({lab}; "
-                                f"signer-independent: {si})", split_name, "primary", reference=reference)
+                                f"signer-independent: {si})", split_name, "primary", reference=reference,
+                                alias_of=alias_of)
     cv = sorted((work / "cv").glob("fold*/classifier.pt")) if (work / "cv").exists() else []
     # class spaces (docs 15.32): a classifier chosen with another signer grouping (e.g. WSLP as its own signers)
     # or an encoder trained with other sources has another class space; they are never pooled silently
@@ -1113,7 +1185,7 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
         log("E1c")
         prot["E1c"] = e1_closed_set(rec, extra_test, "E1c other sources' held-out signers (real signer ids: "
                                     + ", ".join(sorted({c.source for c in extra_test})) + "); signer-independent",
-                                    split_name, "extra_signers")
+                                    split_name, "extra_signers", alias_of=alias_of)
     else:
         prot["E1c"] = {"run": False, "reason": "no other labelled source has a signer-held-out test part yet (needs a "
                        "source with real signer ids and >= 6 signers, e.g. ISL500)"}
@@ -1123,7 +1195,8 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     cls_why = classifier_refusal(rec.classifier, split_name)
     e3_label = ("E3 fused system (classifier + dictionary retrieval + fusion fitted on validation) with accept / "
                 "suggest / abstain; INCLUDE test part + other sources' held-out signers")
-    prot["E3"] = refused_entry(e3_label, cls_why) if cls_why else e3_fused(rec, test_inc + extra_test, e3_label)
+    prot["E3"] = refused_entry(e3_label, cls_why) if cls_why else e3_fused(rec, test_inc + extra_test, e3_label,
+                                                                            alias_of=alias_of)
     # E2 held-out-concept one-shot
     one = (paths.splits / "oneshot_concepts.json") if paths is not None else None
     fold_models = sorted((work / "oneshot").glob("fold*/encoder.pt")) if (work / "oneshot").exists() else []
@@ -1221,6 +1294,7 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     doc = {"schema": 2, "language": "isl", "profile": profile, "smoke": smoke, "partial_data": bool(partial or smoke),
            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "git_commit": git_commit(),
            "label": label, "data": data_doc, "leakage_guards": leak, "protocols": prot,
+           "aliases": {k: v for k, v in aliases.items() if k != "alias_of"},
            "seconds": round(time.time() - t0, 1)}
     md = markdown_report(doc)
     for d in [work / "eval", *(out_dirs or [])]:
@@ -1389,6 +1463,30 @@ def _like_for_like_lines(lf: dict | None) -> list[str]:
     return out
 
 
+def _alias_lines(doc: dict) -> list[str]:
+    """Alias-label numbers next to the strict ones (docs 15.34). Never a headline or a gate (critic 12)."""
+    al = doc.get("aliases") or {}
+    if not al.get("used"):
+        return []
+    out = ["", f"Alias labels ({len(al.get('groups') or {})} groups from the {al.get('source')}; fused decision sums "
+               f"the groups: {'yes' if al.get('fusion_sums_groups') else 'no'}). NOT a gate: every number above and "
+               "every gate uses strict labels."]
+    if al.get("mismatch"):
+        out.append("* **fusion.json was fitted with another alias map than the link step's: run fit-fusion again**")
+    for pid in ("E1b", "E1c", "E3"):
+        a = (doc["protocols"].get(pid) or {}).get("alias_labels")
+        if not a:
+            continue
+        row = (f"* {pid}: n {a.get('n')}, top-1 strict {_fmt(a.get('top1_strict'))} / alias {_fmt(a.get('top1'))}, "
+               f"top-5 alias {_fmt(a.get('top5'))}")
+        b = (a.get("policies") or {}).get("balanced")
+        if b:
+            row += (f"; balanced accepted precision strict {_fmt(b.get('accepted_precision_strict'))} / alias "
+                    f"{_fmt(b.get('accepted_precision'))}")
+        out.append(row)
+    return out
+
+
 def _e4_lines(e4: dict) -> list[str]:
     """E4 with the user-sign FALSE-ACCEPT rate first (a precision number: a user sign accepted for a word the signer
     did not enrol), per population; INCLUDE-only is the row to compare packs on (docs 15.27)."""
@@ -1482,6 +1580,7 @@ def markdown_report(doc: dict) -> str:
             lines.append("NOT pooled (other signer grouping): " + ", ".join(
                 f"{f['fold']} ({f['signer_grouping']})" for f in cvb["not_pooled"]))
     lines += _like_for_like_lines((doc["protocols"].get("E1b") or {}).get("like_for_like"))
+    lines += _alias_lines(doc)
     oov = (doc["protocols"].get("E2") or {}).get("oov_false_accept")
     if oov:
         lines += ["", f"E2 held-out concepts against a gallery WITHOUT them (n {oov.get('n')}; every accept is wrong): "

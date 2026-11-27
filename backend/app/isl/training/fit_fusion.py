@@ -178,8 +178,13 @@ def _nll(results, truths) -> float:
 
 def fit_fusion(rec, val_clips: list[Clip], profile: str, version: str = "fusion-1",
                data=None, weight_clips: int = WEIGHT_FIT_CLIPS, weight_seed: int = WEIGHT_FIT_SEED,
-               rescore: int = WEIGHT_FIT_RESCORE) -> tuple[FusionParams, dict]:
+               rescore: int = WEIGHT_FIT_RESCORE, aliases: dict | None = None) -> tuple[FusionParams, dict]:
     """``data``: the run's ``IslData``, for the full index leak guard (split + training clips, docs 15.22).
+
+    ``aliases`` (alias -> root, docs 15.34; None = as before): the weights are fitted on strict keys as before; then
+    the parameters get the alias map, every clip is fused once more with the groups summed, and the thresholds and
+    the certification are fitted on those summed groups - what the app then does - with STRICT labels (the shown
+    word must be the clip's own concept id). One extra fuse pass, only with aliases.
 
     Cost (docs 15.23, 15.24): the evidence is computed once - compact (only the retrieval and classifier columns
     ``fuse`` reads, with their normalisers), with a shared prior - and reused by the "My signs" mode choice; the
@@ -261,6 +266,17 @@ def fit_fusion(rec, val_clips: list[Clip], profile: str, version: str = "fusion-
     params = params.with_(weight_fit=wfit)
     rep["weights"] = {k: getattr(params, k) for k in ("alpha", "beta", "gamma", "tau_r", "t_c")} | {
         "nll": nll_full, "fit": wfit}
+    if aliases:
+        from app.isl.vocab.aliases import alias_groups, aliases_sha256
+
+        params = params.with_(aliases=dict(aliases))
+        del results
+        results = [fuse(i, params) for i in inputs]  # the groups summed, as the app will fuse
+        groups = alias_groups(params.aliases)
+        in_group = sum(1 for r in results if r.roots and r.roots[0] in groups)
+        rep["aliases"] = {"n_aliases": len(params.aliases), "groups": groups,
+                          "sha256": aliases_sha256(params.aliases), "val_top1_in_a_group": in_group,
+                          "labels": "strict (thresholds and certification on the clip's own concept id)"}
     # per-source certification (docs 15.25): every clip's source and signer group; the classifier's classes for the
     # open-vocabulary check (no classifier: every word is retrieval only)
     closed = set(stats.get("cls_names") or (list(clf.class_names) if clf is not None else []))

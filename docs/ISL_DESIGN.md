@@ -3963,3 +3963,64 @@ resumed with it; E1a records the effective grouping; `fusion_fit_space` and its 
 `test_eval_runners.py` (a cv fold of another grouping is not pooled and is named in `E1b.cv`, `report.json` and
 `report.md`; with every fold left out `E1b.cv` says why; a one-shot fold encoder trained without WSLP is listed; a
 fusion fitted on another classifier is flagged by evaluate and refused by build-pack).
+
+### 15.34 Linker numbering and alias groups (QA plan 1.2, critic 12, 27 Nov 2026)
+
+**Finding.** WSLP numbers repeated words: "Adult(1)". The linker kept the "(1)", so 26 WSLP words became new
+concepts (`isl.adult-1`, `isl.bank-1`, ...) next to the real ones. Some twins are also kept apart only because their
+source names differ: INCLUDE's `isl.female` and ISLRTC's `isl.woman-female`, `isl.big` and `isl.large`, `isl.mouse`
+and `isl.rat-mouse`, `isl.race~ethnicity` and `isl.race`. A model that picks the twin is not wrong for the user, and
+the fused probability of the word is split over two keys. The plan expects a small gain (+0.35 pp). The groups are
+also what 1.3 (variant forms) builds on.
+
+**What changed.** Everything is opt-in. With no new flag and no new file, linking, training, fit-fusion, evaluate and
+`build-pack` behave as in Batch 0.
+* `app/isl/vocab/aliases.py` (new): `strip_sign_number` removes a trailing "(digits)" only ("(academic)" and a bare
+  "(1)" stay). `TWIN_ALIASES` maps alias -> root; the root is the INCLUDE concept, because INCLUDE labels E1b.
+  `NEVER_ALIAS` keeps `isl.you` and `isl.you~plural` apart (a real sense difference); `resolve_aliases` refuses it,
+  follows chains to the final root, refuses cycles, and keeps only pairs whose two ids are known.
+* `GlossLinker(strip_numbering=, aliases=)`. With `strip_numbering`, "adult(1)" links to `isl.adult` (exact). A word
+  the vocabulary does not know gets one new concept for all its numbers (`zebra(1)`, `zebra(2)` -> `isl.zebra`). The
+  clip's `variant_id` keeps the number (`wslp:adult1`). `alias_of` gives the groups of known concepts. `expand` (the
+  held-out concept guard) adds the whole alias group.
+* **One switch, at the link step.** `link-sources --link-aliases` turns on both. The link step always writes
+  `<work>/link_settings.json` (on or off) with the resolved `alias_of` and its sha256. Every later step of that work
+  folder (`_model_ctx`: training, index, fit-fusion, evaluate) reads the file and links the same way. No file (a work
+  folder linked before this change): the old linking. So the running 0.6 refresh, which starts at `index`, is not
+  affected. Relinked clips change the training labels; the training-list hash of 15.19 holds the labels, so an old
+  training state is refused, not resumed.
+* `FusionParams.aliases` (alias -> root, stored in fusion.json). When set, `fuse` sums the per-crop fused
+  probabilities of each group before the accept rule. The word shown is the group member with the highest
+  probability; `FusionResult.roots` records the root. Crop agreement is counted on the summed groups. User signs are
+  never in a group. A fusion.json without the field loads with `{}`: strict keys, as before. The app gets this from
+  the pack's fusion.json; `decide()` itself is unchanged. Sliding mode (classifier alone) stays per class.
+* `fit_fusion(..., aliases=)`. `cli fit-fusion` passes the link step's map (none without the file). The weights are
+  fitted on strict keys as before. Then every validation clip is fused once more with the groups summed, and the
+  thresholds and the certification are fitted on that, with **strict** labels: the shown word must be the clip's own
+  concept id. So the certified precision describes what the app does, and an alias does not make a word "correct".
+  `rep["aliases"]` lists the groups.
+
+**Evaluation (critic 12).** Strict labels stay the metrics, the headlines and every gate. Alias numbers are reported
+next to them, never instead.
+* E1b and E1c: `alias_labels` with top-1 / top-5 after summing the classifier's probabilities over each group, the
+  strict numbers of the same clips, and the clips that change (`top1_only_alias`, `top1_only_strict`).
+* E3: `alias_labels` with top-1 / top-5 and, per policy, accepted precision and wrong-accept rate on strict and on
+  alias labels. The decisions are the app's (with the fusion's groups when it has them).
+* `report.json` `aliases`: which map was used (the link step's, else fusion.json's), whether fusion sums the groups,
+  and `mismatch` when fusion.json was fitted with another map than the link step's (run fit-fusion again).
+* `report.md`: an "Alias labels ... NOT a gate" block under the E1b rows. E1b like for like stays strict.
+
+**Driver.** `LINK_ALIASES=1|0`: research 1, commercial-safe 0. Only the link step passes `--link-aliases`. The value is
+in the start line (`link_aliases=`), in the link stamp and in the dry run. A scratch run seeds `link_settings.json`
+with the other link outputs. A bad value is refused (exit 2). The Batch 1 run (`--from link`) gets it.
+
+**Measured on the real research vocabulary** (read-only): all 26 numbered WSLP glosses link exactly to an existing
+concept with stripping. All four twin pairs exist in both the research and the commercial-safe vocabularies.
+
+Tests: `backend/tests/isl/test_linker_aliases.py`. `link('adult(1)', 'wslp')` gives `isl.adult` only with
+stripping; summing female 0.45 + woman-female 0.40 turns "not accepted" into "accept" (and can change the winner);
+crop votes use the groups; you / you~plural are refused; an old fusion.json has no aliases; the app's
+`user_sign_decision` accepts the summed group; E1 / E3 alias rates count a twin as correct and keep the strict
+number; fit-fusion keeps the strict weights and fits thresholds on the groups; `evaluate --all` keeps strict metrics,
+adds alias rows and flags a fusion fitted with another map; `link-sources` writes the settings and a later step reads
+them; the driver passes `--link-aliases` for research only.

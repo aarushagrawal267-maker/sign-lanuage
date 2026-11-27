@@ -79,6 +79,11 @@ class FusionParams:
     # the kinds of index rows left out (``common.fusion_fit_space``). {} = not recorded (fitted before 15.33): no check.
     # evaluate --all flags a fusion fitted on another class space; build-pack refuses it.
     fitted_on: dict = field(default_factory=dict)
+    # alias groups (docs 15.34): alias concept -> root concept (the same sign and word, e.g. "isl.woman-female" ->
+    # "isl.female"). When set, ``fuse`` sums the probabilities of each group before the accept rule; fit-fusion sets it
+    # only when the link step turned aliases on, and fits the thresholds on the summed groups. {} = strict keys, as
+    # before (every fusion.json written before 15.34).
+    aliases: dict = field(default_factory=dict)
 
     def __post_init__(self):
         # Every policy must always have a threshold: a fusion.json written with only some policies (or none) made
@@ -103,6 +108,12 @@ class FusionParams:
         if self.certification is not None:
             object.__setattr__(self, "certification", dict(self.certification))
         object.__setattr__(self, "fitted_on", dict(self.fitted_on or {}))
+        al = {str(a): str(r) for a, r in dict(self.aliases or {}).items() if a and r and a != r}
+        if al:
+            from app.isl.vocab.aliases import resolve_aliases
+
+            al = resolve_aliases(al)
+        object.__setattr__(self, "aliases", al)
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -386,6 +397,33 @@ class FusionResult:
     best_global_cos: float
     best_user: tuple[str, float] | None  # (key, mean cosine)
     components: dict[str, set[str]]  # which components ranked a key in their top-10
+    # alias roots of ``keys`` (docs 15.34) when ``FusionParams.aliases`` merged the groups, else None. Each key is the
+    # group member with the highest probability; ``probs`` and the crop votes are summed over the group.
+    roots: list[str] | None = None
+
+
+def merge_alias_groups(keys: list[str], pf: np.ndarray, alias_of: dict, comps: dict):
+    """Sum the per-crop fused probabilities ``pf`` (crops, K; columns sorted by mean, best first) over each alias
+    group. Returns (keys, pf, mean, roots, comps): one column per group, named by its best member, sorted again by
+    the summed mean. User signs and keys without an alias are their own group (docs 15.34)."""
+    from app.isl.vocab.aliases import merge_columns
+
+    roots, idx = merge_columns(keys, alias_of)
+    if len(roots) == len(keys):
+        return keys, pf, pf.mean(0), list(roots), comps
+    G = np.zeros((pf.shape[0], len(roots)), np.float64)
+    np.add.at(G.T, np.asarray(idx), pf.T)
+    rep: dict[int, str] = {}
+    for k, g in zip(keys, idx):  # keys come best first: the first member seen is the group's best
+        rep.setdefault(g, k)
+    gmean = G.mean(0)
+    order = np.argsort(-gmean, kind="stable")
+    members: dict[int, set[str]] = {}
+    for k, g in zip(keys, idx):
+        members.setdefault(g, set()).add(k)
+    new_keys = [rep[int(g)] for g in order]
+    new_comps = {name: set(v) | {rep[g] for g, m in members.items() if m & v} for name, v in comps.items()}
+    return new_keys, G[:, order], gmean[order], [roots[int(g)] for g in order], new_comps
 
 
 def fuse(inp: FusionInputs, p: FusionParams) -> FusionResult:
@@ -505,6 +543,9 @@ def fuse(inp: FusionInputs, p: FusionParams) -> FusionResult:
     order = np.argsort(-mean)
     keys = [keys[i] for i in order]
     pf, mean = pf[:, order], mean[order]
+    roots = None
+    if p.aliases:  # alias groups summed before the accept rule (docs 15.34); crop votes on the summed groups too
+        keys, pf, mean, roots, comps = merge_alias_groups(keys, pf, p.aliases, comps)
     per_crop = [keys[int(i)] for i in pf.argmax(1)]
     agree = sum(k == keys[0] for k in per_crop)
     best_g = float(inp.ret.mean(0).max()) if has_r else -1.0
@@ -513,7 +554,7 @@ def fuse(inp: FusionInputs, p: FusionParams) -> FusionResult:
         j = int(np.argmax(mean_u))
         best_u = (inp.user_ids[j], float(mean_u[j]))
     best = max(best_g, best_u[1] if best_u else -1.0)
-    return FusionResult(keys, mean, per_crop, agree, best, best_g, best_u, comps)
+    return FusionResult(keys, mean, per_crop, agree, best, best_g, best_u, comps, roots)
 
 
 def decide(p_sorted: np.ndarray, agree: int, crops: int, params: FusionParams, policy: str = "balanced",

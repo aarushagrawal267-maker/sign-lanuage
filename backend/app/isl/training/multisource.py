@@ -167,11 +167,18 @@ class GlossLinker:
     Order: the adapter's own ``concept_id`` (vocabulary built with that source) -> exact headword key
     (preferring the plain concept over domain/sense-qualified ones) -> a *unique* synonym key -> a new
     source-independent concept ``isl.<slug>`` (the same gloss from two sources gives the same new id).
-    New concepts are written by :meth:`extra_concepts` so a pack can show them."""
+    New concepts are written by :meth:`extra_concepts` so a pack can show them.
+
+    Opt-in (docs 15.34, link step ``--link-aliases``): ``strip_numbering`` removes WSLP's trailing "(N)" before
+    linking, so "Adult(1)" links to ``isl.adult`` instead of a new ``isl.adult-1``; ``aliases`` (alias -> root,
+    e.g. ``app.isl.vocab.aliases.TWIN_ALIASES``) gives :attr:`alias_of`, the alias groups of known concepts.
+    Both off by default: links exactly as before."""
 
     LINKABLE_KINDS = {"word", "multiword", "synonym_list", "number", "phrase", "letter", None}
 
-    def __init__(self, entries: Iterable = ()):
+    def __init__(self, entries: Iterable = (), *, strip_numbering: bool = False, aliases: dict | None = None):
+        self.strip_numbering = bool(strip_numbering)
+        self.alias_table = dict(aliases or {})
         self.by_head: dict[str, list[str]] = defaultdict(list)
         self.by_syn: dict[str, set[str]] = defaultdict(set)
         self.keys_of: dict[str, set[str]] = defaultdict(set)
@@ -195,14 +202,29 @@ class GlossLinker:
         self.counts: Counter = Counter()
 
     @classmethod
-    def from_vocab(cls, vocab) -> GlossLinker:
+    def from_vocab(cls, vocab, **kw) -> GlossLinker:
         if vocab is None:
-            return cls([])
-        return cls(getattr(vocab, "entries", None) or getattr(vocab, "rows", None) or [])
+            return cls([], **kw)
+        return cls(getattr(vocab, "entries", None) or getattr(vocab, "rows", None) or [], **kw)
+
+    @property
+    def alias_of(self) -> dict[str, str]:
+        """alias -> root over the concepts this linker knows (vocabulary and new ones); {} when aliases are off."""
+        if not self.alias_table:
+            return {}
+        from app.isl.vocab.aliases import resolve_aliases
+
+        return resolve_aliases(self.alias_table, self.known | set(self.new))
 
     def link(self, gloss: str, source: str = "") -> tuple[str | None, str]:
+        from app.isl.vocab.aliases import strip_sign_number
         from app.isl.vocab.normalize import slugify
 
+        if self.strip_numbering and gloss:
+            g = strip_sign_number(gloss)
+            if g != gloss:
+                self.counts["numbering_stripped"] += 1
+                gloss = g
         k = _key(gloss)
         if not k:
             return None, "empty"
@@ -257,6 +279,10 @@ class GlossLinker:
         for cid, ks in self.keys_of.items():
             if ks & keys:
                 out.add(cid)
+        al = self.alias_of
+        if al:  # the whole alias group of every concept found (docs 15.34)
+            roots = {al.get(c, c) for c in out}
+            out |= roots | {a for a, r in al.items() if r in roots}
         return out
 
     def extra_concepts(self) -> list[dict]:
@@ -380,10 +406,11 @@ class MultiSourceReport:
 
 def attach_all_sources(data, paths: IslPaths, vocab, profile: str, *, seed: int = 0,
                        duplicates_file: Path | None = None, hash_files: bool = True,
-                       max_per_source: int | None = None) -> MultiSourceReport:
+                       max_per_source: int | None = None, link: dict | None = None) -> MultiSourceReport:
     """Add every other labelled word source of ``profile`` to an ``IslData`` (``data.extra`` and
     ``data.extra_assign``), link their glosses, and drop training clips that duplicate evaluation clips.
-    INCLUDE keeps its own split; ISLRTC stays a training / gallery source."""
+    INCLUDE keeps its own split; ISLRTC stays a training / gallery source. ``link``: the work folder's link
+    settings (:func:`read_link_settings`; default: link as before)."""
     rep = MultiSourceReport()
     names = [n for n in WORD_SOURCES[get_profile(profile).name] if n not in ("include", "islrtc")]
     clips = read_clips(names, paths, vocab, profile, rep.sources)
@@ -392,7 +419,7 @@ def attach_all_sources(data, paths: IslPaths, vocab, profile: str, *, seed: int 
         for c in clips:
             by[c.source].append(c)
         clips = [c for v in by.values() for c in random.Random(seed).sample(v, min(len(v), max_per_source))]
-    linker = GlossLinker.from_vocab(vocab)
+    linker = GlossLinker.from_vocab(vocab, **linker_options(link))
     clips = linker.link_clips(clips)
     # clips of the core INCLUDE / ISLRTC sources that the vocabulary did not link get linked by gloss too
     data.linker = linker
@@ -419,7 +446,8 @@ def attach_all_sources(data, paths: IslPaths, vocab, profile: str, *, seed: int 
     data.extra = keep + eval_extra
     data.extra_assign = {c.clip_id: assign[c.clip_id] for c in data.extra}
     data.dedup = dedup
-    rep.links = dict(linker.counts) | {"new_concepts": len(linker.new)}
+    rep.links = dict(linker.counts) | {"new_concepts": len(linker.new)} | (
+        {"aliases": len(linker.alias_of)} if linker.alias_table else {})
     rep.dedup = {"unions": dict(dedup.reasons), "dropped_train_extra": dropped_extra,
                  "dropped_train_islrtc": dropped_isl,
                  "dropped_eval_duplicates": sum(1 for c in clips if assign.get(c.clip_id) in ("val", "test"))
@@ -481,6 +509,54 @@ def read_pretrain_list(work: Path) -> set[str] | None:
     if not f.exists():
         return None
     return {ln.strip() for ln in f.read_text(encoding="utf-8").splitlines() if ln.strip()}
+
+
+# --------------------------------------------------------------------------------------------- link settings
+
+LINK_SETTINGS = "link_settings.json"
+
+
+def link_settings(link_aliases: bool = False) -> dict:
+    """What the link step decides for a whole work folder (docs 15.34). ``link_aliases``: strip WSLP's "(N)"
+    numbering and use the twin alias table. Off: exactly the old linking."""
+    from app.isl.vocab.aliases import ALIAS_VERSION
+
+    on = bool(link_aliases)
+    return {"version": 1, "strip_sign_numbers": on, "aliases": on, "alias_version": ALIAS_VERSION if on else None}
+
+
+def linker_options(settings: dict | None) -> dict:
+    """``GlossLinker`` keyword arguments of link settings (``{}`` or None: the old linking)."""
+    from app.isl.vocab.aliases import TWIN_ALIASES
+
+    s = settings or {}
+    return {"strip_numbering": bool(s.get("strip_sign_numbers")), "aliases": TWIN_ALIASES if s.get("aliases") else None}
+
+
+def read_link_settings(work: Path) -> dict:
+    """``<work>/link_settings.json`` written by the link step; ``{}`` when there is none (a work folder linked before
+    docs 15.34: every later step links as before)."""
+    f = Path(work) / LINK_SETTINGS
+    if not f.exists():
+        return {}
+    d = json.loads(f.read_text())
+    return d if isinstance(d, dict) else {}
+
+
+def write_link_settings(work: Path, settings: dict, linker: GlossLinker | None = None) -> dict:
+    """Write the link step's settings, with the resolved alias map of ``linker``, so every later step of the work
+    folder (training, index, fit-fusion, evaluate) links and scores the same way."""
+    from app.isl.vocab.aliases import aliases_sha256
+
+    al = linker.alias_of if (linker is not None and settings.get("aliases")) else {}
+    d = {**settings, "alias_of": al, "alias_sha256": aliases_sha256(al),
+         "numbering_stripped": int(linker.counts.get("numbering_stripped", 0)) if linker is not None else 0}
+    f = Path(work) / LINK_SETTINGS
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(d, indent=1, ensure_ascii=False))
+    tmp.replace(f)
+    return d
 
 
 def write_extra_concepts(linker: GlossLinker, path: Path) -> int:

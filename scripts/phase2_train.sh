@@ -53,6 +53,9 @@
 #   ENC_EXCLUDE_SOURCES=wslp   encoder / oneshot leave these sources out of supervision (--exclude-sources; "" = none)
 #   INDEX_WSLP_TWINS=auto      index / index_final: keep | drop | auto (drop WSLP rows of concepts with an ISLRTC row
 #                              when encoder.pt was trained without WSLP; an older encoder's index is built as before)
+# LINK_ALIASES=1|0 (docs 15.34; research 1, commercial-safe 0): the link step strips WSLP's "(N)" numbering
+#   (adult(1) -> isl.adult) and turns on the twin alias groups (female / woman-female, ...) for the work folder
+#   (link-sources --link-aliases -> <work>/link_settings.json, read by every later step). Only the link step reads it.
 # EVAL_COMPARE_TO=<report.json>: the evaluate step runs `evaluate --all --compare-to <report.json>` (E1b and E4 like
 # for like against that report, e.g. artifacts/isl/commercial-safe/eval/report.json; docs 15.27, 15.28, 15.31).
 # One profile per run (refused with --profile both); a missing file is refused before anything runs (exit 2).
@@ -202,6 +205,10 @@ fi
 DICT_GROUP="${CLS_DICTIONARY_GROUP:-$DG_DEFAULT}"
 ENC_XSRC="${ENC_EXCLUDE_SOURCES-$XS_DEFAULT}"
 WSLP_TWINS="${INDEX_WSLP_TWINS:-$TW_DEFAULT}"
+# linker aliases (docs 15.34): research on, commercial-safe off; only the link step passes it
+LINK_ALIASES="${LINK_ALIASES:-$([[ "$PROFILE" == "research" ]] && echo 1 || echo 0)}"
+case "$LINK_ALIASES" in 0|1) ;; *) echo "LINK_ALIASES must be 0 or 1" >&2; exit 2 ;; esac
+LA_ARG=""; [[ $LINK_ALIASES == 1 ]] && LA_ARG="--link-aliases"
 case "$DICT_GROUP" in 0|1) ;; *) echo "CLS_DICTIONARY_GROUP must be 0 or 1" >&2; exit 2 ;; esac
 case "$WSLP_TWINS" in keep|drop|auto) ;; *) echo "INDEX_WSLP_TWINS must be keep, drop or auto" >&2; exit 2 ;; esac
 [[ "$ENC_XSRC" =~ ^[a-z0-9_,]*$ ]] || { echo "ENC_EXCLUDE_SOURCES: comma-separated source names" >&2; exit 2; }
@@ -210,13 +217,14 @@ case "$WSLP_TWINS" in keep|drop|auto) ;; *) echo "INDEX_WSLP_TWINS must be keep,
 DG_ARG=""; [[ $DICT_GROUP == 1 ]] && DG_ARG="--dictionary-group"
 XS_ARG=""; [[ -n "$ENC_XSRC" ]] && XS_ARG="--exclude-sources $ENC_XSRC"
 TW_ARG=""; [[ "$WSLP_TWINS" != keep ]] && TW_ARG="--wslp-twins $WSLP_TWINS"
-WSLP_SETTINGS="dict_group=$DICT_GROUP enc_exclude=${ENC_XSRC:--} wslp_twins=$WSLP_TWINS"
+WSLP_SETTINGS="dict_group=$DICT_GROUP enc_exclude=${ENC_XSRC:--} wslp_twins=$WSLP_TWINS link_aliases=$LINK_ALIASES"
 # the setting a step ran with, written into its stamp so the log's "skip ... (done ...)" lines show it (docs 15.33)
 step_settings() {
   case "$1" in
     classifier|cv|e1a) echo " dict_group=$DICT_GROUP" ;;
     encoder|oneshot) echo " enc_exclude=${ENC_XSRC:--}" ;;
     index|index_final) echo " wslp_twins=$WSLP_TWINS" ;;
+    link) echo " link_aliases=$LINK_ALIASES" ;;
   esac
 }
 # a scratch run: a full run with a tag or its own work folder (smoke runs have their own private ISL root). It must
@@ -288,7 +296,7 @@ in_list() { local x n="$1"; shift; for x in "$@"; do [[ "$x" == "$n" ]] && retur
 step_outputs() {  # what a step leaves in the work folder for later steps (a leading ! = required); for seeding
   case "$1" in
     vocab) echo "!vocabulary.jsonl" ;;
-    link) echo "extra_concepts.jsonl sources.json multisource.json" ;;
+    link) echo "extra_concepts.jsonl sources.json multisource.json link_settings.json" ;;
     pretrain_dedup) echo "pretrain_dedup.json" ;;
     pretrain) echo "!pretrained_encoder.pt pretrain_clips.txt" ;;
     encoder) echo "!encoder.pt" ;;
@@ -332,7 +340,7 @@ run_step() {
       cli dedup --sources include islrtc cislr wslp isl500 mendeley_emergency mendeley_agri ;;
     vocab) cli vocab --no-trims --out "$VOCAB" ;;  # to the work folder (commit to models/packs/isl after review)
     splits) cli splits --vocab "$VOCAB" ;;  # fetches the official INCLUDE lists only when missing
-    link) cli link-sources $COMMON --all-sources $CAP ;;
+    link) cli link-sources $COMMON --all-sources $CAP $LA_ARG ;;
     bench) cli bench --threads "$THREADS" --steps $([[ $SMOKE == 1 ]] && echo 1 || echo 5) --hidden-sizes ${HIDDEN:-192} ;;
     pretrain_dedup) cli pretrain-dedup $COMMON --all-sources $CAP $PDD ;;  # Sign Library copies / eval-clip matches
     pretrain) train pretrain $COMMON $CAP $PRE ;;
@@ -379,6 +387,7 @@ if [[ $DRY_RUN == 1 ]]; then
   echo "pack: ${PACK_OUT:-default (artifacts/packs/<id>)}"
   [[ -n "$COMPARE_TO" ]] && echo "evaluate compares to: $COMPARE_TO"
   echo "wslp/dictionary: classifier dictionary group=$DICT_GROUP, encoder excludes=${ENC_XSRC:--}, index wslp twins=$WSLP_TWINS"
+  echo "linker: aliases and WSLP number stripping=$LINK_ALIASES (link step only)"
 fi
 
 if [[ $LIST == 1 ]]; then

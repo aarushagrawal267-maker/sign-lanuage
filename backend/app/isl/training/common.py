@@ -177,6 +177,13 @@ class IslData:
     dedup: object = None
     multisource: dict = field(default_factory=dict)
     islrtc_stats: dict = field(default_factory=dict)  # re-extracted / truncated ISLRTC clips (resolve_islrtc)
+    # the work folder's link settings (multisource.read_link_settings, docs 15.34): {} = linked as before
+    link: dict = field(default_factory=dict)
+
+    @property
+    def alias_of(self) -> dict:
+        """alias -> root of the link step (docs 15.34); {} when the link step did not turn aliases on."""
+        return dict((self.link or {}).get("alias_of") or {})
 
     def include_part(self, part: str) -> list[Clip]:
         return [c for c in self.include if self.assign.get(c.clip_id) == part and c.concept_id]

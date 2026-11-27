@@ -565,7 +565,8 @@ def _model_ctx(paths: IslPaths, args):
     from app.core.config import get_settings
     from app.isl.profiles import get_profile
     from app.isl.training.common import ISL_FEATURES, load_isl_data, load_vocab, set_threads
-    from app.isl.training.multisource import GlossLinker, attach_all_sources, write_extra_concepts
+    from app.isl.training.multisource import (GlossLinker, attach_all_sources, linker_options, read_link_settings,
+                                              write_extra_concepts)
     from app.isl.training.pipeline import workdir
 
     set_threads(args.threads)
@@ -573,10 +574,13 @@ def _model_ctx(paths: IslPaths, args):
     vocab = load_vocab(_vocab_path(args))
     data = load_isl_data(paths, vocab, profile, args.split, max_islrtc=args.max_islrtc or None, seed=args.seed)
     work = workdir(profile)
-    data.linker = GlossLinker.from_vocab(vocab)
+    # how the link step linked this work folder (docs 15.34): every step links the same way; no file = as before
+    link = getattr(args, "link_settings_override", None)
+    data.link = dict(link if link is not None else read_link_settings(work))
+    data.linker = GlossLinker.from_vocab(vocab, **linker_options(data.link))
     if getattr(args, "all_sources", False):
         rep = attach_all_sources(data, paths, vocab, profile, seed=args.seed,
-                                 max_per_source=getattr(args, "max_per_source", 0) or None)
+                                 max_per_source=getattr(args, "max_per_source", 0) or None, link=data.link)
         write_extra_concepts(data.linker, work / "extra_concepts.jsonl")
         used = Counter(c.source for c in data.extra if c.concept_id)
         used.update({"include": sum(1 for c in data.include if c.concept_id), "islrtc": len(data.islrtc)})
@@ -926,8 +930,10 @@ def cmd_fit_fusion(paths: IslPaths, args) -> int:
 
     profile, data, fcfg, work = _model_ctx(paths, args)
     rec = load_recognizer(work, fcfg, _vocab_path(args), profile=profile)
-    # data: the leak guard also checks the index's split and training clips against this run's (docs 15.22)
-    params, rep = fit_fusion(rec, data.labelled_part("val"), profile, data=data)
+    # data: the leak guard also checks the index's split and training clips against this run's (docs 15.22).
+    # aliases: only when the link step turned them on (docs 15.34); the thresholds are then fitted on the summed
+    # alias groups the app will use, and scored on strict labels
+    params, rep = fit_fusion(rec, data.labelled_part("val"), profile, data=data, aliases=data.alias_of or None)
     assert set(params.accept) == {"strict", "balanced", "lenient"}, params.accept  # decide() needs all three
     # the class spaces it was fitted on (docs 15.33): evaluate flags, build-pack refuses another classifier / encoder
     params = params.with_(fitted_on=_fusion_fit_space(rec))
@@ -997,10 +1003,17 @@ def cmd_build_pack(paths: IslPaths, args) -> int:
 
 
 def cmd_link_sources(paths: IslPaths, args) -> int:
-    """Read every labelled source of the profile, link glosses to concepts, split signers, drop duplicates."""
+    """Read every labelled source of the profile, link glosses to concepts, split signers, drop duplicates.
+    Writes ``<work>/link_settings.json`` (docs 15.34): every later step of the work folder links the same way."""
+    from app.isl.training.multisource import link_settings, write_link_settings
+
     args.all_sources = True
+    args.link_settings_override = link_settings(bool(getattr(args, "link_aliases", False)))
     profile, data, fcfg, work = _model_ctx(paths, args)
-    _print({"data": data.summary(), "multisource": data.multisource, "work": str(work)})
+    data.link = write_link_settings(work, args.link_settings_override, data.linker)
+    _print({"data": data.summary(), "multisource": data.multisource, "work": str(work),
+            "link": {k: v for k, v in data.link.items() if k != "alias_of"} | {"alias_groups": len(set(
+                data.alias_of.values()))}})
     return 0
 
 
@@ -1213,6 +1226,10 @@ def build_parser() -> argparse.ArgumentParser:
                              help="comma-separated sources left out of encoder supervision, e.g. wslp (docs 15.32)")
     lk = sub.add_parser("link-sources")
     _model_args(lk)
+    lk.add_argument("--link-aliases", action="store_true",
+                    help="strip WSLP's '(N)' numbering (adult(1) -> isl.adult) and use the twin alias groups (female / "
+                         "woman-female, ...); written to <work>/link_settings.json, which every later step reads "
+                         "(docs 15.34). Default: link as before")
     pdd = sub.add_parser("pretrain-dedup")
     _model_args(pdd)
     pdd.add_argument("--max-chunks", type=int, default=0, help="smoke: check at most N Sign Library chunks")
