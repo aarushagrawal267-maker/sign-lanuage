@@ -12,29 +12,29 @@ const NAV: { group: string; items: { to: string; label: string; icon: ReactNode 
     group: "Recognise",
     items: [
       { to: "/", label: "Overview", icon: <LayoutDashboard className="size-4" /> },
-      { to: "/live", label: "Live Recognition", icon: <Video className="size-4" /> },
-      { to: "/analyze", label: "Video Analysis", icon: <FileVideo className="size-4" /> },
+      { to: "/live", label: "Live recognition", icon: <Video className="size-4" /> },
+      { to: "/analyze", label: "Video analysis", icon: <FileVideo className="size-4" /> },
     ],
   },
   {
     group: "Explore",
     items: [
       { to: "/vocabulary", label: "Vocabulary", icon: <Boxes className="size-4" /> },
-      { to: "/studio", label: "Landmark Studio", icon: <ScanFace className="size-4" /> },
+      { to: "/studio", label: "Landmark studio", icon: <ScanFace className="size-4" /> },
       { to: "/dataset", label: "Dataset", icon: <Database className="size-4" /> },
     ],
   },
   {
     group: "Model",
     items: [
-      { to: "/lab", label: "Model Laboratory", icon: <FlaskConical className="size-4" /> },
+      { to: "/lab", label: "Model laboratory", icon: <FlaskConical className="size-4" /> },
       { to: "/evaluation", label: "Evaluation", icon: <Gauge className="size-4" /> },
-      { to: "/experiments", label: "Experiment History", icon: <History className="size-4" /> },
+      { to: "/experiments", label: "Experiment history", icon: <History className="size-4" /> },
     ],
   },
   {
     group: "Learn",
-    items: [{ to: "/research", label: "Research & Docs", icon: <BookOpen className="size-4" /> }],
+    items: [{ to: "/research", label: "Research & docs", icon: <BookOpen className="size-4" /> }],
   },
 ];
 
@@ -43,12 +43,12 @@ function Brand() {
     <div className="flex items-center gap-2.5 px-2">
       <svg viewBox="0 0 32 32" className="size-8" aria-hidden>
         <rect width="32" height="32" rx="8" fill="#1b1f25" />
-        <g fill="none" stroke="#4c8dff" strokeWidth="2.2" strokeLinecap="round"><path d="M11 23V12M15 23V9M19 23V10M23 23v-8" /></g>
-        <g fill="#2dd4bf"><circle cx="11" cy="12" r="1.8" /><circle cx="15" cy="9" r="1.8" /><circle cx="19" cy="10" r="1.8" /><circle cx="23" cy="15" r="1.8" /></g>
+        <g fill="none" stroke="#7aa7ff" strokeWidth="2.2" strokeLinecap="round"><path d="M11 23V12M15 23V9M19 23V10M23 23v-8" /></g>
+        <g fill="#e8ebef"><circle cx="11" cy="12" r="1.8" /><circle cx="15" cy="9" r="1.8" /><circle cx="19" cy="10" r="1.8" /><circle cx="23" cy="15" r="1.8" /></g>
       </svg>
       <div className="leading-tight">
-        <div className="text-[13px] font-semibold text-fg">Sign Intelligence</div>
-        <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-fg-3">Studio · WLASL100</div>
+        <div className="text-sm font-medium text-fg">Sign Intelligence</div>
+        <div className="text-xs text-fg-3">Studio · WLASL100</div>
       </div>
     </div>
   );
@@ -58,10 +58,10 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
   return (
     <>
       <Brand />
-      <nav className="mt-6 flex flex-col gap-5" aria-label="Main">
+      <nav className="mt-6 flex flex-col gap-6" aria-label="Main">
         {NAV.map((g) => (
           <div key={g.group}>
-            <div className="mb-1.5 px-3 font-mono text-[10px] uppercase tracking-[0.16em] text-fg-3">{g.group}</div>
+            <div className="mb-2 px-3 text-xs font-medium text-fg-3">{g.group}</div>
             <ul className="flex flex-col gap-0.5">
               {g.items.map((it) => (
                 <li key={it.to}>
@@ -71,7 +71,7 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
                     onClick={onNavigate}
                     className={({ isActive }) =>
                       cx(
-                        "flex items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] transition-colors",
+                        "flex h-9 items-center gap-2.5 rounded-lg px-3 text-sm transition-colors",
                         isActive ? "bg-ink-800 font-medium text-fg shadow-[inset_2px_0_0_var(--color-accent)]" : "text-fg-2 hover:bg-ink-800/60 hover:text-fg",
                       )
                     }
@@ -85,7 +85,7 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
           </div>
         ))}
       </nav>
-      <div className="mt-auto rounded-xl border border-ink-700 bg-ink-850 p-3 text-[11px] leading-relaxed text-fg-3">
+      <div className="mt-auto rounded-lg border border-ink-700 bg-ink-850 p-3 text-xs leading-relaxed text-fg-3">
         Educational &amp; research implementation. Recognises isolated WLASL100 signs as ASL <span className="text-fg-2">gloss labels</span> — not
         sentence translation. Not a replacement for interpreters.
       </div>
@@ -130,7 +130,7 @@ export function Layout({ children }: { children: ReactNode }) {
           </div>
           <div className="flex items-center gap-2">
             {m ? (
-              <Badge tone={m.is_synthetic ? "warn" : "accent"}>
+              <Badge tone={m.is_synthetic ? "warn" : "neutral"}>
                 <span className="hidden sm:inline">model</span> #{m.experiment_id} · {m.architecture.toUpperCase()}
                 {m.is_synthetic && " · synthetic"}
               </Badge>
@@ -138,7 +138,7 @@ export function Layout({ children }: { children: ReactNode }) {
               <Badge>no active model</Badge>
             )}
             <span
-              className={cx("inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px]", health?.ok && !error ? "border-good/40 text-[#5fd35f]" : "border-danger/40 text-danger")}
+              className={cx("inline-flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 text-2xs font-medium", health?.ok && !error ? "border-good/40 text-[#5fd35f]" : "border-danger/40 text-danger")}
               title={error ?? "Backend reachable"}
             >
               <span className={cx("size-1.5 rounded-full", health?.ok && !error ? "bg-good" : "bg-danger")} />
@@ -154,7 +154,7 @@ export function Layout({ children }: { children: ReactNode }) {
           </div>
         )}
         <main className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-6 md:px-8 md:py-8">{children}</main>
-        <footer className="border-t border-ink-700 px-4 py-4 text-[11px] text-fg-3 md:px-8">
+        <footer className="border-t border-ink-700 px-4 py-4 text-2xs text-fg-3 md:px-8">
           WLASL data © the WLASL authors, used under the Computational Use of Data Agreement (C-UDA) — academic &amp; computational use only, no
           commercial use. Li et al., WACV 2020. Landmarks: Google MediaPipe (Apache-2.0).
         </footer>
