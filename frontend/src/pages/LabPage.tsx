@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { FlaskConical, Play, Square, Zap } from "lucide-react";
+import { FlaskConical, Play, Power, Square } from "lucide-react";
 import { api, type ExperimentDetail, type ExperimentSummary, type SplitInfo, type DatasetSummary } from "../api/client";
 import { useApi } from "../lib/hooks";
 import { num, pct } from "../lib/format";
@@ -104,8 +104,8 @@ function RunMonitor({ id, onDone }: { id: number; onDone: () => void }) {
       {exp.status === "completed" && (
         <div className="mt-4 flex flex-wrap items-center gap-3">
           <span className="text-sm text-fg-2">Best epoch {exp.val_metrics && "best_epoch" in exp.val_metrics ? exp.val_metrics.best_epoch : "—"} · validation top-1 {pct(exp.val?.top1)}</span>
-          <Button size="sm" variant="primary" icon={<Zap className="size-3.5" />} onClick={() => api.post(`/api/experiments/${id}/activate`).then(onDone)} disabled={exp.is_active}>{exp.is_active ? "Active model" : "Activate for recognition"}</Button>
-          <Link to={`/evaluation?exp=${id}`} className="text-sm text-accent hover:underline">Full evaluation</Link>
+          <Button size="sm" variant="primary" icon={<Power className="size-3.5" />} onClick={() => api.post(`/api/experiments/${id}/activate`).then(onDone)} disabled={exp.is_active}>{exp.is_active ? "Active model" : "Activate for recognition"}</Button>
+          <Link to={`/evaluation?exp=${id}`} className="text-sm text-accent-fg hover:underline">Full evaluation</Link>
         </div>
       )}
     </Card>
@@ -197,7 +197,7 @@ export default function LabPage() {
 
   return (
     <div className="fade-in">
-      <PageHeader eyebrow="Sequence models · PyTorch" title="Model Laboratory"
+      <PageHeader eyebrow="Sequence models · PyTorch" title="Model laboratory"
         description="Configure and train GRU, LSTM or temporal-CNN classifiers on extracted landmark sequences. Model selection uses validation data only; the held-out test set is evaluated separately on the Evaluation page." />
 
       <div className="grid gap-5 xl:grid-cols-[420px_minmax(0,1fr)]">
@@ -206,7 +206,7 @@ export default function LabPage() {
             <div className="flex flex-wrap gap-2">
               {PRESETS.map((p) => (
                 <button key={p.key} onClick={() => set(p.patch)} className="rounded-lg border border-ink-600 px-2.5 py-1.5 text-left text-xs hover:border-accent" title={p.hint}>
-                  <div className="font-medium text-fg">{p.label}</div><div className="text-[10px] text-fg-3">{p.hint}</div>
+                  <div className="font-medium text-fg">{p.label}</div><div className="text-2xs text-fg-3">{p.hint}</div>
                 </button>
               ))}
             </div>

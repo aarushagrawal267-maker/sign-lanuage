@@ -8,13 +8,13 @@ import { Badge, Button, Card, Empty, Kv, Notice, PageHeader, Progress, Stat } fr
 function Step({ done, title, children, to, cta }: { done: boolean; title: string; children: React.ReactNode; to: string; cta: string }) {
   return (
     <li className="flex gap-3 py-3">
-      {done ? <CheckCircle2 className="mt-0.5 size-5 shrink-0 text-teal" aria-label="done" /> : <Circle className="mt-0.5 size-5 shrink-0 text-fg-3" aria-label="to do" />}
+      {done ? <CheckCircle2 className="mt-0.5 size-5 shrink-0 text-fg-2" aria-label="done" /> : <Circle className="mt-0.5 size-5 shrink-0 text-fg-3" aria-label="to do" />}
       <div className="flex min-w-0 flex-1 flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <div className={done ? "text-sm text-fg-2" : "text-sm font-medium text-fg"}>{title}</div>
           <div className="text-xs text-fg-3">{children}</div>
         </div>
-        {!done && <Link to={to} className="inline-flex items-center gap-1 text-xs font-medium text-accent hover:underline">{cta}<ArrowRight className="size-3" /></Link>}
+        {!done && <Link to={to} className="inline-flex items-center gap-1 text-xs font-medium text-accent-fg hover:underline">{cta}<ArrowRight className="size-3" /></Link>}
       </div>
     </li>
   );
@@ -27,14 +27,14 @@ export default function OverviewPage() {
   if (error && !o) {
     return (
       <>
-        <PageHeader eyebrow="Sign intelligence overview" title="Overview" />
+        <PageHeader title="Overview" />
         <Notice tone="danger" title="Backend not reachable">
           {error}. Start the application with <code>start.ps1</code> (backend on http://localhost:8000).
         </Notice>
       </>
     );
   }
-  if (!o) return <PageHeader eyebrow="Sign intelligence overview" title="Overview" description="Loading…" />;
+  if (!o) return <PageHeader title="Overview" description="Loading…" />;
 
   const st = o.video_status;
   const valid = st.valid ?? 0;
@@ -44,13 +44,13 @@ export default function OverviewPage() {
     { done: o.total_videos > 0, title: "Load the official WLASL100 annotations", body: "Fetches WLASL_v0.3.json + nslt_100.json and builds signer-grouped splits.", to: "/dataset", cta: "Dataset" },
     { done: valid > 0, title: "Acquire and validate videos", body: `${num(valid)} valid of ${num(o.total_videos)} annotated instances.`, to: "/dataset", cta: "Acquire" },
     { done: o.landmark_sequences > 0, title: "Extract MediaPipe landmarks", body: `${num(o.landmark_sequences)} landmark sequences extracted.`, to: "/dataset", cta: "Extract" },
-    { done: (o.experiments.completed ?? 0) > 0, title: "Train a sequence model", body: "GRU, LSTM or temporal CNN on the signer-independent split.", to: "/lab", cta: "Model Laboratory" },
-    { done: !!active && !active.is_synthetic, title: "Activate a model and sign live", body: "Use your webcam on the Live Recognition page.", to: active ? "/live" : "/experiments", cta: active ? "Go live" : "Activate" },
+    { done: (o.experiments.completed ?? 0) > 0, title: "Train a sequence model", body: "GRU, LSTM or temporal CNN on the signer-independent split.", to: "/lab", cta: "Model laboratory" },
+    { done: !!active && !active.is_synthetic, title: "Activate a model and sign live", body: "Use your webcam on the Live recognition page.", to: active ? "/live" : "/experiments", cta: active ? "Go live" : "Activate" },
   ];
 
   return (
     <div className="fade-in">
-      <PageHeader eyebrow="Sign intelligence overview" title="Overview"
+      <PageHeader title="Overview"
         description="Status of the WLASL100 dataset, landmark extraction, models and recent recognitions. Every number on this page comes from the local database."
         actions={<Link to="/live"><Button variant="primary" icon={<Video className="size-4" />}>Live recognition</Button></Link>} />
 
@@ -63,7 +63,7 @@ export default function OverviewPage() {
         <Stat label="Valid videos" value={num(valid)} sub={`${num(unavailable)} unavailable · ${num((st.pending ?? 0) + (st.downloaded ?? 0))} pending`} />
         <Stat label="Landmark sequences" value={num(o.landmark_sequences)} sub={Object.entries(o.samples_by_official_split).map(([k, v]) => `${k} ${v}`).join(" · ") || "none yet"} />
         <Stat label="Active model" value={active ? `#${active.id}` : "—"} tone={active ? "accent" : undefined}
-          sub={active ? `${active.architecture.toUpperCase()} · val top-1 ${pct(active.val?.top1)}` : "train & activate in the Laboratory"} />
+          sub={active ? `${active.architecture.toUpperCase()} · val top-1 ${pct(active.val?.top1)}` : "train and activate in the laboratory"} />
       </div>
 
       <div className="mt-5 grid gap-5 lg:grid-cols-[1.3fr_1fr]">
@@ -72,7 +72,7 @@ export default function OverviewPage() {
             {steps.map((s) => <Step key={s.title} done={s.done} title={s.title} to={s.to} cta={s.cta}>{s.body}</Step>)}
           </ol>
           {o.running_jobs.length > 0 && (
-            <div className="mt-3 flex flex-col gap-3 rounded-xl border border-ink-700 bg-ink-900 p-3">
+            <div className="mt-3 flex flex-col gap-3 rounded-lg border border-ink-700 bg-ink-900 p-3">
               {o.running_jobs.map((j) => (
                 <div key={j.id}>
                   <div className="mb-1.5 flex justify-between text-xs"><span className="font-medium text-fg">{j.kind} job #{j.id}</span><span className="text-fg-3">{j.message ?? "starting…"}</span></div>
@@ -84,11 +84,11 @@ export default function OverviewPage() {
         </Card>
 
         <Card title="Latest evaluation" subtitle={o.latest_experiment ? `${o.latest_experiment.name} · finished ${timeAgo(o.latest_experiment.finished_at)}` : undefined}
-          actions={o.latest_experiment && <Link to={`/evaluation?exp=${o.latest_experiment.id}`} className="text-xs font-medium text-accent hover:underline">Details</Link>}>
+          actions={o.latest_experiment && <Link to={`/evaluation?exp=${o.latest_experiment.id}`} className="text-xs font-medium text-accent-fg hover:underline">Details</Link>}>
           {o.latest_experiment ? (
             <div>
               <div className="mb-3 flex flex-wrap gap-1.5">
-                <Badge tone="accent">{o.latest_experiment.architecture.toUpperCase()}</Badge>
+                <Badge>{o.latest_experiment.architecture.toUpperCase()}</Badge>
                 <Badge>{o.latest_experiment.split_name}</Badge>
                 {o.latest_experiment.is_synthetic && <Badge tone="warn">synthetic</Badge>}
               </div>
@@ -100,7 +100,7 @@ export default function OverviewPage() {
               <Kv k="Parameters" v={num(o.latest_experiment.n_params)} />
             </div>
           ) : (
-            <Empty icon={<FlaskConical className="size-6" />} title="No completed experiments">Train a model in the Model Laboratory to see real evaluation results here.</Empty>
+            <Empty icon={<FlaskConical className="size-6" />} title="No completed experiments">Train a model in the Model laboratory to see real evaluation results here.</Empty>
           )}
         </Card>
       </div>

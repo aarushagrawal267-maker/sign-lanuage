@@ -82,7 +82,7 @@ export default function AnalyzePage() {
 
   return (
     <div className="fade-in">
-      <PageHeader eyebrow="Offline · not live recognition" title="Video Analysis"
+      <PageHeader eyebrow="Offline · not live recognition" title="Video analysis"
         description="Analyse a local video file you are permitted to use. Frames are processed by MediaPipe on the local backend, classified with the active model, and the temporary copy is deleted immediately afterwards." />
 
       {IS_STATIC && <div className="mb-5"><Notice tone="warn" title="Not available in the online demo">Video-file analysis needs the Python backend. Run the project locally (setup.ps1 / start.ps1) to use it; live webcam recognition works here.</Notice></div>}
@@ -90,8 +90,8 @@ export default function AnalyzePage() {
         <div className="flex min-w-0 flex-col gap-4">
           <Card>
             <div className="flex flex-col gap-4 md:flex-row md:items-end">
-              <label className="flex flex-1 cursor-pointer items-center gap-3 rounded-xl border border-dashed border-ink-600 px-4 py-4 hover:border-accent">
-                <Upload className="size-5 text-accent" aria-hidden />
+              <label className="flex flex-1 cursor-pointer items-center gap-3 rounded-lg border border-dashed border-ink-600 px-4 py-4 hover:border-accent">
+                <Upload className="size-5 text-fg-3" aria-hidden />
                 <span className="min-w-0 text-sm">
                   <span className="block truncate font-medium text-fg">{file ? file.name : "Choose a video file"}</span>
                   <span className="text-xs text-fg-3">{file ? `${(file.size / 1e6).toFixed(1)} MB` : "MP4, WebM, MOV… up to 200 MB. One sign per clip works best."}</span>
@@ -107,7 +107,7 @@ export default function AnalyzePage() {
           </Card>
 
           {url ? (
-            <div className="relative overflow-hidden rounded-2xl border border-ink-700 bg-black" style={{ aspectRatio: res ? `${res.width} / ${res.height}` : "16 / 9" }}>
+            <div className="relative overflow-hidden rounded-xl border border-ink-700 bg-black" style={{ aspectRatio: res ? `${res.width} / ${res.height}` : "16 / 9" }}>
               <video ref={videoRef} src={url} controls playsInline muted className="absolute inset-0 size-full object-contain" />
               <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 size-full" aria-hidden />
             </div>
@@ -121,7 +121,7 @@ export default function AnalyzePage() {
                 <>
                   <div className="relative h-10 rounded-lg bg-ink-900">
                     {res.stream.commits.map((c, i) => (
-                      <button key={i} className="absolute top-1 -translate-x-1/2 rounded-md border border-teal/50 bg-teal-soft px-1.5 py-0.5 font-mono text-[10px] text-teal"
+                      <button key={i} className="absolute top-1 -translate-x-1/2 rounded-md border border-teal/50 bg-teal-soft px-1.5 py-0.5 font-mono text-2xs text-teal"
                         style={{ left: `${Math.min(97, (c.t / dur) * 100)}%` }} onClick={() => { if (videoRef.current) videoRef.current.currentTime = c.t / 1000; }}>
                         {c.gloss.toUpperCase()}
                       </button>

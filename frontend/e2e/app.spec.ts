@@ -2,15 +2,15 @@ import { expect, test } from "@playwright/test";
 
 const PAGES: [string, RegExp][] = [
   ["/", /Overview/],
-  ["/live", /Live Sign Recognition/],
-  ["/analyze", /Video Analysis/],
-  ["/vocabulary", /Sign Vocabulary Explorer/],
-  ["/studio", /Landmark Visualisation Studio/],
-  ["/dataset", /Dataset Explorer/],
-  ["/lab", /Model Laboratory/],
-  ["/evaluation", /Model Evaluation/],
-  ["/experiments", /Experiment History/],
-  ["/research", /Research & Documentation/],
+  ["/live", /Live sign recognition/],
+  ["/analyze", /Video analysis/],
+  ["/vocabulary", /Sign vocabulary explorer/],
+  ["/studio", /Landmark visualisation studio/],
+  ["/dataset", /Dataset explorer/],
+  ["/lab", /Model laboratory/],
+  ["/evaluation", /Model evaluation/],
+  ["/experiments", /Experiment history/],
+  ["/research", /Research & documentation/],
 ];
 
 test("every page renders without console errors and the backend is reachable", async ({ page }) => {

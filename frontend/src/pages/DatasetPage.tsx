@@ -31,7 +31,7 @@ function JobPanel({ jobs, onCancel }: { jobs: Job[]; onCancel: (id: number) => v
             </div>
             {(j.status === "running" || j.status === "queued") && <Progress value={j.progress} />}
             {j.status !== "running" && Object.keys(j.result || {}).length > 0 && (
-              <div className="font-mono text-[11px] text-fg-3">{Object.entries(j.result).map(([k, v]) => `${k}: ${String(v)}`).join(" · ")}</div>
+              <div className="font-mono text-2xs text-fg-3">{Object.entries(j.result).map(([k, v]) => `${k}: ${String(v)}`).join(" · ")}</div>
             )}
           </li>
         ))}
@@ -84,7 +84,7 @@ function Actions({ status, onChanged }: { status: DatasetStatus | null; onChange
             </Button>
             <Button variant="secondary" disabled={!loaded} loading={busy === "scan"} onClick={() => run("scan", () => api.post("/api/dataset/scan"))}>Scan local files</Button>
           </div>
-          <p className="text-[11px] text-fg-3">Videos provided by the WLASL authors go in <code className="font-mono">data/videos/provided/&lt;video_id&gt;.mp4</code>, then “Scan local files”.</p>
+          <p className="text-2xs text-fg-3">Videos provided by the WLASL authors go in <code className="font-mono">data/videos/provided/&lt;video_id&gt;.mp4</code>, then “Scan local files”.</p>
         </div>
         <div className="flex flex-col gap-2">
           <div className="text-sm font-medium text-fg">3 · Landmarks</div>
@@ -124,7 +124,7 @@ function SplitsCard({ splits }: { splits: SplitInfo[] }) {
               const t = r.eval_videos_with_train_signers.test;
               return (
                 <tr key={s.id} className="border-b border-ink-700/60">
-                  <td className="py-2.5 pr-3"><div className="font-medium text-fg">{s.name}</div><div className="text-[11px] text-fg-3">{s.kind}</div></td>
+                  <td className="py-2.5 pr-3"><div className="font-medium text-fg">{s.name}</div><div className="text-2xs text-fg-3">{s.kind}</div></td>
                   <td className="py-2.5 pr-3 font-mono text-xs">{r.n_videos.train} / {r.n_videos.val} / {r.n_videos.test}</td>
                   <td className="py-2.5 pr-3 font-mono text-xs">{r.n_signers.train} / {r.n_signers.val} / {r.n_signers.test}</td>
                   <td className="py-2.5 pr-3 font-mono text-xs">{ov}</td>
@@ -187,11 +187,11 @@ function VideoTable({ inventory }: { inventory: InventoryRow[] }) {
                 <td className="py-2 pr-3 font-mono text-xs">{v.gloss.toUpperCase()}</td>
                 <td className="py-2 pr-3 font-mono text-xs">{v.signer_id}</td>
                 <td className="py-2 pr-3 text-xs">{v.split}</td>
-                <td className="py-2 pr-3 text-xs text-fg-2"><a href={v.url} target="_blank" rel="noreferrer noopener" className="hover:text-accent">{v.host}</a></td>
+                <td className="py-2 pr-3 text-xs text-fg-2"><a href={v.url} target="_blank" rel="noreferrer noopener" className="hover:text-accent-fg">{v.host}</a></td>
                 <td className="py-2 pr-3 font-mono text-xs">{v.frame_start}–{v.frame_end === -1 ? "end" : v.frame_end}</td>
-                <td className="py-2 pr-3"><Badge tone={STATUS_TONE[v.status] ?? "neutral"}>{v.status}</Badge>{v.error && <div className="mt-1 max-w-56 truncate text-[11px] text-fg-3" title={v.error}>{v.error}</div>}</td>
-                <td className="py-2 pr-3 font-mono text-[11px] text-fg-2">{v.width ? `${v.width}×${v.height} · ${v.fps?.toFixed(0)} fps · ${v.clip_frames} fr` : "—"}</td>
-                <td className="py-2 font-mono text-[11px] text-fg-2">{v.landmarks ? `${v.landmarks.status} · hands ${pct(v.landmarks.any_hand_rate, 0)}` : "—"}</td>
+                <td className="py-2 pr-3"><Badge tone={STATUS_TONE[v.status] ?? "neutral"}>{v.status}</Badge>{v.error && <div className="mt-1 max-w-56 truncate text-2xs text-fg-3" title={v.error}>{v.error}</div>}</td>
+                <td className="py-2 pr-3 font-mono text-2xs text-fg-2">{v.width ? `${v.width}×${v.height} · ${v.fps?.toFixed(0)} fps · ${v.clip_frames} fr` : "—"}</td>
+                <td className="py-2 font-mono text-2xs text-fg-2">{v.landmarks ? `${v.landmarks.status} · hands ${pct(v.landmarks.any_hand_rate, 0)}` : "—"}</td>
               </tr>
             ))}
           </tbody>
@@ -231,7 +231,7 @@ export default function DatasetPage() {
 
   return (
     <div className="fade-in">
-      <PageHeader eyebrow="WLASL100 · official annotations" title="Dataset Explorer"
+      <PageHeader eyebrow="WLASL100 · official annotations" title="Dataset explorer"
         description="Inventory, availability, signers, splits and landmark extraction status for the WLASL100 subset. Videos stay on this machine and are never redistributed (C-UDA)."
         actions={glosses.length > 0 && <Button variant="ghost" icon={<Download className="size-4" />} onClick={() => downloadCsv("wlasl100_inventory.csv", glosses.map((g) => ({ ...g, signers: g.signers.join(" "), split: JSON.stringify(g.split), resolutions: JSON.stringify(g.resolutions), fps: JSON.stringify(g.fps) })))}>Export inventory</Button>} />
 
@@ -247,7 +247,7 @@ export default function DatasetPage() {
           <>
             <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
               <Stat label="Annotated instances" value={num(s?.videos)} sub={s ? `train ${s.official_split.train ?? 0} · val ${s.official_split.val ?? 0} · test ${s.official_split.test ?? 0}` : undefined} />
-              <Stat label="Valid videos" value={num(s?.status_counts.valid ?? 0)} tone="teal" />
+              <Stat label="Valid videos" value={num(s?.status_counts.valid ?? 0)} />
               <Stat label="Unavailable" value={num((s?.status_counts.failed ?? 0) + (s?.status_counts.invalid ?? 0))} tone={(s?.status_counts.failed ?? 0) > 0 ? "warn" : undefined} sub="dead links or unreadable files" />
               <Stat label="Pending" value={num(s?.status_counts.pending ?? 0)} />
               <Stat label="Landmark sequences" value={num(s?.landmarks.status_counts.ok ?? 0)} sub={s?.landmarks.mean_any_hand_rate !== null && s?.landmarks.mean_any_hand_rate !== undefined ? `mean hand detection ${pct(s.landmarks.mean_any_hand_rate, 0)}` : undefined} />
@@ -270,7 +270,7 @@ export default function DatasetPage() {
                         <tr key={h.host} className="border-b border-ink-700/50">
                           <td className="py-1.5 text-fg-2">{h.host}</td>
                           <td className="py-1.5 text-right font-mono text-xs">{h.total}</td>
-                          <td className="py-1.5 text-right font-mono text-xs text-teal">{(h.valid as number) ?? 0}</td>
+                          <td className="py-1.5 text-right font-mono text-xs text-fg">{(h.valid as number) ?? 0}</td>
                           <td className="py-1.5 text-right font-mono text-xs text-danger">{((h.failed as number) ?? 0) + ((h.invalid as number) ?? 0)}</td>
                           <td className="py-1.5 text-right font-mono text-xs text-fg-3">{(h.pending as number) ?? 0}</td>
                         </tr>
@@ -290,13 +290,13 @@ export default function DatasetPage() {
                   <>
                     <ColumnChart ariaLabel="Histogram of clip durations" height={130} valueFormat={(v) => `${v} clips`}
                       bars={s.duration_histogram.map((b) => ({ label: `${b.from.toFixed(1)}–${b.to.toFixed(1)} s`, value: b.count }))} />
-                    <div className="mt-1 flex justify-between font-mono text-[10px] text-fg-3"><span>0 s</span><span>{s.duration_histogram[s.duration_histogram.length - 1].to.toFixed(1)} s</span></div>
+                    <div className="mt-1 flex justify-between font-mono text-2xs text-fg-3"><span>0 s</span><span>{s.duration_histogram[s.duration_histogram.length - 1].to.toFixed(1)} s</span></div>
                     {s.sequence_length && (
                       <div className="mt-4">
                         <Kv k="Median clip length" v={`${s.sequence_length.median_frames.toFixed(0)} frames`} />
                         <Kv k="10th–90th percentile" v={`${s.sequence_length.p10_frames.toFixed(0)}–${s.sequence_length.p90_frames.toFixed(0)} frames`} />
-                        <Kv k="Recommended sequence length" v={<span className="text-accent">{s.sequence_length.recommended_seq_len} steps</span>} />
-                        <p className="mt-2 text-[11px] text-fg-3">Basis: {s.sequence_length.basis}. Each clip is resampled to this many steps by timestamp.</p>
+                        <Kv k="Recommended sequence length" v={<span className="text-accent-fg">{s.sequence_length.recommended_seq_len} steps</span>} />
+                        <p className="mt-2 text-2xs text-fg-3">Basis: {s.sequence_length.basis}. Each clip is resampled to this many steps by timestamp.</p>
                       </div>
                     )}
                   </>
@@ -314,7 +314,7 @@ export default function DatasetPage() {
                     ))}</tbody>
                   </table>
                 </div>
-                <p className="mt-3 text-[11px] text-fg-3">Signers appearing in several official partitions are why the official split is not signer-independent.</p>
+                <p className="mt-3 text-2xs text-fg-3">Signers appearing in several official partitions are why the official split is not signer-independent.</p>
               </Card>
               <Card title="Provenance" subtitle="Annotation files exactly as fetched">
                 {prov ? (

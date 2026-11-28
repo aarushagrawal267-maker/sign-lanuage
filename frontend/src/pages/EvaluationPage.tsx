@@ -30,7 +30,7 @@ function PerClassTable({ m }: { m: Metrics }) {
   return (
     <div>
       <div className="mb-3 flex items-center justify-between gap-3">
-        <input className={inputCls + " max-w-60"} placeholder="Filter glosses…" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Filter glosses" />
+        <input className={inputCls + " max-w-60"} placeholder="Filter glosses" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Filter glosses" />
         <Button size="sm" variant="ghost" icon={<Download className="size-3.5" />} onClick={() => downloadCsv(`per_class_${m.partition ?? "eval"}.csv`, m.per_class)}>CSV</Button>
       </div>
       <div className="max-h-[480px] overflow-auto">
@@ -52,7 +52,7 @@ function PerClassTable({ m }: { m: Metrics }) {
           </tbody>
         </table>
       </div>
-      <p className="mt-2 text-[11px] text-fg-3">{m.per_class.filter((c) => c.support === 0).length} classes have no samples in this partition and cannot be scored. Weak classes are shown, not hidden — sort by F1 ascending to see them first.</p>
+      <p className="mt-2 text-2xs text-fg-3">{m.per_class.filter((c) => c.support === 0).length} classes have no samples in this partition and cannot be scored. Weak classes are shown, not hidden — sort by F1 ascending to see them first.</p>
     </div>
   );
 }
@@ -67,7 +67,7 @@ function MetricsView({ m, exp }: { m: Metrics; exp: ExperimentDetail }) {
         <Stat label="Top-5 accuracy" value={pct(m.top5)} />
         <Stat label="Macro F1" value={pct(m.macro_f1)} sub={`over ${m.classes_evaluated} classes present`} />
         <Stat label="Model inference" value={ms(m.latency?.mean_ms)} sub={m.latency ? `p95 ${ms(m.latency.p95_ms)} · ${m.latency.device}, batch 1` : undefined} />
-        <Stat label="Signers evaluated" value={signers.length} sub={exp.split?.signer_independent ? "unseen during training" : "overlap with training signers"} tone={exp.split?.signer_independent ? "teal" : "warn"} />
+        <Stat label="Signers evaluated" value={signers.length} sub={exp.split?.signer_independent ? "unseen during training" : "overlap with training signers"} tone={exp.split?.signer_independent ? undefined : "warn"} />
       </div>
 
       <div className="grid gap-5 xl:grid-cols-[1.2fr_1fr]">
@@ -139,7 +139,7 @@ export default function EvaluationPage() {
 
   return (
     <div className="fade-in">
-      <PageHeader eyebrow="Metrics from stored experiment records" title="Model Evaluation"
+      <PageHeader eyebrow="Metrics from stored experiment records" title="Model evaluation"
         description="Validation results guide model selection. Held-out test results are computed only on explicit request and are reported separately."
         actions={completed.length > 0 && (
           <select className={inputCls + " w-72"} value={id ?? ""} onChange={(e) => setParams({ exp: e.target.value })} aria-label="Experiment">
@@ -148,7 +148,7 @@ export default function EvaluationPage() {
         )} />
 
       {!completed.length ? (
-        <Card><Empty title="No completed experiments">Train a model in the Model Laboratory. Evaluation metrics are computed from real predictions on held-out signers.</Empty></Card>
+        <Card><Empty title="No completed experiments">Train a model in the Model laboratory. Evaluation metrics are computed from real predictions on held-out signers.</Empty></Card>
       ) : !exp ? (
         <p className="text-sm text-fg-3">Loading…</p>
       ) : (
