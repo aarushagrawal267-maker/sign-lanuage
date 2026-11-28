@@ -4884,3 +4884,95 @@ look, `--no-isl500-gate` is recorded; ISL500 validation needs the same signer sp
 and refuses a test-selected fold classifier; a second candidate from the same folder is refused, forced it is flagged;
 the failed verdict names the fallback; floors are information rows; ranking counts gates; a swapped recorded
 `fusion.json` or index file is refused.
+
+### 15.46 Encoder warm start from another work folder: the research encoders start from the commercial-safe ones (28 Nov 2026)
+
+**Measured.** Encoder probe, dictionary protocol: INCLUDE -> ISLRTC recall@1 on 698 INCLUDE validation queries, and
+ISL500 -> ISLRTC recall@1 on 588 ISL500 queries.
+
+| encoder | INCLUDE r1 | ISL500 r1 |
+|---|---|---|
+| commercial-safe `artifacts/isl/commercial-safe/encoder.pt` | 0.431 | 0.165 |
+| research, own self-supervised pre-training, bridge sampler, 3 epochs x 400 steps (tag `encprobe-bridge`) | 0.097 | 0.354 |
+| same recipe, warm-started from the commercial-safe `encoder.pt` (tag `encprobe-csinit`) | 0.451 | 0.468 |
+
+The warm-started run cleared the bar (paired on the INCLUDE queries: new_only 59 vs bar_only 45). Its epoch curve was
+0.33 -> 0.44 -> 0.45. So the research run should warm-start its encoders from the commercial-safe ones. That probe
+copied the commercial-safe `encoder.pt` over the tag folder's `pretrained_encoder.pt` (a hack: the report then
+described the wrong pre-training, and nothing recorded the lineage). This section makes it a first-class option.
+
+**Licence.** A commercial-safe component inside the research profile is allowed, never the reverse (15.44, 15.45).
+A research encoder warm-started from a commercial-safe one is a research encoder: it is trained on research data and
+its `meta.profile` is `research`. It is not a mixed-profile component, so build-pack needs no `--allow-profile-mix`
+for it. The lineage is recorded anyway (below).
+
+**Driver: `ENC_INIT=<work folder>`.** Empty (the default) changes nothing: `--init auto`, the same command lines, dry
+run and stamps as before.
+* The encoder step passes `--init <dir>/encoder.pt`. The oneshot step passes `--init-dir <dir>`: fold k warm-starts
+  from `<dir>/oneshot/fold<k>/encoder.pt`.
+* Before anything runs, the driver checks the files of the steps that run (missing: exit 2) and runs
+  `python -m app.isl.training.enc_init` on them (profile, feature config, model shape; exit 2 on a refusal).
+* `pretrain_dedup` and `pretrain` are skipped and stamped `skipped: ENC_INIT=<dir>`. Nothing else reads
+  `pretrained_encoder.pt` (checked by grep: `--init auto`, the v2 split guard of an `auto` init, and evaluate's
+  pre-training guard, which now follows the encoder's lineage, below). In a scratch run they are stamped, not seeded.
+* The encoder and oneshot stamps end with `enc_init=<dir>`. A resume with another `ENC_INIT` (or none) warns that the
+  stamp settings differ. Training the encoders later without `ENC_INIT` on a folder whose pre-training was skipped is
+  refused (exit 2): the encoders would silently start from no pre-training. Use `--from pretrain_dedup`.
+* `ENC_INIT` must be a folder and not this run's own work folder. Refused with `--profile both`.
+* The dry run prints each init file with its full SHA-256.
+
+**CLI checks (exit 2).** An explicit `train-encoder --init FILE`, `train-oneshot --init FILE` or `train-oneshot
+--init-dir DIR` is refused when:
+* the file is missing or is not an ISL encoder checkpoint;
+* its profile may not serve in this run's profile (`component_profile_allowed`: commercial-safe -> research only);
+* its feature config differs (the `auto` pre-training warm start still only warns, 15.15), or its model shape
+  (hidden, layers, emb_dim) differs;
+* it is a fine-tuned encoder whose `excluded_concepts` is not a superset of the concepts this model must never see.
+  For fold k that is fold k's expanded held-out set; for the main encoder its own (empty) set. A self-supervised
+  checkpoint saw no label and is not checked for concepts;
+* it is a fine-tuned encoder trained on another primary split, or on ISL500 under another signer split.
+All folds are checked before any fold trains. `--init-dir` with `--init` is refused.
+
+**Signer split v2 guard.** An explicit init that has no `pretrain_clips.txt` next to a `pretrained_encoder.pt`
+used to pass with "cannot be checked". It now passes without the warning when the checkpoint proves it never read an
+ISL500 clip: its profile has no ISL500 source, its recorded training sources and pre-training sources have none, and
+so does any warm start it descends from. v2 only moves ISL500 signers, so such an encoder saw no clip v2 moves. Any
+other explicit init keeps the warning. The real commercial-safe `encoder.pt` and both fold encoders pass this proof.
+
+**Lineage.**
+* `meta.warm_start` of the new encoder (and of each fold encoder): path, full SHA-256, work folder, profile, version,
+  number and hash of its excluded concepts, split, signer split, training sources, fold, and `self_supervised`. That
+  last one is the pre-training the warm start descends from: its `pretrain_clips.txt`, found next to the recorded
+  pre-trained checkpoint and verified against the SHA-256 recorded at pre-training time.
+* The resume signature already holds the init path and SHA-256 (`init`, `init_sha` in `LoopConfig.extra`): a resume
+  with another init (or none) raises `StateMismatch`.
+* build-pack writes `components.encoder.warm_start` into `pack.json` (path, SHA-256, profile, pre-training list and
+  its SHA-256). It refuses a pack whose encoder was warm-started from a profile that may not serve in the pack's one.
+
+**Evaluate.** The pre-training guard follows the main encoder's lineage. For a warm-started encoder it checks the warm
+start's own pre-training list, not this folder's `pretrained_encoder.pt`, which that encoder did not use.
+`pretraining_check.lineage` names the list, and report.md has a "pre-training lineage" line. E2's note is built from
+the fold encoders' lineage. Without a warm start it is exactly the old note. With one, it names each fold's warm
+start and the list that saw unlabelled ISLRTC clips, with the count (`pretraining_lineage` in E2). When the list is
+missing or changed (SHA-256), the guard and the note say "cannot be checked"; they never drop the note.
+
+**Commands.**
+
+```
+# dry run: the init files with their SHA-256, pretrain_dedup / pretrain stamped skipped
+ENC_INIT=artifacts/isl/commercial-safe scripts/phase2_train.sh --profile research --from link --dry-run
+# the research run, encoders warm-started from commercial-safe
+ENC_INIT=artifacts/isl/commercial-safe scripts/phase2_train.sh --profile research --from link
+# a probe in a scratch run (replaces the encprobe-csinit hack)
+PHASE2_TAG=encprobe-csinit2 ENC_INIT=artifacts/isl/commercial-safe ENC_EPOCHS=3 ENC_STEPS=400 \
+  scripts/phase2_train.sh --profile research --from encoder --until encoder
+```
+
+Tests (`backend/tests/isl/test_enc_init.py`): driver dry run and run with and without `ENC_INIT` (default command
+lines unchanged; `--init <dir>/encoder.pt`, `--init-dir <dir>`, the start-time check, skipped stamps, SHA-256 lines);
+missing files, own folder and `--profile both` refused; a later run without `ENC_INIT` warned and refused; a scratch
+run does not seed the pre-training; per-fold init selection through the CLI with lineage in each fold's meta; superset
+refusal (swapped folds, the main encoder as a fold init); licence-direction and model-shape refusals; resume with
+another init refused; v2 guard passes a proven no-ISL500 init and keeps the warning otherwise; evaluate's guard, E2
+note and report.md follow the warm start's list (a changed list: "cannot be checked"); pack.json records the lineage
+and a commercial-safe pack refuses a research warm start.

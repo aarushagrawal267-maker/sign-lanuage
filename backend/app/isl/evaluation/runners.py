@@ -1015,12 +1015,20 @@ def e4_like_for_like(e4: dict, ref_path: Path, k: str = "k3") -> dict:
 
 # --------------------------------------------------------------------------------------------- pre-training guard
 
-def pretraining_guard(work: Path, data) -> dict:
+def pretraining_guard(work: Path, data, encoder_meta: dict | None = None) -> dict:
     """Computed, not asserted: the pre-trained encoder's actual clip list (``<work>/pretrain_clips.txt``, written by
     ``pretrain``) against every evaluation clip and its duplicate group, plus the Sign Library content matches
-    (``pretrain_dedup.json``). ``excludes_eval_clips`` is True / False, or None when it cannot be checked."""
-    from app.isl.training.multisource import eval_clip_ids, read_pretrain_list
-    from app.isl.training.pose_dedup import DEDUP_FILE, load_dedup
+    (``pretrain_dedup.json``). ``excludes_eval_clips`` is True / False, or None when it cannot be checked.
+
+    ``encoder_meta`` of an encoder warm-started from another work folder (``meta.warm_start``, driver ENC_INIT, docs
+    15.46): the true lineage is checked instead, i.e. the pre-training list the warm start descends from (e.g. the
+    commercial-safe folder's ``pretrain_clips.txt``, verified against its recorded SHA-256), never this folder's own
+    pretrained_encoder.pt, which that encoder did not use. ``lineage`` in the result says which list was read."""
+    ws = (encoder_meta or {}).get("warm_start")
+    if isinstance(ws, dict):
+        return _warm_start_guard(ws, data)
+    from app.isl.training.multisource import read_pretrain_list
+    from app.isl.training.pose_dedup import DEDUP_FILE
 
     ck = work / "pretrained_encoder.pt"
     if not ck.exists():
@@ -1029,11 +1037,47 @@ def pretraining_guard(work: Path, data) -> dict:
     if ids is None:
         return {"excludes_eval_clips": None,
                 "reason": "pre-training clip list (pretrain_clips.txt) missing: re-run the pretrain step to check"}
+    return _pretrain_list_guard(ids, work / DEDUP_FILE, data)
+
+
+def _warm_start_guard(ws: dict, data) -> dict:
+    """:func:`pretraining_guard` for a warm-started encoder: the warm start's own pre-training list (docs 15.46)."""
+    import hashlib
+
+    ss = ws.get("self_supervised") or {}
+    lineage = {"warm_start": ws.get("path"), "warm_start_sha256": ws.get("sha256"),
+               "warm_start_profile": ws.get("profile"), "pretrain_list": ss.get("list_file"),
+               "pretrain_list_sha256": ss.get("list_sha256_recorded") or ss.get("list_sha256"),
+               "pretrained": bool(ss.get("pretrained"))}
+    if not ss.get("pretrained"):
+        return {"excludes_eval_clips": None, "lineage": lineage,
+                "reason": f"no self-supervised pre-training in this encoder's lineage (warm start {ws.get('path')}: "
+                          f"{ss.get('reason') or 'none recorded'})"}
+    lf = Path(ss["list_file"]) if ss.get("list_file") else None
+    if lf is None or not lf.is_file():
+        return {"excludes_eval_clips": None, "lineage": lineage,
+                "reason": f"the pre-training list of the warm start {ws.get('path')} is missing "
+                          f"({ss.get('list_file') or 'not found when it was trained'}): cannot be checked"}
+    text = lf.read_bytes()
+    want = ss.get("list_sha256_recorded") or ss.get("list_sha256")
+    if want and hashlib.sha256(text).hexdigest() != want:
+        return {"excludes_eval_clips": None, "lineage": lineage,
+                "reason": f"{lf} changed since the warm start was recorded (SHA-256 differs): cannot be checked"}
+    from app.isl.training.pose_dedup import DEDUP_FILE
+
+    ids = {ln.strip() for ln in text.decode("utf-8").splitlines() if ln.strip()}
+    return {**_pretrain_list_guard(ids, lf.parent / DEDUP_FILE, data), "lineage": lineage}
+
+
+def _pretrain_list_guard(ids: set[str], dedup_file: Path, data) -> dict:
+    from app.isl.training.multisource import eval_clip_ids
+    from app.isl.training.pose_dedup import load_dedup
+
     ev = eval_clip_ids(data)
     overlap = sorted(ids & ev)
     out = {"excludes_eval_clips": not overlap, "pretrain_clips": len(ids), "eval_clips_and_duplicates": len(ev),
            "overlap": len(overlap), "overlap_examples": overlap[:10]}
-    dd = load_dedup(work / DEDUP_FILE)
+    dd = load_dedup(dedup_file)
     if dd is not None:
         chunks = {m.get("chunk") for m in dd.get("eval_matches") or []}
         seen = sorted(chunks & ids)
@@ -1047,6 +1091,52 @@ def pretraining_guard(work: Path, data) -> dict:
     out["islrtc_clips_seen_unlabelled"] = len(gal & ids)
     out["islrtc_clips"] = len(gal)
     return out
+
+
+def _e2_pretraining_note(work: Path, data, pre_guard: dict, fold_lineage: dict) -> tuple[str, bool | None, list]:
+    """E2's note on what the self-supervised pre-training saw, for the fold encoders' TRUE lineage (docs 15.46).
+    No fold warm-started from another work folder: today's note, from this folder's pre-training list (the guard of
+    the main encoder, or of this folder when the main encoder was itself warm-started). Otherwise the warm start's own
+    pre-training list is what saw unlabelled ISLRTC clips: named, counted and never dropped."""
+    warm = {k: g for k, g in fold_lineage.items() if g is not None}
+    own = [k for k, g in fold_lineage.items() if g is None]
+    base = pre_guard if "lineage" not in pre_guard else pretraining_guard(work, data)
+    if not warm:
+        seen_gal = base.get("islrtc_clips_seen_unlabelled")
+        return ("NOTE: self-supervised pre-training saw ISLRTC clips WITHOUT labels, including the dictionary "
+                "reference clips E2 retrieves against"
+                + (f" ({seen_gal} of {base.get('islrtc_clips')} ISLRTC clips were in the pre-training list)"
+                   if seen_gal is not None else "") + "."), (seen_gal > 0) if seen_gal is not None else None, []
+    parts, rows, seen = [], [], []
+    for k, g in sorted(warm.items()):
+        lin = g.get("lineage") or {}
+        sg = g.get("islrtc_clips_seen_unlabelled")
+        seen.append((sg > 0) if sg is not None else (False if not lin.get("pretrained") else None))
+        rows.append({"fold": k, **lin, "islrtc_clips_seen_unlabelled": sg, "islrtc_clips": g.get("islrtc_clips"),
+                     "excludes_eval_clips": g.get("excludes_eval_clips"),
+                     **({"reason": g["reason"]} if g.get("reason") else {})})
+        if not lin.get("pretrained"):
+            parts.append(f"fold {k} was warm-started from {lin.get('warm_start')} ({lin.get('warm_start_profile')}), "
+                         "whose lineage has no self-supervised pre-training")
+        elif sg is None:
+            parts.append(f"fold {k} was warm-started from {lin.get('warm_start')} ({lin.get('warm_start_profile')}); "
+                         f"its pre-training list {lin.get('pretrain_list')} saw ISLRTC clips WITHOUT labels, but how "
+                         f"many cannot be checked ({g.get('reason')})")
+        else:
+            parts.append(f"fold {k} was warm-started from {lin.get('warm_start')} ({lin.get('warm_start_profile')}); "
+                         f"its pre-training list {lin.get('pretrain_list')} (sha256 "
+                         f"{str(lin.get('pretrain_list_sha256') or '-')[:16]}) is what saw unlabelled clips: {sg} of "
+                         f"{g.get('islrtc_clips')} ISLRTC clips, including dictionary reference clips E2 retrieves "
+                         "against, were in it")
+    for k in own:
+        sg = base.get("islrtc_clips_seen_unlabelled")
+        seen.append((sg > 0) if sg is not None else None)
+        rows.append({"fold": k, "warm_start": None, "islrtc_clips_seen_unlabelled": sg,
+                     "islrtc_clips": base.get("islrtc_clips")})
+        cnt = f" ({sg} of {base.get('islrtc_clips')} ISLRTC clips were in its list)" if sg is not None else ""
+        parts.append(f"fold {k} was initialised from this folder's own pre-training{cnt}")
+    any_seen = True if any(x is True for x in seen) else (None if any(x is None for x in seen) else False)
+    return ("NOTE (pre-training lineage, docs 15.46): " + "; ".join(parts) + "."), any_seen, rows
 
 
 # --------------------------------------------------------------------------------------------- E5 / E7 / E8
@@ -1210,9 +1300,10 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
     log = progress or (lambda m: None)
     t0 = time.time()
     partial = partial_data_flag(work) if partial_data is None else bool(partial_data)
-    pre_guard = pretraining_guard(work, data)
     split_name = data.split.get("name")
     rec = load_recognizer(work, fcfg, vocab_path, profile=profile)  # refuses an eval-including / stale index
+    # the main encoder's true pre-training lineage (a warm start from another work folder: its list; docs 15.46)
+    pre_guard = pretraining_guard(work, data, getattr(getattr(rec, "encoder", None), "meta", None))
     prot: dict = {}
     cv_records: dict = {}
     e2_records: dict = {}
@@ -1341,12 +1432,17 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
         doc = json.loads(one.read_text())
         restricted = {c["concept_id"] for c in doc.get("concepts", []) if c.get("usable")}
         folds = []
+        fold_lineage: dict = {}  # docs 15.46: the fold encoders' own pre-training lineage (warm start or own)
         for p in fold_models:
             k = int(p.parent.name.removeprefix("fold"))
             fd = next((f for f in doc["protocol"]["folds"] if f["fold"] == k), None)
             if fd is None:
                 continue
             enc = EncoderPredictor(p)
+            if isinstance(enc.meta.get("warm_start"), dict):
+                fold_lineage[k] = pretraining_guard(work, data, enc.meta)
+            else:
+                fold_lineage[k] = None
             held = heldout_set(getattr(data, "linker", None), fd["held_out_concepts"])
             # the fold encoder's own training list: with the sources it was trained without (docs 15.32)
             xsrc = encoder_excluded_sources(enc.meta)
@@ -1365,16 +1461,14 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
             if name == "full" and r_:
                 e2_records = r_
         full = pooled.get("full", {})
-        seen_gal = pre_guard.get("islrtc_clips_seen_unlabelled")
+        e2_note, seen_any, e2_lineage = _e2_pretraining_note(work, data, pre_guard, fold_lineage)
         prot["E2"] = {"label": "E2 open vocabulary, one-shot: concepts held out of ALL supervised training (synonyms "
                                "too); other signers' INCLUDE clips (val/test parts, never seen even unlabelled) vs one "
                                "ISLRTC dictionary clip per word; thresholds "
                                "fitted on seen-class validation queries only. Some misses are regional variants, not "
-                               "model errors. NOTE: self-supervised pre-training saw ISLRTC clips WITHOUT labels, "
-                               "including the dictionary reference clips E2 retrieves against"
-                               + (f" ({seen_gal} of {pre_guard.get('islrtc_clips')} ISLRTC clips were in the "
-                                  "pre-training list)" if seen_gal is not None else "") + ".",
-                      "pretraining_saw_gallery_unlabelled": (seen_gal > 0) if seen_gal is not None else None,
+                               "model errors. " + e2_note,
+                      "pretraining_saw_gallery_unlabelled": seen_any,
+                      **({"pretraining_lineage": e2_lineage} if e2_lineage else {}),
                       "run": bool(full), "n": full.get("n", 0), "n_groups": full.get("n_groups"),
                       **({} if full else {"reason": "no queries: no held-out concept has both INCLUDE val/test clips "
                                           "and a dictionary clip in the gallery (smoke runs sample the ISLRTC clips)"
@@ -1853,6 +1947,11 @@ def markdown_report(doc: dict) -> str:
               f"* pre-training excludes evaluation clips: {_fmt(lg.get('pretraining_excludes_eval_clips'))} "
               + (f"(computed: {pc.get('overlap')} of {pc.get('pretrain_clips')} pre-training clips are evaluation "
                  f"clips or their duplicates)" if pc.get("pretrain_clips") is not None else f"({pc.get('reason', '')})")]
+    if pc.get("lineage"):  # docs 15.46: a warm start from another work folder; its pre-training list was checked
+        ln = pc["lineage"]
+        lines.append(f"* pre-training lineage: the encoder was warm-started from {ln.get('warm_start')} "
+                     f"({ln.get('warm_start_profile')}, sha256 {str(ln.get('warm_start_sha256') or '-')[:16]}); the "
+                     f"pre-training list checked is {ln.get('pretrain_list') or 'none'}")
     if pc.get("sign_library"):
         lines.append(f"* OpenHands Sign Library: {pc['sign_library']}")
     cs = lg.get("class_space") or {}

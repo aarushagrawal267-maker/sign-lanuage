@@ -377,6 +377,18 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
                  "index": imeta.profile if src_index is not None else None,
                  "fusion": FusionParams.load(work / "fusion.json").profile if (work / "fusion.json").exists() else None}
     other = {k: v for k, v in comp_prof.items() if v and v != prof.name}
+    # an encoder warm-started from another work folder (docs 15.46) is a component of THIS profile (trained here: its
+    # meta.profile is this one), so it is not a mixed-profile component; its warm start must still be licence-
+    # compatible with the pack (commercial-safe -> research, never the reverse), and its lineage is recorded
+    enc_ws = enc_meta.get("warm_start") if (work / "encoder.pt").exists() else None
+    if isinstance(enc_ws, dict):
+        from app.isl.profiles import component_profile_allowed
+
+        if not component_profile_allowed(enc_ws.get("profile"), prof.name):
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise ValueError(f"refusing to build a {prof.name} pack: its encoder was warm-started from "
+                             f"{enc_ws.get('path')} of profile {enc_ws.get('profile')!r}, which is not licence-"
+                             "compatible with it (docs 15.44, 15.46)")
     mixed = {}
     if other and allow_profile_mix:
         from app.isl.profiles import component_profile_allowed
@@ -422,6 +434,16 @@ def build_pack(work: Path, profile: str, fcfg: FeatureConfig, out: Path | None =
         man["components"]["index"] = {**man["components"]["index"], **index_info}
     for comp, cs in class_spaces.items():
         man["components"][comp] = {**(man["components"].get(comp) or {}), "class_space": cs}
+    if isinstance(enc_ws, dict):  # docs 15.46: the encoder's warm-start lineage travels with the pack
+        ss = enc_ws.get("self_supervised") or {}
+        man["components"]["encoder"] = {**(man["components"].get("encoder") or {}), "warm_start": {
+            "path": enc_ws.get("path"), "sha256": enc_ws.get("sha256"), "profile": enc_ws.get("profile"),
+            "encoder_version": enc_ws.get("encoder_version"),
+            "pretrain_list": ss.get("list_file"), "pretrain_list_sha256": ss.get("list_sha256_recorded")
+            or ss.get("list_sha256"),
+            "note": (f"a {prof.name} encoder (trained on this profile's data) warm-started from a "
+                     f"{enc_ws.get('profile')} encoder: not a mixed-profile component; the warm start is licence-"
+                     "compatible with this profile (docs 15.44, 15.46)")}}
     # the variant-audit file whose relinks trained this pack (docs 15.36-37): shipped numbers trace back to it
     from app.isl.evaluation.runners import variant_links_summary
     from app.isl.training.multisource import read_link_settings

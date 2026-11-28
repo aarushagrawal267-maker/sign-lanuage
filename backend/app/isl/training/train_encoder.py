@@ -373,10 +373,12 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
                   version: str = ENCODER_VERSION, cache_items: int = 12000,
                   exclude_sources: tuple[str, ...] | list[str] = (), bridge_p: int = 0,
                   bridge_weights: dict | None = None, val_protocol: str = "mixed",
-                  dict_val_per_signer: int = DICT_VAL_PER_SIGNER) -> dict:
+                  dict_val_per_signer: int = DICT_VAL_PER_SIGNER, warm_start: dict | None = None) -> dict:
     """``bridge_p`` > 0 turns the bridge sampler on (that many bridge labels per batch, signer sources drawn by
     ``bridge_weights``, default :data:`DEFAULT_BRIDGE_WEIGHTS`); ``val_protocol="dictionary"`` selects the epoch on the
-    dictionary protocol (docs 15.40). Defaults: exactly the old sampler and validation."""
+    dictionary protocol (docs 15.40). Defaults: exactly the old sampler and validation. ``warm_start`` (the lineage of
+    an explicit ``init_from``, :func:`app.isl.training.enc_init.init_lineage`, docs 15.46) is recorded in
+    ``meta.warm_start``; the resume signature already carries the init's path and SHA-256 (``init`` / ``init_sha``)."""
     if val_protocol not in VAL_PROTOCOLS:
         raise ValueError(f"val_protocol must be one of {VAL_PROTOCOLS}, not {val_protocol!r}")
     if bridge_p < 0:
@@ -522,7 +524,8 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
                      "train_sources": dict(src_counts), "val_queries": len(vq), "gallery": len(gal)},
             "sampler": sampler, "val_protocol": val_protocol,
             "select_key": DICT_SELECT_KEY if val_protocol == "dictionary" else "val_r1",
-            **({"val_dictionary_sets": dict_info} if dict_info is not None else {})}
+            **({"val_dictionary_sets": dict_info} if dict_info is not None else {}),
+            **({"warm_start": warm_start} if warm_start is not None else {})}
 
     def save_best(epoch: int, row: dict) -> None:
         atomic_save({"state_dict": enc.state_dict(), "meta": {**meta, "best_epoch": epoch}}, out)
@@ -568,6 +571,7 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
             "val_r5": best.get("val_r5"), "val_queries": len(vq), "finished": res.finished,
             "resumed_from": res.resumed_from, "step_seconds": res.step_seconds, "pretrained": bool(init),
             "class_space": class_space,
+            **({"warm_start": {k: warm_start.get(k) for k in ("path", "sha256", "profile")}} if warm_start else {}),
             **({"val_protocol": val_protocol, "select_key": select_key, "val_dict": val_dict,
                 "sampler": sampler} if val_protocol != "mixed" or plan is not None else {}),
             "seconds": round(time.time() - t0, 1)}

@@ -94,6 +94,15 @@
 #   0's test part). Needs the cv step: the folds are the ones the cv step trains (CV_FOLDS, passed as --oof-folds);
 #   FUSION_OOF=1 with an empty CV_FOLDS is refused at start (exit 2). A fold whose classifier was early-stopped on the
 #   E1b test (fold 4) is skipped by fit-fusion (docs 15.43). FUSION_OOF_KEEP_IN_SAMPLE=1 adds --oof-keep-in-sample.
+# ENC_INIT=<work folder> (docs 15.46; default empty = --init auto, as before): the encoders warm-start from another work
+#   folder's encoders, e.g. ENC_INIT=artifacts/isl/commercial-safe for the research run: the encoder step passes
+#   --init <dir>/encoder.pt, the oneshot step --init-dir <dir> (fold k starts from <dir>/oneshot/fold<k>/encoder.pt).
+#   Refused (exit 2): a missing file, another feature config or model shape, an init whose profile may not serve in
+#   this one (research -> commercial-safe), or a fold init trained with one of the fold's held-out concepts (its
+#   excluded_concepts must cover them). pretrain_dedup and pretrain are then not needed: stamped "skipped: ENC_INIT"
+#   (evaluate checks the warm start's own pre-training list, e.g. <dir>/pretrain_clips.txt). The stamps of encoder
+#   and oneshot record enc_init=<dir>; a resume with another init is refused (the state's init SHA-256). Dry runs print
+#   the init files with their SHA-256. One profile per run (refused with --profile both).
 # EVAL_COMPARE_TO=<report.json>: the evaluate step runs `evaluate --all --compare-to <report.json>` (E1b and E4 like
 # for like against that report, e.g. artifacts/isl/commercial-safe/eval/report.json; docs 15.27, 15.28, 15.31).
 # One profile per run (refused with --profile both); a missing file is refused before anything runs (exit 2).
@@ -153,6 +162,9 @@ if [[ "$PROFILE" == "both" && -n "${EVAL_COMPARE_TO:-}" ]]; then
   # commercial-safe would be compared with its own report, which its evaluate step then replaces (docs 15.31)
   echo "EVAL_COMPARE_TO needs one profile per run (not --profile both): run the two profiles separately" >&2; exit 2
 fi
+if [[ "$PROFILE" == "both" && -n "${ENC_INIT:-}" ]]; then
+  echo "ENC_INIT needs one profile per run (not --profile both): run the two profiles separately" >&2; exit 2
+fi
 if [[ "$PROFILE" == "both" ]]; then
   args=("$@")
   rc=0
@@ -208,7 +220,9 @@ if [[ $SMOKE == 1 ]]; then
   CAP="--max-per-source ${SMOKE_PER_SOURCE:-300} --max-islrtc ${SMOKE_ISLRTC:-400}"
   PRE="--hidden 32 --layers 1 --emb-dim 32 --epochs 1 --batches 4 --batch-size 8 --max-clips 200"
   ENC="--hidden 32 --layers 1 --emb-dim 32 --epochs 1 --batches 4 --p 8 --k 2 --batch-size 16"
-  ONE="--hidden 32 --layers 1 --emb-dim 32 --epochs 1 --batches 3 --p 8 --k 2 --batch-size 16 --folds 0"
+  ONE_FOLDS="0"
+  ENC_SHAPE="--hidden 32 --layers 1 --emb-dim 32"
+  ONE="--hidden 32 --layers 1 --emb-dim 32 --epochs 1 --batches 3 --p 8 --k 2 --batch-size 16 --folds $ONE_FOLDS"
   CLS="--hidden 32 --layers 1 --epochs 2 --batches 6 --batch-size 16"
   E1A_PAT=""
   LET="--epochs 3"
@@ -235,7 +249,9 @@ else
   # commercial-safe as before (400 / 300)
   if [[ "$PROFILE" == "research" ]]; then ES_DEF=800; OS_DEF=800; else ES_DEF=400; OS_DEF=300; fi
   ENC="--hidden $H --layers $L --emb-dim $E --epochs ${ENC_EPOCHS:-40} --batches ${ENC_STEPS:-$ES_DEF} --p 32 --k 2 --patience 10"
-  ONE="--hidden $H --layers $L --emb-dim $E --epochs ${ONESHOT_EPOCHS:-20} --batches ${ONESHOT_STEPS:-${ENC_STEPS:-$OS_DEF}} --p 32 --k 2 --patience 6 --folds ${ONESHOT_FOLDS:-0 1}"
+  ONE_FOLDS="${ONESHOT_FOLDS:-0 1}"
+  ENC_SHAPE="--hidden $H --layers $L --emb-dim $E"
+  ONE="--hidden $H --layers $L --emb-dim $E --epochs ${ONESHOT_EPOCHS:-20} --batches ${ONESHOT_STEPS:-${ENC_STEPS:-$OS_DEF}} --p 32 --k 2 --patience 6 --folds $ONE_FOLDS"
   # research: more steps and a shorter patience on the worst-source key (docs 15.38); commercial-safe as before
   if [[ "$PROFILE" == "research" ]]; then CS_DEF=800; CP_DEF=8; else CS_DEF=300; CP_DEF=10; fi
   CLS="--hidden $H --layers $L --epochs ${CLS_EPOCHS:-40} --batches ${CLS_STEPS:-$CS_DEF} --patience ${CLS_PATIENCE:-$CP_DEF}"
@@ -284,6 +300,19 @@ EB_ARG=""
 [[ -n "$ENC_SW" ]] && EB_ARG="$EB_ARG --source-weights $ENC_SW"
 [[ "$ENC_VP" != mixed ]] && EB_ARG="$EB_ARG --val-protocol $ENC_VP"
 ENC_SETTINGS="bridge_p=$ENC_BP source_weights=${ENC_SW:-default} val=$ENC_VP"
+# encoder warm start from another work folder (docs 15.46): empty = --init auto (this folder's pre-training), as before
+ENC_INIT_DIR=""
+EI_ENC=(--init auto)
+EI_ONE=(--init auto)
+if [[ -n "${ENC_INIT:-}" ]]; then
+  ENC_INIT_DIR="$(realpath -m -- "$ENC_INIT")"
+  [[ -d "$ENC_INIT_DIR" ]] || { echo "ENC_INIT: $ENC_INIT_DIR is not a folder (a work folder, e.g. artifacts/isl/commercial-safe)" >&2; exit 2; }
+  if [[ "$ENC_INIT_DIR" == "$(realpath -m -- "$WORK")" ]]; then
+    echo "ENC_INIT: $ENC_INIT_DIR is this run's own work folder (its encoders would start from themselves)" >&2; exit 2
+  fi
+  EI_ENC=(--init "$ENC_INIT_DIR/encoder.pt")
+  EI_ONE=(--init-dir "$ENC_INIT_DIR")
+fi
 ENC_BAR_FILE=""  # absolute now: the steps run from backend/ (docs 15.41)
 if [[ -n "${ENC_BAR:-}" ]]; then
   ENC_BAR_FILE="$(realpath -m -- "$ENC_BAR")"
@@ -336,7 +365,8 @@ step_settings() {
   case "$1" in
     classifier|cv) echo " dict_group=$DICT_GROUP quota=$CLS_QUOTA select=$CLS_SEL" ;;
     e1a) echo " dict_group=$DICT_GROUP" ;;
-    encoder|oneshot) echo " enc_exclude=${ENC_XSRC:--} $ENC_SETTINGS" ;;
+    encoder|oneshot) echo " enc_exclude=${ENC_XSRC:--} $ENC_SETTINGS${ENC_INIT_DIR:+ enc_init=$ENC_INIT_DIR}" ;;
+    pretrain_dedup|pretrain) [[ -n "$ENC_INIT_DIR" ]] && echo " skipped: ENC_INIT=$ENC_INIT_DIR" ;;
     index|index_final) echo " wslp_twins=$WSLP_TWINS" ;;
     link) echo " link_aliases=$LINK_ALIASES variant_links=$VL_FILE signer_split=$SIGNER_SPLIT" ;;
     fusion) [[ $FUSION_OOF == 1 ]] && echo " oof=1" ;;
@@ -357,8 +387,8 @@ stamp_warn() {
       [[ $has == "$FUSION_OOF" ]] && return 0
       log "warning: fusion stamp settings differ from the current ones (stamp oof=$has, FUSION_OOF=$FUSION_OOF); use --from fusion to refit"
       return 0 ;;
-    encoder|oneshot)
-      [[ "$ENC_BP" == 0 && -z "$ENC_SW" && "$ENC_VP" == mixed \
+    encoder|oneshot)  # (and docs 15.46: a stamp with another enc_init, or none, than this run's ENC_INIT)
+      [[ "$ENC_BP" == 0 && -z "$ENC_SW" && "$ENC_VP" == mixed && -z "$ENC_INIT_DIR" \
          && "$(cat "$STAMPS/$1.done" 2>/dev/null)" != *"bridge_p="* ]] && return 0 ;;
     *) return 0 ;;
   esac
@@ -498,13 +528,18 @@ run_step() {
     splits) cli splits --vocab "$VOCAB" ;;  # fetches the official INCLUDE lists only when missing
     link) cli link-sources $COMMON --all-sources $CAP $LA_ARG $VL_ARG $SS_ARG ;;
     bench) cli bench --threads "$THREADS" --steps $([[ $SMOKE == 1 ]] && echo 1 || echo 5) --hidden-sizes ${HIDDEN:-192} ;;
+    # with ENC_INIT nothing reads this folder's pre-training (docs 15.46): skipped, the stamp says so
+    pretrain_dedup|pretrain) if [[ -n "$ENC_INIT_DIR" ]]; then
+        log "  skipped: ENC_INIT=$ENC_INIT_DIR (the encoders warm-start from its encoders; evaluate checks its pre-training list)"
+        return 0
+      fi ;;&
     pretrain_dedup) cli pretrain-dedup $COMMON --all-sources $CAP $PDD ;;  # Sign Library copies / eval-clip matches
     pretrain) train pretrain $COMMON $CAP $PRE ;;
     encoder)
       rm -f "$WORK/eval/encoder_probe.json"  # a probe of the old encoder (docs 15.41)
-      train train-encoder $COMMON --all-sources $CAP $ENC --init auto $XS_ARG $EB_ARG || return $?
+      train train-encoder $COMMON --all-sources $CAP $ENC "${EI_ENC[@]}" $XS_ARG $EB_ARG || return $?
       [[ -z "$ENC_BAR_FILE" ]] || enc_probe ;;
-    oneshot) train train-oneshot $COMMON --all-sources $CAP $ONE --init auto $XS_ARG $EB_ARG ;;
+    oneshot) train train-oneshot $COMMON --all-sources $CAP $ONE "${EI_ONE[@]}" $XS_ARG $EB_ARG ;;
     classifier) train train-classifier $COMMON --all-sources $CAP $CLS $DG_ARG $CQ_ARG ;;
     cv)  # classifiers for the other folds of the primary split: E1b mean / spread and a signer-grouped interval
       local base
@@ -550,6 +585,12 @@ if [[ $DRY_RUN == 1 ]]; then
   echo "classifier: source quota=$CLS_QUOTA, selection=$CLS_SEL (classifier and cv), settings: $CLS"
   echo "encoder: $ENC_SETTINGS (encoder and oneshot), settings: $ENC; oneshot: $ONE"
   [[ -n "$ENC_BAR_FILE" ]] && echo "encoder probe after the encoder step: bar $ENC_BAR_FILE -> $WORK/eval/encoder_probe.json"
+  if [[ -n "$ENC_INIT_DIR" ]]; then  # docs 15.46
+    echo "encoder warm start: ENC_INIT=$ENC_INIT_DIR (encoder --init, oneshot --init-dir; pretrain_dedup and pretrain skipped)"
+    for f in "$ENC_INIT_DIR/encoder.pt" $(for k in $ONE_FOLDS; do echo "$ENC_INIT_DIR/oneshot/fold$k/encoder.pt"; done); do
+      if [[ -f "$f" ]]; then echo "  init $f sha256:$(sha256sum "$f" | cut -d' ' -f1)"; else echo "  init $f MISSING"; fi
+    done
+  fi
   [[ -n "$UNTIL" ]] && echo "until: $UNTIL (later steps are not run)"
   echo "variant links: VARIANT_LINKS=$VARIANT_LINKS, $WORK/variant_links.json: $VL_FILE (link step only)"
   echo "signer split: SIGNER_SPLIT=$SIGNER_SPLIT (link step only); fusion out-of-fold calibration: FUSION_OOF=$FUSION_OOF${FO_ARG:+ ($FO_ARG)}"
@@ -584,8 +625,12 @@ if [[ -n "$FROM" && -z "$ONLY" ]]; then
       [[ "$s" == "$UNTIL" ]] && reached=2
       continue
     fi
-    # scratch run: an earlier step without a stamp is seeded from the real work folder, never run (docs 15.20)
-    if [[ $SCRATCH == 1 && ! -f "$STAMPS/$s.done" ]] && ! in_list "$s" "${FORGET[@]}"; then SEED+=("$s"); fi
+    # scratch run: an earlier step without a stamp is seeded from the real work folder, never run (docs 15.20);
+    # with ENC_INIT the pre-training steps are not seeded but stamped skipped (docs 15.46)
+    if [[ $SCRATCH == 1 && ! -f "$STAMPS/$s.done" ]] && ! in_list "$s" "${FORGET[@]}"; then
+      [[ -n "$ENC_INIT_DIR" ]] && in_list "$s" pretrain_dedup pretrain && continue
+      SEED+=("$s")
+    fi
   done
 fi
 RUN=()
@@ -662,6 +707,30 @@ if [[ "$ONLY" == link ]]; then
     exit 2
   fi
 fi
+# encoder warm start (docs 15.46): the init files the steps that run need, checked before anything runs (exit 2)
+if [[ -n "$ENC_INIT_DIR" ]] && { in_list encoder "${RUN[@]}" || in_list oneshot "${RUN[@]}"; }; then
+  ei_files=()
+  in_list encoder "${RUN[@]}" && ei_files+=("$ENC_INIT_DIR/encoder.pt")
+  if in_list oneshot "${RUN[@]}"; then for k in $ONE_FOLDS; do ei_files+=("$ENC_INIT_DIR/oneshot/fold$k/encoder.pt"); done; fi
+  for f in "${ei_files[@]}"; do
+    [[ -f "$f" ]] || { echo "ENC_INIT: $f is missing (nothing was run)" >&2; exit 2; }
+  done
+  # profile (licence direction), feature config and model shape; the per-fold concept check runs in train-oneshot
+  if ! nice -n 10 "$PY" -m app.isl.training.enc_init --profile "$PROFILE" $ENC_SHAPE "${ei_files[@]}"; then
+    echo "ENC_INIT=$ENC_INIT_DIR refused for profile $PROFILE (nothing was run)" >&2
+    exit 2
+  fi
+fi
+# a pre-training skipped by ENC_INIT: without ENC_INIT the encoders would silently start from no pre-training
+if [[ -z "$ENC_INIT_DIR" ]] && { in_list encoder "${RUN[@]}" || in_list oneshot "${RUN[@]}"; }; then
+  for s in pretrain_dedup pretrain; do
+    if ! in_list "$s" "${RUN[@]}" && [[ "$(cat "$STAMPS/$s.done" 2>/dev/null)" == *"skipped: ENC_INIT"* ]]; then
+      echo "step $s was skipped by ENC_INIT ($(cat "$STAMPS/$s.done")), but this run trains the encoders without it:" >&2
+      echo "  set ENC_INIT again, or run --from pretrain_dedup to pre-train this folder (nothing was run)" >&2
+      exit 2
+    fi
+  done
+fi
 [[ $DRY_RUN == 1 ]] && echo "linker this run: link_aliases=$LA_STATE variant_links=$VL_STATE signer_split=$SS_STATE"
 [[ $DRY_RUN == 1 && -n "${SS_WARN:-}" ]] && echo "warning: $SS_WARN"
 # (not for --check-only, which runs no step)
@@ -696,7 +765,9 @@ if [[ $DRY_RUN == 1 ]]; then
   for s in "${STEPS[@]}"; do
     [[ $past_until == 1 ]] && { echo "would stop before $s (--until $UNTIL)"; break; }
     [[ "$s" == "$UNTIL" ]] && past_until=1
-    if in_list "$s" "${RUN[@]}"; then echo "would run $s"
+    if in_list "$s" "${RUN[@]}" && [[ -n "$ENC_INIT_DIR" ]] && in_list "$s" pretrain_dedup pretrain; then
+      echo "would stamp $s skipped: ENC_INIT (nothing trained)"
+    elif in_list "$s" "${RUN[@]}"; then echo "would run $s"
     elif [[ -z "$ONLY" ]] && ! in_list "$s" "${SEED[@]}"; then
       echo "would skip $s (done $(cat "$STAMPS/$s.done"))"; stamp_warn "$s"
     fi
@@ -730,7 +801,7 @@ mkdir -p "$WORK"
 free_gb=$(df -Pk "$REPO" | awk 'NR==2 {print int($4/1048576)}')
 if [[ "$free_gb" -lt 10 ]]; then log "only ${free_gb} GB free (< 10 GB floor): not starting"; exit 3; fi
 
-log "phase 2 driver: profile=$PROFILE smoke=$SMOKE tag=${RUN_TAG:--} allow_partial=$ALLOW_PARTIAL threads=$THREADS work=$WORK stamps=$STAMPS${COMPARE_TO:+ compare_to=$COMPARE_TO} $WSLP_SETTINGS cls_quota=$CLS_QUOTA cls_select=$CLS_SEL enc: $ENC_SETTINGS fusion_oof=$FUSION_OOF${UNTIL:+ until=$UNTIL} git=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+log "phase 2 driver: profile=$PROFILE smoke=$SMOKE tag=${RUN_TAG:--} allow_partial=$ALLOW_PARTIAL threads=$THREADS work=$WORK stamps=$STAMPS${COMPARE_TO:+ compare_to=$COMPARE_TO} $WSLP_SETTINGS cls_quota=$CLS_QUOTA cls_select=$CLS_SEL enc: $ENC_SETTINGS${ENC_INIT_DIR:+ enc_init=$ENC_INIT_DIR} fusion_oof=$FUSION_OOF${UNTIL:+ until=$UNTIL} git=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
 [[ -n "${LA_WARN:-}" ]] && log "warning: $LA_WARN"
 [[ -n "${SS_WARN:-}" ]] && log "warning: $SS_WARN"
 if [[ ${#SEED[@]} -gt 0 ]]; then

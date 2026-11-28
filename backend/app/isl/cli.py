@@ -51,6 +51,8 @@ training ones --resume / --max-minutes (exit code 75 = stopped with state saved,
                          unlabelled / sentence source of the profile -> <work>/pretrained_encoder.pt
   train-encoder --init auto
                          fine-tune from the pre-trained encoder
+  train-encoder --init OTHER_WORK/encoder.pt, train-oneshot --init-dir OTHER_WORK
+                         warm start from another work folder's encoders (driver: ENC_INIT; docs 15.46)
   train-oneshot --folds 0 1
                          E2 encoders with each fold's concepts held out of all supervised training
                          (both: --bridge-p 12 --source-weights include=0.5,isl500=0.35,mendeley=0.15 = the bridge
@@ -653,9 +655,19 @@ def cmd_train_encoder(paths: IslPaths, args) -> int:
     except ValueError as e:
         print(f"train-encoder: {e}", file=sys.stderr)
         return 2
+    explicit = _explicit_init(args)
+    if explicit is not None and not explicit.is_file():  # before the data is loaded (docs 15.46)
+        print(f"train-encoder: refused warm start: {explicit} is missing", file=sys.stderr)
+        return 2
     profile, data, fcfg, work = _model_ctx(paths, args)
     if not _pretrain_split_guard("train-encoder", args, work, data):
         return 2
+    warm = None
+    if explicit is not None:  # an explicit warm start is checked and its lineage recorded (docs 15.46)
+        warm = _check_warm_start("train-encoder", explicit, args, profile, fcfg, data)
+        if warm is None:
+            return 2
+        _print({"warm_start": warm})
     _print({"data": data.summary()})
     out = Path(args.ckpt) if getattr(args, "ckpt", None) else work / "encoder.pt"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -664,9 +676,40 @@ def cmd_train_encoder(paths: IslPaths, args) -> int:
                         threads=args.threads, batches_per_epoch=args.batches or (20 if args.smoke else None),
                         progress=lambda f, m: _log(f"  encoder {m}"), init_from=_init_path(args, work),
                         use_extra=args.all_sources, resume=args.resume, max_minutes=args.max_minutes,
-                        exclude_sources=_exclude_sources(args), **opts)
+                        exclude_sources=_exclude_sources(args), warm_start=warm, **opts)
     _print(res)
     return 0 if res.get("finished", True) else EX_PARTIAL
+
+
+def _explicit_init(args) -> Path | None:
+    """``--init PATH`` (not ``auto`` / ``none``): an explicit warm start, checked by :func:`_check_warm_start`."""
+    v = getattr(args, "init", None)
+    return None if (not v or v in ("auto", "none")) else Path(v)
+
+
+def _check_warm_start(cmd: str, path: Path, args, profile: str, fcfg, data, must_exclude=(),
+                      fold: int | None = None) -> dict | None:
+    """An explicit warm start (docs 15.46): refused (message, None) for a missing file, another feature config or
+    model shape, another primary split, a licence-incompatible profile (research -> commercial-safe) or an encoder
+    trained with concepts this model must not see; else its lineage for ``meta.warm_start``."""
+    from app.isl.training.enc_init import check_init, init_lineage, read_meta
+    from app.isl.training.multisource import signer_split_version
+
+    cfg = _train_cfg(args, SMOKE_ENC)
+    mk = {"hidden": cfg.hidden, "layers": cfg.layers, "emb_dim": args.emb_dim or (128 if args.smoke else 256)}
+    meta = None
+    if Path(path).is_file():
+        try:
+            meta = read_meta(path)
+        except Exception as e:  # noqa: BLE001
+            print(f"{cmd}: refused warm start: {path} cannot be read: {e}", file=sys.stderr)
+            return None
+    bad = check_init(path, profile=profile, fcfg=fcfg, model_kwargs=mk, must_exclude=must_exclude,
+                     split=data.split.get("name"), signer_split=signer_split_version(getattr(data, "link", None)),
+                     meta=meta)
+    for b in bad:
+        print(f"{cmd}: refused warm start{f' (fold {fold})' if fold is not None else ''}: {b}", file=sys.stderr)
+    return None if bad else init_lineage(path, meta=meta, fold=fold)
 
 
 def _encoder_options(args) -> dict:
@@ -839,17 +882,20 @@ def _fusion_fit_space(rec) -> dict:
                             idx.meta.row_filters if idx is not None else None)
 
 
-def _pretrain_split_guard(cmd: str, args, work: Path, data) -> bool:
+def _pretrain_split_guard(cmd: str, args, work: Path, data, init: Path | None = None) -> bool:
     """Signer split v2 (docs 15.42, 15.43): a pre-trained warm start must not have seen an evaluation clip of THIS
     split (a pre-training of the v1 split saw the two ISL500 signers v2 moves to validation). Checked from the
     ``pretrain_clips.txt`` next to it: ``<work>/pretrained_encoder.pt`` (missing list = refused) or an explicit
     ``--init .../pretrained_encoder.pt`` whose folder holds the list. Any other ``--init`` cannot be checked: a
-    warning says so. Prints the reason and returns False when refused. v1 (every run before 15.42): not checked
-    here, exactly as before (the report's pre-training guard still reports it)."""
+    warning says so, unless the checkpoint itself proves it never read an ISL500 clip (its profile has no ISL500
+    source and its recorded training / pre-training sources have none: v2 moves only ISL500 signers; docs 15.46).
+    ``init`` overrides ``--init`` (train-oneshot --init-dir: one per fold). Prints the reason and returns False when
+    refused. v1 (every run before 15.42): not checked here, exactly as before (the report's pre-training guard still
+    reports it)."""
     from app.isl.training.multisource import eval_clip_ids, read_pretrain_list, signer_split_version
 
     ver = signer_split_version(getattr(data, "link", None))
-    init = _init_path(args, work)
+    init = init if init is not None else _init_path(args, work)
     if ver == "v1" or init is None:
         return True
     own = Path(init).resolve() == (work / "pretrained_encoder.pt").resolve()
@@ -857,6 +903,14 @@ def _pretrain_split_guard(cmd: str, args, work: Path, data) -> bool:
     ids = read_pretrain_list(folder) if (own or Path(init).name == "pretrained_encoder.pt") else None
     if ids is None:
         if not own:
+            from app.isl.training.enc_init import no_isl500_proof
+
+            proof = no_isl500_proof(init) if Path(init).is_file() else {"ok": False}
+            if proof["ok"]:
+                print(f"{cmd}: signer split {ver}: the warm start {init} never read an ISL500 clip, so it saw no "
+                      f"validation / test clip this split moves ({'; '.join(proof['reasons'])}; docs 15.46)",
+                      file=sys.stderr)
+                return True
             print(f"{cmd}: warning: signer split {ver}: the warm start {init} is not checked against this split's "
                   f"validation / test clips (no {folder / 'pretrain_clips.txt'} for a pretrained_encoder.pt next to "
                   "it); make sure it never saw them (docs 15.43)", file=sys.stderr)
@@ -972,6 +1026,19 @@ def cmd_train_oneshot(paths: IslPaths, args) -> int:
     except ValueError as e:
         print(f"train-oneshot: {e}", file=sys.stderr)
         return 2
+    init_dir = Path(args.init_dir) if getattr(args, "init_dir", None) else None
+    if init_dir is not None and getattr(args, "init", None) not in (None, "none"):
+        print("train-oneshot: --init-dir and --init together: --init-dir already gives each fold its warm start",
+              file=sys.stderr)
+        return 2
+    explicit = _explicit_init(args)
+    if init_dir is not None:
+        missing = [str(_fold_init(init_dir, k)) for k in args.folds if not _fold_init(init_dir, k).is_file()]
+    else:
+        missing = [str(explicit)] if explicit is not None and not explicit.is_file() else []
+    if missing:  # before the data is loaded (docs 15.46)
+        print(f"train-oneshot: refused warm start: missing {', '.join(missing)}", file=sys.stderr)
+        return 2
     profile, data, fcfg, work = _model_ctx(paths, args)
     if not _pretrain_split_guard("train-oneshot", args, work, data):
         return 2
@@ -980,13 +1047,31 @@ def cmd_train_oneshot(paths: IslPaths, args) -> int:
         _print({"skipped": True, "reason": "no oneshot_concepts.json: run 'splits' with a vocabulary first"})
         return 0
     doc = json.loads(one.read_text())
-    out, code = {}, 0
+    # every fold's warm start is checked before any fold trains (docs 15.46): fold k never starts from an encoder that
+    # was trained with one of fold k's held-out concepts (its excluded_concepts must be a superset of them)
+    plans: dict = {}
     for k in args.folds:
         fd = next((f for f in doc["protocol"]["folds"] if f["fold"] == k), None)
         if fd is None or not fd["held_out_concepts"]:
-            out[k] = {"skipped": True}
             continue
         held = heldout_set(data.linker, fd["held_out_concepts"])
+        init = _fold_init(init_dir, k) if init_dir is not None else explicit
+        warm = None
+        if init is not None:
+            if init_dir is not None and not _pretrain_split_guard("train-oneshot", args, work, data, init=init):
+                return 2
+            warm = _check_warm_start("train-oneshot", init, args, profile, fcfg, data, must_exclude=held, fold=k)
+            if warm is None:
+                return 2
+        plans[k] = (fd, held, init if init is not None else _init_path(args, work), warm)
+    if any(p[3] for p in plans.values()):
+        _print({"warm_start": {k: p[3] for k, p in plans.items()}})
+    out, code = {}, 0
+    for k in args.folds:
+        if k not in plans:
+            out[k] = {"skipped": True}
+            continue
+        fd, held, init, warm = plans[k]
         d = work / "oneshot" / f"fold{k}"
         d.mkdir(parents=True, exist_ok=True)
         res = train_encoder(data, d / "encoder.pt", fcfg, _train_cfg(args, SMOKE_ENC),
@@ -994,15 +1079,20 @@ def cmd_train_oneshot(paths: IslPaths, args) -> int:
                             exclude_concepts=held, smoke=args.smoke, threads=args.threads,
                             batches_per_epoch=args.batches or (20 if args.smoke else None),
                             progress=lambda f, m, _k=k: _log(f"  oneshot fold{_k} {m}"),
-                            init_from=_init_path(args, work), use_extra=args.all_sources, resume=args.resume,
+                            init_from=init, use_extra=args.all_sources, resume=args.resume,
                             max_minutes=args.max_minutes, version=f"isl-enc-1-oneshot{k}",
-                            exclude_sources=_exclude_sources(args), **opts)
+                            exclude_sources=_exclude_sources(args), warm_start=warm, **opts)
         out[k] = {**res, "held_out": len(fd["held_out_concepts"]), "held_out_expanded": len(held)}
         if not res.get("finished", True):
             code = EX_PARTIAL
             break
     _print(out)
     return code
+
+
+def _fold_init(init_dir: Path, k: int) -> Path:
+    """train-oneshot --init-dir: fold k starts from the other work folder's fold k encoder (docs 15.46)."""
+    return Path(init_dir) / "oneshot" / f"fold{k}" / "encoder.pt"
 
 
 def cmd_train_fingerspell(paths: IslPaths, args) -> int:
@@ -1633,7 +1723,8 @@ def _model_args(sp, train: bool = False) -> None:
         sp.add_argument("--resume", action="store_true", help="continue from the saved training state")
         sp.add_argument("--max-minutes", type=float, default=0.0,
                         help="stop after this long with the state saved (exit code 75); run again with --resume")
-        sp.add_argument("--init", default=None, help="encoder warm start: a checkpoint, 'auto' (pretrained) or 'none'")
+        sp.add_argument("--init", default=None, help="encoder warm start: a checkpoint, 'auto' (pretrained) or 'none'; "
+                                                     "a checkpoint is checked and its lineage recorded (docs 15.46)")
         sp.add_argument("--min-signers", type=int, default=2, help="classifier: signer groups a class needs")
         sp.add_argument("--ckpt", help="classifier / train-encoder: checkpoint path (default <work>/classifier.pt, "
                                         "<work>/encoder.pt); only these two use it, train-oneshot refuses it")
@@ -1697,6 +1788,11 @@ def build_parser() -> argparse.ArgumentParser:
             spx.add_argument("--max-clips", type=int, default=0, help="use at most N unlabelled clips (0 = all)")
         if name == "train-oneshot":
             spx.add_argument("--folds", type=int, nargs="+", default=[0, 1])
+            spx.add_argument("--init-dir", default=None,
+                             help="warm-start fold k from DIR/oneshot/fold<k>/encoder.pt (another work folder, e.g. "
+                                  "artifacts/isl/commercial-safe); refused unless that encoder's excluded_concepts "
+                                  "cover fold k's held-out concepts, its profile may serve in this one, and feature "
+                                  "config, model shape and split match (docs 15.46). Not with --init")
         if name == "train-classifier":
             spx.add_argument("--dictionary-group", action="store_true",
                              help="count ISLRTC, WSLP and CISLR as ONE signer group when choosing classes (WSLP is "
