@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { FlaskConical, Play, Square, Zap } from "lucide-react";
 import { api, type ExperimentDetail, type ExperimentSummary, type SplitInfo, type DatasetSummary } from "../api/client";
@@ -73,10 +73,24 @@ export function TrainingCurves({ exp }: { exp: ExperimentDetail }) {
 
 function RunMonitor({ id, onDone }: { id: number; onDone: () => void }) {
   const { data: exp } = useApi<ExperimentDetail>(`/api/experiments/${id}`, 1500);
-  const running = exp && (exp.status === "running" || exp.status === "queued");
+  const running = !!exp && (exp.status === "running" || exp.status === "queued");
+  // Always call the latest callback without making it an effect dependency: a parent that passes an
+  // inline arrow must not re-run the effect below on every render.
+  const onDoneRef = useRef(onDone);
   useEffect(() => {
-    if (exp && !running) onDone();
-  }, [exp, running, onDone]);
+    onDoneRef.current = onDone;
+  });
+  // Report a run as done once, on its transition from queued/running to finished. A run that was
+  // already finished when the monitor opened (e.g. the bundled model) is not reported, and neither
+  // is every 1.5 s poll of a finished run; otherwise onDone -> parent reload -> re-render -> onDone
+  // loops ("Maximum update depth exceeded" and hundreds of GET /api/experiments per second).
+  const seen = useRef<{ id: number; running: boolean } | null>(null);
+  useEffect(() => {
+    if (!exp || exp.id !== id) return; // still showing the previous run's data while the new one loads
+    const wasRunning = seen.current?.id === id && seen.current.running;
+    seen.current = { id, running };
+    if (wasRunning && !running) onDoneRef.current();
+  }, [exp, id, running]);
   if (!exp) return null;
   const last = exp.history[exp.history.length - 1];
   const sec = exp.history.reduce((a, b) => a + b.seconds, 0);
@@ -104,7 +118,7 @@ function RunMonitor({ id, onDone }: { id: number; onDone: () => void }) {
       {exp.status === "completed" && (
         <div className="mt-4 flex flex-wrap items-center gap-3">
           <span className="text-sm text-fg-2">Best epoch {exp.val_metrics && "best_epoch" in exp.val_metrics ? exp.val_metrics.best_epoch : "—"} · validation top-1 {pct(exp.val?.top1)}</span>
-          <Button size="sm" variant="primary" icon={<Zap className="size-3.5" />} onClick={() => api.post(`/api/experiments/${id}/activate`).then(onDone)} disabled={exp.is_active}>{exp.is_active ? "Active model" : "Activate for recognition"}</Button>
+          <Button size="sm" variant="primary" icon={<Zap className="size-3.5" />} onClick={() => api.post(`/api/experiments/${id}/activate`).then(() => onDone())} disabled={exp.is_active}>{exp.is_active ? "Active model" : "Activate for recognition"}</Button>
           <Link to={`/evaluation?exp=${id}`} className="text-sm text-accent hover:underline">Full evaluation</Link>
         </div>
       )}
@@ -253,7 +267,7 @@ export default function LabPage() {
         <div className="flex min-w-0 flex-col gap-5">
           {!splits.data?.length && <Notice tone="warn" title="No dataset splits yet">Load the WLASL100 annotations and extract landmarks on the Dataset page before training.</Notice>}
           {monitorId ? (
-            <RunMonitor id={monitorId} onDone={() => exps.reload()} />
+            <RunMonitor id={monitorId} onDone={exps.reload} />
           ) : (
             <Card><Empty icon={<FlaskConical className="size-6" />} title="No run selected">Start a training run — its loss and accuracy curves will stream here from the real training loop.</Empty></Card>
           )}
