@@ -71,3 +71,25 @@ test("keyboard: skip link, focus after navigation, experiment details, mobile me
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(menu).toBeFocused();
 });
+
+test("model laboratory settles with a finished run on screen (no reload loop)", async ({ page }) => {
+  // The e2e backend has a completed, activated experiment, like the bundled model on a fresh clone.
+  // RunMonitor used to call onDone() on every render once its run was finished, which reloaded the
+  // experiment list in a loop (hundreds of GET /api/experiments and "Maximum update depth exceeded").
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
+  let listCalls = 0;
+  page.on("request", (r) => {
+    if (new URL(r.url()).pathname === "/api/experiments" && r.method() === "GET") listCalls++;
+  });
+  await page.goto("/lab");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText(/Model Laboratory/);
+  await expect(page.getByText(/^Run #\d+/).first()).toBeVisible();
+  await expect(page.getByText("completed", { exact: true }).first()).toBeVisible();
+  listCalls = 0;
+  await page.waitForTimeout(6000);
+  // The page polls the list every 4 s, so at most two requests in 6 s (the loop made hundreds).
+  expect(listCalls).toBeLessThanOrEqual(2);
+  expect(errors).toEqual([]);
+});
