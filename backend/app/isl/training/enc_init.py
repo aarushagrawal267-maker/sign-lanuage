@@ -209,6 +209,74 @@ def check_init(path, *, profile: str, fcfg=None, model_kwargs: dict | None = Non
     return bad
 
 
+def fold_of(path) -> int | None:
+    """k for ``.../oneshot/fold<k>/encoder.pt``, else None."""
+    p = Path(path)
+    if p.parent.parent.name == "oneshot" and p.parent.name.startswith("fold"):
+        try:
+            return int(p.parent.name.removeprefix("fold"))
+        except ValueError:
+            return None
+    return None
+
+
+def fold_heldout(path) -> dict[int, list[str]]:
+    """``{fold: raw held-out concept ids}`` of a ``splits/oneshot_concepts.json`` (no linker expansion)."""
+    import json
+
+    doc = json.loads(Path(path).read_text())
+    folds = (doc.get("protocol") or {}).get("folds", [])
+    return {int(f["fold"]): list(f.get("held_out_concepts") or []) for f in folds}
+
+
+def init_linker(init_meta: dict, init_path, fallback_vocab):
+    """The linker the warm start's own run labelled its clips with: its work folder's ``link_settings.json`` and
+    ``vocabulary.jsonl`` (read only; this run's vocabulary when the folder has none). Returns (linker, info)."""
+    from app.isl.training.common import load_vocab
+    from app.isl.training.multisource import GlossLinker, linker_options, read_link_settings
+
+    wf = init_work_folder(init_path)
+    vf = wf / "vocabulary.jsonl"
+    vocab = load_vocab(vf) if vf.is_file() else fallback_vocab
+    link = read_link_settings(wf)
+    info = {"work": str(wf), "vocab": str(vf) if vf.is_file() else "this run's", "link_settings": link or {}}
+    return GlossLinker.from_vocab(vocab, **linker_options(link)), info
+
+
+def relabel(linker, clip) -> str | None:
+    """The concept ``linker`` gives ``clip``: a clip linked by gloss is re-linked from its raw gloss; an adapter-given
+    concept (before this run's variant relabel) goes through ``linker``'s variant links. None = not linked."""
+    q = clip.quality or {}
+    if "link" in q:
+        cid, _ = linker.link(clip.raw_gloss, clip.source)
+    else:
+        cid = q.get("variant_of") or clip.concept_id
+    if cid and linker.variants:
+        cid = linker.variant_of(cid, clip.source)
+    return cid
+
+
+def clip_level_exclusion(data, init_meta: dict, init_path, held: set[str], fallback_vocab) -> dict:
+    """Clip-level form of the superset check (docs 15.46): the init's excluded_concepts are concept ids of ITS linker,
+    the held-out set is this run's. A clip this run labels with a held-out concept that the init's linker labels
+    with a concept the init did not exclude was (possibly) in the init's supervised training: refused. The clips
+    checked are this run's supervised-candidate clips of the init's training sources (INCLUDE train part, ISLRTC,
+    other sources' train part); ``{"violations": [...], "checked": n, ...}``."""
+    srcs = set(((init_meta.get("data") or {}).get("train_sources") or {}).keys())
+    excl = set(init_meta.get("excluded_concepts") or [])
+    cands = list(data.include_part("train")) + list(data.islrtc) + list(data.extra_part("train"))
+    cands = [c for c in cands if c.concept_id in held and (not srcs or c.source in srcs)]
+    if not cands:
+        return {"violations": [], "checked": 0}
+    linker, info = init_linker(init_meta, init_path, fallback_vocab)
+    bad = []
+    for c in cands:
+        y = relabel(linker, c)
+        if y is not None and y not in excl:
+            bad.append({"clip": c.clip_id, "source": c.source, "here": c.concept_id, "init": y})
+    return {"violations": bad, "checked": len(cands), "init_linker": info}
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m app.isl.training.enc_init",
                                  description="check warm-start encoders for a run (docs 15.46); exit 2 = refused")
@@ -216,14 +284,23 @@ def main(argv=None) -> int:
     ap.add_argument("--hidden", type=int)
     ap.add_argument("--layers", type=int)
     ap.add_argument("--emb-dim", type=int)
+    ap.add_argument("--oneshot-concepts", default=None,
+                    help="splits/oneshot_concepts.json: a fold file (<dir>/oneshot/fold<k>/encoder.pt) must exclude "
+                         "fold k's raw held-out concepts (the linked expansion is checked by train-oneshot)")
     ap.add_argument("files", nargs="+")
     a = ap.parse_args(argv)
     from app.isl.training.common import ISL_FEATURES
 
     mk = {k: v for k, v in (("hidden", a.hidden), ("layers", a.layers), ("emb_dim", a.emb_dim)) if v is not None}
+    held = fold_heldout(a.oneshot_concepts) if a.oneshot_concepts else {}
     rc = 0
     for f in a.files:
-        bad = check_init(f, profile=a.profile, fcfg=ISL_FEATURES, model_kwargs=mk)
+        k = fold_of(f)
+        if a.oneshot_concepts and k is not None and not held.get(k):
+            print(f"ENC_INIT: {f}: fold {k} has no held-out concepts (not trained): not needed")
+            continue
+        bad = check_init(f, profile=a.profile, fcfg=ISL_FEATURES, model_kwargs=mk,
+                         must_exclude=held.get(k, ()) if k is not None else ())
         for b in bad:
             print(f"ENC_INIT refused: {b}", file=sys.stderr)
         rc = 2 if bad else rc

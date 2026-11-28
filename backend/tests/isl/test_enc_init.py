@@ -126,7 +126,10 @@ def test_driver_enc_init_refusals(tmp_path, monkeypatch):
     r = _driver(tmp_path, monkeypatch, "research", "--from", "encoder", "--until", "encoder", "--dry-run",
                 enc_init=cs)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "oneshot/fold1/encoder.pt MISSING" in r.stdout  # still printed in the dry run's list
+    # the dry run says what the warm start does in this run: the encoder only; the oneshot file is not listed
+    assert f"encoder warm start: ENC_INIT={cs} (encoder --init; pretrain_dedup and pretrain seeded / run / kept" \
+        in r.stdout and "oneshot is kept without ENC_INIT" in r.stdout
+    assert f"  init {cs / 'encoder.pt'} sha256:" in r.stdout and "oneshot/fold1" not in r.stdout
     r = _driver(tmp_path, monkeypatch, "research", "--dry-run", enc_init=tmp_path / "nowhere")
     assert r.returncode == 2 and "is not a folder" in r.stderr
     r = _driver(tmp_path, monkeypatch, "research", "--dry-run", enc_init=tmp_path / "art" / "research")
@@ -331,8 +334,15 @@ def test_cli_warm_start_per_fold_lineage_and_refusals(two_profiles, capsys):
     assert cli.main(root + ["train-oneshot", *res, "--folds", "0", "--init", str(cs / "encoder.pt")]) == 2
     assert "superset" in capsys.readouterr().err
     assert cli.main(root + ["train-oneshot", *res, "--init-dir", str(cs), "--init", "auto"]) == 2
-    assert cli.main(root + ["train-oneshot", *res, "--folds", "2", "--init-dir", str(cs)]) == 2  # no fold2 file
-    assert "missing" in capsys.readouterr().err
+    part = t["base"].parent / "part"  # fold 1 trains (held-out concepts) but has no file: refused before loading
+    (part / "oneshot" / "fold0").mkdir(parents=True)
+    shutil.copy2(cs / "oneshot" / "fold0" / "encoder.pt", part / "oneshot" / "fold0" / "encoder.pt")
+    capsys.readouterr()
+    assert cli.main(root + ["train-oneshot", *res, "--folds", "0", "1", "--init-dir", str(part)]) == 2
+    err = capsys.readouterr().err
+    assert "missing" in err and "fold1" in err and "fold0" not in err
+    # a fold with no held-out concepts is not trained: its file is not needed (no fold2 file, protocol has no fold 2)
+    assert cli.main(root + ["train-oneshot", *res, "--folds", "2", "--init-dir", str(cs)]) == 0
     # licence direction: a research encoder never starts a commercial-safe one
     assert cli.main(root + ["train-encoder", "--profile", "commercial-safe", *t["common"], "--ckpt",
                             str(base.parent / "x.pt"), "--init", str(base / "research" / "encoder.pt")]) == 2
@@ -435,3 +445,285 @@ def test_evaluate_and_pack_report_the_warm_start_lineage(phase2, tmp_path):
     fix_index()
     with pytest.raises(ValueError, match="warm-started from"):
         build_pack(work, "commercial-safe", ISL_FEATURES, tmp_path / "pack2", smoke=True, vocab_path=w["vocab"])
+
+
+# ------------------------------------------------------------------------- review fixes (docs 15.46, review 1)
+
+def _seed_folder(tmp_path) -> Path:
+    """A real work folder to seed a scratch run from: its own pre-training and encoders (no warm start)."""
+    seed = tmp_path / "seed" / "research"
+    for f in ("vocabulary.jsonl", "pretrained_encoder.pt", "pretrain_clips.txt", "pretrain_dedup.json", "encoder.pt",
+              "oneshot/fold0/encoder.pt", "oneshot/fold1/encoder.pt"):
+        (seed / f).parent.mkdir(parents=True, exist_ok=True)
+        (seed / f).write_text(f"seed {f}\n")
+    return seed.parent
+
+
+@pytest.mark.parametrize("start", ["oneshot", "classifier"])
+def test_driver_scratch_run_seeds_the_pretraining_when_encoders_are_seeded(tmp_path, monkeypatch, start):
+    """A scratch run --from oneshot / classifier with ENC_INIT seeds encoders that descend from the real folder's own
+    pre-training: the pre-training is seeded as before (evaluate then checks the list they used), never stamped
+    "skipped: ENC_INIT", and the dry run says what the warm start really does."""
+    seed = _seed_folder(tmp_path)
+    cs = _init_dir(tmp_path)
+    r = _driver(tmp_path, monkeypatch, "research", "--from", start, "--dry-run", seed_base=seed, enc_init=cs)
+    assert r.returncode == 0, r.stdout + r.stderr
+    for s in ("pretrain_dedup", "pretrain", "encoder"):
+        assert f"would seed {s}\n" in r.stdout, s
+    assert "skipped: ENC_INIT" not in r.stdout and "would stamp" not in r.stdout
+    assert f"would copy {seed / 'research' / 'pretrained_encoder.pt'}" in r.stdout
+    assert f"would copy {seed / 'research' / 'pretrain_clips.txt'}" in r.stdout
+    if start == "classifier":
+        assert "would seed oneshot" in r.stdout and "neither encoder nor oneshot runs" in r.stdout
+        assert f"encoder warm start: ENC_INIT={cs} not used (" in r.stdout and "  init " not in r.stdout
+        assert not _calls(tmp_path, "app.isl.training.enc_init")
+        return
+    assert f"encoder warm start: ENC_INIT={cs} (oneshot --init-dir; pretrain_dedup and pretrain seeded" in r.stdout
+    assert f"encoder is seeded from {seed / 'research'}" in r.stdout
+    assert f"  init {cs / 'oneshot/fold0/encoder.pt'} sha256:" in r.stdout and f"  init {cs / 'encoder.pt'}" \
+        not in r.stdout
+    # the real (fake-python) run: the seeded pre-training files are there, the oneshot step warm-starts
+    r = _driver(tmp_path, monkeypatch, "research", "--from", start, "--until", "oneshot", seed_base=seed,
+                enc_init=cs)
+    assert r.returncode == 0, r.stdout + r.stderr
+    work = tmp_path / "art" / "research"
+    st = work / "driver" / "phase2_research.stamps"
+    for f in ("pretrained_encoder.pt", "pretrain_clips.txt", "pretrain_dedup.json", "encoder.pt"):
+        assert (work / f).read_text() == f"seed {f}\n"
+    for s in ("pretrain_dedup", "pretrain", "encoder"):
+        assert "seeded from" in (st / f"{s}.done").read_text()
+    (one,) = _calls(tmp_path, "train-oneshot")
+    assert f"--init-dir {cs}" in one and not _calls(tmp_path, "pretrain", "train-encoder")
+
+
+def test_driver_enc_init_from_encoder_scratch_and_until(tmp_path, monkeypatch):
+    """--from encoder --until encoder in a scratch run: the folder holds only the warm-started encoder (no oneshot):
+    the pre-training is skipped. --until encoder on a folder whose oneshot was trained without ENC_INIT: it runs."""
+    seed = _seed_folder(tmp_path)
+    cs = _init_dir(tmp_path)
+    r = _driver(tmp_path, monkeypatch, "research", "--from", "encoder", "--until", "encoder", "--dry-run",
+                seed_base=seed, enc_init=cs)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "would stamp pretrain skipped: ENC_INIT" in r.stdout and "would seed pretrain\n" not in r.stdout
+    st = _stamps(tmp_path)  # a finished folder (oneshot stamped "old": its own pre-training)
+    r = _driver(tmp_path, monkeypatch, "research", "--from", "pretrain_dedup", "--until", "encoder", "--dry-run",
+                enc_init=cs)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "would run pretrain_dedup" in r.stdout and "would run pretrain\n" in r.stdout
+    assert "oneshot is kept without ENC_INIT (old)" in r.stdout
+    # the same with a oneshot stamp of an earlier ENC_INIT run: skipped
+    (st / "oneshot.done").write_text(f"t 1s enc_exclude=wslp x enc_init={cs}\n")
+    r = _driver(tmp_path, monkeypatch, "research", "--from", "pretrain_dedup", "--until", "encoder", "--dry-run",
+                enc_init=cs)
+    assert r.returncode == 0 and "would stamp pretrain skipped: ENC_INIT" in r.stdout
+
+
+def test_driver_skipped_pretrain_keeps_its_files(tmp_path, monkeypatch):
+    """A pretrain skipped by ENC_INIT keeps this folder's pretrained_encoder.pt with its clip list and state (no
+    orphaned checkpoint); without ENC_INIT --from pretrain removes them as before."""
+    st = _stamps(tmp_path)
+    work = tmp_path / "art" / "research"
+    files = {f: work / f for f in ("pretrained_encoder.pt", "pretrain_clips.txt", "pretrained_encoder.state.pt")}
+    for p in files.values():
+        p.write_text("old\n")
+    cs = _init_dir(tmp_path)
+    r = _driver(tmp_path, monkeypatch, "research", "--from", "link", "--until", "oneshot", "--dry-run", enc_init=cs)
+    assert r.returncode == 0, r.stdout + r.stderr
+    for name in ("pretrain_clips.txt", "pretrained_encoder.state.pt"):
+        assert f"would keep {files[name]} (pretrain skipped: ENC_INIT)" in r.stdout
+        assert f"would remove {files[name]}" not in r.stdout
+    r = _driver(tmp_path, monkeypatch, "research", "--from", "link", "--until", "oneshot", enc_init=cs)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert all(p.read_text() == "old\n" for p in files.values())
+    assert "skipped: ENC_INIT" in (st / "pretrain.done").read_text()
+    r = _driver(tmp_path, monkeypatch, "research", "--from", "pretrain_dedup", "--until", "oneshot", "--dry-run")
+    assert r.returncode == 0 and f"would remove {files['pretrain_clips.txt']}" in r.stdout
+
+
+def test_driver_passes_the_oneshot_concepts_to_the_start_check(tmp_path, monkeypatch):
+    _stamps(tmp_path)
+    cs = _init_dir(tmp_path)
+    oc = tmp_path / "isl" / "splits" / "oneshot_concepts.json"
+    oc.parent.mkdir(parents=True)
+    oc.write_text("{}")
+    r = _driver(tmp_path, monkeypatch, "research", "--from", "encoder", "--until", "oneshot", "--dry-run",
+                enc_init=cs)
+    assert r.returncode == 0, r.stdout + r.stderr
+    (check,) = _calls(tmp_path, "app.isl.training.enc_init")
+    assert f"--oneshot-concepts {oc}" in check
+    (tmp_path / "fake_py.log").unlink()
+    r = _driver(tmp_path, monkeypatch, "research", "--from", "encoder", "--until", "encoder", "--dry-run",
+                enc_init=cs)
+    (check,) = _calls(tmp_path, "app.isl.training.enc_init")
+    assert "--oneshot-concepts" not in check  # oneshot does not run
+
+
+def test_start_check_refuses_a_swapped_fold(tmp_path, capsys):
+    """The driver's start-time check: a fold file must exclude its fold's raw held-out concepts; a fold without
+    held-out concepts needs no file."""
+    from app.isl.training.enc_init import main
+
+    oc = tmp_path / "oneshot_concepts.json"
+    oc.write_text(json.dumps({"protocol": {"folds": [{"fold": 0, "held_out_concepts": ["isl.apple"]},
+                                                     {"fold": 1, "held_out_concepts": ["isl.book"]},
+                                                     {"fold": 2, "held_out_concepts": []}]}}))
+    d = tmp_path / "cs"
+    f0 = _ck(d / "oneshot" / "fold0" / "encoder.pt", _meta(excl={"isl.apple"}))
+    f1 = _ck(d / "oneshot" / "fold1" / "encoder.pt", _meta(excl={"isl.apple"}))  # fold 0's encoder: swapped
+    mk = ["--profile", "research", "--hidden", "16", "--layers", "1", "--emb-dim", "16", "--oneshot-concepts", str(oc)]
+    assert main(mk + [str(f0)]) == 0
+    assert main(mk + [str(f0), str(f1)]) == 2
+    assert "isl.book" in capsys.readouterr().err
+    assert main(mk + [str(f0), str(d / "oneshot" / "fold2" / "encoder.pt")]) == 0  # not trained: not needed
+    assert "not needed" in capsys.readouterr().out
+    assert main(mk[:-2] + [str(f0), str(f1)]) == 0  # without the protocol: shape / profile only, as before
+
+
+def test_clip_level_exclusion_uses_the_init_linker(tmp_path):
+    """The superset check compares concept ids of two linkers; the clip-level check relabels this run's clips of a
+    held-out concept with the init's linker and refuses one it did not exclude."""
+    from app.isl.training.enc_init import clip_level_exclusion, relabel
+
+    def clip(cid, src="include", gloss="x", q=None):
+        return SimpleNamespace(clip_id=f"{src}/{cid}/{gloss}", concept_id=cid, source=src, raw_gloss=gloss,
+                               quality=q or {})
+
+    class Lk:
+        variants = {}
+
+        def link(self, gloss, source):
+            return ({"pomme": "isl.fruit"}.get(gloss), "gloss")
+
+    held = {"isl.apple"}
+    data = SimpleNamespace(include_part=lambda part: [clip("isl.apple"), clip("isl.cat")], islrtc=[],
+                           extra_part=lambda part: [clip("isl.apple", "wslp", "pomme", {"link": "alias"})])
+    ok_meta = _meta(excl={"isl.apple", "isl.fruit"}, train_sources={"include": 1, "wslp": 1})
+    bad_meta = _meta(excl={"isl.apple"}, train_sources={"include": 1, "wslp": 1})
+    init = _ck(tmp_path / "cs" / "oneshot" / "fold0" / "encoder.pt", ok_meta)
+    import app.isl.training.enc_init as ei
+
+    orig = ei.init_linker
+    ei.init_linker = lambda m, p, v: (Lk(), {"work": "cs", "vocab": "-"})
+    try:
+        assert relabel(Lk(), clip("isl.apple", "wslp", "pomme", {"link": "alias"})) == "isl.fruit"
+        assert relabel(Lk(), clip("isl.apple", q={"variant_of": "isl.apple"})) == "isl.apple"
+        r = clip_level_exclusion(data, ok_meta, init, held, None)
+        assert r["checked"] == 2 and r["violations"] == []
+        r = clip_level_exclusion(data, bad_meta, init, held, None)
+        assert [v["init"] for v in r["violations"]] == ["isl.fruit"]
+        # a source the init never trained on is not its training clip
+        r = clip_level_exclusion(data, {**bad_meta, "data": {"train_sources": {"include": 1}}}, init, held, None)
+        assert r["checked"] == 1 and r["violations"] == []
+    finally:
+        ei.init_linker = orig
+
+
+def test_warm_start_from_a_fine_tuned_init_with_pretraining(two_profiles, monkeypatch):
+    """The real shape: the commercial-safe encoder was itself fine-tuned from its pre-training, so its
+    meta.pretraining has init_from / loaded_tensors / skipped of ITS load. The research encoder's meta.pretraining
+    names the file it really loaded, keeps the inherited record apart, and its warm start's lineage finds the
+    commercial-safe pretrain_clips.txt; the one-shot folds record the clip-level check."""
+    import torch
+
+    from app.isl import cli
+
+    t = two_profiles
+    root, base = t["root"], t["base"]
+    cs2_base = base.parent / "cs2"
+    monkeypatch.setenv("SLR_ISL_WORKDIR", str(cs2_base))
+    cs = ["--profile", "commercial-safe", *t["common"]]
+    pre = ["--profile", "commercial-safe", "--vocab", str(t["vocab"]), "--split", t["split"], "--threads", "1",
+           "--smoke", "--hidden", "16", "--layers", "1", "--emb-dim", "16", "--epochs", "1", "--batches", "1",
+           "--batch-size", "8", "--max-clips", "40"]
+    assert cli.main(root + ["pretrain", *pre]) == 0
+    assert cli.main(root + ["train-encoder", *cs, "--init", "auto"]) == 0
+    csw = cs2_base / "commercial-safe"
+    cs_meta = torch.load(csw / "encoder.pt", map_location="cpu", weights_only=False)["meta"]
+    assert cs_meta["pretraining"]["init_from"] == str(csw / "pretrained_encoder.pt")
+    monkeypatch.setenv("SLR_ISL_WORKDIR", str(base))
+    res = ["--profile", "research", *t["common"]]
+    assert cli.main(root + ["train-encoder", *res, "--init", str(csw / "encoder.pt")]) == 0
+    meta = torch.load(base / "research" / "encoder.pt", map_location="cpu", weights_only=False)["meta"]
+    pt = meta["pretraining"]
+    assert pt["init_from"] == str(csw / "encoder.pt")  # the file really loaded, not the init's own pretrain
+    assert pt["inherited_load"]["init_from"] == str(csw / "pretrained_encoder.pt")
+    assert pt["sources"] == cs_meta["pretraining"]["sources"]  # the inherited pre-training record is kept
+    ss = meta["warm_start"]["self_supervised"]
+    assert ss["list_verified"] and ss["list_file"] == str(csw / "pretrain_clips.txt")
+    # the folds: per-fold warm start with the clip-level check recorded
+    assert cli.main(root + ["train-oneshot", *res, "--folds", "0", "1", "--init-dir", str(t["cs"])]) == 0
+    m = torch.load(base / "research" / "oneshot" / "fold0" / "encoder.pt", map_location="cpu",
+                   weights_only=False)["meta"]
+    assert m["warm_start"]["clip_level_check"]["violations"] == 0
+    assert m["warm_start"]["clip_level_check"]["checked"] > 0
+
+
+@pytest.mark.parametrize("which", ["encoder", "folds"])
+def test_evaluate_guard_when_only_some_encoders_were_warm_started(phase2, tmp_path, which):
+    """Only the main encoder warm-started: the leakage guard checks the warm start's list, E2's note this folder's own
+    (the fold encoders used it). Only the folds: the guard checks this folder's list, E2 names the warm start's."""
+    import torch
+
+    from app.isl.evaluation.runners import evaluate_all
+    from app.isl.training import multisource as ms
+    from app.isl.training.common import ISL_FEATURES
+    from app.isl.training.enc_init import init_lineage
+
+    w, data = phase2["world"], phase2["data"]
+    work = tmp_path / "work"
+    shutil.copytree(phase2["work"], work, ignore=shutil.ignore_patterns("eval"))
+    isl = sorted(data.islrtc, key=lambda c: c.clip_id)
+    cs = tmp_path / "cs"
+    cs.mkdir()
+    lst = ms.write_pretrain_list(cs, isl[:5])
+    f = "encoder.pt" if which == "encoder" else "oneshot/fold0/encoder.pt"
+    ck = torch.load(work / f, map_location="cpu", weights_only=False)
+    ck["meta"]["profile"] = "commercial-safe"
+    ck["meta"]["pretraining"] = {"init_from": str(cs / "pretrained_encoder.pt"), "clip_list": lst,
+                                 "sources": {"islrtc": 5}, "labels_used": False}
+    _ck(cs / f, ck["meta"], ck["state_dict"])
+    ms.write_pretrain_list(work, isl[:3])  # this folder's own pre-training: 3 ISLRTC clips
+    (work / "pretrained_encoder.pt").write_bytes(b"x")
+    ck = torch.load(work / f, map_location="cpu", weights_only=False)
+    ck["meta"]["warm_start"] = init_lineage(cs / f)
+    torch.save(ck, work / f)
+    im = json.loads((work / "index" / "meta.json").read_text())
+    im["encoder_sha256"] = _sha(work / "encoder.pt")
+    (work / "index" / "meta.json").write_text(json.dumps(im))
+    doc = evaluate_all(work, data, ISL_FEATURES, profile="research", smoke=True, vocab_path=w["vocab"],
+                       paths=w["paths"], out_dirs=[], e4_ks=(1,), latency_n=1)
+    lg, e2 = doc["leakage_guards"], doc["protocols"]["E2"]
+    md = (work / "eval" / "report.md").read_text()
+    n = len(data.islrtc)
+    if which == "encoder":
+        assert lg["pretraining_check"]["pretrain_clips"] == 5 and lg["pretraining_check"]["lineage"]
+        sv = lg["pretraining_check"]["supervised"]
+        assert sv["sources"] and sv["reconstructed_clips"] > 0 and "reconstructed" in sv["how"]
+        assert lg["warm_start_supervised_excludes_eval_clips"] == sv["excludes_eval_clips"]
+        assert "warm start's supervised training excludes evaluation clips" in md
+        assert f"(3 of {n} ISLRTC clips were in the pre-training list)" in e2["label"]
+        assert "warm-started" not in e2["label"] and e2["pretraining_saw_gallery_unlabelled"] is True
+    else:
+        assert lg["pretraining_check"]["pretrain_clips"] == 3 and "lineage" not in lg["pretraining_check"]
+        assert "warm_start_supervised_excludes_eval_clips" not in lg
+        assert "fold 0 was warm-started from" in e2["label"] and f"5 of {n} ISLRTC clips" in e2["label"]
+        assert e2["pretraining_lineage"][0]["fold"] == 0
+
+
+def test_warm_start_supervised_check_says_when_it_cannot_check():
+    from app.isl.evaluation.runners import warm_start_supervised_check
+
+    c = lambda i, s: SimpleNamespace(clip_id=i, source=s)  # noqa: E731
+    data = SimpleNamespace(include_part=lambda p: [c("include/a", "include")], islrtc=[c("islrtc/b", "islrtc")],
+                           extra_part=lambda p: [c("wslp/c", "wslp")], include=[], extra=[], assign={},
+                           extra_assign={}, multisource={"dedup": {"dropped_train_extra": 0,
+                                                                   "dropped_train_islrtc": 0}})
+    ws = {"train_sources": {"include": 1, "islrtc": 1}, "split": "s"}
+    r = warm_start_supervised_check(ws, data)
+    assert r["excludes_eval_clips"] is True and r["reconstructed_clips"] == 2
+    data.multisource["dedup"]["dropped_train_islrtc"] = 2
+    r = warm_start_supervised_check(ws, data)
+    assert r["excludes_eval_clips"] is None and "dropped 2" in r["reason"]
+    data.multisource = {}
+    assert warm_start_supervised_check(ws, data)["excludes_eval_clips"] is None
+    assert warm_start_supervised_check({}, data)["excludes_eval_clips"] is None

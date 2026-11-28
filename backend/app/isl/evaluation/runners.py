@@ -1041,7 +1041,49 @@ def pretraining_guard(work: Path, data, encoder_meta: dict | None = None) -> dic
 
 
 def _warm_start_guard(ws: dict, data) -> dict:
-    """:func:`pretraining_guard` for a warm-started encoder: the warm start's own pre-training list (docs 15.46)."""
+    """:func:`pretraining_guard` for a warm-started encoder: the warm start's own pre-training list (docs 15.46), plus
+    ``supervised``: :func:`warm_start_supervised_check` (its labelled training against this run's evaluation clips)."""
+    out = _warm_start_pretrain_guard(ws, data)
+    out["supervised"] = warm_start_supervised_check(ws, data)
+    return out
+
+
+def warm_start_supervised_check(ws: dict, data) -> dict:
+    """The warm start's SUPERVISED (labelled) training against this run's evaluation clips and their duplicate groups
+    (docs 15.46). Its checkpoint records its training sources and split, not its clip ids, so its training list is
+    reconstructed from this run's data: every clip of its training sources in a training role here (INCLUDE train
+    part of the same split, ISLRTC, other sources' train part; concept exclusions ignored, a superset). Clips this run
+    dropped from training as duplicates of its own evaluation clips (``multisource.dedup``) are gone from the data
+    but may have been in the warm start's training (its run had no such evaluation clips): any such drop makes the
+    check ``None`` (cannot be checked), never a silent yes."""
+    from app.isl.training.multisource import eval_clip_ids
+
+    srcs = set((ws.get("train_sources") or {}).keys())
+    if not srcs:
+        return {"excludes_eval_clips": None, "reason": "the warm start records no training sources"}
+    cands = list(data.include_part("train")) + list(data.islrtc) + list(data.extra_part("train"))
+    ids = {c.clip_id for c in cands if c.source in srcs}
+    ev = eval_clip_ids(data)
+    overlap = sorted(ids & ev)
+    dd = (getattr(data, "multisource", None) or {}).get("dedup") or {}
+    dropped = None if not dd else int(dd.get("dropped_train_extra") or 0) + int(dd.get("dropped_train_islrtc") or 0)
+    out = {"reconstructed_clips": len(ids), "sources": sorted(srcs), "split": ws.get("split"),
+           "overlap": len(overlap), "overlap_examples": overlap[:10], "dropped_here_as_eval_duplicates": dropped,
+           "how": "reconstructed from this run's data (the warm start records its sources and split, not its clip ids)"}
+    if overlap:
+        return {**out, "excludes_eval_clips": False}
+    if dropped is None:
+        return {**out, "excludes_eval_clips": None,
+                "reason": "this run's dedup counts are not recorded: clips dropped as evaluation duplicates cannot be "
+                          "ruled out of the warm start's training"}
+    if dropped:
+        return {**out, "excludes_eval_clips": None,
+                "reason": f"this run dropped {dropped} training clips as duplicates of its evaluation clips; the warm "
+                          "start's run may have trained on them (cannot be checked)"}
+    return {**out, "excludes_eval_clips": True}
+
+
+def _warm_start_pretrain_guard(ws: dict, data) -> dict:
     import hashlib
 
     ss = ws.get("self_supervised") or {}
@@ -1520,6 +1562,8 @@ def evaluate_all(work: Path, data, fcfg, *, profile: str, smoke: bool, vocab_pat
             "classifier_refused": cls_why, "dedup": getattr(data, "multisource", {}).get("dedup"),
             "links": getattr(data, "multisource", {}).get("links"),
             "pretraining_excludes_eval_clips": pre_guard.get("excludes_eval_clips"), "pretraining_check": pre_guard,
+            **({"warm_start_supervised_excludes_eval_clips": pre_guard["supervised"].get("excludes_eval_clips")}
+               if isinstance(pre_guard.get("supervised"), dict) else {}),
             "index": ({"dir": "index", "training_parts_only": (index_guard["contains_eval"] is False
                                                                and index_guard["split_checked"]
                                                                and index_guard["train_clip_ids_checked"]),
@@ -1952,6 +1996,15 @@ def markdown_report(doc: dict) -> str:
         lines.append(f"* pre-training lineage: the encoder was warm-started from {ln.get('warm_start')} "
                      f"({ln.get('warm_start_profile')}, sha256 {str(ln.get('warm_start_sha256') or '-')[:16]}); the "
                      f"pre-training list checked is {ln.get('pretrain_list') or 'none'}")
+    sv = pc.get("supervised")
+    if isinstance(sv, dict):  # docs 15.46: the warm start's labelled training, which the line above does not cover
+        lines.append("* warm start's supervised training excludes evaluation clips: "
+                     f"{_fmt(sv.get('excludes_eval_clips'))} "
+                     + (f"({sv.get('overlap')} of {sv.get('reconstructed_clips')} clips of its sources "
+                        f"{', '.join(sv.get('sources') or [])} are evaluation clips or their duplicates; this run "
+                        f"dropped {sv.get('dropped_here_as_eval_duplicates')} training duplicates of evaluation clips; "
+                        f"{sv.get('how')})" if sv.get("reconstructed_clips") is not None else "")
+                     + (f" ({sv['reason']})" if sv.get("reason") else ""))
     if pc.get("sign_library"):
         lines.append(f"* OpenHands Sign Library: {pc['sign_library']}")
     cs = lg.get("class_space") or {}
@@ -1972,6 +2025,9 @@ def markdown_report(doc: dict) -> str:
     if lg.get("pretraining_excludes_eval_clips") is False:
         lines.append("* **LEAKAGE: pre-training saw evaluation clips; the numbers above are not clean.** Examples: "
                      + ", ".join(pc.get("overlap_examples") or []))
+    if lg.get("warm_start_supervised_excludes_eval_clips") is False:
+        lines.append("* **LEAKAGE: the warm start's supervised training had evaluation clips; the numbers above are "
+                     "not clean.** Examples: " + ", ".join((pc.get("supervised") or {}).get("overlap_examples") or []))
     for k in ("E5", "E6", "E7", "E8"):
         p = doc["protocols"].get(k)
         if p:

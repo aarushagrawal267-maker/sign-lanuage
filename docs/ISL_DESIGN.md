@@ -4912,14 +4912,16 @@ run and stamps as before.
   from `<dir>/oneshot/fold<k>/encoder.pt`.
 * Before anything runs, the driver checks the files of the steps that run (missing: exit 2) and runs
   `python -m app.isl.training.enc_init` on them (profile, feature config, model shape; exit 2 on a refusal).
-* `pretrain_dedup` and `pretrain` are skipped and stamped `skipped: ENC_INIT=<dir>`. Nothing else reads
-  `pretrained_encoder.pt` (checked by grep: `--init auto`, the v2 split guard of an `auto` init, and evaluate's
-  pre-training guard, which now follows the encoder's lineage, below). In a scratch run they are stamped, not seeded.
+* `pretrain_dedup` and `pretrain` are skipped and stamped `skipped: ENC_INIT=<dir>` when every encoder the folder
+  will hold comes from `ENC_INIT` (review fix below: not when an encoder is seeded or kept from its own pre-training).
+  Nothing else reads `pretrained_encoder.pt` (checked by grep: `--init auto`, the v2 split guard of an `auto` init,
+  and evaluate's pre-training guard, which now follows the encoder's lineage, below). In a scratch run they are then
+  stamped, not seeded.
 * The encoder and oneshot stamps end with `enc_init=<dir>`. A resume with another `ENC_INIT` (or none) warns that the
   stamp settings differ. Training the encoders later without `ENC_INIT` on a folder whose pre-training was skipped is
   refused (exit 2): the encoders would silently start from no pre-training. Use `--from pretrain_dedup`.
 * `ENC_INIT` must be a folder and not this run's own work folder. Refused with `--profile both`.
-* The dry run prints each init file with its full SHA-256.
+* The dry run prints the init file of each step that runs with its full SHA-256.
 
 **CLI checks (exit 2).** An explicit `train-encoder --init FILE`, `train-oneshot --init FILE` or `train-oneshot
 --init-dir DIR` is refused when:
@@ -4976,3 +4978,78 @@ refusal (swapped folds, the main encoder as a fold init); licence-direction and 
 another init refused; v2 guard passes a proven no-ISL500 init and keeps the warning otherwise; evaluate's guard, E2
 note and report.md follow the warm start's list (a changed list: "cannot be checked"); pack.json records the lineage
 and a commercial-safe pack refuses a research warm start.
+
+**Review fixes (review of 3b9d4e7, 28 Nov 2026).**
+* *Major: the pre-training was skipped in scratch runs whose encoders were seeded.* `PHASE2_TAG=x ENC_INIT=...
+  --from classifier` (or `--from oneshot`) seeded `encoder.pt` / the folds from the real folder, which descend from
+  its own pre-training, but stamped the pre-training `skipped: ENC_INIT` and did not seed `pretrained_encoder.pt`,
+  `pretrain_clips.txt` or `pretrain_dedup.json`: evaluate then said "cannot be checked" and E2 lost its ISLRTC count.
+  Now the driver decides after the plan (`EI_SKIP_PRE`): the pre-training is skipped only when every encoder the
+  folder will hold comes from `ENC_INIT`. For encoder and oneshot each: it runs now (with `ENC_INIT`), or it is
+  neither run nor seeded and has no stamp (no output: past `--until`) or an `enc_init=` stamp. A seeded encoder or one
+  stamped without `enc_init` keeps the pre-training seeded / run / stamped as without `ENC_INIT`, and the dry-run
+  header says why (`encoder is seeded from ... (its own pre-training)`, `neither encoder nor oneshot runs`, `oneshot
+  is kept without ENC_INIT (...)`). The header names only the steps that use the warm start and lists only their
+  files. `--from encoder --until encoder` in a scratch run (the probe) still skips: the folder holds only the
+  warm-started encoder. Default (no `ENC_INIT`) dry runs are byte-identical to before (compared for both profiles and
+  six `--from` / `--force` / `--only` / `--until` cases).
+* *Minor: a skipped pretrain orphaned the folder's checkpoint.* `ENC_INIT=... --from link` on a real folder removed
+  `pretrain_clips.txt` and `pretrained_encoder.state.pt` (forget) but kept `pretrained_encoder.pt`. A pretrain skipped
+  by `ENC_INIT` now keeps its list and state with the checkpoint (`would keep ...` in the dry run); a later
+  `--from pretrain_dedup` without `ENC_INIT` forgets them as usual.
+* *Minor: `meta.pretraining.init_from` pointed at the init's own pre-trained checkpoint.* For a fine-tuned init (the
+  real commercial-safe `encoder.pt` has `init_from`, `loaded_tensors`, `skipped` of ITS load) the spread overwrote
+  this load's keys. `meta.pretraining` now has this load's `init_from` / `loaded_tensors` / `skipped`, the init's
+  record under `inherited_load`, and the inherited pre-training keys (sources, clip list) as before. A pre-trained init
+  (`--init auto`) has none of the three keys, so its record is exactly the old one (same keys, order, values).
+* *Minor: concept ids of two linkers.* The superset check compares the init's `excluded_concepts` (its linker) with
+  this run's held-out expansion (this linker). `train-oneshot` now also checks at clip level
+  (`enc_init.clip_level_exclusion`): every clip of the init's training sources in a training role here (INCLUDE train,
+  ISLRTC, other sources' train part) that this run labels with a fold-k held-out concept is relabelled with the init's
+  own linker (its folder's `link_settings.json` and `vocabulary.jsonl`, read only; a gloss-linked clip is re-linked
+  from its raw gloss, an adapter concept goes through the init's variant links). A label the init did not exclude is
+  refused (exit 2). The result is recorded in `meta.warm_start.clip_level_check` (clips checked, violations 0).
+  Clips this run dropped as evaluation duplicates are not in the data, so they are not relabelled. Real data (read
+  only, research data against the real commercial-safe fold encoders): fold 0 checked 526 clips, fold 1 495, 0
+  violations each; the superset check passes too.
+* *Minor: the warm start's supervised training was not checked against this run's evaluation clips.* The guard of a
+  warm-started encoder now adds `supervised` (`warm_start_supervised_check`): the warm start's training list is
+  reconstructed from this run's data (its recorded training sources in a training role here, concept exclusions
+  ignored: a superset), and its overlap with `eval_clip_ids(data)` (evaluation clips and their duplicate groups) is
+  computed. Clips this run dropped as duplicates of its own evaluation clips are not in the data but may have been in
+  the warm start's training (its run had no ISL500 / CISLR / WSLP evaluation clips), so any such drop makes the answer
+  "cannot be checked", never a silent yes (today research `multisource.json` has 0 and 0). report.md has a line "warm
+  start's supervised training excludes evaluation clips", `leakage_guards.warm_start_supervised_excludes_eval_clips`
+  carries it, and an overlap adds a LEAKAGE line. The checkpoint records sources and split, not clip ids: this is a
+  reconstruction and the report says so.
+* *Minor: a swapped fold init was refused hours into a run.* The driver's start-time check now passes
+  `--oneshot-concepts <isl root>/splits/oneshot_concepts.json` when oneshot runs: each fold file must exclude its
+  fold's raw held-out concepts (a necessary condition of the expanded check, refused at start, exit 2); a fold with no
+  held-out concepts is not needed. `train-oneshot --init-dir` asks for the files of the folds that train only.
+* *Major, not fixed here (process): the old driver was run with `--smoke` during the review of 3b9d4e7.* It deleted 14
+  untracked state files under `artifacts/isl/phase2-smoke/{research,commercial-safe}` (both `pretrain_clips.txt`
+  included): re-evaluated smoke reports will say their pre-training guard cannot be checked and smoke resumes retrain
+  from scratch. Nothing may be written under `artifacts/isl/` while the live chain runs, so the rebuild waits for it to
+  be idle: `scripts/phase2_train.sh --profile commercial-safe --smoke --from pretrain_dedup`, then the same for
+  `--profile research` (the smoke work folder ignores `PHASE2_WORK_BASE`: old-vs-new comparisons need a copy of the
+  repo with its own ISL root, never a smoke run of this checkout).
+
+Commands (dry runs write nothing):
+
+```
+# scratch run from the classifier: encoders and pre-training seeded, ENC_INIT not used
+PHASE2_TAG=x ENC_INIT=artifacts/isl/commercial-safe scripts/phase2_train.sh --profile research --from classifier --dry-run
+# scratch run from oneshot: the encoder and the pre-training seeded, the folds warm-started
+PHASE2_TAG=x ENC_INIT=artifacts/isl/commercial-safe scripts/phase2_train.sh --profile research --from oneshot --dry-run
+```
+
+Tests (`test_enc_init.py`, 20): scratch runs `--from oneshot` / `--from classifier` with `ENC_INIT` seed the
+pre-training (dry run and run); `--from encoder --until encoder` skips it, `--until encoder` over a oneshot trained
+without `ENC_INIT` runs it, over an `enc_init` oneshot stamp skips it; a skipped pretrain keeps its files; the start
+check gets `--oneshot-concepts` only when oneshot runs, refuses a swapped fold and does not need a fold without
+held-out concepts; `train-oneshot --init-dir` refuses only a missing file of a fold that trains; the clip-level check
+relabels with the init's linker; a warm start from a commercial-safe encoder that was itself fine-tuned from its
+pre-training (the real shape) records the loaded file in `init_from` and the inherited load apart, and its folds
+record the clip-level check; evaluate with only the main encoder or only the folds warm-started (guard and E2 note each
+follow their own lineage, the supervised line in report.md); the supervised check says "cannot be checked" when this
+run dropped evaluation duplicates or recorded no dedup counts.

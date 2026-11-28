@@ -364,6 +364,18 @@ def encoder_excluded_sources(meta: dict | None) -> list[str]:
     return class_space_of(meta)["excluded_sources"]
 
 
+def _pretraining_record(init: dict, init_fc, init_fc_diff) -> dict:
+    """``meta.pretraining`` of a warm-started encoder: the init's own pre-training record (sources, clip list, ...)
+    with THIS load's ``init_from`` / ``loaded_tensors`` / ``skipped`` on top. A fine-tuned init (e.g. another work
+    folder's encoder.pt, docs 15.46) carries those three keys from ITS load: they are kept under ``inherited_load``,
+    never left to overwrite this one. A pre-trained init has none of them: the record is exactly the old one."""
+    ipt = dict(init["meta"].get("pretraining") or {})
+    own = {"init_from": init["path"], "loaded_tensors": init["loaded"], "skipped": init["skipped"]}
+    prev = {k: ipt[k] for k in own if k in ipt}
+    return {**own, **ipt, **own, **({"inherited_load": prev} if prev else {}),
+            "init_feature_config": init_fc, "init_feature_config_diff": init_fc_diff}
+
+
 def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfig, *, emb_dim: int = 256,
                   p: int = 32, k: int = 2, arc_weight: float = 0.5, exclude_concepts: set[str] | None = None,
                   smoke: bool = False, threads: int = 2, batches_per_epoch: int | None = None, progress=None,
@@ -516,10 +528,7 @@ def train_encoder(data: IslData, out: Path, fcfg: FeatureConfig, cfg: TrainConfi
     meta = {"kind": "isl-encoder", "encoder_version": version, "model_kwargs": model_kwargs,
             "feature_config": fcfg.to_dict(), "profile": data.profile, "language": "isl", "smoke": smoke,
             "train_config": asdict(cfg), "excluded_concepts": sorted(excl), "class_space": class_space,
-            "pretraining": ({"init_from": init["path"], "loaded_tensors": init["loaded"], "skipped": init["skipped"],
-                             **(init["meta"].get("pretraining") or {}),
-                             "init_feature_config": init_fc, "init_feature_config_diff": init_fc_diff}
-                            if init else None),
+            "pretraining": _pretraining_record(init, init_fc, init_fc_diff) if init else None,
             "data": {**data.summary(), "train_items": len(train_clips), "concepts": len(concepts),
                      "train_sources": dict(src_counts), "val_queries": len(vq), "gallery": len(gal)},
             "sampler": sampler, "val_protocol": val_protocol,

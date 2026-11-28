@@ -1033,7 +1033,14 @@ def cmd_train_oneshot(paths: IslPaths, args) -> int:
         return 2
     explicit = _explicit_init(args)
     if init_dir is not None:
-        missing = [str(_fold_init(init_dir, k)) for k in args.folds if not _fold_init(init_dir, k).is_file()]
+        # only the folds that train need their file: a fold with no held-out concepts is skipped anyway
+        need = list(args.folds)
+        if (paths.splits / "oneshot_concepts.json").exists():
+            from app.isl.training.enc_init import fold_heldout
+
+            ho = fold_heldout(paths.splits / "oneshot_concepts.json")
+            need = [k for k in args.folds if ho.get(k)]
+        missing = [str(_fold_init(init_dir, k)) for k in need if not _fold_init(init_dir, k).is_file()]
     else:
         missing = [str(explicit)] if explicit is not None and not explicit.is_file() else []
     if missing:  # before the data is loaded (docs 15.46)
@@ -1063,6 +1070,21 @@ def cmd_train_oneshot(paths: IslPaths, args) -> int:
             warm = _check_warm_start("train-oneshot", init, args, profile, fcfg, data, must_exclude=held, fold=k)
             if warm is None:
                 return 2
+            if not warm.get("pretrained_only"):  # the same check at clip level, with the init's own linker
+                from app.isl.training.common import load_vocab
+                from app.isl.training.enc_init import clip_level_exclusion, read_meta
+
+                cl = clip_level_exclusion(data, read_meta(init), init, held, load_vocab(_vocab_path(args)))
+                if cl["violations"]:
+                    v = cl["violations"]
+                    print(f"train-oneshot: refused warm start (fold {k}): {init} was trained with {len(v)} clips this "
+                          f"run labels with a held-out concept of fold {k}: its own linker gave them concepts it did "
+                          f"not exclude (e.g. {v[:3]}; docs 15.46)", file=sys.stderr)
+                    return 2
+                warm["clip_level_check"] = {"checked": cl["checked"], "violations": 0,
+                                            **({"init_linker": {"work": cl["init_linker"]["work"],
+                                                                "vocab": cl["init_linker"]["vocab"]}}
+                                               if "init_linker" in cl else {})}
         plans[k] = (fd, held, init if init is not None else _init_path(args, work), warm)
     if any(p[3] for p in plans.values()):
         _print({"warm_start": {k: p[3] for k, p in plans.items()}})

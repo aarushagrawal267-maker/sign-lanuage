@@ -99,10 +99,16 @@
 #   --init <dir>/encoder.pt, the oneshot step --init-dir <dir> (fold k starts from <dir>/oneshot/fold<k>/encoder.pt).
 #   Refused (exit 2): a missing file, another feature config or model shape, an init whose profile may not serve in
 #   this one (research -> commercial-safe), or a fold init trained with one of the fold's held-out concepts (its
-#   excluded_concepts must cover them). pretrain_dedup and pretrain are then not needed: stamped "skipped: ENC_INIT"
-#   (evaluate checks the warm start's own pre-training list, e.g. <dir>/pretrain_clips.txt). The stamps of encoder
-#   and oneshot record enc_init=<dir>; a resume with another init is refused (the state's init SHA-256). Dry runs print
-#   the init files with their SHA-256. One profile per run (refused with --profile both).
+#   excluded_concepts must cover them; the fold files' raw held-out concepts are checked at start, the linked
+#   expansion and the clip-level check in train-oneshot). pretrain_dedup and pretrain are skipped (stamped "skipped:
+#   ENC_INIT", not seeded in a scratch run) only when every encoder the folder will hold comes from ENC_INIT: encoder
+#   and oneshot both run now, or one runs and the other has no output here or an enc_init stamp; otherwise (e.g. a
+#   scratch run --from oneshot or later, whose seeded encoders descend from the real pre-training) they are seeded or
+#   run as before. A skipped pretrain keeps this folder's pretrained_encoder.pt with its clip list and state (never an
+#   orphaned checkpoint). Evaluate checks the warm start's own pre-training list (<dir>/pretrain_clips.txt). The
+#   stamps of encoder and oneshot record enc_init=<dir>; a resume with another init is refused (the state's init
+#   SHA-256). Dry runs print the init files of the steps that run with their SHA-256. One profile per run (refused with
+#   --profile both).
 # EVAL_COMPARE_TO=<report.json>: the evaluate step runs `evaluate --all --compare-to <report.json>` (E1b and E4 like
 # for like against that report, e.g. artifacts/isl/commercial-safe/eval/report.json; docs 15.27, 15.28, 15.31).
 # One profile per run (refused with --profile both); a missing file is refused before anything runs (exit 2).
@@ -302,6 +308,7 @@ EB_ARG=""
 ENC_SETTINGS="bridge_p=$ENC_BP source_weights=${ENC_SW:-default} val=$ENC_VP"
 # encoder warm start from another work folder (docs 15.46): empty = --init auto (this folder's pre-training), as before
 ENC_INIT_DIR=""
+EI_SKIP_PRE=0  # 1 = pretrain_dedup / pretrain stamped "skipped: ENC_INIT" (decided once the plan is known)
 EI_ENC=(--init auto)
 EI_ONE=(--init auto)
 if [[ -n "${ENC_INIT:-}" ]]; then
@@ -366,7 +373,7 @@ step_settings() {
     classifier|cv) echo " dict_group=$DICT_GROUP quota=$CLS_QUOTA select=$CLS_SEL" ;;
     e1a) echo " dict_group=$DICT_GROUP" ;;
     encoder|oneshot) echo " enc_exclude=${ENC_XSRC:--} $ENC_SETTINGS${ENC_INIT_DIR:+ enc_init=$ENC_INIT_DIR}" ;;
-    pretrain_dedup|pretrain) [[ -n "$ENC_INIT_DIR" ]] && echo " skipped: ENC_INIT=$ENC_INIT_DIR" ;;
+    pretrain_dedup|pretrain) [[ $EI_SKIP_PRE == 1 ]] && echo " skipped: ENC_INIT=$ENC_INIT_DIR" ;;
     index|index_final) echo " wslp_twins=$WSLP_TWINS" ;;
     link) echo " link_aliases=$LINK_ALIASES variant_links=$VL_FILE signer_split=$SIGNER_SPLIT" ;;
     fusion) [[ $FUSION_OOF == 1 ]] && echo " oof=1" ;;
@@ -470,8 +477,18 @@ state_files() {  # training state files of a step that exist (removed by --from 
 }
 
 forget() {  # forget a step (--from, --force): its stamp and its training state
-  local s="$1" f
-  for f in "$STAMPS/$s.done" $(state_files "$s"); do
+  local s="$1" f st
+  st=$(state_files "$s")
+  # a pretrain skipped by ENC_INIT (docs 15.46): its clip list and state stay with this folder's pretrained_encoder.pt
+  # (removing them would leave that checkpoint without the list its provenance check reads); a later run that
+  # pre-trains again (--from pretrain_dedup without ENC_INIT) forgets them as usual
+  if [[ "$s" == pretrain && $EI_SKIP_PRE == 1 && -n "$st" ]]; then
+    for f in $st; do
+      if [[ $DRY_RUN == 1 ]]; then echo "would keep $f (pretrain skipped: ENC_INIT)"; else log "  kept $f (pretrain skipped: ENC_INIT)"; fi
+    done
+    st=""
+  fi
+  for f in "$STAMPS/$s.done" $st; do
     [[ -f "$f" ]] || continue
     if [[ $DRY_RUN == 1 ]]; then echo "would remove $f"; else rm -f -- "${f:?}" && log "  removed $f"; fi
   done
@@ -529,7 +546,7 @@ run_step() {
     link) cli link-sources $COMMON --all-sources $CAP $LA_ARG $VL_ARG $SS_ARG ;;
     bench) cli bench --threads "$THREADS" --steps $([[ $SMOKE == 1 ]] && echo 1 || echo 5) --hidden-sizes ${HIDDEN:-192} ;;
     # with ENC_INIT nothing reads this folder's pre-training (docs 15.46): skipped, the stamp says so
-    pretrain_dedup|pretrain) if [[ -n "$ENC_INIT_DIR" ]]; then
+    pretrain_dedup|pretrain) if [[ $EI_SKIP_PRE == 1 ]]; then
         log "  skipped: ENC_INIT=$ENC_INIT_DIR (the encoders warm-start from its encoders; evaluate checks its pre-training list)"
         return 0
       fi ;;&
@@ -585,12 +602,6 @@ if [[ $DRY_RUN == 1 ]]; then
   echo "classifier: source quota=$CLS_QUOTA, selection=$CLS_SEL (classifier and cv), settings: $CLS"
   echo "encoder: $ENC_SETTINGS (encoder and oneshot), settings: $ENC; oneshot: $ONE"
   [[ -n "$ENC_BAR_FILE" ]] && echo "encoder probe after the encoder step: bar $ENC_BAR_FILE -> $WORK/eval/encoder_probe.json"
-  if [[ -n "$ENC_INIT_DIR" ]]; then  # docs 15.46
-    echo "encoder warm start: ENC_INIT=$ENC_INIT_DIR (encoder --init, oneshot --init-dir; pretrain_dedup and pretrain skipped)"
-    for f in "$ENC_INIT_DIR/encoder.pt" $(for k in $ONE_FOLDS; do echo "$ENC_INIT_DIR/oneshot/fold$k/encoder.pt"; done); do
-      if [[ -f "$f" ]]; then echo "  init $f sha256:$(sha256sum "$f" | cut -d' ' -f1)"; else echo "  init $f MISSING"; fi
-    done
-  fi
   [[ -n "$UNTIL" ]] && echo "until: $UNTIL (later steps are not run)"
   echo "variant links: VARIANT_LINKS=$VARIANT_LINKS, $WORK/variant_links.json: $VL_FILE (link step only)"
   echo "signer split: SIGNER_SPLIT=$SIGNER_SPLIT (link step only); fusion out-of-fold calibration: FUSION_OOF=$FUSION_OOF${FO_ARG:+ ($FO_ARG)}"
@@ -625,23 +636,53 @@ if [[ -n "$FROM" && -z "$ONLY" ]]; then
       [[ "$s" == "$UNTIL" ]] && reached=2
       continue
     fi
-    # scratch run: an earlier step without a stamp is seeded from the real work folder, never run (docs 15.20);
-    # with ENC_INIT the pre-training steps are not seeded but stamped skipped (docs 15.46)
-    if [[ $SCRATCH == 1 && ! -f "$STAMPS/$s.done" ]] && ! in_list "$s" "${FORGET[@]}"; then
-      [[ -n "$ENC_INIT_DIR" ]] && in_list "$s" pretrain_dedup pretrain && continue
-      SEED+=("$s")
-    fi
+    # scratch run: an earlier step without a stamp is seeded from the real work folder, never run (docs 15.20)
+    if [[ $SCRATCH == 1 && ! -f "$STAMPS/$s.done" ]] && ! in_list "$s" "${FORGET[@]}"; then SEED+=("$s"); fi
   done
 fi
-RUN=()
-past_until=0
-for s in "${STEPS[@]}"; do
-  if [[ -n "$ONLY" ]]; then [[ "$s" == "$ONLY" ]] && RUN+=("$s"); continue; fi
-  [[ $past_until == 1 ]] && continue
-  [[ "$s" == "$UNTIL" ]] && past_until=1
-  in_list "$s" "${SEED[@]}" && continue
-  if in_list "$s" "${FORGET[@]}" || [[ ! -f "$STAMPS/$s.done" ]]; then RUN+=("$s"); fi
-done
+plan_run() {
+  RUN=()
+  local s past_until=0
+  for s in "${STEPS[@]}"; do
+    if [[ -n "$ONLY" ]]; then [[ "$s" == "$ONLY" ]] && RUN+=("$s"); continue; fi
+    [[ $past_until == 1 ]] && continue
+    [[ "$s" == "$UNTIL" ]] && past_until=1
+    in_list "$s" "${SEED[@]}" && continue
+    if in_list "$s" "${FORGET[@]}" || [[ ! -f "$STAMPS/$s.done" ]]; then RUN+=("$s"); fi
+  done
+}
+plan_run
+# encoder warm start (docs 15.46): the pre-training is skipped only when every encoder this folder will hold comes from
+# ENC_INIT. A step's encoders do when it runs now (with ENC_INIT), or when it is neither run nor seeded and either has
+# no stamp (no output here: past --until) or an enc_init stamp. A seeded encoder or one stamped without enc_init
+# descends from the (real) folder's own pre-training: then the pre-training is seeded or run as before, so evaluate
+# checks the list those encoders really used.
+ei_from_init() {
+  in_list "$1" "${RUN[@]}" && return 0
+  in_list "$1" "${SEED[@]}" && return 1
+  [[ -f "$STAMPS/$1.done" ]] || return 0
+  [[ "$(cat "$STAMPS/$1.done")" == *" enc_init="* ]]
+}
+EI_WHY=""
+if [[ -n "$ENC_INIT_DIR" ]]; then
+  if ! in_list encoder "${RUN[@]}" && ! in_list oneshot "${RUN[@]}"; then
+    EI_WHY="neither encoder nor oneshot runs"
+  else
+    for s in encoder oneshot; do
+      ei_from_init "$s" && continue
+      if in_list "$s" "${SEED[@]}"; then EI_WHY="$s is seeded from $SEED_WORK (its own pre-training)"
+      else EI_WHY="$s is kept without ENC_INIT ($(cat "$STAMPS/$s.done"))"; fi
+      break
+    done
+  fi
+  if [[ -z "$EI_WHY" ]]; then
+    EI_SKIP_PRE=1
+    seed_kept=()
+    for s in "${SEED[@]}"; do in_list "$s" pretrain_dedup pretrain || seed_kept+=("$s"); done
+    SEED=("${seed_kept[@]}")
+    plan_run  # the pre-training steps are now run (= stamped skipped) instead of seeded
+  fi
+fi
 # the linker setting this run really has (docs 15.35): LINK_ALIASES acts only when the link step runs; otherwise the
 # work folder's link_settings.json (written by its link step) decides, and the start line says which
 if in_list link "${RUN[@]}"; then
@@ -715,8 +756,13 @@ if [[ -n "$ENC_INIT_DIR" ]] && { in_list encoder "${RUN[@]}" || in_list oneshot 
   for f in "${ei_files[@]}"; do
     [[ -f "$f" ]] || { echo "ENC_INIT: $f is missing (nothing was run)" >&2; exit 2; }
   done
-  # profile (licence direction), feature config and model shape; the per-fold concept check runs in train-oneshot
-  if ! nice -n 10 "$PY" -m app.isl.training.enc_init --profile "$PROFILE" $ENC_SHAPE "${ei_files[@]}"; then
+  # profile (licence direction), feature config, model shape and, for the fold files, the fold's raw held-out
+  # concepts against the init's excluded_concepts (a swapped fold is refused now, not hours later; train-oneshot
+  # still checks the linked expansion and the clip-level relabelling before any fold trains)
+  ei_oc=()
+  oc_file="${SROOT:-$ISL_ROOT}/splits/oneshot_concepts.json"
+  in_list oneshot "${RUN[@]}" && [[ -f "$oc_file" ]] && ei_oc=(--oneshot-concepts "$oc_file")
+  if ! nice -n 10 "$PY" -m app.isl.training.enc_init --profile "$PROFILE" $ENC_SHAPE "${ei_oc[@]}" "${ei_files[@]}"; then
     echo "ENC_INIT=$ENC_INIT_DIR refused for profile $PROFILE (nothing was run)" >&2
     exit 2
   fi
@@ -729,6 +775,25 @@ if [[ -z "$ENC_INIT_DIR" ]] && { in_list encoder "${RUN[@]}" || in_list oneshot 
       echo "  set ENC_INIT again, or run --from pretrain_dedup to pre-train this folder (nothing was run)" >&2
       exit 2
     fi
+  done
+fi
+if [[ $DRY_RUN == 1 && -n "$ENC_INIT_DIR" ]]; then  # docs 15.46: what the warm start really does in this run
+  ei_use=()
+  in_list encoder "${RUN[@]}" && ei_use+=("encoder --init")
+  in_list oneshot "${RUN[@]}" && ei_use+=("oneshot --init-dir")
+  if [[ $EI_SKIP_PRE == 1 ]]; then ei_pre="pretrain_dedup and pretrain skipped"
+  else ei_pre="pretrain_dedup and pretrain seeded / run / kept as without ENC_INIT: $EI_WHY"; fi
+  if [[ ${#ei_use[@]} -eq 0 ]]; then
+    echo "encoder warm start: ENC_INIT=$ENC_INIT_DIR not used ($ei_pre)"
+  else
+    ei_u="${ei_use[*]}"
+    echo "encoder warm start: ENC_INIT=$ENC_INIT_DIR (${ei_u/ oneshot/, oneshot}; $ei_pre)"
+  fi
+  ei_show=()
+  in_list encoder "${RUN[@]}" && ei_show+=("$ENC_INIT_DIR/encoder.pt")
+  if in_list oneshot "${RUN[@]}"; then for k in $ONE_FOLDS; do ei_show+=("$ENC_INIT_DIR/oneshot/fold$k/encoder.pt"); done; fi
+  for f in "${ei_show[@]}"; do
+    if [[ -f "$f" ]]; then echo "  init $f sha256:$(sha256sum "$f" | cut -d' ' -f1)"; else echo "  init $f MISSING"; fi
   done
 fi
 [[ $DRY_RUN == 1 ]] && echo "linker this run: link_aliases=$LA_STATE variant_links=$VL_STATE signer_split=$SS_STATE"
@@ -765,7 +830,7 @@ if [[ $DRY_RUN == 1 ]]; then
   for s in "${STEPS[@]}"; do
     [[ $past_until == 1 ]] && { echo "would stop before $s (--until $UNTIL)"; break; }
     [[ "$s" == "$UNTIL" ]] && past_until=1
-    if in_list "$s" "${RUN[@]}" && [[ -n "$ENC_INIT_DIR" ]] && in_list "$s" pretrain_dedup pretrain; then
+    if in_list "$s" "${RUN[@]}" && [[ $EI_SKIP_PRE == 1 ]] && in_list "$s" pretrain_dedup pretrain; then
       echo "would stamp $s skipped: ENC_INIT (nothing trained)"
     elif in_list "$s" "${RUN[@]}"; then echo "would run $s"
     elif [[ -z "$ONLY" ]] && ! in_list "$s" "${SEED[@]}"; then
