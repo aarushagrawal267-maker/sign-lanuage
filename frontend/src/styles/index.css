@@ -20,9 +20,13 @@
   --color-fg-2: #b4bcc7; /* secondary text */
   --color-fg-3: #8a93a0; /* muted text (>= 4.5:1 on surface) */
 
-  --color-accent: #4c8dff; /* electric blue - active / interactive */
-  --color-accent-soft: #1d3157;
-  --color-teal: #2dd4bf; /* confirmed recognition */
+  /* One accent for the chrome. White text on it is 5.3:1. */
+  --color-accent: #2b66d6;
+  --color-accent-hover: #3270e0;
+  --color-accent-fg: #7aa7ff; /* accent as text or icon on dark surfaces */
+  --color-accent-soft: #1a2c4f;
+  /* Teal means one thing: a sign was accepted. */
+  --color-teal: #2dd4bf;
   --color-teal-soft: #0f3a36;
   --color-warn: #fab219;
   --color-serious: #ec835a;
@@ -33,6 +37,12 @@
   --color-series-1: #3987e5;
   --color-series-2: #d95926;
   --color-series-3: #199e70;
+  /* data marks that predate the darker accent (confidence ring, top-5 bars, F1 bands) */
+  --color-data-blue: #4c8dff;
+
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
 }
 
 :root {
@@ -72,7 +82,7 @@ body {
 }
 
 .fade-in {
-  animation: fade-in 180ms ease-out both;
+  animation: fade-in 180ms var(--ease-out) both;
 }
 @keyframes fade-in {
   from {
@@ -106,13 +116,13 @@ body {
 /* Long-form documentation */
 .prose-doc h2 {
   font-size: 1.15rem;
-  font-weight: 600;
+  font-weight: 500;
   margin: 2rem 0 0.75rem;
   color: var(--color-fg);
 }
 .prose-doc h3 {
   font-size: 0.95rem;
-  font-weight: 600;
+  font-weight: 500;
   margin: 1.25rem 0 0.5rem;
   color: var(--color-fg);
 }
@@ -156,7 +166,7 @@ body {
   margin: 0.75rem 0;
 }
 .prose-doc a {
-  color: var(--color-accent);
+  color: var(--color-accent-fg);
   text-decoration: underline;
   text-underline-offset: 3px;
 }

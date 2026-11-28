@@ -104,11 +104,11 @@ export function LineChart({ x, series, height = 220, yDomain, xLabel, yFormat = 
         {yt.map((t) => (
           <g key={t}>
             <line x1={PAD.l} x2={w - PAD.r} y1={sy(t)} y2={sy(t)} stroke="var(--color-ink-700)" strokeWidth={1} />
-            <text x={PAD.l - 8} y={sy(t) + 4} textAnchor="end" className="fill-fg-3 font-mono text-[10px]">{yFormat(t)}</text>
+            <text x={PAD.l - 8} y={sy(t) + 4} textAnchor="end" className="fill-fg-3 font-mono text-2xs">{yFormat(t)}</text>
           </g>
         ))}
         {xt.map((t) => (
-          <text key={t} x={sx(t)} y={height - 8} textAnchor="middle" className="fill-fg-3 font-mono text-[10px]">{xFormat(t)}</text>
+          <text key={t} x={sx(t)} y={height - 8} textAnchor="middle" className="fill-fg-3 font-mono text-2xs">{xFormat(t)}</text>
         ))}
         {series.map((s) => (
           <path key={s.key} d={path(s.values)} fill="none" stroke={s.color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" strokeDasharray={s.dashed ? "5 4" : undefined} />
@@ -125,7 +125,7 @@ export function LineChart({ x, series, height = 220, yDomain, xLabel, yFormat = 
           </g>
         )}
       </svg>
-      {xLabel && <div className="-mt-1 text-right text-[10px] text-fg-3">{xLabel}</div>}
+      {xLabel && <div className="-mt-1 text-right text-2xs text-fg-3">{xLabel}</div>}
       {hover !== null && (
         <div className="pointer-events-none absolute top-6 z-10 min-w-36 rounded-lg border border-ink-600 bg-ink-900/95 px-3 py-2 text-xs shadow-xl"
           style={{ left: Math.min(Math.max(0, (sx(x[hover]) / w) * 100), 70) + "%" }}>

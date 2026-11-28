@@ -55,20 +55,20 @@ export function ConfusionMatrix({ matrix, labels, size = 520 }: { matrix: number
   return (
     <div className="flex flex-col gap-3 lg:flex-row lg:items-start">
       <div className="relative w-full max-w-[560px]">
-        <div className="mb-1 text-right text-[11px] text-fg-3">predicted →</div>
+        <div className="mb-1 text-right text-2xs text-fg-3">predicted →</div>
         <canvas ref={ref} style={{ width: "100%", aspectRatio: "1 / 1" }} className="rounded-md border border-ink-700"
           onPointerMove={onMove} onPointerLeave={() => setHover(null)}
           role="img" aria-label={`Row-normalised confusion matrix over ${n} classes. Rows are true classes, columns predicted.`} />
-        <div className="mt-1 text-[11px] text-fg-3">↑ true class (rows normalised to recall)</div>
+        <div className="mt-1 text-2xs text-fg-3">↑ true class (rows normalised to recall)</div>
       </div>
       <div className="min-w-56 flex-1 text-sm">
-        <div className="mb-2 flex items-center gap-2 text-[11px] text-fg-3">
+        <div className="mb-2 flex items-center gap-2 text-2xs text-fg-3">
           0%
           <span className="h-2 w-32 rounded-full" style={{ background: `linear-gradient(90deg, #111317, ${RAMP.slice().reverse().join(",")})` }} />
           100% of true class
         </div>
         {hover ? (
-          <div className="rounded-xl border border-ink-700 bg-ink-900 p-3">
+          <div className="rounded-lg border border-ink-700 bg-ink-900 p-3">
             <div className="font-mono text-lg text-fg">{matrix[hover.i][hover.j]} <span className="text-sm text-fg-3">/ {rowSums[hover.i]}</span></div>
             <div className="text-fg-2">true <span className="font-medium text-fg">{labels[hover.i]}</span></div>
             <div className="text-fg-2">predicted <span className="font-medium text-fg">{labels[hover.j]}</span></div>

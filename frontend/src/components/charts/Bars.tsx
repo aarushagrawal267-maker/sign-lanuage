@@ -48,7 +48,7 @@ export function ColumnChart({ bars, height = 160, color = "var(--color-series-1)
 }
 
 /** Horizontal labelled bars - used for top-k predictions and ranked lists. */
-export function HBars({ items, max = 1, format = (v: number) => `${(v * 100).toFixed(1)}%`, highlightFirst = false, color = "var(--color-accent)" }: {
+export function HBars({ items, max = 1, format = (v: number) => `${(v * 100).toFixed(1)}%`, highlightFirst = false, color = "var(--color-data-blue)" }: {
   items: { label: string; value: number; sub?: string }[]; max?: number; format?: (v: number) => string; highlightFirst?: boolean; color?: string;
 }) {
   return (

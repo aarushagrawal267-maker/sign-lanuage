@@ -9,9 +9,9 @@ export function PageHeader({ eyebrow, title, description, actions }: { eyebrow?:
   return (
     <header className="mb-6 flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
       <div className="max-w-3xl">
-        {eyebrow && <div className="mb-1 font-mono text-[11px] uppercase tracking-[0.14em] text-accent">{eyebrow}</div>}
-        <h1 className="text-2xl font-semibold tracking-tight text-fg">{title}</h1>
-        {description && <p className="mt-1.5 text-sm leading-relaxed text-fg-2">{description}</p>}
+        {eyebrow && <div className="mb-1 text-xs text-fg-3">{eyebrow}</div>}
+        <h1 className="text-2xl font-medium text-fg">{title}</h1>
+        {description && <p className="mt-2 text-sm leading-relaxed text-fg-2">{description}</p>}
       </div>
       {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
     </header>
@@ -22,11 +22,11 @@ export function Card({ title, subtitle, actions, children, className, padded = t
   title?: ReactNode; subtitle?: ReactNode; actions?: ReactNode; children: ReactNode; className?: string; padded?: boolean;
 }) {
   return (
-    <section className={cx("rounded-2xl border border-ink-700 bg-ink-850", className)}>
+    <section className={cx("rounded-xl border border-ink-700 bg-ink-850", className)}>
       {(title || actions) && (
-        <div className="flex items-start justify-between gap-3 border-b border-ink-700/70 px-5 py-3.5">
+        <div className="flex items-start justify-between gap-3 border-b border-ink-700/70 px-5 py-4">
           <div>
-            {title && <h2 className="text-[13px] font-semibold tracking-wide text-fg">{title}</h2>}
+            {title && <h2 className="text-sm font-medium text-fg">{title}</h2>}
             {subtitle && <p className="mt-0.5 text-xs text-fg-3">{subtitle}</p>}
           </div>
           {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
@@ -38,11 +38,11 @@ export function Card({ title, subtitle, actions, children, className, padded = t
 }
 
 export function Stat({ label, value, sub, tone }: { label: string; value: ReactNode; sub?: ReactNode; tone?: "accent" | "teal" | "warn" | "danger" }) {
-  const toneCls = tone === "teal" ? "text-teal" : tone === "accent" ? "text-accent" : tone === "warn" ? "text-warn" : tone === "danger" ? "text-danger" : "text-fg";
+  const toneCls = tone === "teal" ? "text-teal" : tone === "accent" ? "text-accent-fg" : tone === "warn" ? "text-warn" : tone === "danger" ? "text-danger" : "text-fg";
   return (
-    <div className="rounded-2xl border border-ink-700 bg-ink-850 px-5 py-4">
+    <div className="rounded-xl border border-ink-700 bg-ink-850 px-5 py-4">
       <div className="text-xs font-medium text-fg-3">{label}</div>
-      <div className={cx("mt-1.5 font-mono text-2xl font-medium tabular", toneCls)}>{value}</div>
+      <div className={cx("mt-2 font-mono text-2xl font-medium tabular", toneCls)}>{value}</div>
       {sub && <div className="mt-1 text-xs text-fg-3">{sub}</div>}
     </div>
   );
@@ -53,7 +53,7 @@ export function Button({ variant = "secondary", size = "md", icon, loading, chil
   variant?: BtnVariant; size?: "sm" | "md" | "lg"; icon?: ReactNode; loading?: boolean;
 }) {
   const v = {
-    primary: "bg-accent text-white hover:bg-[#5d99ff] border-transparent",
+    primary: "bg-accent text-white hover:bg-accent-hover border-transparent",
     teal: "bg-teal text-ink-950 hover:bg-[#46dcc9] border-transparent",
     secondary: "bg-ink-800 text-fg hover:bg-ink-700 border-ink-700",
     ghost: "bg-transparent text-fg-2 hover:bg-ink-800 hover:text-fg border-transparent",
@@ -75,21 +75,21 @@ export function Button({ variant = "secondary", size = "md", icon, loading, chil
 export function Badge({ children, tone = "neutral", className }: { children: ReactNode; tone?: "neutral" | "accent" | "teal" | "warn" | "danger" | "good"; className?: string }) {
   const t = {
     neutral: "border-ink-600 bg-ink-800 text-fg-2",
-    accent: "border-accent/40 bg-accent-soft/60 text-[#a9c8ff]",
+    accent: "border-accent/50 bg-accent-soft/60 text-accent-fg",
     teal: "border-teal/40 bg-teal-soft text-teal",
     warn: "border-warn/40 bg-warn/10 text-warn",
     danger: "border-danger/40 bg-danger/10 text-danger",
     good: "border-good/50 bg-good/10 text-[#5fd35f]",
   }[tone];
-  return <span className={cx("inline-flex items-center gap-1 whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] font-medium", t, className)}>{children}</span>;
+  return <span className={cx("inline-flex items-center gap-1 whitespace-nowrap rounded-md border px-1.5 py-0.5 text-2xs font-medium", t, className)}>{children}</span>;
 }
 
 export function Notice({ tone = "info", title, children }: { tone?: "info" | "warn" | "danger"; title?: string; children: ReactNode }) {
   const t = tone === "warn" ? "border-warn/35 bg-warn/[0.06]" : tone === "danger" ? "border-danger/40 bg-danger/[0.07]" : "border-accent/30 bg-accent/[0.06]";
   const Icon = tone === "info" ? Info : AlertTriangle;
-  const ic = tone === "warn" ? "text-warn" : tone === "danger" ? "text-danger" : "text-accent";
+  const ic = tone === "warn" ? "text-warn" : tone === "danger" ? "text-danger" : "text-accent-fg";
   return (
-    <div role={tone === "info" ? "note" : "alert"} className={cx("flex gap-3 rounded-xl border px-4 py-3", t)}>
+    <div role={tone === "info" ? "note" : "alert"} className={cx("flex gap-3 rounded-lg border px-4 py-3", t)}>
       <Icon className={cx("mt-0.5 size-4 shrink-0", ic)} aria-hidden />
       <div className="text-sm leading-relaxed text-fg-2">
         {title && <div className="mb-0.5 font-medium text-fg">{title}</div>}
@@ -113,7 +113,7 @@ export function Empty({ icon, title, children, action }: { icon?: ReactNode; tit
 export function Progress({ value, tone = "accent" }: { value: number; tone?: "accent" | "teal" }) {
   return (
     <div className="h-1.5 w-full overflow-hidden rounded-full bg-ink-700" role="progressbar" aria-valuenow={Math.round(value * 100)} aria-valuemin={0} aria-valuemax={100}>
-      <div className={cx("h-full rounded-full transition-[width] duration-300", tone === "teal" ? "bg-teal" : "bg-accent")} style={{ width: `${Math.max(0, Math.min(1, value)) * 100}%` }} />
+      <div className={cx("h-full origin-left rounded-full transition-transform duration-300 ease-out", tone === "teal" ? "bg-teal" : "bg-accent")} style={{ transform: `scaleX(${Math.max(0, Math.min(1, value))})` }} />
     </div>
   );
 }
@@ -123,7 +123,7 @@ export function Field({ label, hint, children }: { label: string; hint?: ReactNo
     <label className="flex flex-col gap-1.5">
       <span className="text-xs font-medium text-fg-2">{label}</span>
       {children}
-      {hint && <span className="text-[11px] leading-snug text-fg-3">{hint}</span>}
+      {hint && <span className="text-2xs text-fg-3">{hint}</span>}
     </label>
   );
 }
