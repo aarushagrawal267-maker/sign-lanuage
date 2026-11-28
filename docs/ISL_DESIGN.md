@@ -4934,15 +4934,22 @@ run and stamps as before.
   checkpoint saw no label and is not checked for concepts;
 * it is a fine-tuned encoder trained on another primary split, or on ISL500 under another signer split.
 All folds are checked before any fold trains. `--init-dir` with `--init` is refused.
-* **Unreachable held-out concepts (28 Nov fix).** The superset check compares concept ids of two linkers. The first
-  full research run (`b1-full`) was refused at fold 1: its held-out set holds `isl.mean~isl500`, the variant concept
-  that this run's variant links (15.36) make for ISL500 clips only. That id does not exist in the commercial-safe run,
-  which reads no ISL500 clip. A held-out concept is now excused from the id check when no clip of any source the init
-  could have read (its profile's sources and its recorded training sources; every clip of every part, a superset of
-  its training) carries it, in this run's labels or in the init's own linker's labels
-  (`enc_init.unreachable_heldout`). An init without a profile or training sources excuses nothing. The fold encoder
-  still excludes the full held-out set; the excused ids are printed and recorded in `meta.warm_start.excused_concepts`.
-  The clip-level check below is unchanged.
+* **Unreachable held-out variant ids (28 Nov fix).** The superset check compares concept ids of two linkers. The
+  first full research run (`b1-full`) was refused at fold 1: its held-out set holds `isl.mean~isl500`, the variant
+  concept this run's variant links (15.36) make for ISL500 clips only. That id does not exist in the commercial-safe
+  run, which reads no ISL500 clip; the commercial-safe fold-1 encoder excludes its base `isl.mean`. A held-out id is
+  excused from the id check only when it is proven from structure (`enc_init.unreachable_heldout`): this run's linker
+  made it as the variant of a concept the init excluded, for a source the init cannot read (not among its profile's
+  sources nor its recorded training sources), it is not a vocabulary id, and no variant map of an init source makes
+  it. As a cross-check, no loaded clip of an init source may carry it (this run's labels or the init's own linker's).
+  An id merely absent from the loaded clips (dedup drops, caps, no `--all-sources`) is never excused, nor is anything
+  when the init records no profile or training sources or the run has no variant links. The fold encoder still
+  excludes the full held-out set and the clip-level check still gets it; the excused ids are printed and recorded in
+  `meta.warm_start.excused_concepts` (with the rule). Real data: fold 0 excused none; fold 1 excused exactly
+  `isl.mean~isl500` (clip-level check 0 violations), and `b1-full` fold training started. A first version of the fix
+  (commit 96da186) excused any held-out id no loaded clip of an init source carried; review found that dedup drops
+  and caps could hide such a clip, so it was narrowed to the structural rule before fold 1 trained (fold 1's lineage
+  record, written at start, carries the first version's fields without `rule`; the excused set is the same).
 
 **Signer split v2 guard.** An explicit init that has no `pretrain_clips.txt` next to a `pretrained_encoder.pt`
 used to pass with "cannot be checked". It now passes without the warning when the checkpoint proves it never read an
@@ -5020,7 +5027,8 @@ and a commercial-safe pack refuses a research warm start.
   refused (exit 2). The result is recorded in `meta.warm_start.clip_level_check` (clips checked, violations 0).
   Clips this run dropped as evaluation duplicates are not in the data, so they are not relabelled. Real data (read
   only, research data against the real commercial-safe fold encoders): fold 0 checked 526 clips, fold 1 495, 0
-  violations each; the superset check passes too.
+  violations each; the superset check passed too (before variant links; with them, fold 1 relies on the excused
+  variant id above).
 * *Minor: the warm start's supervised training was not checked against this run's evaluation clips.* The guard of a
   warm-started encoder now adds `supervised` (`warm_start_supervised_check`): the warm start's training list is
   reconstructed from this run's data (its recorded training sources in a training role here, concept exclusions

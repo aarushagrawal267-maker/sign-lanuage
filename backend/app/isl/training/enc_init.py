@@ -6,7 +6,8 @@ from the commercial-safe ones). An explicit warm start is checked before anythin
 the file exists and is an ISL encoder, its data profile may serve in this run's profile (a commercial-safe encoder in
 a research run, never the reverse: :func:`app.isl.profiles.component_profile_allowed`), the same feature config and
 model shape, the same primary split, and a supervised encoder must have been trained without every concept the new
-model must not see (``excluded_concepts`` a superset of the fold's held-out set). :func:`init_lineage` is what the new
+model must not see (``excluded_concepts`` a superset of the fold's held-out set, except the variant ids
+:func:`unreachable_heldout` proves the init cannot have read). :func:`init_lineage` is what the new
 checkpoint records in ``meta.warm_start`` and what the evaluation report and the pack read: path, SHA-256, profile
 and, honestly, the self-supervised pre-training the warm start descends from (its ``pretrain_clips.txt``).
 
@@ -279,12 +280,16 @@ def clip_level_exclusion(data, init_meta: dict, init_path, held: set[str], fallb
 
 def unreachable_heldout(data, init_meta: dict, init_path, held: set[str], fallback_vocab) -> dict:
     """Held-out concepts the init cannot have trained on (docs 15.46, 28 Nov fix): the concept-id superset check
-    compares this run's held-out ids with the init's ``excluded_concepts``, so an id that exists only here (e.g. a
-    variant concept such as ``isl.mean~isl500`` that variant links make for ISL500 clips only) is refused although the
-    init never read a clip of it. A held-out concept is excused when NO clip of any source the init could have read
-    (its data profile's sources and its recorded training sources; every clip of every part, a superset of its
-    training) carries it, neither in this run's labels nor in the init's own linker's labels. Unprovable (unknown
-    profile, no training sources) = nothing excused. ``{"concepts": [...], "init_sources": [...], "checked": n}``."""
+    compares this run's held-out ids with the init's ``excluded_concepts``, so a variant id that exists only here
+    (e.g. ``isl.mean~isl500``, which this run's variant links make for ISL500 clips only) is refused although the
+    init never read a clip of it. Excused only when it is PROVEN from structure, never from the clips that happen to
+    be loaded (dedup drops, caps and ``--all-sources`` change those):
+    * this run's linker made it as the variant of a concept the init DID exclude, for a source the init could not
+      read (not among its data profile's sources nor its recorded training sources), and it is not a vocabulary id
+      (the linker never assigns a variant id that is known, nor one of another source's map for an init source); and
+    * as a cross-check, no loaded clip of an init source carries it, in this run's labels or the init's own linker's.
+    An init without a profile or training sources, or a run without variant links, excuses nothing.
+    ``{"concepts": [...], "init_sources": [...], "checked": n, "rule": ...}``."""
     from app.isl.profiles import get_profile
 
     excl = set(init_meta.get("excluded_concepts") or [])
@@ -299,13 +304,24 @@ def unreachable_heldout(data, init_meta: dict, init_path, held: set[str], fallba
         srcs = set(get_profile(prof).all_sources()) | set(ts)
     except ValueError:
         return {"concepts": [], "checked": 0, "reason": "the init records no data profile or training sources"}
+    lk = getattr(data, "linker", None)
+    variants = dict(getattr(lk, "variants", None) or {})
+    known = set(getattr(lk, "known", None) or ())
+    made_for_init_source = {v for src, m in variants.items() if src in srcs for v in m.values()}
+    structural = {v for src, m in variants.items() if src not in srcs for base, v in m.items()
+                  if v in todo and base in excl and v not in known and v not in made_for_init_source}
+    if not structural:
+        return {"concepts": [], "checked": 0, "init_sources": sorted(srcs),
+                "reason": "no held-out id is a variant (made for a source the init cannot read) of an excluded concept"}
     clips = [c for c in list(data.include) + list(data.islrtc) + list(getattr(data, "extra", None) or [])
              if c.source in srcs]
     seen = {c.concept_id for c in clips if c.concept_id}
-    if todo - seen:
+    if structural - seen:
         linker, _ = init_linker(init_meta, init_path, fallback_vocab)
         seen |= {y for y in (relabel(linker, c) for c in clips) if y}
-    return {"concepts": sorted(todo - seen), "init_sources": sorted(srcs), "checked": len(clips)}
+    return {"concepts": sorted(structural - seen), "init_sources": sorted(srcs), "checked": len(clips),
+            "rule": "variant id of an excluded concept, made for a source the init cannot read; no loaded clip of an "
+                    "init source carries it"}
 
 
 def main(argv=None) -> int:

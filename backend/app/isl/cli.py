@@ -1067,8 +1067,9 @@ def cmd_train_oneshot(paths: IslPaths, args) -> int:
         if init is not None:
             if init_dir is not None and not _pretrain_split_guard("train-oneshot", args, work, data, init=init):
                 return 2
-            # a held-out concept no clip of the init's sources carries (in this run's labels or the init's own) cannot
-            # have been in its training: excused from the concept-id superset check, recorded in the lineage
+            # a held-out variant id this run's linker made (for a source the init cannot read) of a concept the init
+            # excluded cannot have been in its training: excused from the concept-id superset check only (the fold
+            # encoder and the clip-level check keep the full held-out set), recorded in the lineage
             excused = {"concepts": []}
             if Path(init).is_file():
                 from app.isl.training.common import load_vocab
@@ -1085,11 +1086,11 @@ def cmd_train_oneshot(paths: IslPaths, args) -> int:
             if warm is None:
                 return 2
             if excused["concepts"]:
-                print(f"train-oneshot: fold {k}: {len(excused['concepts'])} held-out concepts have no clip in the warm "
-                      f"start's sources {excused['init_sources']} (e.g. {excused['concepts'][:5]}): it cannot have "
-                      "trained on them (docs 15.46)", file=sys.stderr)
+                print(f"train-oneshot: fold {k}: {len(excused['concepts'])} held-out variant concepts were made for "
+                      f"sources the warm start cannot read (it reads {excused['init_sources']}): "
+                      f"{excused['concepts']}; it cannot have trained on them (docs 15.46)", file=sys.stderr)
                 warm["excused_concepts"] = {"concepts": excused["concepts"], "init_sources": excused["init_sources"],
-                                            "clips_checked": excused["checked"]}
+                                            "clips_checked": excused["checked"], "rule": excused["rule"]}
             if not warm.get("pretrained_only"):  # the same check at clip level, with the init's own linker
                 from app.isl.training.common import load_vocab
                 from app.isl.training.enc_init import clip_level_exclusion, read_meta
@@ -1833,7 +1834,8 @@ def build_parser() -> argparse.ArgumentParser:
             spx.add_argument("--init-dir", default=None,
                              help="warm-start fold k from DIR/oneshot/fold<k>/encoder.pt (another work folder, e.g. "
                                   "artifacts/isl/commercial-safe); refused unless that encoder's excluded_concepts "
-                                  "cover fold k's held-out concepts, its profile may serve in this one, and feature "
+                                  "cover fold k's held-out concepts (except variant ids made for a source it cannot "
+                                  "read), its profile may serve in this one, and feature "
                                   "config, model shape and split match (docs 15.46). Not with --init")
         if name == "train-classifier":
             spx.add_argument("--dictionary-group", action="store_true",

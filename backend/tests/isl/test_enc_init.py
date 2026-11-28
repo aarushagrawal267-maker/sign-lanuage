@@ -729,10 +729,10 @@ def test_warm_start_supervised_check_says_when_it_cannot_check():
     assert warm_start_supervised_check({}, data)["excludes_eval_clips"] is None
 
 
-def test_unreachable_heldout_excuses_only_concepts_the_init_cannot_have_seen(tmp_path):
-    """A held-out id that exists only in this run (a variant concept of a source the init's profile does not read,
-    e.g. ``isl.mean~isl500``) is excused from the superset check; one carried by a clip of an init source (in this
-    run's labels or the init's linker's) is not; an init without a profile or training sources excuses nothing."""
+def test_unreachable_heldout_excuses_only_proven_variant_ids(tmp_path):
+    """Only a variant id this run's linker made, for a source the init cannot read, of a concept the init excluded is
+    excused (e.g. ``isl.mean~isl500``); never an id merely absent from the loaded clips (dedup drops, caps), one a
+    profile-only source or the init's own linker carries, one of an unexcluded base, or a known vocabulary id."""
     from app.isl.training.enc_init import unreachable_heldout
 
     def clip(cid, src="include", gloss="x", q=None):
@@ -743,28 +743,75 @@ def test_unreachable_heldout_excuses_only_concepts_the_init_cannot_have_seen(tmp
         variants = {}
 
         def link(self, gloss, source):
-            return ({"pomme": "isl.pear"}.get(gloss), "gloss")
+            return ({"pomme": "isl.pear~isl500"}.get(gloss), "gloss")
 
+    variants = {"isl500": {"isl.mean": "isl.mean~isl500", "isl.cat": "isl.cat~isl500", "isl.pear": "isl.pear~isl500",
+                           "isl.fig": "isl.fig~isl500", "isl.owl": "isl.owl~isl500", "isl.hat": "isl.hat"},
+                "mendeley_emergency": {"isl.owl": "isl.owl~isl500"}}
+    linker = SimpleNamespace(variants=variants, known={"isl.mean", "isl.cat", "isl.pear", "isl.fig", "isl.hat"})
     data = SimpleNamespace(include=[clip("isl.mean"), clip("isl.cat")],
                            islrtc=[clip("isl.dog", "islrtc", "pomme", {"link": "gloss"})],
-                           extra=[clip("isl.mean~isl500", "isl500"), clip("isl.pear", "isl500"),
-                                  clip("isl.owl", "isl500")])
-    meta = _meta(excl={"isl.mean"}, train_sources={"include": 2, "islrtc": 1})
+                           extra=[clip("isl.mean~isl500", "isl500"), clip("isl.fig~isl500", "mendeley_emergency"),
+                                  clip("isl.zebra", "isl500")],
+                           linker=linker)
+    # mendeley_emergency is a commercial-safe profile source, not among the recorded training sources
+    meta = _meta(excl={"isl.mean", "isl.pear", "isl.fig", "isl.owl", "isl.hat"},
+                 train_sources={"include": 2, "islrtc": 1})
     init = _ck(tmp_path / "cs" / "oneshot" / "fold1" / "encoder.pt", meta)
     import app.isl.training.enc_init as ei
 
     orig = ei.init_linker
     ei.init_linker = lambda m, p, v: (Lk(), {"work": "cs", "vocab": "-"})
     try:
-        held = {"isl.mean", "isl.mean~isl500", "isl.cat", "isl.pear", "isl.owl"}
+        held = {"isl.mean", "isl.mean~isl500", "isl.cat~isl500", "isl.pear~isl500", "isl.fig~isl500",
+                "isl.owl~isl500", "isl.zebra", "isl.gone~isl500"}
         r = unreachable_heldout(data, meta, init, held, None)
-        # isl.cat: an include clip here; isl.pear: the init's linker labels an ISLRTC clip with it; isl.mean: excluded
-        assert r["concepts"] == ["isl.mean~isl500", "isl.owl"] and "isl500" not in r["init_sources"]
-        assert r["checked"] == 3
+        # isl.cat~isl500: its base was not excluded; isl.pear~isl500: the init's linker labels an ISLRTC clip with it;
+        # isl.fig~isl500: a profile-only source's clip carries it; isl.owl~isl500: also made for an init source;
+        # isl.zebra / isl.gone~isl500: carried by no loaded clip, but not a proven variant (never excused)
+        assert r["concepts"] == ["isl.mean~isl500"] and "isl500" not in r["init_sources"]
+        assert "mendeley_emergency" in r["init_sources"] and r["checked"] == 4
         assert unreachable_heldout(data, {**meta, "profile": None}, init, held, None)["concepts"] == []
         assert unreachable_heldout(data, {**meta, "data": {}}, init, held, None)["concepts"] == []
-        # a research init reads ISL500: nothing there is unreachable
+        nolink = SimpleNamespace(**{**vars(data), "linker": None})
+        assert unreachable_heldout(nolink, meta, init, held, None)["concepts"] == []
+        # a research init reads ISL500: nothing is unreachable
         rmeta = _meta(profile="research", excl={"isl.mean"}, train_sources={"include": 2, "isl500": 3})
         assert unreachable_heldout(data, rmeta, init, held, None)["concepts"] == []
     finally:
         ei.init_linker = orig
+
+
+def test_cli_oneshot_excuse_wiring(two_profiles, monkeypatch, capsys):
+    """train-oneshot drops an excused id from the superset check only: the fold encoder and the clip-level check keep
+    the full held-out set and the lineage records the excuse; without the excuse the same run is refused."""
+    import app.isl.evaluation.runners as runners
+    import app.isl.training.enc_init as ei
+    import app.isl.training.train_encoder as te
+    from app.isl import cli
+
+    t = two_profiles
+    res = ["--profile", "research", *t["common"]]
+    orig_held = runners.heldout_set
+    monkeypatch.setattr(runners, "heldout_set",
+                        lambda lk, cs: orig_held(lk, cs) | ({"isl.book~isl500"} if "isl.book" in cs else set()))
+    seen = {}
+    orig_cl = ei.clip_level_exclusion
+    monkeypatch.setattr(ei, "clip_level_exclusion",
+                        lambda data, m, p, held, v: seen.setdefault("cl", set(held)) and orig_cl(data, m, p, held, v))
+
+    def fake_train(data, ckpt, *a, exclude_concepts=(), warm_start=None, **kw):
+        seen.setdefault("train", {})[str(ckpt)] = (set(exclude_concepts), warm_start)
+        return {"finished": True}
+
+    monkeypatch.setattr(te, "train_encoder", fake_train)
+    capsys.readouterr()
+    assert cli.main(t["root"] + ["train-oneshot", *res, "--folds", "1", "--init-dir", str(t["cs"])]) == 2
+    assert "superset" in capsys.readouterr().err and "train" not in seen
+    monkeypatch.setattr(ei, "unreachable_heldout", lambda data, m, p, held, v: {
+        "concepts": ["isl.book~isl500"], "init_sources": ["include"], "checked": 1, "rule": "test"})
+    assert cli.main(t["root"] + ["train-oneshot", *res, "--folds", "1", "--init-dir", str(t["cs"])]) == 0
+    assert "isl.book~isl500" in capsys.readouterr().err
+    (excl, ws), = seen["train"].values()
+    assert "isl.book~isl500" in excl and "isl.book" in excl and "isl.book~isl500" in seen["cl"]
+    assert ws["excused_concepts"]["concepts"] == ["isl.book~isl500"] and ws["excused_concepts"]["rule"] == "test"
