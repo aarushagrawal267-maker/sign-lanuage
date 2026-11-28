@@ -54,7 +54,7 @@ export function Button({ variant = "secondary", size = "md", icon, loading, chil
 }) {
   const v = {
     primary: "bg-accent text-white hover:bg-accent-hover border-transparent",
-    teal: "bg-teal text-ink-950 hover:bg-[#46dcc9] border-transparent",
+    teal: "bg-teal text-ink-950 hover:bg-teal-hover border-transparent",
     secondary: "bg-ink-800 text-fg hover:bg-ink-700 border-ink-700",
     ghost: "bg-transparent text-fg-2 hover:bg-ink-800 hover:text-fg border-transparent",
     danger: "bg-transparent text-danger hover:bg-danger/10 border-danger/40",
@@ -79,7 +79,7 @@ export function Badge({ children, tone = "neutral", className }: { children: Rea
     teal: "border-teal/40 bg-teal-soft text-teal",
     warn: "border-warn/40 bg-warn/10 text-warn",
     danger: "border-danger/40 bg-danger/10 text-danger",
-    good: "border-good/50 bg-good/10 text-[#5fd35f]",
+    good: "border-good/50 bg-good/10 text-good-fg",
   }[tone];
   return <span className={cx("inline-flex items-center gap-1 whitespace-nowrap rounded-md border px-1.5 py-0.5 text-2xs font-medium", t, className)}>{children}</span>;
 }
@@ -113,7 +113,7 @@ export function Empty({ icon, title, children, action }: { icon?: ReactNode; tit
 export function Progress({ value, tone = "accent" }: { value: number; tone?: "accent" | "teal" }) {
   return (
     <div className="h-1.5 w-full overflow-hidden rounded-full bg-ink-700" role="progressbar" aria-valuenow={Math.round(value * 100)} aria-valuemin={0} aria-valuemax={100}>
-      <div className={cx("h-full origin-left rounded-full transition-transform duration-300 ease-out", tone === "teal" ? "bg-teal" : "bg-accent")} style={{ transform: `scaleX(${Math.max(0, Math.min(1, value))})` }} />
+      <div className={cx("h-full origin-left transition-transform duration-300 ease-out", tone === "teal" ? "bg-teal" : "bg-accent")} style={{ transform: `scaleX(${Math.max(0, Math.min(1, value))})` }} />
     </div>
   );
 }
@@ -133,7 +133,7 @@ export const inputCls =
 
 export function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label: string }) {
   return (
-    <button type="button" role="switch" aria-checked={checked} onClick={() => onChange(!checked)} className="flex items-center gap-2.5 text-sm text-fg-2">
+    <button type="button" role="switch" aria-checked={checked} onClick={() => onChange(!checked)} className="flex items-center gap-2.5 text-left text-sm text-fg-2">
       <span className={cx("relative inline-flex h-5 w-9 shrink-0 rounded-full border transition-colors", checked ? "border-accent bg-accent" : "border-ink-600 bg-ink-800")}>
         <span className={cx("absolute top-0.5 size-3.5 rounded-full bg-white transition-transform", checked ? "translate-x-4" : "translate-x-0.5")} />
       </span>
@@ -169,7 +169,7 @@ export function Kv({ k, v }: { k: ReactNode; v: ReactNode }) {
   return (
     <div className="flex items-baseline justify-between gap-4 border-b border-ink-700/60 py-2 text-sm last:border-0">
       <span className="text-fg-3">{k}</span>
-      <span className="text-right font-mono text-[13px] text-fg tabular">{v}</span>
+      <span className="text-right font-mono text-sm text-fg tabular">{v}</span>
     </div>
   );
 }

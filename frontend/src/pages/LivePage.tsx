@@ -78,7 +78,7 @@ export default function LivePage() {
             <canvas ref={live.canvasRef} className="pointer-events-none absolute inset-0 size-full" style={{ objectFit: "contain" }} aria-hidden />
 
             {camera !== "active" && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-ink-950 p-6 text-center">
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-ink-950 p-6 pt-12 text-center sm:pt-6">
                 <div className="hidden size-12 items-center justify-center rounded-lg border border-ink-600 bg-ink-850 sm:flex">
                   {camera === "error" ? <CameraOff className="size-5 text-danger" /> : <Camera className="size-5 text-fg-2" />}
                 </div>

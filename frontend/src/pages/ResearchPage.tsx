@@ -25,7 +25,7 @@ export default function ResearchPage() {
         <nav aria-label="Sections" className="lg:sticky lg:top-20 lg:self-start">
           <ul className="flex flex-wrap gap-1 lg:flex-col">
             {SECTIONS.map(([id, label]) => (
-              <li key={id}><a href={`#${id}`} className="block rounded-md px-2.5 py-1.5 text-[13px] text-fg-2 hover:bg-ink-800 hover:text-fg">{label}</a></li>
+              <li key={id}><a href={`#${id}`} className="block rounded-md px-2.5 py-1.5 text-sm text-fg-2 hover:bg-ink-800 hover:text-fg">{label}</a></li>
             ))}
           </ul>
         </nav>
@@ -59,7 +59,7 @@ export default function ResearchPage() {
             <li>Videos are referenced by URL only; many links have expired. Missing videos are recorded as unavailable and never substituted.
               The authors provide missing videos on request via the form linked in the official repository.</li>
           </ul>
-          <p>Measured properties (resolution, true fps, duration) are recorded per video after download and shown in the Dataset Explorer.</p>
+          <p>Measured properties (resolution, true fps, duration) are recorded per video after download and shown in the Dataset explorer.</p>
 
           <h2 id="mediapipe">MediaPipe architecture</h2>
           <p>Google MediaPipe <strong>Holistic Landmarker</strong> combines pose (33 landmarks), two hands (21 landmarks each) and a 478-point face mesh in a single
@@ -88,7 +88,7 @@ export default function ResearchPage() {
 
           <h2 id="sequence">Temporal sequence learning</h2>
           <p>Signs are dynamic, so classification always uses a sequence, never a single frame. Each clip (the annotated frame range) is resampled by timestamp to a
-            fixed number of steps (default 48; the Dataset Explorer recommends a value from the measured clip lengths). Resampling never blends a detected frame
+            fixed number of steps (default 48; the Dataset explorer recommends a value from the measured clip lengths). Resampling never blends a detected frame
             with a missing one. Training augmentation: mirroring (left-handed signing), small rotation/scale/shift, temporal crop and time-warp, landmark jitter and
             random hand dropout.</p>
 
@@ -171,7 +171,7 @@ export default function ResearchPage() {
           <h2 id="reproducibility">Reproducibility</h2>
           <ol>
             <li>Run <code>setup.ps1</code> (Python venv, PyTorch CPU/CUDA, Node packages, MediaPipe model), then <code>start.ps1</code>.</li>
-            <li>Dataset Explorer → <em>Load annotations</em>. The annotation SHA-256 is recorded as the dataset version.</li>
+            <li>Dataset explorer → <em>Load annotations</em>. The annotation SHA-256 is recorded as the dataset version.</li>
             <li><em>Download &amp; validate</em> the videos, then <em>Extract landmarks</em>.</li>
             <li>Model laboratory → train on <code>signer-holdout</code>. Every run stores its full configuration, seed, feature settings, split and checkpoint.</li>
             <li>Compare runs on validation; once settled, run the held-out test evaluation once on the Evaluation page.</li>

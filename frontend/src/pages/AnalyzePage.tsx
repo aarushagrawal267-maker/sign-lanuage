@@ -170,7 +170,7 @@ export default function AnalyzePage() {
               <Kv k="Body detected" v={pct(res.quality.pose_rate, 0)} />
               <Kv k="Any hand detected" v={pct(res.quality.any_hand_rate, 0)} />
               <Kv k="Face detected" v={pct(res.quality.face_rate, 0)} />
-              {!res.quality.usable && <p className="mt-2 text-xs text-warn">Low detection quality — results are unreliable.</p>}
+              {!res.quality.usable && <p className="mt-2 text-xs text-warn">Low detection quality — results are unreliable</p>}
             </Card>
           )}
         </div>

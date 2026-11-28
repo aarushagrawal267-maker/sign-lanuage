@@ -138,7 +138,7 @@ export function Layout({ children }: { children: ReactNode }) {
               <Badge>no active model</Badge>
             )}
             <span
-              className={cx("inline-flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 text-2xs font-medium", health?.ok && !error ? "border-good/40 text-[#5fd35f]" : "border-danger/40 text-danger")}
+              className={cx("inline-flex items-center gap-1.5 rounded-md border px-1.5 py-0.5 text-2xs font-medium", health?.ok && !error ? "border-good/40 text-good-fg" : "border-danger/40 text-danger")}
               title={error ?? "Backend reachable"}
             >
               <span className={cx("size-1.5 rounded-full", health?.ok && !error ? "bg-good" : "bg-danger")} />

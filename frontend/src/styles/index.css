@@ -27,11 +27,13 @@
   --color-accent-soft: #1a2c4f;
   /* Teal means one thing: a sign was accepted. */
   --color-teal: #2dd4bf;
+  --color-teal-hover: #46dcc9;
   --color-teal-soft: #0f3a36;
   --color-warn: #fab219;
   --color-serious: #ec835a;
   --color-danger: #f0616d;
   --color-good: #0ca30c;
+  --color-good-fg: #5fd35f;
 
   /* chart series (validated: dark mode, surface #15181d) */
   --color-series-1: #3987e5;
