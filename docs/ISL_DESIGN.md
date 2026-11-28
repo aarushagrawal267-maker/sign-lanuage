@@ -4934,6 +4934,15 @@ run and stamps as before.
   checkpoint saw no label and is not checked for concepts;
 * it is a fine-tuned encoder trained on another primary split, or on ISL500 under another signer split.
 All folds are checked before any fold trains. `--init-dir` with `--init` is refused.
+* **Unreachable held-out concepts (28 Nov fix).** The superset check compares concept ids of two linkers. The first
+  full research run (`b1-full`) was refused at fold 1: its held-out set holds `isl.mean~isl500`, the variant concept
+  that this run's variant links (15.36) make for ISL500 clips only. That id does not exist in the commercial-safe run,
+  which reads no ISL500 clip. A held-out concept is now excused from the id check when no clip of any source the init
+  could have read (its profile's sources and its recorded training sources; every clip of every part, a superset of
+  its training) carries it, in this run's labels or in the init's own linker's labels
+  (`enc_init.unreachable_heldout`). An init without a profile or training sources excuses nothing. The fold encoder
+  still excludes the full held-out set; the excused ids are printed and recorded in `meta.warm_start.excused_concepts`.
+  The clip-level check below is unchanged.
 
 **Signer split v2 guard.** An explicit init that has no `pretrain_clips.txt` next to a `pretrained_encoder.pt`
 used to pass with "cannot be checked". It now passes without the warning when the checkpoint proves it never read an

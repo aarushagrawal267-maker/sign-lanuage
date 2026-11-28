@@ -727,3 +727,44 @@ def test_warm_start_supervised_check_says_when_it_cannot_check():
     data.multisource = {}
     assert warm_start_supervised_check(ws, data)["excludes_eval_clips"] is None
     assert warm_start_supervised_check({}, data)["excludes_eval_clips"] is None
+
+
+def test_unreachable_heldout_excuses_only_concepts_the_init_cannot_have_seen(tmp_path):
+    """A held-out id that exists only in this run (a variant concept of a source the init's profile does not read,
+    e.g. ``isl.mean~isl500``) is excused from the superset check; one carried by a clip of an init source (in this
+    run's labels or the init's linker's) is not; an init without a profile or training sources excuses nothing."""
+    from app.isl.training.enc_init import unreachable_heldout
+
+    def clip(cid, src="include", gloss="x", q=None):
+        return SimpleNamespace(clip_id=f"{src}/{cid}/{gloss}", concept_id=cid, source=src, raw_gloss=gloss,
+                               quality=q or {})
+
+    class Lk:
+        variants = {}
+
+        def link(self, gloss, source):
+            return ({"pomme": "isl.pear"}.get(gloss), "gloss")
+
+    data = SimpleNamespace(include=[clip("isl.mean"), clip("isl.cat")],
+                           islrtc=[clip("isl.dog", "islrtc", "pomme", {"link": "gloss"})],
+                           extra=[clip("isl.mean~isl500", "isl500"), clip("isl.pear", "isl500"),
+                                  clip("isl.owl", "isl500")])
+    meta = _meta(excl={"isl.mean"}, train_sources={"include": 2, "islrtc": 1})
+    init = _ck(tmp_path / "cs" / "oneshot" / "fold1" / "encoder.pt", meta)
+    import app.isl.training.enc_init as ei
+
+    orig = ei.init_linker
+    ei.init_linker = lambda m, p, v: (Lk(), {"work": "cs", "vocab": "-"})
+    try:
+        held = {"isl.mean", "isl.mean~isl500", "isl.cat", "isl.pear", "isl.owl"}
+        r = unreachable_heldout(data, meta, init, held, None)
+        # isl.cat: an include clip here; isl.pear: the init's linker labels an ISLRTC clip with it; isl.mean: excluded
+        assert r["concepts"] == ["isl.mean~isl500", "isl.owl"] and "isl500" not in r["init_sources"]
+        assert r["checked"] == 3
+        assert unreachable_heldout(data, {**meta, "profile": None}, init, held, None)["concepts"] == []
+        assert unreachable_heldout(data, {**meta, "data": {}}, init, held, None)["concepts"] == []
+        # a research init reads ISL500: nothing there is unreachable
+        rmeta = _meta(profile="research", excl={"isl.mean"}, train_sources={"include": 2, "isl500": 3})
+        assert unreachable_heldout(data, rmeta, init, held, None)["concepts"] == []
+    finally:
+        ei.init_linker = orig

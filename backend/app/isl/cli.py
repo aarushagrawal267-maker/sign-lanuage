@@ -1067,9 +1067,29 @@ def cmd_train_oneshot(paths: IslPaths, args) -> int:
         if init is not None:
             if init_dir is not None and not _pretrain_split_guard("train-oneshot", args, work, data, init=init):
                 return 2
-            warm = _check_warm_start("train-oneshot", init, args, profile, fcfg, data, must_exclude=held, fold=k)
+            # a held-out concept no clip of the init's sources carries (in this run's labels or the init's own) cannot
+            # have been in its training: excused from the concept-id superset check, recorded in the lineage
+            excused = {"concepts": []}
+            if Path(init).is_file():
+                from app.isl.training.common import load_vocab
+                from app.isl.training.enc_init import is_pretrained_only, read_meta, unreachable_heldout
+
+                try:
+                    im = read_meta(init)
+                except Exception:  # noqa: BLE001 - _check_warm_start reports it
+                    im = None
+                if im is not None and not is_pretrained_only(im):
+                    excused = unreachable_heldout(data, im, init, held, load_vocab(_vocab_path(args)))
+            warm = _check_warm_start("train-oneshot", init, args, profile, fcfg, data,
+                                     must_exclude=held - set(excused["concepts"]), fold=k)
             if warm is None:
                 return 2
+            if excused["concepts"]:
+                print(f"train-oneshot: fold {k}: {len(excused['concepts'])} held-out concepts have no clip in the warm "
+                      f"start's sources {excused['init_sources']} (e.g. {excused['concepts'][:5]}): it cannot have "
+                      "trained on them (docs 15.46)", file=sys.stderr)
+                warm["excused_concepts"] = {"concepts": excused["concepts"], "init_sources": excused["init_sources"],
+                                            "clips_checked": excused["checked"]}
             if not warm.get("pretrained_only"):  # the same check at clip level, with the init's own linker
                 from app.isl.training.common import load_vocab
                 from app.isl.training.enc_init import clip_level_exclusion, read_meta

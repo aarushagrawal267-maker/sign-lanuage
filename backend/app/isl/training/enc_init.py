@@ -277,6 +277,37 @@ def clip_level_exclusion(data, init_meta: dict, init_path, held: set[str], fallb
     return {"violations": bad, "checked": len(cands), "init_linker": info}
 
 
+def unreachable_heldout(data, init_meta: dict, init_path, held: set[str], fallback_vocab) -> dict:
+    """Held-out concepts the init cannot have trained on (docs 15.46, 28 Nov fix): the concept-id superset check
+    compares this run's held-out ids with the init's ``excluded_concepts``, so an id that exists only here (e.g. a
+    variant concept such as ``isl.mean~isl500`` that variant links make for ISL500 clips only) is refused although the
+    init never read a clip of it. A held-out concept is excused when NO clip of any source the init could have read
+    (its data profile's sources and its recorded training sources; every clip of every part, a superset of its
+    training) carries it, neither in this run's labels nor in the init's own linker's labels. Unprovable (unknown
+    profile, no training sources) = nothing excused. ``{"concepts": [...], "init_sources": [...], "checked": n}``."""
+    from app.isl.profiles import get_profile
+
+    excl = set(init_meta.get("excluded_concepts") or [])
+    todo = set(held) - excl
+    if not todo:
+        return {"concepts": [], "checked": 0}
+    prof = init_meta.get("profile")
+    ts = (init_meta.get("data") or {}).get("train_sources")
+    try:
+        if not prof or not ts:
+            raise ValueError
+        srcs = set(get_profile(prof).all_sources()) | set(ts)
+    except ValueError:
+        return {"concepts": [], "checked": 0, "reason": "the init records no data profile or training sources"}
+    clips = [c for c in list(data.include) + list(data.islrtc) + list(getattr(data, "extra", None) or [])
+             if c.source in srcs]
+    seen = {c.concept_id for c in clips if c.concept_id}
+    if todo - seen:
+        linker, _ = init_linker(init_meta, init_path, fallback_vocab)
+        seen |= {y for y in (relabel(linker, c) for c in clips) if y}
+    return {"concepts": sorted(todo - seen), "init_sources": sorted(srcs), "checked": len(clips)}
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m app.isl.training.enc_init",
                                  description="check warm-start encoders for a run (docs 15.46); exit 2 = refused")
