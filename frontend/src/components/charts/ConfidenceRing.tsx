@@ -3,7 +3,7 @@ export function ConfidenceRing({ value, threshold, size = 120, tone = "accent" }
   const r = size / 2 - 8;
   const c = 2 * Math.PI * r;
   const v = value === null ? 0 : Math.max(0, Math.min(1, value));
-  const color = tone === "teal" ? "var(--color-teal)" : tone === "muted" ? "var(--color-fg-3)" : "var(--color-accent)";
+  const color = tone === "teal" ? "var(--color-teal)" : tone === "muted" ? "var(--color-fg-3)" : "var(--color-data-blue)";
   const th = threshold !== undefined ? threshold * 2 * Math.PI - Math.PI / 2 : null;
   return (
     <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} role="img" aria-label={value === null ? "no confidence" : `confidence ${(v * 100).toFixed(0)} percent`}>

@@ -14,8 +14,8 @@ import { HBars } from "../components/charts/Bars";
 
 function DetectionChip({ on, icon, label }: { on: boolean; icon: React.ReactNode; label: string }) {
   return (
-    <span className={cx("inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-medium",
-      on ? "border-teal/40 bg-teal-soft/70 text-teal" : "border-ink-600 bg-ink-900/80 text-fg-3")}
+    <span className={cx("inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-2xs font-medium transition-colors",
+      on ? "border-fg-3/50 bg-ink-800/90 text-fg" : "border-ink-700 bg-ink-900/80 text-fg-3")}
       aria-label={`${label} ${on ? "detected" : "not detected"}`}>
       {icon}
       {label}
@@ -36,7 +36,7 @@ export default function LivePage() {
   const settled = !inProgress && !!lastResult?.top?.length;
   const accepted = settled && !!lastResult?.accepted;
   const headline = settled ? lastResult!.top![0] : top;
-  const headLabel = inProgress ? (top ? "provisional — sign in progress" : "collecting") : settled ? (accepted ? (status === "recognized" ? "recognised gloss" : "last recognised") : "last attempt — rejected") : "gloss";
+  const headLabel = inProgress ? (top ? "Provisional, sign in progress" : "Collecting") : settled ? (accepted ? (status === "recognized" ? "Recognised gloss" : "Last recognised") : "Last attempt, rejected") : "Gloss";
   const toneRing = accepted ? "teal" : settled ? "muted" : "accent";
   const committed = accepted;
 
@@ -45,16 +45,15 @@ export default function LivePage() {
 
   return (
     <div className="fade-in">
-      <div className="mb-5 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+      <div className="mb-6 flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
         <div>
-          <div className="mb-1 font-mono text-[11px] uppercase tracking-[0.14em] text-accent">Live · isolated sign recognition</div>
-          <h1 className="text-2xl font-semibold tracking-tight">Live Sign Recognition</h1>
-          <p className="mt-1 max-w-2xl text-sm text-fg-2">
+          <h1 className="text-2xl font-medium">Live sign recognition</h1>
+          <p className="mt-2 max-w-2xl text-sm leading-relaxed text-fg-2">
             Sign one WLASL100 word at a time: raise your hands, perform the sign, then lower your hands. The output is an ASL gloss label, not a translation.
           </p>
         </div>
         <div className="flex items-center gap-2 text-xs text-fg-3">
-          <ShieldCheck className="size-4 text-teal" aria-hidden />
+          <ShieldCheck className="size-4 shrink-0" aria-hidden />
           Video stays in your browser · only landmark coordinates are sent to the local server
         </div>
       </div>
@@ -62,7 +61,7 @@ export default function LivePage() {
       {model?.is_synthetic && (
         <div className="mb-4">
           <Notice tone="warn" title="The active model was trained on synthetic test data">
-            It verifies the pipeline only and cannot recognise real ASL. Train a model on WLASL100 landmarks in the Model Laboratory.
+            It verifies the pipeline only and cannot recognise real ASL. Train a model on WLASL100 landmarks in the Model laboratory.
           </Notice>
         </div>
       )}
@@ -70,7 +69,7 @@ export default function LivePage() {
       <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_380px]">
         {/* ------------------------------------------------ camera stage */}
         <div className="flex min-w-0 flex-col gap-3">
-          <div className="relative mx-auto w-full overflow-hidden rounded-2xl border border-ink-700 bg-black"
+          <div className="relative mx-auto w-full overflow-hidden rounded-xl border border-ink-700 bg-black"
             style={{
               aspectRatio: live.videoSize ? `${live.videoSize.w} / ${live.videoSize.h}` : "16 / 9",
               maxWidth: live.videoSize ? `calc(74vh * ${(live.videoSize.w / live.videoSize.h).toFixed(4)})` : undefined,
@@ -79,9 +78,9 @@ export default function LivePage() {
             <canvas ref={live.canvasRef} className="pointer-events-none absolute inset-0 size-full" style={{ objectFit: "contain" }} aria-hidden />
 
             {camera !== "active" && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-[radial-gradient(ellipse_at_center,#15203a_0%,#0b0d10_70%)] p-6 text-center">
-                <div className="flex size-14 items-center justify-center rounded-2xl border border-ink-600 bg-ink-850">
-                  {camera === "error" ? <CameraOff className="size-6 text-danger" /> : <Camera className="size-6 text-accent" />}
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-ink-950 p-6 pt-12 text-center sm:pt-6">
+                <div className="hidden size-12 items-center justify-center rounded-lg border border-ink-600 bg-ink-850 sm:flex">
+                  {camera === "error" ? <CameraOff className="size-5 text-danger" /> : <Camera className="size-5 text-fg-2" />}
                 </div>
                 <div>
                   <div className="text-base font-medium">{camera === "error" ? "Camera unavailable" : camera === "starting" ? "Waiting for camera permission…" : "Camera is off"}</div>
@@ -95,12 +94,12 @@ export default function LivePage() {
 
             {/* status pill + camera indicator */}
             <div className="absolute left-3 top-3 flex flex-wrap items-center gap-2">
-              <span data-testid="live-status" className={cx("inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium backdrop-blur", TONE_CLASS[meta.tone])} role="status" aria-live="polite">
+              <span data-testid="live-status" className={cx("inline-flex items-center gap-2 rounded-md border px-2.5 py-1 text-xs font-medium backdrop-blur", TONE_CLASS[meta.tone])} role="status" aria-live="polite">
                 <span className={cx("size-1.5 rounded-full bg-current", (meta.tone === "busy" || meta.tone === "active") && "pulse-dot")} />
                 {meta.label}
               </span>
               {camera === "active" && (
-                <span className="inline-flex items-center gap-1.5 rounded-full border border-danger/50 bg-black/60 px-2.5 py-1 text-[11px] font-medium text-danger">
+                <span className="inline-flex items-center gap-1.5 rounded-md border border-danger/50 bg-black/60 px-2 py-1 text-2xs font-medium text-danger">
                   <span className="size-1.5 rounded-full bg-danger pulse-dot" /> Camera on
                 </span>
               )}
@@ -114,7 +113,7 @@ export default function LivePage() {
               </div>
             )}
             {camera === "active" && (
-              <div className="absolute inset-x-3 bottom-3 flex flex-wrap gap-x-4 gap-y-1 rounded-lg bg-black/55 px-3 py-1.5 font-mono text-[11px] text-fg-2 backdrop-blur">
+              <div className="absolute inset-x-3 bottom-3 flex flex-wrap gap-x-4 gap-y-1 rounded-md bg-black/55 px-3 py-1.5 font-mono text-2xs text-fg-2 backdrop-blur">
                 <span>landmarks {metrics.fps ? `${metrics.fps.toFixed(1)} fps` : "—"}</span>
                 <span>mediapipe {ms(metrics.mpMs)}</span>
                 {recognizing && <span>server {ms(metrics.serverMs)}</span>}
@@ -126,7 +125,7 @@ export default function LivePage() {
           </div>
 
           {/* controls */}
-          <div className="flex flex-wrap items-center gap-2 rounded-2xl border border-ink-700 bg-ink-850 p-2.5">
+          <div className="flex flex-wrap items-center gap-2 rounded-xl border border-ink-700 bg-ink-850 p-2">
             {camera === "active" ? (
               <Button variant="secondary" icon={<CameraOff className="size-4" />} onClick={actions.stopCamera}>Stop camera</Button>
             ) : (
@@ -213,9 +212,9 @@ export default function LivePage() {
           <Card title="Current sign" subtitle={meta.help}>
             <div className="flex items-center gap-5">
               <ConfidenceRing value={headline ? headline.prob : null} threshold={threshold ?? undefined} tone={toneRing} />
-              <div className="min-w-0">
-                <div className="text-[11px] uppercase tracking-[0.14em] text-fg-3">{headLabel}</div>
-                <div data-testid="current-gloss" className={cx("truncate font-mono text-3xl font-medium tracking-tight", committed ? "text-teal" : settled ? "text-fg-3" : "text-fg")}>
+              <div className="min-w-0 flex-1">
+                <div className="text-xs text-fg-3">{headLabel}</div>
+                <div data-testid="current-gloss" className={cx("mt-1 truncate border-b pb-1 font-mono text-3xl font-medium transition-colors", committed ? "border-teal/60 text-teal" : settled ? "border-ink-600 text-fg-3" : "border-ink-600 text-fg")}>
                   {headline ? headline.gloss.toUpperCase() : "—"}
                 </div>
                 {settled && lastResult && (
@@ -229,28 +228,28 @@ export default function LivePage() {
             </div>
             {provisional && provisional.length > 0 && (
               <div className="mt-5">
-                <div className="mb-2 text-[11px] uppercase tracking-[0.14em] text-fg-3">Top-5 class scores</div>
+                <div className="mb-2 text-xs text-fg-3">Top-5 class scores</div>
                 <HBars items={provisional.map((p) => ({ label: p.gloss.toUpperCase(), value: p.prob }))} highlightFirst={!!committed} />
               </div>
             )}
             {recognizing && server && (server.segment_frames ?? 0) > 0 && (
-              <div className="mt-4 font-mono text-[11px] text-fg-3">collecting · {server.segment_frames} frames · {((server.segment_ms ?? 0) / 1000).toFixed(1)} s</div>
+              <div className="mt-4 font-mono text-2xs text-fg-3">collecting · {server.segment_frames} frames · {((server.segment_ms ?? 0) / 1000).toFixed(1)} s</div>
             )}
           </Card>
 
-          <Card title="Recognised text" subtitle="Space-separated ASL glosses — not an English translation"
+          <Card title="Recognised text" subtitle="Space-separated ASL glosses, not an English translation"
             actions={<>
               <Button size="sm" variant="ghost" icon={<Copy className="size-3.5" />} disabled={!transcript.length} onClick={() => navigator.clipboard?.writeText(text)}>Copy</Button>
               <Button size="sm" variant="ghost" icon={<Eraser className="size-3.5" />} disabled={!transcript.length} onClick={actions.clearText}>Clear</Button>
             </>}>
-            <div data-testid="transcript" className="flex min-h-16 flex-wrap content-start gap-2" aria-live="polite">
+            <div data-testid="transcript" className="flex min-h-16 flex-wrap content-start items-end gap-x-3 gap-y-3 border-b border-ink-600 pb-2" aria-live="polite">
               {transcript.length === 0 ? (
-                <span className="text-sm text-fg-3">Recognised signs appear here.</span>
+                <span className="text-sm text-fg-3">Recognised signs appear here</span>
               ) : (
                 transcript.map((t) => (
-                  <span key={t.id} className="fade-in inline-flex items-baseline gap-1.5 rounded-lg border border-teal/30 bg-teal-soft/50 px-2.5 py-1">
-                    <span className="font-mono text-sm font-medium text-teal">{t.gloss.toUpperCase()}</span>
-                    <span className="font-mono text-[10px] text-fg-3">{Math.round(t.score * 100)}</span>
+                  <span key={t.id} className="fade-in inline-flex items-baseline gap-1">
+                    <span className="font-mono text-base font-medium text-teal">{t.gloss.toUpperCase()}</span>
+                    <span className="font-mono text-2xs text-fg-3 tabular" title="confidence">{Math.round(t.score * 100)}</span>
                   </span>
                 ))
               )}
@@ -259,13 +258,13 @@ export default function LivePage() {
 
           <Card title="Recent signs">
             {transcript.length === 0 ? (
-              <p className="text-sm text-fg-3">No recognitions in this session yet.</p>
+              <p className="text-sm text-fg-3">No recognitions in this session yet</p>
             ) : (
-              <ul className="flex max-h-56 flex-col gap-1 overflow-y-auto">
+              <ul className="flex max-h-56 flex-col overflow-y-auto">
                 {[...transcript].reverse().slice(0, 20).map((t) => (
-                  <li key={t.id} className="flex items-center justify-between rounded-md px-2 py-1.5 text-sm hover:bg-ink-800">
-                    <span className="font-mono text-fg">{t.gloss.toUpperCase()}</span>
-                    <span className="flex items-center gap-3 font-mono text-xs text-fg-3">
+                  <li key={t.id} className="flex items-baseline justify-between border-b border-ink-700 py-2 text-sm last:border-0">
+                    <span className="font-mono font-medium text-fg">{t.gloss.toUpperCase()}</span>
+                    <span className="flex items-center gap-3 font-mono text-xs text-fg-3 tabular">
                       {pct(t.score, 0)}
                       <span>{new Date(t.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
                     </span>
@@ -277,7 +276,7 @@ export default function LivePage() {
 
           <Card title="Model">
             {live.modelAvailable === false ? (
-              <p className="text-sm text-fg-2">No active model. <Link className="text-accent underline underline-offset-2" to="/lab">Train one in the Model Laboratory</Link> and activate it.</p>
+              <p className="text-sm text-fg-2">No active model. <Link className="text-accent-fg underline underline-offset-2" to="/lab">Train one in the Model laboratory</Link> and activate it.</p>
             ) : model ? (
               <div className="flex flex-col gap-1.5 text-sm">
                 <div className="flex items-center justify-between gap-2"><span className="truncate text-fg">{model.name}</span>{model.is_synthetic && <Badge tone="warn">synthetic</Badge>}</div>
@@ -285,7 +284,7 @@ export default function LivePage() {
                 <div className="font-mono text-xs text-fg-3">validation top-1 {pct(model.val_top1)} · threshold {pct(model.threshold, 0)}</div>
               </div>
             ) : (
-              <p className="text-sm text-fg-3">Start recognition to connect to the active model.</p>
+              <p className="text-sm text-fg-3">Start recognition to connect to the active model</p>
             )}
           </Card>
         </div>

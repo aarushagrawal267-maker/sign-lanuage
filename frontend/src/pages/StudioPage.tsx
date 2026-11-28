@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Camera, CameraOff, Circle, Pause, Play, Wand2 } from "lucide-react";
+import { Camera, CameraOff, Circle, ListOrdered, Pause, Play } from "lucide-react";
 import { api, type SystemInfo, type FeatureSpec, type LandmarkClip, type RawFrame, type TopK, type VideoRow } from "../api/client";
 import { DEFAULT_FACE_IDX, loadHolistic, toRawFrame } from "../mediapipe/holistic";
 import { COLORS, HAND_CONNECTIONS, drawFrame } from "../mediapipe/draw";
@@ -86,7 +86,7 @@ function useRecorder() {
 
 function Hand3D({ hand, color, yaw, pitch }: { hand: number[][] | null; color: string; yaw: number; pitch: number }) {
   const size = 220;
-  if (!hand) return <div className="flex h-[220px] items-center justify-center rounded-xl border border-ink-700 bg-ink-900 text-xs text-fg-3">hand not detected in this frame</div>;
+  if (!hand) return <div className="flex h-[220px] items-center justify-center rounded-lg border border-ink-700 bg-ink-900 text-xs text-fg-3">hand not detected in this frame</div>;
   const w = hand[0];
   const rel = hand.map((p) => [p[0] - w[0], p[1] - w[1], p[2] - w[2]]);
   const scale = Math.max(1e-6, ...rel.map((p) => Math.hypot(p[0], p[1], p[2])));
@@ -97,7 +97,7 @@ function Hand3D({ hand, color, yaw, pitch }: { hand: number[][] | null; color: s
     return { x: size / 2 + (x1 / scale) * size * 0.4, y: size * 0.75 + (y1 / scale) * size * 0.4 - size * 0.25, z: z2 };
   });
   return (
-    <svg viewBox={`0 0 ${size} ${size}`} className="w-full rounded-xl border border-ink-700 bg-ink-900" role="img" aria-label="3D hand landmark view">
+    <svg viewBox={`0 0 ${size} ${size}`} className="w-full rounded-lg border border-ink-700 bg-ink-900" role="img" aria-label="3D hand landmark view">
       {HAND_CONNECTIONS.map(([a, b], i) => <line key={i} x1={proj[a].x} y1={proj[a].y} x2={proj[b].x} y2={proj[b].y} stroke={color} strokeWidth={2} strokeLinecap="round" opacity={0.85} />)}
       {proj.map((p, i) => <circle key={i} cx={p.x} cy={p.y} r={i === 0 ? 4.5 : 3} fill={i === 0 ? "#fff" : color} stroke="var(--color-ink-900)" strokeWidth={1.5} />)}
     </svg>
@@ -112,7 +112,7 @@ function PresenceStrip({ frames, cursor }: { frames: RawFrame[]; cursor: number 
   return (
     <div className="flex flex-col gap-1.5">
       {rows.map((r) => (
-        <div key={r.key} className="grid grid-cols-[5.5rem_1fr_3rem] items-center gap-3 text-[11px]">
+        <div key={r.key} className="grid grid-cols-[5.5rem_1fr_3rem] items-center gap-3 text-2xs">
           <span className="text-fg-3">{r.label}</span>
           <div className="relative flex h-3 overflow-hidden rounded-sm bg-ink-900">
             {frames.map((f, i) => <span key={i} className="h-full flex-1" style={{ background: f[r.key] ? r.color : "transparent", opacity: 0.85 }} />)}
@@ -203,7 +203,7 @@ export default function StudioPage() {
 
   return (
     <div className="fade-in">
-      <PageHeader eyebrow="MediaPipe Holistic" title="Landmark Visualisation Studio"
+      <PageHeader eyebrow="MediaPipe Holistic" title="Landmark visualisation studio"
         description="Inspect exactly what the model sees: hand, body and facial landmarks, their trajectories and raw coordinate values over time." />
 
       <div className="mb-5 flex flex-wrap items-center gap-3">
@@ -234,11 +234,11 @@ export default function StudioPage() {
 
       <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_400px]">
         <div className="flex min-w-0 flex-col gap-4">
-          <div className="relative overflow-hidden rounded-2xl border border-ink-700 bg-[radial-gradient(ellipse_at_center,#141a26_0%,#0b0d10_75%)]" style={{ aspectRatio: aspect }}>
+          <div className="relative overflow-hidden rounded-xl border border-ink-700 bg-ink-950" style={{ aspectRatio: aspect }}>
             <video ref={rec.videoRef} playsInline muted className={cx("absolute inset-0 size-full object-contain opacity-30", (clip || rec.state === "off") && "hidden")} />
             <canvas ref={canvasRef} className="absolute inset-0 size-full" aria-label="Landmark skeleton view" />
             {!frame && <div className="absolute inset-0 flex items-center justify-center p-6 text-center text-sm text-fg-3">{source === "webcam" ? "Start the camera and record a short clip." : "Choose a dataset clip with extracted landmarks."}</div>}
-            {clip && <div className="absolute left-3 top-3 rounded-full bg-black/60 px-3 py-1 font-mono text-[11px] text-fg-2">{clip.label}</div>}
+            {clip && <div className="absolute left-3 top-3 rounded-md bg-black/60 px-2.5 py-1 font-mono text-2xs text-fg-2">{clip.label}</div>}
           </div>
 
           {clip && (
@@ -278,8 +278,8 @@ export default function StudioPage() {
             <div className="mb-3"><Segmented ariaLabel="Hand" value={comp === "left" ? "left" : "right"} onChange={(v) => setComp(v)} options={[{ value: "left", label: "Left hand" }, { value: "right", label: "Right hand" }]} /></div>
             <Hand3D hand={frame ? (comp === "left" ? frame.left : frame.right) : null} color={comp === "left" ? COLORS.left : COLORS.right} yaw={yaw} pitch={pitch} />
             <div className="mt-3 grid grid-cols-2 gap-3">
-              <label className="text-[11px] text-fg-3">rotate ↔<input type="range" min={-3.14} max={3.14} step={0.02} value={yaw} onChange={(e) => setYaw(Number(e.target.value))} className="w-full accent-[var(--color-accent)]" /></label>
-              <label className="text-[11px] text-fg-3">tilt ↕<input type="range" min={-1.5} max={1.5} step={0.02} value={pitch} onChange={(e) => setPitch(Number(e.target.value))} className="w-full accent-[var(--color-accent)]" /></label>
+              <label className="text-2xs text-fg-3">rotate ↔<input type="range" min={-3.14} max={3.14} step={0.02} value={yaw} onChange={(e) => setYaw(Number(e.target.value))} className="w-full accent-[var(--color-accent)]" /></label>
+              <label className="text-2xs text-fg-3">tilt ↕<input type="range" min={-1.5} max={1.5} step={0.02} value={pitch} onChange={(e) => setPitch(Number(e.target.value))} className="w-full accent-[var(--color-accent)]" /></label>
             </div>
           </Card>
 
@@ -288,7 +288,7 @@ export default function StudioPage() {
               <option value="right">right hand</option><option value="left">left hand</option><option value="pose">body pose</option><option value="face">face subset</option></select>}>
             {coords ? (
               <div className="max-h-72 overflow-y-auto">
-                <table className="w-full font-mono text-[11px]">
+                <table className="w-full font-mono text-2xs">
                   <thead className="sticky top-0 bg-ink-850 text-fg-3"><tr><th className="py-1 text-left font-medium">#</th><th className="py-1 text-left font-medium">point</th><th className="py-1 text-right font-medium">x</th><th className="py-1 text-right font-medium">y</th><th className="py-1 text-right font-medium">z</th>{comp === "pose" && <th className="py-1 text-right font-medium">vis</th>}</tr></thead>
                   <tbody>{coords.map((p, i) => (comp === "pose" && !(i in POSE_NAMES)) ? null : (
                     <tr key={i} className="border-b border-ink-700/40"><td className="py-0.5 text-fg-3">{i}</td>
@@ -303,7 +303,7 @@ export default function StudioPage() {
 
           {clip && (
             <Card title="Classify this clip" subtitle="Uses the active model on the same features as live recognition">
-              <Button variant="secondary" icon={<Wand2 className="size-4" />} onClick={classify}>Classify</Button>
+              <Button variant="secondary" icon={<ListOrdered className="size-4" />} onClick={classify}>Classify</Button>
               {pred?.top && <div className="mt-4"><HBars items={pred.top.map((t) => ({ label: t.gloss.toUpperCase(), value: t.prob }))} highlightFirst /></div>}
               {pred?.error && <p className="mt-3 text-sm text-danger">{pred.error}</p>}
             </Card>

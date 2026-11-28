@@ -19,7 +19,7 @@ const ResearchPage = lazy(() => import("./pages/ResearchPage"));
 const Router = import.meta.env.VITE_STATIC === "1" ? HashRouter : BrowserRouter;
 
 function NotFound() {
-  return <p className="text-sm text-fg-2">Page not found.</p>;
+  return <p className="text-sm text-fg-2">Page not found</p>;
 }
 
 createRoot(document.getElementById("root")!).render(

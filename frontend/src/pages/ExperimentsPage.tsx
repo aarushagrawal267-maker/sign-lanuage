@@ -1,6 +1,6 @@
 import { Fragment, useState } from "react";
 import { Link } from "react-router-dom";
-import { ChevronDown, ChevronRight, Download, Trash2, Zap } from "lucide-react";
+import { ChevronDown, ChevronRight, Download, Power, Trash2 } from "lucide-react";
 import { IS_STATIC, api, type ExperimentDetail, type ExperimentSummary } from "../api/client";
 import { useApi } from "../lib/hooks";
 import { dateTime, num, pct } from "../lib/format";
@@ -23,10 +23,10 @@ function Detail({ id, onChange }: { id: number; onChange: () => void }) {
         {ds?.skipped && <Kv k="excluded" v={Object.entries(ds.skipped).filter(([, n]) => n).map(([k, n]) => `${k} ${n}`).join(", ") || "none"} />}
         <div className="mb-2 mt-4 text-xs font-medium text-fg-2">Provenance</div>
         <Kv k="dataset" v={e.dataset_version ?? "—"} />
-        <Kv k="checkpoint" v={<span className="break-all text-[11px]">{e.checkpoint_path ?? "—"}</span>} />
+        <Kv k="checkpoint" v={<span className="break-all text-2xs">{e.checkpoint_path ?? "—"}</span>} />
         <Kv k="device" v={e.device ?? "—"} />
         <div className="mt-4 flex flex-wrap gap-2">
-          <Button size="sm" variant="primary" icon={<Zap className="size-3.5" />} disabled={e.status !== "completed" || e.is_active} onClick={() => api.post(`/api/experiments/${id}/activate`).then(onChange)}>
+          <Button size="sm" variant="primary" icon={<Power className="size-3.5" />} disabled={e.status !== "completed" || e.is_active} onClick={() => api.post(`/api/experiments/${id}/activate`).then(onChange)}>
             {e.is_active ? "Active" : "Activate"}
           </Button>
           <Link to={`/evaluation?exp=${id}`}><Button size="sm" variant="secondary">Evaluation</Button></Link>
@@ -48,12 +48,12 @@ export default function ExperimentsPage() {
   const rows = exps.data ?? [];
   return (
     <div className="fade-in">
-      <PageHeader eyebrow="Reproducible runs" title="Experiment History"
+      <PageHeader eyebrow="Reproducible runs" title="Experiment history"
         description="Every training run with its dataset version, vocabulary, architecture, features, sequence length, parameters, signer partitions, metrics, checkpoint and timestamp."
         actions={rows.length > 0 && !IS_STATIC && <a href="/api/experiments/export.csv" download><Button variant="ghost" icon={<Download className="size-4" />}>Export CSV</Button></a>} />
       <Card padded={false}>
         {!rows.length ? (
-          <Empty title="No experiments yet">Runs started in the Model Laboratory are recorded here automatically.</Empty>
+          <Empty title="No experiments yet">Runs started in the Model laboratory are recorded here automatically.</Empty>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full min-w-[980px] text-sm">
@@ -67,7 +67,7 @@ export default function ExperimentsPage() {
                       <td className="px-3 py-2.5 text-fg-3">{open === r.id ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}</td>
                       <td className="px-3 py-2.5">
                         <div className="flex items-center gap-2"><span className="font-mono text-xs text-fg-3">#{r.id}</span><span className="text-fg">{r.name}</span></div>
-                        <div className="mt-0.5 flex gap-1.5">{r.is_active && <Badge tone="teal">active</Badge>}{r.is_synthetic && <Badge tone="warn">synthetic</Badge>}</div>
+                        <div className="mt-0.5 flex gap-1.5">{r.is_active && <Badge tone="accent">active</Badge>}{r.is_synthetic && <Badge tone="warn">synthetic</Badge>}</div>
                       </td>
                       <td className="px-3 py-2.5"><Badge tone={r.status === "completed" ? "good" : r.status === "failed" ? "danger" : r.status === "running" ? "accent" : "neutral"}>{r.status}</Badge></td>
                       <td className="px-3 py-2.5 font-mono text-xs">{r.architecture.toUpperCase()}</td>

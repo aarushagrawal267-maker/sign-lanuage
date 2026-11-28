@@ -19,18 +19,18 @@ const SECTIONS = [
 export default function ResearchPage() {
   return (
     <div className="fade-in">
-      <PageHeader eyebrow="Methodology" title="Research & Documentation"
+      <PageHeader title="Research & documentation"
         description="How the system works, what it can and cannot do, and how to reproduce the results." />
       <div className="grid gap-8 lg:grid-cols-[220px_minmax(0,1fr)]">
         <nav aria-label="Sections" className="lg:sticky lg:top-20 lg:self-start">
           <ul className="flex flex-wrap gap-1 lg:flex-col">
             {SECTIONS.map(([id, label]) => (
-              <li key={id}><a href={`#${id}`} className="block rounded-md px-2.5 py-1.5 text-[13px] text-fg-2 hover:bg-ink-800 hover:text-fg">{label}</a></li>
+              <li key={id}><a href={`#${id}`} className="block rounded-md px-2.5 py-1.5 text-sm text-fg-2 hover:bg-ink-800 hover:text-fg">{label}</a></li>
             ))}
           </ul>
         </nav>
 
-        <article className="prose-doc max-w-3xl rounded-2xl border border-ink-700 bg-ink-850 px-6 py-4 md:px-10 md:py-6">
+        <article className="prose-doc max-w-3xl rounded-xl border border-ink-700 bg-ink-850 px-6 py-4 md:px-10 md:py-6">
           <h2 id="scope">Scope</h2>
           <p>This is an independent <strong>educational and research implementation</strong> of <strong>isolated, word-level</strong> American Sign Language (ASL)
             recognition. It classifies one sign at a time into one of the 100 glosses of WLASL100 and prints that gloss as text.</p>
@@ -59,13 +59,13 @@ export default function ResearchPage() {
             <li>Videos are referenced by URL only; many links have expired. Missing videos are recorded as unavailable and never substituted.
               The authors provide missing videos on request via the form linked in the official repository.</li>
           </ul>
-          <p>Measured properties (resolution, true fps, duration) are recorded per video after download and shown in the Dataset Explorer.</p>
+          <p>Measured properties (resolution, true fps, duration) are recorded per video after download and shown in the Dataset explorer.</p>
 
           <h2 id="mediapipe">MediaPipe architecture</h2>
           <p>Google MediaPipe <strong>Holistic Landmarker</strong> combines pose (33 landmarks), two hands (21 landmarks each) and a 478-point face mesh in a single
             task. The same <code>holistic_landmarker.task</code> model runs in two places:</p>
           <ul>
-            <li><strong>Offline</strong> (dataset videos, Video Analysis): Python <code>mediapipe</code> in VIDEO mode on the backend.</li>
+            <li><strong>Offline</strong> (dataset videos, Video analysis): Python <code>mediapipe</code> in VIDEO mode on the backend.</li>
             <li><strong>Live</strong> (webcam): <code>@mediapipe/tasks-vision</code> WebAssembly in the browser, GPU delegate when available, CPU otherwise.</li>
           </ul>
           <p>Left/right hand labels refer to the <strong>signer's own hands</strong>. Frames are always processed unmirrored; the webcam preview is only
@@ -88,7 +88,7 @@ export default function ResearchPage() {
 
           <h2 id="sequence">Temporal sequence learning</h2>
           <p>Signs are dynamic, so classification always uses a sequence, never a single frame. Each clip (the annotated frame range) is resampled by timestamp to a
-            fixed number of steps (default 48; the Dataset Explorer recommends a value from the measured clip lengths). Resampling never blends a detected frame
+            fixed number of steps (default 48; the Dataset explorer recommends a value from the measured clip lengths). Resampling never blends a detected frame
             with a missing one. Training augmentation: mirroring (left-handed signing), small rotation/scale/shift, temporal crop and time-warp, landmark jitter and
             random hand dropout.</p>
 
@@ -132,7 +132,7 @@ export default function ResearchPage() {
             <li>The camera starts only when you press <em>Start camera</em> and the browser permission is granted; a red indicator shows while it is on.</li>
             <li>Video frames are processed in the browser. No webcam image is sent anywhere, saved, or used to identify you.</li>
             <li>Only recognised gloss labels and scores are stored (Recognition history), and can be cleared.</li>
-            <li>Uploaded files for Video Analysis go only to the local backend and are deleted right after processing.</li>
+            <li>Uploaded files for Video analysis go only to the local backend and are deleted right after processing.</li>
           </ul>
 
           <h2 id="licensing">Dataset licensing & citation</h2>
@@ -171,9 +171,9 @@ export default function ResearchPage() {
           <h2 id="reproducibility">Reproducibility</h2>
           <ol>
             <li>Run <code>setup.ps1</code> (Python venv, PyTorch CPU/CUDA, Node packages, MediaPipe model), then <code>start.ps1</code>.</li>
-            <li>Dataset Explorer → <em>Load annotations</em>. The annotation SHA-256 is recorded as the dataset version.</li>
+            <li>Dataset explorer → <em>Load annotations</em>. The annotation SHA-256 is recorded as the dataset version.</li>
             <li><em>Download &amp; validate</em> the videos, then <em>Extract landmarks</em>.</li>
-            <li>Model Laboratory → train on <code>signer-holdout</code>. Every run stores its full configuration, seed, feature settings, split and checkpoint.</li>
+            <li>Model laboratory → train on <code>signer-holdout</code>. Every run stores its full configuration, seed, feature settings, split and checkpoint.</li>
             <li>Compare runs on validation; once settled, run the held-out test evaluation once on the Evaluation page.</li>
             <li>For the most robust estimate, train on each <code>signer-cv5-fold</code> split and report the mean and spread.</li>
           </ol>

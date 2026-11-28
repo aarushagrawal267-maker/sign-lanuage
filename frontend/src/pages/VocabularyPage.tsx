@@ -10,7 +10,7 @@ type Sort = "class" | "alpha" | "f1" | "data";
 function f1Tone(f1: number | undefined) {
   if (f1 === undefined) return "bg-ink-700";
   if (f1 >= 0.7) return "bg-teal";
-  if (f1 >= 0.4) return "bg-accent";
+  if (f1 >= 0.4) return "bg-data-blue";
   return "bg-serious";
 }
 
@@ -45,8 +45,8 @@ function DetailPanel({ e, onClose, modelName }: { e: VocabEntry; onClose: () => 
         <div className="mb-2 text-xs font-medium text-fg-2">Reference example</div>
         {e.local_example ? (
           <>
-            <video controls muted loop playsInline className="w-full max-w-lg rounded-xl border border-ink-700 bg-black" src={`/api/dataset/videos/${e.local_example}/file`} />
-            <p className="mt-1.5 text-[11px] text-fg-3">Your local copy of WLASL video {e.local_example} (C-UDA: for research use on this machine; not redistributed).</p>
+            <video controls muted loop playsInline className="w-full max-w-lg rounded-lg border border-ink-700 bg-black" src={`/api/dataset/videos/${e.local_example}/file`} />
+            <p className="mt-1.5 text-2xs text-fg-3">Your local copy of WLASL video {e.local_example} (C-UDA: for research use on this machine; not redistributed).</p>
           </>
         ) : (
           <p className="text-sm text-fg-3">No local video for this gloss. Reference clips are shown only from videos you have acquired under the WLASL licence.</p>
@@ -73,7 +73,7 @@ export default function VocabularyPage() {
 
   return (
     <div className="fade-in">
-      <PageHeader eyebrow="Supported vocabulary" title="Sign Vocabulary Explorer"
+      <PageHeader title="Sign vocabulary explorer"
         description="The 100 ASL signs the system can recognise (WLASL100, first 100 glosses of the official annotation file). Each label is a gloss — an English word used to name a sign — not a full natural-language translation." />
 
       <div className="mb-5"><Notice>Anything signed outside this list cannot be recognised. Glosses may have several regional or dialect variants; WLASL includes some of them, not all.</Notice></div>
@@ -87,7 +87,7 @@ export default function VocabularyPage() {
         <Segmented ariaLabel="Sort" value={sort} onChange={setSort} options={[
           { value: "class", label: "Class id" }, { value: "alpha", label: "A–Z" }, { value: "f1", label: "Weakest first" }, { value: "data", label: "Most data" }]} />
         <span className="text-xs text-fg-3">{items.length} of {data?.glosses.length ?? 0}</span>
-        {data?.model && <span className="ml-auto flex items-center gap-2 text-xs text-fg-3"><span className="size-2 rounded-full bg-teal" />F1 ≥ 70% <span className="size-2 rounded-full bg-accent" />40–70% <span className="size-2 rounded-full bg-serious" />&lt; 40% (validation)</span>}
+        {data?.model && <span className="ml-auto flex items-center gap-2 text-xs text-fg-3"><span className="size-2 rounded-full bg-teal" />F1 ≥ 70% <span className="size-2 rounded-full bg-data-blue" />40–70% <span className="size-2 rounded-full bg-serious" />&lt; 40% (validation)</span>}
       </div>
 
       {error && <Notice tone="danger">{error}</Notice>}
@@ -99,14 +99,14 @@ export default function VocabularyPage() {
         {items.map((g) => (
           <li key={g.class_index}>
             <button onClick={() => setSel(g.class_index === sel ? null : g.class_index)} aria-pressed={sel === g.class_index}
-              className={cx("group flex w-full flex-col gap-2 rounded-xl border bg-ink-850 p-3 text-left transition-colors hover:border-ink-600",
+              className={cx("group flex w-full flex-col gap-2 rounded-lg border bg-ink-850 p-3 text-left transition-colors hover:border-ink-600",
                 sel === g.class_index ? "border-accent" : "border-ink-700")}>
               <div className="flex items-center justify-between">
-                <span className="font-mono text-[10px] text-fg-3">#{String(g.class_index).padStart(2, "0")}</span>
+                <span className="font-mono text-2xs text-fg-3">#{String(g.class_index).padStart(2, "0")}</span>
                 {g.val && <span className={cx("size-2 rounded-full", f1Tone(g.val.f1))} title={`validation F1 ${pct(g.val.f1, 0)}`} />}
               </div>
               <span className="truncate font-mono text-[15px] font-medium text-fg">{g.gloss.toUpperCase()}</span>
-              <div className="flex items-center justify-between text-[11px] text-fg-3">
+              <div className="flex items-center justify-between text-2xs text-fg-3">
                 <span>{g.annotated} clips · {g.signers} signers</span>
                 {g.val ? <span className="font-mono text-fg-2">{pct(g.val.f1, 0)}</span> : g.with_landmarks ? <Badge>{g.with_landmarks} seq</Badge> : null}
               </div>
